@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""Prepare and qualify a named suite on the authorized rig; never run models."""
+"""Qualify the complete benchmark on the authorized rig; never run models."""
 import argparse
+import hashlib
 import json
 
 from benchmark import ROOT, LOCAL, controls, guard, prepare, refresh_fixture, write_json
+from inventory import inventory, select_cases
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=["pilot", "plausible"], required=True)
+    parser.add_argument("--cases", nargs="+", help="Optional focused fixture diagnostics; default is every case")
     preparation = parser.add_mutually_exclusive_group()
     preparation.add_argument("--prepare", action="store_true", help="Build every case from its source pin")
     preparation.add_argument("--refresh", action="store_true", help="Refresh grader-only changes; source/runtime changes require --prepare")
     args = parser.parse_args()
     guard()
-    cases = json.loads((ROOT / "config/suites.json").read_text())[args.suite]
-    summary = {"suite": args.suite, "cases": {}, "valid": False}
-    output = LOCAL / "results/controls" / (args.suite + "-suite.json")
+    cases = select_cases(args.cases)
+    summary = {"benchmark": inventory()["id"], "selected_cases": cases, "cases": {}, "valid": False}
+    selection_id = hashlib.sha256("\0".join(cases).encode()).hexdigest()[:12]
+    output = LOCAL / "results/controls" / (f"selected-{selection_id}.json" if args.cases else "benchmark.json")
     for case in cases:
         print(json.dumps({"case": case, "stage": "qualification_started"}), flush=True)
         try:

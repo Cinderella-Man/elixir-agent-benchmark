@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from benchmark import ROOT, LOCAL, sha, write_json
+from inventory import inventory, select_cases
 
 
 def checks(result):
@@ -19,11 +20,11 @@ def checks(result):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=["pilot", "plausible"], required=True)
+    parser.add_argument("--cases", nargs="+", help="Optional focused evidence export; default is every case")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    ids = json.loads((ROOT / "config/suites.json").read_text())[args.suite]
-    output = {"suite": args.suite, "host": "ratx570", "model_attempts_in_this_qualification": 0,
+    ids = select_cases(args.cases)
+    output = {"benchmark": inventory()["id"], "selected_cases": ids, "host": "ratx570", "model_attempts_in_this_qualification": 0,
               "harness_sha256": sha(ROOT / "scripts/benchmark.py"),
               "formatter_sha256": sha(ROOT / "scripts/grade_formatter.exs"), "cases": {}}
     for case in ids:
@@ -49,7 +50,7 @@ def main():
                                        "acceptance": checks(partial["grade"]["hidden"])}
         output["cases"][case] = entry
     write_json(args.out, output)
-    print(json.dumps({"suite": args.suite, "valid_cases": len(ids), "output": str(args.out)}))
+    print(json.dumps({"benchmark": inventory()["id"], "valid_cases": len(ids), "output": str(args.out)}))
 
 
 if __name__ == "__main__":

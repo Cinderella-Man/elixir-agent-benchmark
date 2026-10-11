@@ -45,7 +45,16 @@ The limit on the combined input and response space available to a candidate in o
 The cumulative allowance for tokens generated across an attempt's interactions, under the declared accounting rules.
 
 **Candidate**:
-The particular model and serving configuration being evaluated. A changed quantization or behavior-changing runtime configuration is a different candidate.
+The particular model, quantization and serving configuration being evaluated. A changed quantization or behavior-changing runtime configuration is a different candidate. Candidate identity includes pinned model artifacts; endpoint aliases alone do not identify a model.
+
+**Benchmark inventory**:
+The versioned list of admitted scenarios executed by default in one benchmark. Repository and domain breakdowns describe parts of this inventory, not separately selected benchmarks.
+
+**Campaign**:
+A frozen matrix of candidates, scenarios and seeds under one declared agent and grading protocol. A focused subset is a diagnostic campaign and does not receive a full-benchmark score.
+
+**Case score**:
+The mean of binary executable outcomes across the declared seeds for one scenario. A complete benchmark score gives each scenario equal weight. Missing, unqualified and errored attempts block a final score rather than disappearing from the denominator.
 
 **Agent scaffold**:
 The interaction rules and tools through which a candidate performs a scenario.

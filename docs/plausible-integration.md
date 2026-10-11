@@ -1,6 +1,6 @@
 # Historical Plausible cases in the runner
 
-The `plausible` suite contains six actual upstream repairs. Each case starts at its own original broken commit, with an empty `starter.patch`. The published fork branches remain at those commits. The runtime uses the complete historical application and its locked dependencies; no defect is invented or transplanted onto a common release.
+The unified benchmark includes six actual upstream Plausible repairs. Each case starts at its own original broken commit, with an empty `starter.patch`. The published fork branches remain at those commits. The runtime uses the complete historical application and its locked dependencies; no defect is invented or transplanted onto a common release.
 
 ## Executable contract
 
@@ -40,22 +40,22 @@ Run only on the authorized `ratx570` rig. The integration installation is `/srv/
 
 ```bash
 # Build and run deterministic fixture controls; no model calls.
-python3 scripts/qualify_suite.py --suite plausible --prepare
+python3 scripts/qualify_suite.py --prepare
 
 # Requalify already prepared images after grader/ticket changes.
 # Changed source, runtime or service inputs require --prepare instead.
-python3 scripts/qualify_suite.py --suite plausible --refresh
+python3 scripts/qualify_suite.py --refresh
 
-# Explicitly select this suite for a later model campaign.
-python3 scripts/run_suite.py --suite plausible --campaign plausible-first --seeds 101
-python3 scripts/report.py --campaign plausible-first --document plausible-first.md
+# Run all admitted cases in one later model campaign.
+python3 scripts/run_suite.py --campaign full-comparison --seeds 101
+python3 scripts/report.py --campaign full-comparison --document full-comparison.md
 ```
 
-The default campaign suite remains the original four-case `pilot`. Qualification requires rejection of the empty patch, acceptance of the reference repair with effective regression coverage, rejection of `System.halt(0)` and behavioral rejection of the case's incomplete repair. Controls bind to the fixture, immutable image, controller and formatter; model runs refuse stale or invalid attestations. `refresh` updates grader metadata only after checking that the prepared image inputs are unchanged.
+The default campaign now includes all sixteen cases, including Plausible and Livebook. Use `--cases` only for focused diagnostics. Qualification requires rejection of the empty patch, acceptance of the reference repair with effective regression coverage, rejection of `System.halt(0)` and behavioral rejection of the case's incomplete repair. Controls bind to the fixture, immutable image, controller and formatter; model runs refuse stale or invalid attestations. `refresh` updates grader metadata only after checking that the prepared image inputs are unchanged.
 
 ## Qualification evidence and remaining scope
 
-All six fixtures passed controls on `ratx570` on 2026-10-11 under the same controller and formatter hashes. Counts below are executed tests; the six expected enterprise exclusions in #5939 are listed separately in the artifact.
+The initial Plausible integration qualified all six fixtures on `ratx570` on 2026-10-11 under the controller and formatter hashes recorded in its artifact. This is historical qualification evidence; current unified controls are recorded in `benchmark-qualification.json`. Counts below are executed tests; the six expected enterprise exclusions in #5939 are listed separately in the artifact.
 
 | Case | Broken acceptance failures | Reference acceptance passes | Protected regression passes | Incomplete-repair failures |
 | --- | ---: | ---: | ---: | ---: |
@@ -72,6 +72,6 @@ The shared-grader change also passed the [four original pilot controls](pilot-in
 
 During qualification, a linked-process CSV failure exposed an unsupported failure shape in the formatter. The formatter was corrected, setup-versus-test failure metadata was added, and all final controls were rerun under the frozen corrected version. The artifact reports those final controls; the initial formatter failure is not represented as a successful control.
 
-Control results are recorded in [the reviewed qualification artifact](plausible-qualification.json), without raw diagnostic logs or timings. Raw control output stays under the ignored `.local/` directory on the rig. The artifact can be regenerated with `scripts/export_qualification.py --suite plausible --out docs/plausible-qualification.json` after valid controls. Source provenance is checked independently by `scripts/verify_historical_candidates.py`.
+Control results are recorded in [the reviewed qualification artifact](plausible-qualification.json), without raw diagnostic logs or timings. Raw control output stays under the ignored `.local/` directory on the rig. The artifact can be regenerated with `scripts/export_qualification.py --out docs/benchmark-qualification.json` after valid controls. Source provenance is checked independently by `scripts/verify_historical_candidates.py`.
 
 No Plausible model attempts or performance measurements are part of this integration. Correct fixture behavior does not establish that an agent can solve each case within its context window. The runner still keeps the full conversation without compaction. Its default 65,536 completion-token allowance is cumulative generation, not a context cap. A common context policy, prompt accounting, response reserve and unscored feasibility attempts remain prerequisites for a comparative campaign. Immediate publication also means possible prior exposure to these PRs and solutions; offline isolation does not remove that limitation.

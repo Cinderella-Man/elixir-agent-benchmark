@@ -6,7 +6,7 @@ The [large-codebase expansion interview](large-codebase-expansion.md) selects Pl
 
 ## First breadth target
 
-The six historical Plausible cases are now [wired into a separate suite](plausible-integration.md), bringing the implemented inventory to ten cases. Fixture qualification and model/context qualification are distinct. These six repairs do not replace the feature, OTP, session or second-application targets below.
+The six historical Plausible cases and six [Livebook cases](livebook-integration.md) join the original four in one 16-case benchmark, executed in full by default. [The comparison protocol](comparison-protocol.md) treats each model/quantization combination as a distinct candidate. Fixture qualification and model/context qualification are distinct. These repairs do not replace the feature, OTP or evolving-session targets below.
 
 Keep the four pilot cases as development checks. The eight additions below would create a 12-scenario development set; these are authoring targets, not implemented or validated fixtures. Select and pin suitable real repositories before writing patches. At least two additions must use applications outside LiveBeats.
 
@@ -36,4 +36,4 @@ The large-codebase interview adds two requirements: tasks must be achievable und
 5. **Increase realistic context.** Add multi-module applications and longer change histories only when the task requires using that information. Include stale documentation, earlier design decisions and cross-file dependencies. Reserve response space and test actual correctness near the desired context limit; repeated filler is not a coding-context benchmark.
 6. **Check transfer to the user's client.** Repeat a fixed subset through pinned Pi after the common-agent comparison. Keep scaffold effects separate. Investigate Cursor compatibility where a reproducible client path is available.
 
-These are implementation priorities, not a promise that every item is already present. Case counts are working targets and may change if source review finds weak or correlated tasks. Maintain separate suite versions as scenarios evolve so that an old score never silently changes meaning.
+These are implementation priorities, not a promise that every item is already present. Case counts are working targets and may change if source review finds weak or correlated tasks. Version the unified inventory as scenarios evolve so that an old score never silently changes meaning.

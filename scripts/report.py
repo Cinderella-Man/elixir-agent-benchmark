@@ -5,6 +5,7 @@ from collections import defaultdict
 import hashlib
 import json
 from pathlib import Path
+from score import markdown_scores, score_campaign
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -22,8 +23,8 @@ def scrub(value, secret):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--campaign", nargs="+", default=["pilot-v2"])
-    parser.add_argument("--document", default="pilot-results.md", help="Markdown filename inside results/reports/")
+    parser.add_argument("--campaign", nargs="+", required=True)
+    parser.add_argument("--document", default="benchmark-results.md", help="Markdown filename inside results/reports/")
     args = parser.parse_args()
     if any(Path(name).name != name or name in {".", ".."} for name in args.campaign):
         parser.error("Campaign must be a directory name")
@@ -34,7 +35,17 @@ def main():
         parser.error("Every requested campaign must exist")
     key_file = ROOT / ".local/api-key"
     secret = key_file.read_text().strip() if key_file.exists() else ""
-    candidates = [c["id"] for c in json.loads((ROOT / "config/candidates.json").read_text())["candidates"]]
+    # Historical campaigns retain their candidate columns even after config changes.
+    candidates = []
+    for source in sources:
+        receipt_path = source / "campaign.json"
+        if receipt_path.exists():
+            candidates.extend(json.loads(receipt_path.read_text()).get("candidates", []))
+        for path in source.glob("*/*/*/attempt.json"):
+            candidates.append(json.loads(path.read_text())["candidate"]["id"])
+        for path in source.glob("*/*/*/setup-error.json"):
+            candidates.append(json.loads(path.read_text())["candidate"])
+    candidates = list(dict.fromkeys(candidates)) or [c["id"] for c in json.loads((ROOT / "config/candidates.json").read_text())["candidates"]]
     cases = set()
     rows = defaultdict(lambda: defaultdict(list))
     evidence = defaultdict(list)
@@ -73,7 +84,7 @@ def main():
         control = json.loads(control_path.read_text()) if control_path.exists() else {}
         if record["status"] == "completed" and (verdict.get("harness_sha256") != controller_hash or
                 not control.get("valid") or control.get("harness_sha256") != controller_hash or
-                control.get("formatter_sha256") != formatter_hash):
+                control.get("formatter_sha256") != formatter_hash or record.get("runtime") != control.get("runtime")):
             status = "Needs current grading"
         artifact = "regrade.json" if regrade_path.exists() else "attempt.json"
         link = f"../{source.name}/{relative_dir}/{artifact}"
@@ -118,6 +129,15 @@ def main():
              "| Scenario | " + " | ".join(candidates) + " |", "| --- | " + " | ".join("---" for _ in candidates) + " |"]
     for case in sorted(cases):
         lines.append("| " + case + " | " + " | ".join("; ".join(rows[case][candidate]) or "Not run" for candidate in candidates) + " |")
+    for source in sources:
+        receipt_path = source / "campaign.json"
+        if receipt_path.exists() and json.loads(receipt_path.read_text()).get("schema_version") == 2:
+            try:
+                scored = score_campaign(source, ROOT)
+                lines += ["", f"Campaign: `{source.name}`", "", *markdown_scores(scored)]
+                (ROOT / "results" / source.name / "scores.json").write_text(json.dumps(scored, indent=2) + "\n")
+            except ValueError as error:
+                lines += ["", f"Score unavailable for `{source.name}`: {error}"]
     lines += ["", "## Attempt completion and request profiles", "",
               "Pass means the final saved patch passes the executable checks. It does not mean the agent submitted a finished answer: a budget-ended attempt can leave a correct repair while still investigating. Completion is shown separately below. Reasoning values are the actual first request payloads, not inferred from the current configuration.", "",
               "| Campaign | Candidate | Case | Seed | Reasoning | Configured context | Calls | Ended by |", "| --- | --- | --- | ---: | --- | ---: | ---: | --- |"]

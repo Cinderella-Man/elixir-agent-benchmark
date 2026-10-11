@@ -112,9 +112,11 @@ def dockerfile(case, base, node=None):
     env = {"MIX_ENV": "test", "MIX_HOME": "/opt/mix", "HEX_HOME": "/opt/hex",
            "ERL_FLAGS": "+S 2:2", **runtime.get("environment", {})}
     lines = ([f"FROM {node} AS nodejs"] if node else []) + [f"FROM {base}", "USER root"]
-    lines += ["RUN if command -v apk; then apk add --no-cache git python3 bash ca-certificates build-base brotli libstdc++; "
-              "else apt-get update && apt-get install -y --no-install-recommends git python3 bash ca-certificates build-essential brotli && rm -rf /var/lib/apt/lists/*; fi",
-              "RUN if command -v useradd; then useradd -m -u 1000 agent; else adduser -D -u 1000 agent; fi"]
+    lines += ["RUN if command -v apk; then apk add --no-cache git python3 bash ca-certificates build-base brotli libstdc++ cmake; "
+              "else apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git python3 bash ca-certificates build-essential brotli cmake && rm -rf /var/lib/apt/lists/*; fi",
+              "RUN if command -v useradd; then existing=$(getent passwd 1000 | cut -d: -f1); groupadd -f agent; "
+              "if [ -n \"$existing\" ]; then usermod -l agent -d /home/agent -m -g agent \"$existing\"; "
+              "else useradd -m -u 1000 -g agent agent; fi; else adduser -D -u 1000 agent; fi"]
     if node:
         lines += ["COPY --from=nodejs /usr/local/bin/node /usr/local/bin/node",
                   "COPY --from=nodejs /usr/local/lib/node_modules /usr/local/lib/node_modules",

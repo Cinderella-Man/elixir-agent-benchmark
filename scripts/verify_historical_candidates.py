@@ -80,8 +80,9 @@ def verify(directory, repository):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", required=True, type=Path)
+    parser.add_argument("--project", choices=["plausible", "livebook"], default="plausible")
     args = parser.parse_args()
-    directories = sorted((ROOT / "candidates").glob("plausible-pr-*/candidate.json"))
+    directories = sorted((ROOT / "candidates").glob(args.project + "-pr-*/candidate.json"))
     require(bool(directories), "No historical candidates found")
     results = [verify(path.parent, args.repository.resolve()) for path in directories]
     print(json.dumps(results, indent=2))
