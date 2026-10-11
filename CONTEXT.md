@@ -53,6 +53,12 @@ The interaction rules and tools through which a candidate performs a scenario.
 **Verifier**:
 The independent checks that determine whether a submitted project state satisfies a scenario's acceptance criteria.
 
+**Fixture qualification**:
+Recorded controls establishing that a particular environment and evaluator reject the broken state and plausible incomplete repairs, accept the reference repair, and reject integrity bypasses. It establishes executable case behavior, not model ability.
+
+**Campaign qualification**:
+The additional validation of the chosen candidates, shared agent contract, context and generation limits, and task feasibility needed before a comparative model campaign.
+
 **Grader-only check**:
 An acceptance check withheld from the agent during an attempt and made available to the verifier. Its source may still be publicly available outside the attempt.
 _Avoid_: Private test when its source is published.

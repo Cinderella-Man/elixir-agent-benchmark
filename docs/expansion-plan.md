@@ -6,6 +6,8 @@ The [large-codebase expansion interview](large-codebase-expansion.md) selects Pl
 
 ## First breadth target
 
+The six historical Plausible cases are now [wired into a separate suite](plausible-integration.md), bringing the implemented inventory to ten cases. Fixture qualification and model/context qualification are distinct. These six repairs do not replace the feature, OTP, session or second-application targets below.
+
 Keep the four pilot cases as development checks. The eight additions below would create a 12-scenario development set; these are authoring targets, not implemented or validated fixtures. Select and pin suitable real repositories before writing patches. At least two additions must use applications outside LiveBeats.
 
 | Addition | Agent's realistic ticket | Observable acceptance contract |
@@ -23,7 +25,7 @@ Concurrency checks should control event order with barriers or injected collabor
 
 ## After breadth
 
-Before a comparative campaign, review the agent-facing contract as well as the cases. The pilot enforces budgets and edit restrictions in the controller, but does not yet show a remaining-budget counter or enumerate allowed edit paths in each ticket. Freeze an explicit common contract for the next version and expose those constraints to every model. Do not silently change the prompts during a scored campaign. Qualify reasoning-token accounting, context truncation, seed support and native tool parsing on each serving stack before claiming equal budgets.
+Before a comparative campaign, review the agent-facing contract as well as the cases. The runner now states permitted edit paths, the project test command, initial action/completion allowances and the no-compaction policy. It does not yet expose a remaining-budget counter or enforce a common context window. Freeze the common contract before running a scored campaign. Qualify reasoning-token accounting, context handling, seed support and native tool parsing on each serving stack before claiming equal budgets.
 
 The large-codebase interview adds two requirements: tasks must be achievable under the declared context policy, and results must come from deterministic executable checks rather than subjective code-quality review or an AI judge. The existing total generation allowance does not enforce a context window. Compaction versus a common cap without compaction remains open in Q24; qualify task feasibility before scored use.
 

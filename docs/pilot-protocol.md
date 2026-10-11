@@ -2,6 +2,8 @@
 
 This is the first runnable slice of the user's Elixir-focused benchmark. The user authorized implementation after accepting eight foundational decisions. The larger design remains quality-first: identical agent tools and instructions, realistic existing-project work, independent acceptance checks, and broader coverage through new cases.
 
+This document describes the original four-case pilot. The subsequent [Plausible integration](plausible-integration.md) adds a separate six-case suite and extends the shared grader to execute new test files, protect pass/exclusion states and assess fail-before/pass-after coverage where required. Historical model verdicts remain tied to their original evaluator; new fixture controls do not silently regrade old model attempts.
+
 ## Cases
 
 | Case | Existing project | Work exercised | Hidden tests |

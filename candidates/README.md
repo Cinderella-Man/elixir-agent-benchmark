@@ -1,8 +1,8 @@
 # Historical Plausible repair candidates
 
-These six drafts use actual merged upstream fixes. Their broken branches point directly to original upstream pre-fix commits in [the user's fork](https://github.com/Cinderella-Man/plausible-analytics); no source defect was invented or transplanted. Each case therefore has its own historical source baseline.
+These six source packages use actual merged upstream fixes. Their broken branches point directly to original upstream pre-fix commits in [the user's fork](https://github.com/Cinderella-Man/plausible-analytics); no source defect was invented or transplanted. Each case therefore has its own historical source baseline.
 
-**Status: source verified, runtime unqualified.** Exact parent relationships, artifact hashes and patch reconstruction have been checked. Application builds, fail-before/pass-after controls, incomplete-repair probes and context feasibility remain pending. These directories deliberately sit outside `cases/`, so the existing campaign runner cannot accidentally treat them as runnable fixtures.
+**Current implementation:** all six have executable counterparts under `cases/`, selected explicitly with `--suite plausible`. See the [integration and qualification record](../docs/plausible-integration.md). This directory preserves the original source-review snapshots: `candidate.json` statuses and `qualification.md` notes describe that earlier phase, and their artifact hashes remain intact. Current runtime admission facts live with the integration, not in these frozen source drafts. Model/context feasibility remains separate from runtime fixture controls.
 
 | Candidate | Real problem | Broken branch |
 | --- | --- | --- |
@@ -38,4 +38,4 @@ python3 scripts/verify_historical_candidates.py --repository /path/to/plausible-
 
 The script makes no network calls and executes no application code. It validates the parent pairs and file hashes, compares the saved patches with upstream diffs, and reconstructs the exact repaired tree from both the complete patch and its three partitions using a temporary Git index. It does not change the clone's working tree or index. This is a provenance check, not a benchmark result or proof of behavioral correctness.
 
-Promotion into `cases/` requires a frozen historical runtime, deterministic failure on the broken state, successful reference repair, protected neighboring behavior, effective regression coverage, integrity controls and context-feasibility evidence. The future attempt workspace receives only the broken source and ticket, with fresh Git history and no network; this candidate directory and its publicly available solutions remain outside it.
+Executable fixtures require a frozen historical runtime, deterministic failure on the broken state, successful reference repair, protected neighboring behavior, effective regression coverage and integrity controls. Comparative campaign use additionally requires context-feasibility evidence. The attempt workspace receives only the broken source and ticket, with fresh Git history and no network; this candidate directory and its publicly available solutions remain outside it.

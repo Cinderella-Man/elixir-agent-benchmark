@@ -1,6 +1,6 @@
 # Plausible historical bug-fix candidates
 
-Investigated 2026-10-11. Status: source-verified shortlist, awaiting runtime qualification. This note follows the user's decision to use actual upstream defects and their merged repairs. The earlier single-`v3.2.1` baseline, invented mutations and fixed six-subsystem quota are superseded for this batch. The six candidates below use their own historical upstream snapshots.
+Investigated 2026-10-11. This source investigation is preserved as provenance; the subsequent [runner integration and runtime evidence](plausible-integration.md) describe the executable cases. This note follows the user's decision to use actual upstream defects and their merged repairs. The earlier single-`v3.2.1` baseline, invented mutations and fixed six-subsystem quota are superseded for this batch. The six candidates below use their own historical upstream snapshots.
 
 Research used public upstream PRs, commit metadata, diffs, source and tests through GitHub's API and a read-only source clone. No application builds, tests, benchmark runs or performance measurements were performed. “Expected to fail before the repair” below is a source inference, not an observed result. Neither an upstream green check nor a PR author's report establishes that our future Community Edition fixture works.
 

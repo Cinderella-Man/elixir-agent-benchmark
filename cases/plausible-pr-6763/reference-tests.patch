@@ -1,0 +1,86 @@
+diff --git a/test/plausible_web/controllers/api/stats_controller/dashboard_csv_export_test.exs b/test/plausible_web/controllers/api/stats_controller/dashboard_csv_export_test.exs
+index 8b8fff10f251737e4e8e013a594e1f36b9a790aa..a0029bacba46ed63669f2594460850984180fe5d 100644
+--- a/test/plausible_web/controllers/api/stats_controller/dashboard_csv_export_test.exs
++++ b/test/plausible_web/controllers/api/stats_controller/dashboard_csv_export_test.exs
+@@ -876,6 +876,55 @@ defmodule PlausibleWeb.Api.StatsController.DashboardCsvExportTest do
+                [""]
+              ]
+     end
++
++    test "exports visitors.csv when the site has no legacy time on page cutoff",
++         %{conn: conn, site: site} do
++      site = Plausible.Sites.update_legacy_time_on_page_cutoff!(site, nil)
++
++      populate_stats(site, [
++        build(:pageview, user_id: 12, pathname: "/blog", timestamp: ~N[2020-01-05 00:00:00]),
++        build(:engagement,
++          user_id: 12,
++          pathname: "/blog",
++          timestamp: ~N[2020-01-05 00:01:00],
++          scroll_depth: 40
++        ),
++        build(:pageview, user_id: 34, pathname: "/blog", timestamp: ~N[2020-01-07 00:00:00])
++      ])
++
++      pages =
++        conn
++        |> do_export(site, %{
++          @base_params
++          | date_range: "7d",
++            relative_date: "2020-01-08",
++            filters: [["is", "event:page", ["/blog"]]],
++            reports: @page_filtered_reports
++        })
++        |> response(200)
++        |> unzip_and_parse_csv(~c"visitors.csv")
++
++      assert [
++               [
++                 "date",
++                 "visitors",
++                 "pageviews",
++                 "visits",
++                 "bounce_rate",
++                 "time_on_page",
++                 "scroll_depth"
++               ]
++               | rows
++             ] = pages
++
++      assert Enum.find(rows, &match?(["2020-01-05" | _], &1)) |> Enum.take(4) ==
++               ["2020-01-05", "1", "1", "1"]
++
++      assert Enum.find(rows, &match?(["2020-01-07" | _], &1)) |> Enum.take(4) ==
++               ["2020-01-07", "1", "1", "1"]
++
++      assert Enum.all?(rows, &(&1 == [""] or Enum.at(&1, 5) == ""))
++    end
+   end
+ 
+   describe "POST /api/stats/:domain/export - with a custom prop filter" do
+diff --git a/test/benchmark_regression_test.exs b/test/benchmark_regression_test.exs
+new file mode 100644
+--- /dev/null
++++ b/test/benchmark_regression_test.exs
+@@ -0,0 +1,21 @@
++defmodule Plausible.Benchmark.LegacyPageMetricTest do
++  use Plausible.DataCase
++  alias Plausible.Stats.QueryBuilder
++
++  setup [:create_user, :create_site]
++
++  test "supported page breakdown retains legacy time on page without a cutoff", %{site: site} do
++    site = Plausible.Sites.update_legacy_time_on_page_cutoff!(site, nil)
++    populate_stats(site, [
++      build(:pageview, user_id: 42, pathname: "/blog", timestamp: ~N[2020-01-05 12:00:00]),
++      build(:pageview, user_id: 42, pathname: "/next", timestamp: ~N[2020-01-05 12:01:00])
++    ])
++    query = QueryBuilder.build!(site,
++      metrics: [:visitors, :time_on_page], input_date_range: :all, dimensions: ["event:page"]
++    )
++    result = Plausible.Stats.query(site, query)
++    blog = Enum.find(result.results, &(&1.dimensions == ["/blog"]))
++    assert blog
++    assert blog.metrics == [1, 60]
++  end
++end

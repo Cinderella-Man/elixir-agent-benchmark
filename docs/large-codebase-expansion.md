@@ -2,7 +2,7 @@
 
 Started 2026-10-11. Current direction: actual historical Plausible repairs, with each broken branch pinned to the real pre-fix revision. The user explicitly replaced invented bugs with solved upstream problems after rounds 3–5. The [PR investigation](plausible-pr-candidates.md) and [historical-repair decision](adr/0002-historical-upstream-repairs.md) govern case selection. This supplements the [existing expansion plan](expansion-plan.md), preserving its feature, OTP, multi-repository and evolving-session work.
 
-Source inspection establishes the candidate commit pairs and test evidence; none of these historical cases has passed runtime qualification. The user created the public fork. Local synthetic drafts and an unqualified shared-release runtime draft were archived after the change of direction; the obsolete remote image preparation was stopped. No application tests, model attempts or performance measurements were run during this expansion investigation. The existing runner is unchanged.
+This document preserves the investigation and interview. The user's subsequent request to wire the cases into the benchmark is implemented in the [Plausible integration](plausible-integration.md), which records runtime controls separately from outstanding model/context feasibility. Local synthetic drafts and the unqualified shared-release runtime draft remain archived; they were not revived. No Plausible model attempts or performance measurements are part of the integration.
 
 The six [historical candidate packages](../candidates/README.md) now contain draft tickets, exact upstream repair/test patches, toolchain declarations and qualification notes. Their six broken branches have been published to the user's fork and checked against the recorded SHAs. The source verifier reconstructed the exact accepted upstream tree for every candidate; this does not establish behavioral red/green results.
 
@@ -65,7 +65,9 @@ Use the original issue or PR's problem report as the ticket source. Remove diagn
 
 Repository size, diagnosis difficulty and repair breadth are different properties. A small correct patch can require substantial investigation; a large repetitive patch can require little. Describe case difficulty using the relevant behaviors, module boundaries, state transitions and edge cases. Do not infer difficulty from changed-line count, source-file count or local execution time.
 
-## Harness changes to plan
+## Harness gaps recorded during planning
+
+This table describes the pre-integration runner. ClickHouse lifecycle, acceptance overlays, declared CE exclusions, new-test discovery, regression-coverage assessment and per-case incomplete-repair probes are now implemented. Common context-window enforcement and compaction remain open; consult the [current integration contract](plausible-integration.md) rather than these historical source line references.
 
 | Verified current limit | Implication for expansion |
 | --- | --- |
@@ -165,10 +167,10 @@ Exact context size and total budgets are not selected yet. They depend on the ca
 2. **Publish reviewable source drafts.** Put each broken branch at the exact upstream pre-fix SHA in the user's fork. Store symptom-focused tickets, source manifests, upstream production/test/ancillary patches and artifact hashes in this repository, outside active `cases/`. No new defect is authored. Source-only drafts must not be auto-discovered by the campaign runner.
 3. **Qualify the historical environments.** Pin each source toolchain, lockfiles, generated assets, PostgreSQL/ClickHouse images and test data. Reuse matching runtime layers only after validating compatibility. Add isolated service support and explicit CE test-selection handling to the runner when integrating these cases.
 4. **Make upstream evidence into deterministic acceptance.** Preserve suitable upstream regression coverage; adapt checks to stable application interfaces when the repair introduces or renames helpers. Prove an intended assertion failure on the original state and a pass after the reference repair. Add neighboring and plausible incomplete-repair checks where the existing tests leave a material gap. Do not use patch similarity or an AI judge.
-5. **Admit validated fixtures.** Execute relevant submitted regression tests, protect original assertions, reject early-exit bypasses and isolate state between grades. Audit answer leakage and establish feasibility under the declared context policy. Only then promote a draft into `cases/` with versioned qualification evidence.
+5. **Integrate validated fixtures and qualify campaign use.** Execute relevant submitted regression tests, protect original assertions, reject early-exit bypasses and isolate state between grades. Audit answer leakage and record fixture evidence with the executable case. Separately establish feasibility under the declared context policy before comparative campaign use.
 6. **Prepare a subsequent comparison campaign.** Freeze common context/action/generation limits, suite and scaffold version before scored attempts on the authorized rig. Broader conclusions also require the second application and accepted breadth/session work.
 
-A merged PR supplies real work and a reference repair; our remaining work is reproducible packaging and verification. The first milestone remains six qualified application-repair fixtures. The current source drafts do not yet establish that milestone, a model ranking, browser coverage or performance qualification.
+A merged PR supplies real work and a reference repair; packaging and verification are still necessary. The [integration record](plausible-integration.md) reports this milestone's actual controls. It establishes neither a model ranking, context feasibility, browser coverage nor performance qualification.
 
 ## Decisions unlocked by this round
 

@@ -74,7 +74,7 @@ def verify(directory, repository):
             require(actual_tree == expected_tree, "Patch replay differs from fixed tree")
 
     return {"id": data["id"], "source_artifacts": "pass",
-            "application_tests": "not_run", "runtime_qualified": False}
+            "application_tests": "not_run_by_this_check", "runtime_qualification": "not_assessed_by_this_check"}
 
 
 def main():
