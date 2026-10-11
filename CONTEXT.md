@@ -14,9 +14,35 @@ Related source tasks or scenarios that share an underlying problem, template or 
 A defined piece of agent work with an initial project state, a user request and acceptance criteria.
 _Avoid_: Prompt, unit test when referring to the whole scenario.
 
+**Repository baseline**:
+The particular project state from which a set of scenarios is constructed. Calling it a healthy baseline means its declared correctness checks have passed.
+
+**Historical repair**:
+A scenario drawn from an actual upstream defect and its accepted repair, preserving the original broken project state and the repair's provenance.
+_Avoid_: Seeded regression when no defect was introduced by the benchmark author.
+
+**Reference repair**:
+A known solution used to qualify a scenario's acceptance checks. Other implementations can satisfy the same behavioral contract.
+
+**Seeded regression**:
+A behavior-breaking change intentionally introduced into a previously correct project state for a repair scenario. It is authored evaluation material, not evidence of a historical upstream defect.
+_Avoid_: Upstream bug when referring to a defect introduced by the benchmark author.
+
+**Authoring repository**:
+The project history used to construct and maintain scenario starting states and reference repairs.
+
+**Attempt workspace**:
+The project state made available to an agent for one attempt. Its accessible material is part of the scenario contract and can differ from the authoring repository.
+
 **Attempt**:
 One independent agent run on a scenario, including its investigation, edits, tool calls and self-corrections.
 _Avoid_: Test when referring to an entire agent run.
+
+**Attempt context budget**:
+The limit on the combined input and response space available to a candidate in one interaction during an attempt. It is distinct from the allowance for generation across the whole attempt.
+
+**Attempt generation budget**:
+The cumulative allowance for tokens generated across an attempt's interactions, under the declared accounting rules.
 
 **Candidate**:
 The particular model and serving configuration being evaluated. A changed quantization or behavior-changing runtime configuration is a different candidate.
@@ -26,6 +52,10 @@ The interaction rules and tools through which a candidate performs a scenario.
 
 **Verifier**:
 The independent checks that determine whether a submitted project state satisfies a scenario's acceptance criteria.
+
+**Grader-only check**:
+An acceptance check withheld from the agent during an attempt and made available to the verifier. Its source may still be publicly available outside the attempt.
+_Avoid_: Private test when its source is published.
 
 **Quality evidence**:
 Recorded outcomes that show how reliably a candidate completes defined work, with the scenario, agent setup and assessment method identified.

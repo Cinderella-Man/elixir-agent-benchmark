@@ -8,6 +8,8 @@ The first 12 model attempts have ended: ten reached grading and two stopped with
 
 Source material: [Cinderella-Man/elixir-sft-dataset tasks](https://github.com/Cinderella-Man/elixir-sft-dataset/tree/main/tasks). The source audit pins and inspects this collection; the pilot uses newly authored scenarios in existing projects. A source task, a variant and an independent benchmark scenario are different units.
 
+The next application expansion uses [six actual historical Plausible repairs](candidates/README.md), with separate public branches at their original broken commits. The source pairs, repair patches and provenance have been verified; their historical runtimes and behavioral acceptance tests are not yet qualified. These drafts stay outside the runnable pilot cases.
+
 This directory is self-contained and can become a separate repository. Planning notes, source evidence, fixtures and benchmark tooling belong here; other local projects are not dependencies.
 
 - [Design decisions](docs/design-tree.md)
