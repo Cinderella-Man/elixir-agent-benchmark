@@ -39,6 +39,7 @@ def protocol(cases, seeds, max_calls, max_tokens, root=ROOT):
         "driver_sha256": digest(root / "scripts/run_suite.py"),
         "scorer_sha256": digest(root / "scripts/score.py"),
         "inventory_code_sha256": digest(root / "scripts/inventory.py"),
+        "endpoint_check_sha256": digest(root / "scripts/check_endpoints.py"),
         "runtimes": {case: digest(root / ".local/runtimes" / (case + ".json")) for case in cases},
         "fixtures": {case: {p.name: digest(p) for p in sorted((root / "cases" / case).iterdir()) if p.is_file()}
                      for case in cases},

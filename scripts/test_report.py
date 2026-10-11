@@ -11,6 +11,11 @@ import report
 
 
 class CampaignReportTest(unittest.TestCase):
+    def test_export_redacts_multiple_endpoint_credentials(self):
+        value = {'text': 'first-key second-key', 'Authorization': 'another-secret'}
+        self.assertEqual(report.scrub(value, ['first-key', 'second-key']),
+                         {'text': '[REDACTED] [REDACTED]', 'Authorization': '[REDACTED]'})
+
     def test_reports_only_cases_selected_for_the_campaign(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

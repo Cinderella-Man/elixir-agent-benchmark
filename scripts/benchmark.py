@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone, remote-only Elixir agent pilot. No throughput or latency scoring."""
+"""Containerized Elixir repair benchmark. No throughput or latency scoring."""
 import argparse
 import base64
 import hashlib
@@ -70,8 +70,22 @@ def bounded_output(args, limit=20000, timeout=140):
 
 
 def guard(initialize=False):
-    if socket.gethostname().split(".")[0].lower() != "ratx570":
-        raise RuntimeError("Execution is authorized only on ratx570; the shared workstation is excluded")
+    host = socket.gethostname().split(".")[0].lower()
+    if host == "crosshaira16":
+        raise RuntimeError("Benchmark execution is prohibited on the shared workstation CrosshairA16")
+    if host != "ratx570":
+        # A fresh clone opts in once on its execution host. The original rig
+        # retains its stricter, immutable power-service checks below.
+        state = {"host": host}
+        if shutil.which("nvidia-smi"):
+            state["gpu_rows"] = shell(["nvidia-smi", "--query-gpu=index,uuid,power.limit",
+                                        "--format=csv,noheader,nounits"]).stdout.strip().splitlines()
+        path = LOCAL / "execution-host.json"
+        if initialize and not path.exists():
+            write_json(path, state)
+        if not path.exists() or json.loads(path.read_text()) != state:
+            raise RuntimeError("Missing or changed execution host/GPU baseline; run init once on the intended host")
+        return state
     unit = Path(shell(["systemctl", "show", "gpu-power-limit.service", "-p", "FragmentPath", "--value"]).stdout.strip())
     if shell(["systemctl", "is-active", "gpu-power-limit.service"]).stdout.strip() != "active":
         raise RuntimeError("GPU power-limit service must remain active")
@@ -86,7 +100,7 @@ def guard(initialize=False):
         write_json(path, state)
     if not path.exists() or json.loads(path.read_text()) != state:
         raise RuntimeError("Missing or changed power baseline; use init once on the authorized rig")
-    return {"unit_sha256": state["sha256"], "gpu_rows": rows}
+    return {"host": host, "unit_sha256": state["sha256"], "gpu_rows": rows}
 
 
 def case_data(case_id):
@@ -546,8 +560,90 @@ def request(candidate, key, payload=None, route="/v1/chat/completions"):
         with urllib.request.urlopen(req, timeout=1200) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
-        detail = error.read(12000).decode(errors="replace").replace(key, "[REDACTED]")
+        detail = error.read(12000).decode(errors="replace")
+        if key:
+            detail = detail.replace(key, "[REDACTED]")
         raise RuntimeError(f"Endpoint HTTP {error.code}: {detail}") from error
+
+
+def api_key(candidate):
+    if name := candidate.get("api_key_env"):
+        return os.environ[name]
+    path = LOCAL / "api-key"
+    return path.read_text().strip() if path.exists() else ""
+
+
+def context_policy():
+    policy = json.loads((ROOT / "config/benchmark.json").read_text())["context_policy"]
+    if (policy.get("compaction") is not False or
+            any(type(policy.get(k)) is not int or policy[k] <= 0
+                for k in ("window_tokens", "response_tokens", "safety_tokens")) or
+            policy["response_tokens"] + policy["safety_tokens"] >= policy["window_tokens"]):
+        raise ValueError("Invalid shared context policy")
+    return policy
+
+
+def endpoint_metadata(candidate, key):
+    models = request(candidate, key, route="/v1/models")
+    props = request(candidate, key, route="/props")
+    if (candidate["model"] not in {m["id"] for m in models.get("data", [])} or
+            props.get("model_alias") != candidate["model"]):
+        raise RuntimeError("Endpoint is not serving the configured model alias")
+    capacity = props.get("default_generation_settings", {}).get("n_ctx")
+    if type(capacity) is not int or capacity < context_policy()["window_tokens"]:
+        raise RuntimeError(f"Endpoint context {capacity} is below the shared {context_policy()['window_tokens']}-token window")
+    if candidate.get("expected_build") and props.get("build_info") != candidate["expected_build"]:
+        raise RuntimeError("Endpoint build differs from the candidate configuration")
+    return {"models": models, "props": props}
+
+
+def endpoint_profile(metadata):
+    # Exclude uptime, random media markers and transient health fields.
+    props = metadata["props"]
+    return {k: props.get(k) for k in ("model_alias", "model_path", "model_ftype", "build_info",
+             "default_generation_settings", "chat_template", "chat_template_caps", "total_slots")}
+
+
+def input_tokens(candidate, key, payload, capacity):
+    mode = candidate.get("token_counter", "llama_cpp")
+    if mode == "llama_cpp":
+        count = request(candidate, key, payload, "/v1/chat/completions/input_tokens").get("input_tokens")
+    elif mode == "strata_owned_overflow_v1":
+        # Only the reviewed owned Strata launcher guarantees rejection BEFORE
+        # generation: fit_max_tokens=False, no native MCP/resume/prefix handling.
+        # This opt-in adapter is not safe for an arbitrary compatible server.
+        if any(payload.get(k) for k in ("strata_mcp", "strata_resume", "strata_prefix")):
+            raise RuntimeError("Native prompt rewriting is unsupported")
+        probe = dict(payload, max_tokens=capacity + 1, max_completion_tokens=capacity + 1, stream=False)
+        try:
+            request(candidate, key, probe)
+        except RuntimeError as error:
+            match = re.fullmatch(r"Endpoint HTTP 400: (.*)", str(error), re.DOTALL)
+            detail = json.loads(match[1]).get("error", {}) if match else {}
+            found = re.search(r"prompt \((\d+) tokens\).*exceeds the context \((\d+)\)", detail.get("message", ""))
+            if detail.get("type") != "invalid_request_error" or not found or int(found[2]) != capacity:
+                raise RuntimeError("Unexpected Strata token-count response") from error
+            count = int(found[1])
+        else:
+            raise RuntimeError("Strata count probe generated unexpectedly; reject this endpoint")
+    else:
+        raise ValueError(f"Unsupported token counter: {mode}")
+    if type(count) is not int or count <= 0:
+        raise RuntimeError("Missing exact input-token count")
+    return count
+
+
+def check_usage(response, prompt_tokens, allowance):
+    usage = response.get("usage", {})
+    count = usage.get("completion_tokens")
+    if type(count) is not int or not 0 <= count <= allowance:
+        raise RuntimeError("Missing or out-of-budget completion-token accounting")
+    if usage.get("prompt_tokens") != prompt_tokens:
+        raise RuntimeError("Preflight input-token count differs from generation accounting")
+    reasoning = usage.get("completion_tokens_details", {}).get("reasoning_tokens", 0)
+    if type(reasoning) is not int or not 0 <= reasoning <= count:
+        raise RuntimeError("Reasoning-token count is inconsistent with completion usage")
+    return count
 
 
 def run_agent(case_id, candidate_id, out, seed, max_calls, max_tokens):
@@ -561,13 +657,16 @@ def run_agent(case_id, candidate_id, out, seed, max_calls, max_tokens):
     out.mkdir(parents=True)
     directory, case = case_data(case_id)
     candidate = next(c for c in json.loads((ROOT / "config/candidates.json").read_text())["candidates"] if c["id"] == candidate_id)
-    key = (LOCAL / "api-key").read_text().strip()
+    key = api_key(candidate)
+    policy = context_policy()
     messages = [{"role": "system", "content": "You are an Elixir coding agent working in an existing project at /workspace. Investigate the ticket, edit source, add regression tests, and verify your work using terminal tools. Every bash call starts in /workspace with a fresh shell. External network access is unavailable. Existing project and dependency source documentation is available locally. Do not change the task's contract or weaken tests. You may ask a clarification by topic. When finished, use submit. Your patch will be independently checked in a fresh environment."},
                 {"role": "user", "content": (directory / "ticket.md").read_text()}]
     messages[0]["content"] += (" Allowed source/test edit prefixes: " + ", ".join(case["allowed_edit_prefixes"]) + "."
                                " The project test command is: " + case["regression_command"] + "."
                                f" Limits: {max_calls} model calls and {max_tokens} cumulative completion tokens."
-                               " Conversation history is not compacted; the token allowance is not a context-window size.")
+                               f" The working context window is {policy['window_tokens']} tokens, including the response."
+                               f" Each response may use at most {policy['response_tokens']} tokens."
+                               " Conversation history is not compacted; when a budget is exhausted, the current patch is graded.")
     if case.get("require_regression_test"):
         messages[0]["content"] += (" Add or update at least one *_test.exs file under test/. Your regression tests must"
                                    " fail behaviorally on the original broken source and pass with your repair;"
@@ -578,11 +677,14 @@ def run_agent(case_id, candidate_id, out, seed, max_calls, max_tokens):
         {"type": "function", "function": {"name": "submit", "description": "Finish and submit the current project edits.", "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}}
     ]
     record = {"case": case_id, "candidate": candidate, "seed": seed,
-              "limits": {"model_calls": max_calls, "server_reported_completion_tokens": max_tokens, "per_call": 8192},
-              "accounting_note": "Uses server-reported completion_tokens; retain raw usage and qualify backend reasoning-token semantics before a model-quality campaign",
-              "candidate_metadata": {"models": request(candidate, key, route="/v1/models"), "props": request(candidate, key, route="/props")},
+              "limits": {"model_calls": max_calls, "server_reported_completion_tokens": max_tokens, "per_call": policy['response_tokens']},
+              "context_policy": policy,
+              "accounting_note": "Completion usage includes reasoning and tool syntax; exact input counts are checked against each response. No compaction.",
+              "candidate_metadata": endpoint_metadata(candidate, key),
               "harness_sha256": sha(Path(__file__)), "case_sha256": sha(directory / "case.json"),
               "power_before": before, "generated_tokens": 0, "calls": 0, "stop_reason": "call_budget"}
+    record["endpoint_profile"] = endpoint_profile(record["candidate_metadata"])
+    record["input_token_counts"] = []
     write_json(out / "attempt.json", record)
     try:
         with Sandbox(case_id) as box:
@@ -595,15 +697,20 @@ def run_agent(case_id, candidate_id, out, seed, max_calls, max_tokens):
                     break
                 payload = {"model": candidate["model"], "messages": messages, "tools": tools,
                            "temperature": 0.6, "top_p": 0.95, "seed": seed,
-                           "max_tokens": min(8192, remaining), "reasoning_effort": candidate["reasoning_effort"],
+                           "max_tokens": min(policy['response_tokens'], remaining), "reasoning_effort": candidate["reasoning_effort"],
+                           "top_k": 20, "min_p": 0.05, "repeat_penalty": 1.0,
                            "chat_template_kwargs": {"enable_thinking": True}, "stream": False}
+                capacity = record["candidate_metadata"]["props"]["default_generation_settings"]["n_ctx"]
+                count = input_tokens(candidate, key, payload, capacity)
+                record["input_token_counts"].append(count)
+                if count + payload["max_tokens"] + policy['safety_tokens'] > policy['window_tokens']:
+                    record["stop_reason"] = "context_budget"
+                    break
                 write_json(out / f"request-{step:03}.json", payload)
                 response = request(candidate, key, payload)
                 response.pop("timings", None)
                 write_json(out / f"response-{step:03}.json", response)
-                usage = response.get("usage", {}).get("completion_tokens")
-                if not isinstance(usage, int) or usage < 0:
-                    raise RuntimeError("Missing completion-token accounting")
+                usage = check_usage(response, count, payload["max_tokens"])
                 record["generated_tokens"] += usage
                 record["calls"] += 1
                 message = response["choices"][0]["message"]
@@ -635,6 +742,9 @@ def run_agent(case_id, candidate_id, out, seed, max_calls, max_tokens):
             patch = box.patch()
             (out / "model.patch").write_text(patch)
         record["grade"] = grade(case_id, patch, expected=control["reference_patch"])
+        record["endpoint_profile_after"] = endpoint_profile(endpoint_metadata(candidate, key))
+        if record["endpoint_profile_after"] != record["endpoint_profile"]:
+            raise RuntimeError("Endpoint profile changed during the attempt")
         record["status"] = "completed"
     except Exception as error:
         record["status"] = "error"

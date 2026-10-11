@@ -16,8 +16,9 @@ class ScoringTest(unittest.TestCase):
         self.directory = self.root / ".local/results/comparison"
         for name in ("config", "scripts", "cases/first", "cases/second", ".local/controls", ".local/results/comparison"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
-        self.write(self.root / "config/benchmark.json", {"id": "test-v1", "cases": ["first", "second"]})
-        for name in ("benchmark.py", "grade_formatter.exs", "run_suite.py", "score.py", "inventory.py"):
+        self.policy = {'window_tokens': 262144, 'response_tokens': 8192, 'safety_tokens': 8, 'compaction': False}
+        self.write(self.root / "config/benchmark.json", {"id": "test-v1", "cases": ["first", "second"], 'context_policy': self.policy})
+        for name in ("benchmark.py", "grade_formatter.exs", "run_suite.py", "score.py", "inventory.py", "check_endpoints.py"):
             (self.root / "scripts" / name).write_text("fixed evaluator")
         for case in ("first", "second"):
             self.write(self.root / "cases" / case / "case.json", {"project": "example"})
@@ -26,10 +27,13 @@ class ScoringTest(unittest.TestCase):
         self.candidates = {name: {"id": name, "model_family": "same-model", "quantization": quant}
                            for name, quant in (("model-q3", "Q3"), ("model-q4", "Q4"))}
         self.frozen = protocol(["first", "second"], [1, 2], 32, 65536, self.root)
-        self.receipt = {"schema_version": 2, "campaign": "comparison", "scope": "full",
+        self.receipt = {"schema_version": 3, "campaign": "comparison", "scope": "full",
                         "cases": ["first", "second"], "seeds": [1, 2], "candidates": list(self.candidates),
                         "max_calls": 32, "max_completion_tokens": 65536,
-                        "protocol": self.frozen, "candidate_snapshots": self.candidates}
+                        "protocol": self.frozen, "candidate_snapshots": self.candidates,
+                        'context_policy': self.policy,
+                        'endpoint_checks': {name: {'valid': True, 'candidate': c, 'context_policy': self.policy,
+                                                   'profile': {'model_alias': name}} for name, c in self.candidates.items()}}
         self.write(self.directory / "campaign.json", self.receipt)
         for case in self.receipt["cases"]:
             runtime = {"fixture_hashes": self.frozen["fixtures"][case], "image": "sha256:fixed"}
@@ -43,6 +47,8 @@ class ScoringTest(unittest.TestCase):
                         "harness_sha256": self.frozen["controller_sha256"],
                         "case_sha256": self.frozen["fixtures"][case]["case.json"],
                         "limits": {"model_calls": 32, "server_reported_completion_tokens": 65536, "per_call": 8192},
+                        'context_policy': self.policy, 'endpoint_profile': {'model_alias': candidate},
+                        'endpoint_profile_after': {'model_alias': candidate},
                         "runtime": runtime, "status": "completed", "grade": {"passed": True}})
 
     def write(self, path, value):
@@ -111,6 +117,13 @@ class ScoringTest(unittest.TestCase):
         self.receipt["scope"] = "diagnostic_subset"
         self.write(self.directory / "campaign.json", self.receipt)
         self.assertIsNone(self.result()["model-q3"]["score_percent"])
+
+    def test_context_or_endpoint_changes_block_comparative_score(self):
+        self.change_attempt(endpoint_profile_after={'model_alias': 'different'})
+        self.assertEqual(self.result()['model-q3']['counts']['endpoint_mismatch'], 1)
+        self.assertIsNone(self.result()['model-q3']['score_percent'])
+        self.change_attempt(context_policy={**self.policy, 'window_tokens': 65536})
+        self.assertEqual(self.result()['model-q3']['counts']['identity_mismatch'], 1)
 
 
 if __name__ == "__main__":

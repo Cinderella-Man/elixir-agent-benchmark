@@ -3,6 +3,7 @@
 import argparse
 from collections import Counter
 import json
+import socket
 from pathlib import Path
 
 from benchmark import ROOT, LOCAL, sha, write_json
@@ -24,7 +25,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     ids = select_cases(args.cases)
-    output = {"benchmark": inventory()["id"], "selected_cases": ids, "host": "ratx570", "model_attempts_in_this_qualification": 0,
+    output = {"benchmark": inventory()["id"], "selected_cases": ids, "host": socket.gethostname(), "model_attempts_in_this_qualification": 0,
               "harness_sha256": sha(ROOT / "scripts/benchmark.py"),
               "formatter_sha256": sha(ROOT / "scripts/grade_formatter.exs"), "cases": {}}
     for case in ids:
@@ -35,7 +36,7 @@ def main():
         for name, digest in control["runtime"]["fixture_hashes"].items():
             assert sha(ROOT / "cases" / case / name) == digest, f"Changed fixture: {case}/{name}"
         entry = {"valid": True, "runtime": control["runtime"],
-                 "power_service_sha256": control["power_envelope"]["unit_sha256"]}
+                 "power_service_sha256": control["power_envelope"].get("unit_sha256")}
         for kind in ("empty_patch", "reference_patch", "early_exit"):
             verdict = control[kind]
             entry[kind] = {"passed": verdict["passed"],

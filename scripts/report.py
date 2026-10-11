@@ -4,6 +4,7 @@ import argparse
 from collections import defaultdict
 import hashlib
 import json
+import os
 from pathlib import Path
 from score import markdown_scores, score_campaign
 
@@ -17,7 +18,10 @@ def scrub(value, secret):
     if isinstance(value, list):
         return [scrub(item, secret) for item in value]
     if isinstance(value, str) and secret:
-        return value.replace(secret, "[REDACTED]")
+        for item in ([secret] if isinstance(secret, str) else secret):
+            if item:
+                value = value.replace(item, "[REDACTED]")
+        return value
     return value
 
 
@@ -34,7 +38,12 @@ def main():
     if any(not source.is_dir() for source in sources):
         parser.error("Every requested campaign must exist")
     key_file = ROOT / ".local/api-key"
-    secret = key_file.read_text().strip() if key_file.exists() else ""
+    secret = [key_file.read_text().strip()] if key_file.exists() else []
+    configs = json.loads((ROOT / "config/candidates.json").read_text())["candidates"]
+    for source in sources:
+        if (source / "campaign.json").exists():
+            configs += list(json.loads((source / "campaign.json").read_text()).get("candidate_snapshots", {}).values())
+    secret += [os.environ[c["api_key_env"]] for c in configs if (c.get("api_key_env") or "") in os.environ]
     # Historical campaigns retain their candidate columns even after config changes.
     candidates = []
     for source in sources:
@@ -124,14 +133,14 @@ def main():
         data = scrub(json.loads(path.read_text()), secret)
         (control_dest / path.name).write_text(json.dumps(data, indent=2) + "\n")
         controls.append((path.stem, data["valid"], len(data["reference_patch"]["hidden"]["test_results"]), len(data["reference_patch"]["regression"]["test_results"])))
-    lines = ["# End-to-end benchmark evidence", "", "Campaigns: " + ", ".join(f"`{name}`" for name in args.campaign) + ". Executed on the authorized `ratx570` rig. Each entry is one attempt with its seed shown, not a stable model success rate. Missing and errored attempts are not zero scores.", "",
+    lines = ["# End-to-end benchmark evidence", "", "Campaigns: " + ", ".join(f"`{name}`" for name in args.campaign) + ". Each entry is one attempt with its seed shown. Execution-host records are preserved in the campaign receipt. Missing and errored attempts are not zero scores.", "",
              "The matrix contains only cases selected or attempted in these campaigns. Case breadth, shared source projects and public solutions limit general model-quality conclusions.", "",
              "| Scenario | " + " | ".join(candidates) + " |", "| --- | " + " | ".join("---" for _ in candidates) + " |"]
     for case in sorted(cases):
         lines.append("| " + case + " | " + " | ".join("; ".join(rows[case][candidate]) or "Not run" for candidate in candidates) + " |")
     for source in sources:
         receipt_path = source / "campaign.json"
-        if receipt_path.exists() and json.loads(receipt_path.read_text()).get("schema_version") == 2:
+        if receipt_path.exists() and json.loads(receipt_path.read_text()).get("schema_version") in {2, 3}:
             try:
                 scored = score_campaign(source, ROOT)
                 lines += ["", f"Campaign: `{source.name}`", "", *markdown_scores(scored)]
@@ -152,7 +161,7 @@ def main():
         lines.append(f"| [{case}](../controls/{case}.json) | {valid} | {hidden} | {regression} |")
     lines += ["", "## Interpretation and preserved failures", "",
               "Request payloads and runtime identities, rather than directory names alone, define an attempt's profile. Endpoint and context/tool-protocol errors remain explicit incomplete attempts. Historical diagnostic campaigns and evaluator corrections are explained in docs/pilot-results.md and docs/pilot-protocol.md.", "",
-              "The runner records existing endpoint context configurations; it does not normalize window sizes or compact history. Cumulative completion-token limits are not context-window limits. Context capacity and compaction policy must be fixed explicitly before a comparative quality campaign.", "",
+              "Schema-3 campaigns enforce the shared context policy recorded in campaign.json before every model request, including a response reserve. History is not compacted. Context, cumulative generation and call limits are separate budgets; exhaustion grades the current patch. Older campaigns did not enforce this common window and retain only their evidence matrices.", "",
               "Evaluator corrections permit harmless new top-level diagnostic scripts and require submitted regression tests to pass before original tests are restored. Where a regrade is linked, it evaluates the same saved patch; original verdicts remain in attempt.json and earlier regrade artifacts. No model answer was regenerated to repair grading issues.", "",
               "The GenStage grader also synchronizes an upstream consumer-down test before killing its consumer. This removes a demonstrated monitor-installation race without changing its expected assertion; the failed reference control is retained in controls-history. A result needs current validated controls and the current evaluator before it is displayed as Pass or Fail.", "",
               "The verifier checks executable behavior and original regression tests in fresh containers. It does not grade code elegance, establish useful 256k context or measure speed. Reference solutions are public upstream behavior, so potential prior model exposure remains a limitation. See the protocol and expansion plan before using these results to select a model.", ""]

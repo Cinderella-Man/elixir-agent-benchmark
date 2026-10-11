@@ -1,39 +1,42 @@
 # Elixir agent benchmark
 
-Compare coding models through Elixir agent work: understanding a project, taking actions with tools, changing code and verifying the result.
+Compare local coding models and quantizations by having them diagnose and repair Elixir projects. Each agent gets a bug report, a full repository, terminal tools and tests in an isolated, offline Docker environment.
 
-The benchmark contains **16 cases**: the original four pilot cases, six historical Plausible repairs, and six historical Livebook repairs. The default campaign runs all of them. [The inventory](config/benchmark.json) fixes the case list; repository breakdowns belong to the same benchmark.
+**One benchmark, 16 cases:** six real Plausible PRs, six real Livebook PRs, and four authored regressions in NimbleOptions, GenStage and LiveBeats. Every case runs by default. Repairs are scored by executable acceptance and regression checks, including useful regression tests where coverage is missing. **No AI judge or subjective code-quality score.**
 
-The first 12 model attempts have ended: ten reached grading and two stopped with context/tool-protocol errors. Earlier setup failures are retained separately. All four fixtures pass reference/broken/early-exit validation, and seven deliberately incomplete repairs are rejected. Execution was on `ratx570`; the final check confirms unchanged GPU power controls and no remaining benchmark containers.
+## Run
 
-Source material: [Cinderella-Man/elixir-sft-dataset tasks](https://github.com/Cinderella-Man/elixir-sft-dataset/tree/main/tasks). The source audit pins and inspects this collection; the pilot uses newly authored scenarios in existing projects. A source task, a variant and an independent benchmark scenario are different units.
+Use a dedicated **Linux x86-64** machine with **Python 3.12+, Git and Docker**, Docker access for your user, and disk space for the application images and dependencies. Preparation needs internet access; agent containers have none. Elixir, PostgreSQL and ClickHouse run in containers.
 
-The application cases use actual broken upstream commits and accepted repairs, with separate public branches in the user's forks. [Plausible](docs/plausible-integration.md) exercises CE application behavior with PostgreSQL and ClickHouse. [Livebook](docs/livebook-integration.md) adds notebook imports, Markdown formatting, LiveView inputs/storage and evaluator behavior. Grading uses executable acceptance and regression checks, including effective fail-before/pass-after coverage. No AI judge or patch-similarity score is used.
-
-All sixteen fixtures have [current qualification evidence](docs/benchmark-qualification.json) from the authorized rig. The twelve historical cases reject their declared incomplete repairs; [seven additional probes](docs/benchmark-partial-controls.json) cover the original pilot. Twenty-seven bounded Python checks validate the controller, inventory and reporting/scoring behavior. No new model attempts or performance measurements are part of this integration.
+Serve your models separately. The current adapters support **llama.cpp with `/v1/chat/completions/input_tokens`**, plus the reviewed Strata adapter described in the [runbook](docs/runbook.md#model-endpoints). An arbitrary OpenAI-compatible endpoint is insufficient. Every server must support native tool calls and at least **262,144 context tokens**. This repository does not download or start models.
 
 ```bash
-# On the authorized rig, after fixture and campaign qualification:
-python3 scripts/run_suite.py --campaign comparison-v1 --seeds 101 202 303
-python3 scripts/report.py --campaign comparison-v1 --document comparison-v1.md
+git clone https://github.com/Cinderella-Man/elixir-agent-benchmark.git
+cd elixir-agent-benchmark
+
+# Edit config/candidates.json: one entry per model + quantization you serve.
+# Set the endpoint URL, served model alias, reasoning setting and artifact pins.
+# For llama.cpp use token_counter: "llama_cpp"; pin your own expected_build.
+# If authentication is required, put the key in .local/api-key (chmod 600),
+# or set api_key_env on each candidate to an environment-variable name.
+
+python3 scripts/benchmark.py init
+python3 scripts/check_endpoints.py
+python3 scripts/qualify_suite.py --prepare
+python3 scripts/run_suite.py --campaign comparison-001
+python3 scripts/report.py --campaign comparison-001
 ```
 
-Each model and quantization is a separate candidate with pinned artifacts. Campaigns freeze the cases, evaluator, budgets and candidate configuration. Completed full matrices receive an equally weighted case score; missing or errored attempts remain visible and prevent a final score. See [the comparison protocol](docs/comparison-protocol.md). Common context capacity, token accounting and feasibility still need qualification before a comparative model campaign; the expansion has not produced new model rankings.
+`init` records the execution host and existing GPU power limits. Endpoint checks make two small, unscored requests per model. `qualify_suite` builds all 16 fixtures and verifies that broken code fails, reference repairs pass, and invalid repairs are rejected. Reuse prepared images on later runs; rerun qualification after changing the evaluator or cases.
 
-This directory is self-contained and can become a separate repository. Planning notes, source evidence, fixtures and benchmark tooling belong here; other local projects are not dependencies.
+The campaign runs **all configured candidates × all 16 cases**, using seed 101. For repeated attempts, add `--seeds 101 202 303`. Each run needs a new campaign name; existing attempts are never overwritten. `--candidates <id> ...` selects models; `--cases <id> ...` is for diagnostics and receives no full-benchmark score.
 
-- [Design decisions](docs/design-tree.md)
-- [Glossary](CONTEXT.md)
-- [Source task audit](docs/source-task-audit.md)
-- [Concrete scenario sketches for discussion](docs/scenario-sketches.md)
-- [Running and extending the pilot](docs/runbook.md)
-- [Plausible cases and qualification](docs/plausible-integration.md)
-- [Livebook cases and qualification](docs/livebook-integration.md)
-- [One-benchmark comparison protocol](docs/comparison-protocol.md)
-- [Pilot protocol and limits](docs/pilot-protocol.md)
+## Budgets and results
 
-Generated transcripts, patches, test logs, runtime inventories and detailed reports live under the ignored `results/` directory. They are optional evidence artifacts, not required source files. Keep reviewed summaries in `docs/`; share a reviewed evidence archive separately when publishing a campaign. Private working data and credentials remain under the ignored `.local/` directory.
+All candidates get **262,144 context tokens**, **8,192 tokens per response**, **65,536 generated tokens per attempt** and **32 model calls**. Reasoning and tool-call syntax count toward generation. History is retained without compaction. The runner counts each complete prompt, reserves response space plus eight safety tokens, and grades the current patch when a budget is exhausted. `--max-calls` and `--max-tokens` change the attempt budgets; the context policy lives in [config/benchmark.json](config/benchmark.json).
 
-The objective is the strongest useful coding and tool-use quality. Small or old models do not enter merely to increase replica count. Speed, memory and usable context remain deployment constraints, not substitutes for solving the work correctly.
+Open **`results/reports/benchmark-results.md`** for the comparison and per-project breakdown. Scores are **passed attempts / planned attempts × 100**, with equal case weight and all declared seeds included. Missing attempts and infrastructure/API errors remain visible and block a final score. Model/quantization identities, server profiles, fixtures and budgets are frozen for each campaign.
 
-Do not run benchmarks or speed measurements on the shared workstation. Execution on the separate `ratx570` rig is authorized. Preserve its GPU power-limit services and settings exactly. The runner enforces the host and recorded power envelope. It does not start, stop or reconfigure model services.
+Transcripts, patches and raw checks stay in `.local/results/<campaign>/`; the report command exports evidence to `results/<campaign>/`. Both directories are ignored by Git. Historical PRs and solutions are public, so prior training exposure is possible. A 256k allowance does not mean every case consumes or validates all 256k tokens.
+
+[Detailed setup and troubleshooting](docs/runbook.md) · [Scoring protocol](docs/comparison-protocol.md) · [Case inventory](config/benchmark.json)

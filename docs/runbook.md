@@ -1,28 +1,35 @@
 # Running and extending the benchmark
 
-Run commands from this directory on the authorized `ratx570` rig. The working installation is `/srv/elixir-agent-benchmark`. Python 3.12+, Docker, Git, SSH and HTTPS access for source/image preparation are required. Elixir and PostgreSQL run inside pinned containers, not on the host.
+Use the [README quickstart](../README.md) on a dedicated Linux x86-64 execution host with Python 3.12+, Git and Docker. Python uses only the standard library. The current user must be able to run Docker containers. Source archives, base images, Hex/Rebar and application dependencies need HTTPS during preparation. Host Elixir, Node and databases are unnecessary. Retain enough disk for all sixteen application images, build trees and evidence, plus model weights if served on the same host.
 
-The unified 16-case integration is staged separately at `/srv/elixir-agent-benchmark/plausible-expansion`; this existing path is retained to avoid disturbing the original installation. Plausible uses Node during preparation and ClickHouse during tests. Livebook uses historical Elixir/OTP images with no database sidecars or browser. No benchmark or performance test runs on the shared workstation.
+`python3 scripts/benchmark.py init` opts in this checkout on its current host and records NVIDIA GPU identities/power limits when available. Later execution refuses a different host or changed GPU baseline. It never changes power settings. The maintainer's shared `CrosshairA16` workstation remains explicitly prohibited; `ratx570` also retains its stricter existing GPU power-service/hash checks. Other dedicated hosts are supported.
 
-## Prepare
+## Model endpoints
 
-Place the model endpoint credential in `.local/api-key` with mode 0600. Edit `config/candidates.json` to describe the intended endpoints and their artifact identities; never commit the credential. The current pilot uses the existing rig services without changing their configuration.
+Edit `config/candidates.json` to contain the candidates you actually serve. IDs must be unique directory-safe names. Set `base_url` to the server root (without `/v1`), `model` to its API alias, `reasoning_effort` to a supported thinking level, and record model family, quantization and exact artifact revision/file/SHA-256. Each quantization gets its own candidate ID. The three checked-in entries describe the maintainer's deployments; replace their URLs, aliases and build pins for your installation.
 
-The current adapter requires OpenAI-style chat completions and model listing plus the serving stack's `/props` route for metadata. A different runtime needs an explicit metadata adapter before entering a campaign. The pilot is not yet a general client for every OpenAI-compatible server.
+- `token_counter: "llama_cpp"` uses `/v1/chat/completions/input_tokens` to count the exact chat template and tools. The tested server advertises build `b1-23b0202`. Use a build with that route, native tool calls, `/props` and `/v1/models`. Allocate at least `--ctx-size 262144` **per slot**, use the intended chat template, and disable automatic context shifting. Set `expected_build` to the value returned by your `/props`, or omit it when establishing a new deployment; the actual profile is still frozen at campaign start.
+- `token_counter: "strata_owned_overflow_v1"` is specific to the reviewed Strata 0.1.42 launcher: source `61b3fb5dd3f1e8ec09cf7e4e05208bc6d3c46406`, `fit_max_tokens=False`, no native MCP/resume/prefix, no reasoning recovery/forced wrap-up. It deliberately requests an impossible response allowance and reads the prompt count from the pre-generation HTTP 400. Do not enable it against an arbitrary server that might clamp output and generate instead. This adapter is for the provisioned deployment, not a general Strata installation guide.
+
+All candidates must report at least 262,144 context tokens. The current harness sends `temperature=0.6`, `top_p=0.95`, `top_k=20`, `min_p=0.05`, `repeat_penalty=1.0`, the configured reasoning effort and `enable_thinking=true`. Sampling and tokenizer differences between backends remain recorded candidate properties.
+
+For one shared credential, create `.local/api-key` and set its permissions to 0600. For separate credentials, set each candidate's `api_key_env` to the environment-variable name containing its key. Unauthenticated local endpoints need neither. Credentials are sent only by the host controller; they are absent from agent containers and request JSON artifacts.
+
+`python3 scripts/check_endpoints.py` performs two small, unscored requests per candidate: a bounded forced tool call, then a tool-result round trip with thinking enabled. It verifies prompt and completion accounting and saves records under `.local/endpoint-checks/`. The campaign repeats these checks and preserves them in its receipt. Unknown routes, unsupported reasoning levels, unavailable endpoints or insufficient context stop execution before scored attempts. Use `--candidates <id> ...` for focused setup checks.
+
+## Prepare cases
 
 ```bash
 python3 scripts/benchmark.py init
-python3 scripts/benchmark.py prepare --case core-nimble-normalization
-python3 scripts/benchmark.py controls --case core-nimble-normalization --out .local/results/controls/core-nimble-normalization.json
+python3 scripts/check_endpoints.py
+python3 scripts/qualify_suite.py --prepare
 ```
 
-Repeat preparation and controls for the other case IDs from the protocol. Preparation downloads the pinned source revision and required runtime/dependencies, then records immutable image IDs, base/service image digests, source archive hashes and fixture hashes beneath `.local/runtimes/`. It builds only the bugged source into the agent image; reference patches and hidden graders are excluded. The first build resolves dependency packages into that image; keep its runtime record and image when reproducing a campaign.
+Preparation downloads exact source revisions and resolves container/dependency inputs, then records immutable image IDs, image digests, source archive hashes and fixture hashes beneath `.local/runtimes/`. Only broken source enters the agent image; the reference repairs and grading overlays stay outside. Preserve runtime records and Docker images to reproduce a campaign exactly: rebuilding may resolve different OS/Hex tooling even though application lockfiles and source revisions are pinned.
 
-Alternatively, `python3 scripts/qualify_suite.py --prepare` prepares and checks every case without model calls. Use `--cases <id> ...` only for focused fixture diagnostics. On prepared images, `--refresh` permits grader/ticket updates only when source, runtime and service inputs still match; rerun controls afterward. These controls also reject each historical case's specified incomplete repair. They do not establish model context feasibility.
+Qualification verifies every fixture's broken start, reference repair and early-exit bypass; historical cases also reject a declared incomplete repair. A campaign requires current valid controls for every selected case. After a controller change, run `python3 scripts/qualify_suite.py` to repeat checks using existing images. After grader/ticket-only changes, use `--refresh`. Source, dependency or runtime changes require `--prepare`. `--cases <id> ...` narrows fixture diagnostics. Seven additional original-case probes are available through `python3 scripts/check_partial_repairs.py`.
 
-Model runs require a successful, current control attestation. Initialization records the existing power service and GPU cap state; it cannot alter them. Do not reinitialize to accept an unexplained change.
-
-After all four controls are valid, `python3 scripts/check_partial_repairs.py` verifies seven deliberately incomplete repairs are rejected. It runs only on the rig and writes `results/partial-repair-controls.json`. The pilot has executed this check successfully; it supplements broken/reference/early-exit controls with evidence that fixing only one part of a ticket is insufficient.
+The maintainer's unified installation is `/srv/elixir-agent-benchmark/plausible-expansion` on `ratx570`. It is independent of the original pilot installation. The Coder390 256k campaign uses a temporary endpoint on GPU 4 / port 8412; its duplicate Swift service is restored after the campaign. This is deployment administration, not work performed by the benchmark runner.
 
 ## Run an independent attempt
 
@@ -45,9 +52,9 @@ python3 scripts/run_suite.py --campaign my-first-matrix --seeds 101
 python3 scripts/report.py --campaign my-first-matrix
 ```
 
-The default is every case in `config/benchmark.json`. There is no repository-specific suite switch. An explicit `--cases` list creates a diagnostic subset and does not receive a full-benchmark score. `--max-calls` and `--max-tokens` expose the action and cumulative completion allowances; neither selects a context-window size. The driver validates every selected fixture before contacting a model and freezes candidate snapshots and protocol inputs in `campaign.json`. The report includes the per-case matrix and deterministic scores for complete matrices. `python3 scripts/score.py --campaign my-first-matrix` emits the same scoring data as JSON.
+The default is every case in `config/benchmark.json`. There is no repository-specific suite switch. An explicit `--cases` list creates a diagnostic subset and does not receive a full-benchmark score. `--max-calls` and `--max-tokens` expose the action and cumulative completion allowances; neither selects a context-window size. The driver validates every selected fixture, checks every endpoint, and freezes candidate snapshots, serving profiles and protocol inputs in `campaign.json`. The report includes the per-case matrix and deterministic scores for complete matrices. `python3 scripts/score.py --campaign my-first-matrix` emits the same scoring data as JSON.
 
-The second command exports selected evidence into `results/my-first-matrix` and writes `results/reports/benchmark-results.md`. Everything under `results/` is ignored by Git. The command redacts the local endpoint key if it appears in an artifact. For later repeated campaigns, pass `--seeds 101 202 303`; every attempt remains separate. Use a new campaign ID for each matrix. The initial manually launched diagnostic campaigns are retained separately.
+The report command exports selected evidence into `results/my-first-matrix` and writes `results/reports/benchmark-results.md`. Everything under `results/` is ignored by Git. The command redacts the configured endpoint credentials if they appear in an artifact. For later repeated campaigns, pass `--seeds 101 202 303`; every attempt remains separate. Use a new campaign ID for each matrix. The initial manually launched diagnostic campaigns are retained separately.
 
 To show multiple campaigns without hiding earlier failures, use `python3 scripts/report.py --campaign pilot-v1 pilot-v2`. Each table entry names its campaign; the request-profile table exposes differences in reasoning settings. Use `--document another-report.md` to preserve a separate report under `results/reports/`. The reviewed summary in `docs/pilot-results.md` is maintained separately and is never overwritten by the exporter. After a documented evaluator correction, `python3 scripts/regrade.py --campaign pilot-v2` grades every completed frozen patch under current validated controls and keeps its original verdict. It does not generate replacement answers.
 

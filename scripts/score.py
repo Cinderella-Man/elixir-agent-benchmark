@@ -15,8 +15,8 @@ def fingerprint(value):
 
 def score_campaign(directory, root=ROOT):
     receipt = json.loads((directory / "campaign.json").read_text())
-    if receipt.get("schema_version") != 2:
-        raise ValueError("Legacy campaign has no frozen protocol; retain its evidence matrix without a comparable score")
+    if receipt.get("schema_version") != 3:
+        raise ValueError("Legacy campaign has no enforced common context; retain its evidence matrix without a comparable score")
     frozen = receipt["protocol"]
     current = protocol(receipt["cases"], receipt["seeds"], receipt["max_calls"], receipt["max_completion_tokens"], root)
     if frozen != current:
@@ -25,10 +25,11 @@ def score_campaign(directory, root=ROOT):
     output = {"campaign": receipt["campaign"], "benchmark": frozen["benchmark"]["id"],
               "protocol_sha256": fingerprint(frozen), "scope": receipt["scope"],
               "scoring": "Each case has equal weight; average all declared seeds, never choose the best attempt.",
-              "comparison_status": "Context capacity and backend token accounting still require common-profile qualification.",
+              "comparison_status": f"Shared context: {receipt['context_policy']['window_tokens']:,} tokens; no compaction. Exact prompt counts and completion limits checked on every request. Backend/model profiles are recorded separately.",
               "candidates": {}}
     for candidate in receipt["candidates"]:
         snapshot = receipt["candidate_snapshots"][candidate]
+        preflight = receipt.get("endpoint_checks", {}).get(candidate, {})
         counts, projects, cells, profiles = Counter(), {}, [], set()
         for case in receipt["cases"]:
             spec = json.loads((root / "cases" / case / "case.json").read_text())
@@ -47,7 +48,11 @@ def score_campaign(directory, root=ROOT):
                                         record.get("seed") == seed and record.get("harness_sha256") == frozen["controller_sha256"] and
                                         record.get("case_sha256") == frozen["fixtures"][case]["case.json"] and
                                         record.get("limits") == {"model_calls": receipt["max_calls"],
-                                            "server_reported_completion_tokens": receipt["max_completion_tokens"], "per_call": 8192})
+                                            "server_reported_completion_tokens": receipt["max_completion_tokens"], "per_call": receipt['context_policy']['response_tokens']} and
+                                        record.get('context_policy') == receipt['context_policy'])
+                    endpoint_valid = (preflight.get('valid') is True and preflight.get('candidate') == snapshot and
+                                      preflight.get('context_policy') == receipt['context_policy'] and
+                                      preflight.get('profile') == record.get('endpoint_profile') == record.get('endpoint_profile_after'))
                     qualified = (control.get("valid") and control.get("harness_sha256") == frozen["controller_sha256"] and
                                  control.get("formatter_sha256") == frozen["formatter_sha256"] and
                                  control.get("runtime", {}).get("fixture_hashes") == frozen["fixtures"][case] and
@@ -56,6 +61,8 @@ def score_campaign(directory, root=ROOT):
                         state = "identity_mismatch"
                     elif record.get("status") == "error":
                         state = "error"
+                    elif record.get("status") == "completed" and not endpoint_valid:
+                        state = "endpoint_mismatch"
                     elif record.get("status") == "completed" and qualified:
                         grade = record.get("grade", {})
                         state = "pass" if grade.get("passed") is True else "fail" if grade.get("passed") is False else "invalid_grade"
