@@ -1,6 +1,6 @@
 # Evaluation contract
 
-A benchmark run evaluates the single model currently served by one endpoint. It freezes the twelve-case inventory, controller and fixture hashes, reported model profile, seed and budgets.
+A benchmark run evaluates the single model currently served by one endpoint. It freezes the selected inventory (currently twelve cases), controller and fixture hashes, reported model profile, seed and budgets. Checksummed release fixtures remain on disk independently of mutable cache pointers; submission receipts bind the actual prepared images, source receipt and patch, and completion receipts bind grading evidence.
 
 Each case begins in a fresh offline workspace at the actual historical broken revision. The agent receives the ticket, broken source and prepared dependencies. Reference repairs, grader-only checks and upstream Git history remain outside its workspace. Preparation and verification are performed in separate Docker containers.
 
@@ -13,3 +13,5 @@ Grading checks the submitted tests, restores original tests before grader overla
 Every case has equal weight. The default contains one attempt per case at seed 101. Only a fully completed run with valid pass/fail outcomes for all twelve cases receives a final score. Missing, errored, cancelled and interrupted attempts remain in the planned denominator and prevent a final score. Changing advanced settings creates a separately recorded run, not evidence of improvement under the same settings.
 
 The website retains each run's model metadata, settings, exchanges, transcript, patch and controls. Identity is explicitly server-reported when exact artifact provenance is unavailable. Cases and solutions are public; prior model exposure is possible. No AI judge, subjective code-quality grade or throughput/latency score is used.
+
+Explicit resume requires matching release, declared model and effective settings after cleanup. Completed pass/fail outcomes and evaluation errors are preserved. A saved submission resumes grading; unfinished unsubmitted work starts a new generation from pristine state, with its earlier evidence and usage retained. Resume does not select the best of multiple completed attempts. Changed inputs or corrupt completion evidence cannot silently reuse results. Legacy runs without these receipts remain readable but cannot resume.

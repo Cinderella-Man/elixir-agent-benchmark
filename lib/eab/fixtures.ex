@@ -12,6 +12,10 @@ defmodule Eab.Fixtures do
   }
 
   def ensure(id, emit, opts \\ []) do
+    Eab.Retention.with_use(fn -> do_ensure(id, emit, opts) end)
+  end
+
+  defp do_ensure(id, emit, opts) do
     spec = Inventory.spec(id)
     project = ensure_project(id, emit, opts)
     engines = ServiceImages.resolve(spec["services"] || %{}, opts)
@@ -20,6 +24,7 @@ defmodule Eab.Fixtures do
     runtime = Baseline.ensure(id, spec, runtime, run_id, emit, opts)
     runtime = Map.put(runtime, "fixture_hashes", Inventory.fixture_hashes(id))
     Store.write("runtimes/#{id}.json", runtime)
+    Eab.Retention.retain(id, runtime)
     runtime
   end
 
@@ -51,6 +56,11 @@ defmodule Eab.Fixtures do
         Inventory.hash(dockerfile(spec, spec["runtime"]["image"], spec["runtime"]["node_image"])),
       "seed_script" => Inventory.hash_file(BuildCache.script()),
       "database_scanner" => Inventory.hash_file(Inventory.path("lib/eab/database_seed.ex")),
+      "source_export" => Inventory.hash_file(Inventory.path("lib/eab/source.ex")),
+      "source_provenance" =>
+        if(File.exists?(Inventory.case_path(id, "provenance.json")),
+          do: Inventory.hash_file(Inventory.case_path(id, "provenance.json"))
+        ),
       "patches" =>
         Map.new(["environment.patch"], fn file ->
           path = Inventory.case_path(id, file)
@@ -73,7 +83,13 @@ defmodule Eab.Fixtures do
              String.starts_with?(repo["url"], "https://github.com/"),
            do: raise("Unpinned repository")
 
-    Source.snapshot(repo, source, emit)
+    provenance = Inventory.read_json(Inventory.case_path(id, "provenance.json"))
+
+    unless provenance["broken_revision"] == repo["revision"] and
+             String.trim_trailing(repo["url"], ".git") == provenance["repository"],
+           do: raise("Case source and provenance disagree")
+
+    source_receipt = Source.snapshot(repo, source, emit, expected_tree: provenance["broken_tree"])
 
     for file <- ["environment.patch"],
         File.exists?(Inventory.case_path(id, file)),
@@ -110,6 +126,7 @@ defmodule Eab.Fixtures do
 
     runtime = %{
       "image" => image,
+      "source_receipt" => source_receipt,
       "images" => [image],
       "inputs" => inputs,
       "base_image" => base,

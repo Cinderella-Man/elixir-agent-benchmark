@@ -165,7 +165,7 @@ flowchart LR
   G --> R[Immutable outcome and evidence]
 ```
 
-This diagram is the intended lifecycle. It does not imply that all release, resume, and retention controls below are already implemented.
+This diagram describes the lifecycle. Release snapshots, resume and retention controls have since been implemented as described in the follow-through below; independent candidate review/admission remains outstanding.
 
 Use separate identities for:
 
@@ -214,7 +214,7 @@ For cross-model insights, report paired case outcomes and project/task breakdown
 
 ## Practice comparison and current gaps
 
-“Current” here refers to the local worktree on the research date, including the cache foundation, not a released/deployed claim.
+“Current” here refers to the local worktree on the research date, including the implementation follow-through below, not a deployed claim.
 
 | SWE-bench practice or lesson | Our current implementation | Change needed before expansion |
 |---|---|---|
@@ -222,27 +222,31 @@ For cross-model insights, report paired case outcomes and project/task breakdown
 | Separate source solution and evaluator tests | Existing repair cases and grader already separate roles | Version the broader feature/refactor/full-stack contract and adapters. |
 | F2P/P2P qualification plus parser validity | Complete-suite markers, failure phases, preservation and negative controls | Explicit capability/structural acceptance and requirements-to-checks matrix. |
 | Human task/test review | Existing twelve curated repair cases | Candidate records, independent review/adjudication, rejection records and sampling policy. |
-| Pinned datasets and reproducible artifacts | Current inventory/protocol identities; content-addressed cache records; qualification identity includes unrecognized fields | Immutable release schema, provenance validation and candidate loader. |
-| Existing reports support skipping repeated evaluations | Durable run evidence exists; completed-case resume is documented | Implement strict identity-bound resume without silently retrying completed failures. |
-| Per-case reports and trajectories | Raw grading/activity evidence; phase UI distinguishes qualification and grading | Compact index, run matrix and semantic failure cards. |
-| Cache retention matters as much as build reuse | Physical-image checks and atomic publication exist | Active leases, shared references, explicit deletion and free-space guard. |
-| Environment cleanliness and access policy affect validity | Independent Pi/grader clones are the foundation | Audit source/history/artifact visibility and freeze network/provenance policy. |
+| Pinned datasets and reproducible artifacts | Immutable release fixtures; source commit/tree/archive receipts; runtime and submission identities | Candidate loader, reconstructed fixed-tree validation and independent review schema. |
+| Existing reports support skipping repeated evaluations | Identity-bound sealed submissions/completions; completed failures retained on resume | Real execution-host qualification of recovery; no automatic evaluation-error retry. |
+| Per-case reports and trajectories | Compact history/case records, named failure cards, full evidence links, project/task breakdowns | Cross-model paired matrix and wider corpus review workflow. |
+| Cache retention matters as much as build reuse | Retained roots, active leases, shared-seed references, previewed removal and free-space checks | Per-release removal and unique storage accounting; separately accessible Docker storage guard where needed. |
+| Environment cleanliness and access policy affect validity | Source exports strip history, reject unsupported submodules and verify receipts; independent Pi/grader clones | Wider candidate artifact audit and explicit contracts for new language/runtime families. |
 
 Sources for the local state and planned work: [expansion plan](/home/bat/projects/elixir-agent-benchmark/docs/benchmark-expansion-plan.md), [baseline ADR](/home/bat/projects/elixir-agent-benchmark/docs/adr/0006-grade-repairs-from-prepared-baselines.md), [resume ADR](/home/bat/projects/elixir-agent-benchmark/docs/adr/0008-resume-completed-case-checkpoints.md), and the implementation links above.
 
-The coordinating implementation audit reports a final full non-Docker suite of **72 passing tests**, plus **three passing bounded Docker correctness tests**. Formatting and warnings-as-errors checks passed. Docker checks covered small synthetic PostgreSQL/ClickHouse state, independent writes, ClickHouse server identity, build-seed reconciliation, and the pinned Pi runtime with synthetic model replies. A production candidate image was built and its packaged cache inputs checked; it was not activated. These checks do not qualify all real application cases or establish performance. Shallow database checkpoint code has no separate dedicated correctness test yet.
+The initial cache foundation passed **72 non-Docker tests** and **three bounded Docker correctness tests** before research follow-through. Subsequent Docker checks also exercise shallow database checkpoints against small synthetic PostgreSQL/ClickHouse state, dictionary/function preservation, independent writes and fresh ClickHouse server identity. Build-seed reconciliation and the pinned Pi runtime use synthetic source/model replies. These checks do not qualify real application cases or establish performance. Production candidate builds remain separate from activating the running controller.
 
-The same twelve case definitions remain in place, but the worktree protocol is now `elixir-agent-benchmark-v2`: prepared database state and removal of the old 32-call limit materially change the experiment. Historical runs retain their recorded protocol. This minimal protocol distinction is already made; the general immutable release catalog remains future work. The running controller was not replaced during this research.
+The same twelve case definitions remain in place, but the worktree protocol is now `elixir-agent-benchmark-v2`: prepared database state and removal of the old 32-call limit materially change the experiment. Historical runs retain their recorded protocol. Content-addressed release snapshots now freeze case files and protocol identities for new runs. Generalized candidate/admission schemas remain future work. The running controller was not replaced during this research.
+
+Implementation follow-through on 2026-10-13 adds explicit recovery after cleanup, checksum-bound saved patches and completed results, archived interrupted generations and their usage, conservative cache removal, and compact evidence/history. A saved submission skips a new Pi attempt; completed failures and evaluation errors remain fixed. Synthetic 500-case records exercise pagination and scoring without adding or running benchmark cases. The data-filesystem reserve is a pre-build check, not guaranteed capacity for all concurrent work; checking separate Docker storage requires an explicitly accessible path. The seed scheduler still uses inventory lookahead, so family-aware oldest-first preparation remains planned. See [operation details](../runbook.md) and [remaining gates](../benchmark-expansion-plan.md).
+
+Validation for this follow-through: the full non-Docker suite passed **93 tests**, and all **three bounded Docker checks** passed. Subsequent focused checks cover orphan-lease recovery and the final dashboard changes. Production packaging verifies the frozen release and all twelve cases' cache inputs; a separate temporary website uses synthetic records for browser inspection. These checks involve no real model campaign, new PR admission or performance measurement. The deployed controller and its data are unchanged.
 
 ## Prioritized recommendations
 
 ### P0 — establish the experiment before adding cases
 
-- Finish immutable case/release schemas and provenance validation. Pin source, task text, checks, evaluator, image digests, and agent protocol independently.
+- Immutable release snapshots and broken-source receipts are implemented. Finish candidate/task schemas, reconstructed fixed-tree provenance and independent review records.
 - Validate the existing twelve under the new pristine application/database lifecycle, including deletion detection, cancellation, and independent Pi/grader state. Use bounded correctness checks only.
-- Complete explicit storage retention/removal and durable completed-case resume. Resume completed outcomes only when identities match; preserve interruptions and usage. A saved submission can be graded without rerunning Pi; an interrupted unsaved attempt needs a fresh generation.
+- Storage retention/removal and durable completed-case resume are implemented with synthetic coverage. Qualify their integration with the real existing cases on the intended execution host. Preserve the rule that saved submissions resume grading and unfinished unsaved work receives a fresh generation.
 - Make scoring dimensions explicit: acceptance, preservation, required model-added coverage, and infrastructure validity. Preserve historical repair-only results and protocol identities.
-- Build the compact evidence index and semantic failure cards so curation and result audits do not depend on reading giant logs.
+- Compact evidence indexes and semantic failure cards are implemented; use them in real-case qualification before expanding the inventory.
 
 ### P1 — qualify diversity before quantity
 

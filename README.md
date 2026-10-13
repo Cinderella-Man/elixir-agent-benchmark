@@ -40,10 +40,12 @@ Pi and the project run on the benchmark's Docker host. The model server can run 
 
 Defaults: all twelve cases, seed 101, unlimited model and tool calls, up to 8,192 tokens per response and 65,536 generated tokens per case. Context is detected automatically and capped at 262,144 tokens. Advanced settings allow explicit overrides within the server's capacity. History is retained without compaction; exhausting either the generation budget or context window submits the current patch for grading.
 
-One run is active at a time. Closing the browser does not stop it. **Stop run** cancels execution and cleans up this installation's containers. An application restart records active work as interrupted; start a fresh run rather than resuming it. Existing results are never overwritten.
+One run is active at a time. Closing the browser does not stop it. **Stop run** cancels execution and cleans up this installation's containers. After interruption, reconnect the same model with the same settings and choose **Resume unfinished cases**. Completed passes, failures and evaluation errors stay fixed; saved submissions resume grading, and unfinished Pi work starts in a fresh workspace with its prior evidence preserved. Changed release, model or settings require a new run. Historical runs without checkpoint receipts cannot resume.
 
 All cases have equal weight. A final score requires a completed pass/fail outcome for every case; errors, cancellations and interrupted work remain visible and prevent a final score. The model's reported identity, effective budgets, requests, responses, patches and controls accompany each run. Missing identity metadata stays explicitly unverified; manual artifact pins are not required.
 
-When a run ends, **Download report** saves its summary and per-case results. Data persists in the `benchmark-data` Docker volume.
+Each run freezes a checksummed release and experiment identity. Select a case for its acceptance, preservation and submitted-test results, named failures and short error excerpts. Full logs, patches, trajectories and grading output remain downloadable. History and case lists are paginated; reports include project/task breakdowns and interrupted-generation counts.
+
+Under **Retained preparation**, preview removal of one case's cached state or unreferenced artifacts. Shared state and active work are protected; nothing is automatically evicted. Missing builds stop if the data filesystem is below the configured free-space reserve (5 GiB by default). When a run ends, **Download report** saves its summary and per-case results. Data persists in the `benchmark-data` Docker volume.
 
 [Setup, development and troubleshooting](docs/runbook.md) · [Evaluation contract](docs/evaluation.md) · [Inventory](config/benchmark.json) · [Design decisions](docs/design-tree.md) · [SWE-bench research](docs/research/swe-bench.md)

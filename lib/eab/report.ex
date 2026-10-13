@@ -1,5 +1,5 @@
 defmodule Eab.Report do
-  alias Eab.{Runner, Store}
+  alias Eab.{Evidence, Runner, Store}
 
   def write(run) do
     score = Runner.score(run)
@@ -21,7 +21,22 @@ defmodule Eab.Report do
             _ -> attempt["status"] || "Not attempted"
           end
 
-        "| #{id} | #{outcome} | #{attempt["calls"] || 0} | #{escape(attempt["error"] || attempt["stop_reason"] || "")} |"
+        "| #{id} | #{outcome} | #{attempt["calls"] || 0} | #{escape(Evidence.verdict(attempt))} |"
+      end)
+
+    evidence =
+      Enum.map_join(run["cases"], "\n\n", fn id ->
+        links =
+          Evidence.links(run["id"], id)
+          |> Enum.map_join(" · ", &"[#{&1["label"]}](#{&1["path"]})")
+
+        "### #{id}\n\n#{links}"
+      end)
+
+    breakdowns =
+      Runner.breakdowns(run)
+      |> Enum.map_join("\n", fn row ->
+        "| #{row["dimension"]} | #{escape(row["value"])} | #{row["passed"]}/#{row["planned"]} | #{row["failed"]} | #{row["pending_or_error"]} |"
       end)
 
     Store.write_text("runs/#{run["id"]}/report.md", """
@@ -30,6 +45,10 @@ defmodule Eab.Report do
     - Run: #{run["id"]}
     - Model: #{escape(model["model"] || "Unknown")}
     - Backend: #{model["backend"] || "Unknown"}
+    - Release: #{run["release_id"] || "Historical protocol only"}
+    - Experiment: #{run["experiment_id"] || "Not sealed"}
+    - Resumptions: #{run["resume_count"] || 0}
+    - Archived interrupted generations: #{length(run["attempt_history"] || [])}
     - Status: #{run["status"]}
     - Passed: #{score["passed"]}/#{score["planned"]}
     - Failed: #{score["failed"]}
@@ -38,11 +57,17 @@ defmodule Eab.Report do
 
     #{escape(run["message"] || "")}
 
-    | Case | Result | Model calls | Stop reason or error |
+    | Case | Result | Model calls | Explanation |
     | --- | --- | ---: | --- |
     #{rows}
 
+    | Group | Value | Passed | Failed | Incomplete/error |
+    | --- | --- | ---: | ---: | ---: |
+    #{breakdowns}
+
     Case directories contain command output, Pi transcripts, patches and grading evidence. Infrastructure errors are not scored as failed repairs.
+
+    #{evidence}
     """)
   end
 

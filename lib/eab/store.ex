@@ -53,8 +53,82 @@ defmodule Eab.Store do
 
   def runs do
     Path.wildcard(path("runs/*/run.json"))
-    |> Enum.map(&Eab.Inventory.read_json/1)
+    |> Enum.map(fn file -> run(Path.basename(Path.dirname(file))) end)
+    |> Enum.reject(&is_nil/1)
     |> Enum.sort_by(& &1["created_at"], :desc)
+  end
+
+  def run(id) do
+    unless valid_id?(id), do: raise(ArgumentError, "Invalid run id")
+
+    case read("runs/#{id}/run.json") do
+      nil ->
+        nil
+
+      record ->
+        unless is_map(record) and record["id"] == id and is_list(record["cases"]) and
+                 is_map(record["attempts"] || %{}) and is_map(record["model"] || %{}),
+               do: raise("Invalid run record schema")
+
+        record
+        |> Map.put_new("phase", record["status"] || "unknown")
+        |> Map.put_new("attempts", %{})
+        |> Map.put_new("model", %{})
+        |> Map.put_new("settings", %{})
+    end
+  rescue
+    error in [Jason.DecodeError, File.Error, RuntimeError] ->
+      %{
+        "id" => id,
+        "created_at" => id,
+        "status" => "corrupt",
+        "phase" => "corrupt",
+        "message" => "Saved record needs attention: #{Exception.message(error)}",
+        "cases" => [],
+        "attempts" => %{},
+        "model" => %{},
+        "settings" => %{}
+      }
+  end
+
+  def index_run(run) do
+    summary =
+      Map.take(run, ~w(id created_at status phase message model score release_id experiment_id))
+
+    # Discovery metadata and transcripts belong to the detailed record, not history.
+    summary =
+      Map.update(summary, "model", %{}, &Map.take(&1 || %{}, ~w(model backend identity_note)))
+
+    write("runs/#{run["id"]}/summary.json", summary)
+  end
+
+  def run_page(offset \\ 0, limit \\ 20) do
+    unless is_integer(offset) and offset >= 0 and limit in 1..100,
+      do: raise("Invalid history page")
+
+    summaries =
+      Path.wildcard(path("runs/*/run.json"))
+      |> Enum.map(fn file ->
+        id = Path.basename(Path.dirname(file))
+
+        try do
+          case read("runs/#{id}/summary.json") do
+            %{"id" => ^id, "model" => model} = summary when is_map(model) -> summary
+            _ -> legacy_summary(id)
+          end
+        rescue
+          Jason.DecodeError -> legacy_summary(id)
+        end
+      end)
+      |> Enum.sort_by(& &1["created_at"], :desc)
+
+    %{items: Enum.slice(summaries, offset, limit), total: length(summaries)}
+  end
+
+  defp legacy_summary(id) do
+    record = run(id)
+    index_run(record)
+    read("runs/#{id}/summary.json")
   end
 
   def artifact(id, relative) do

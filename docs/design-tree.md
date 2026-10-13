@@ -17,13 +17,13 @@ The benchmark is a local, single-user Elixir application. Enter a llama.cpp or S
 | Budgets | Unlimited model/tool calls; up to 8,192 tokens per response and 65,536 generated tokens per case |
 | Attempts | One per case, seed 101 by default; advanced settings available |
 | History | Persist model details, settings, logs, exchanges, patches and results |
-| Interruption | Save interrupted work and start a fresh run |
+| Interruption | Explicit identity-bound resume; preserve completed outcomes and earlier generations |
 | Scoring | Equal case weight; executable checks; incomplete runs have no final score |
 | Isolation | Offline attempt workspaces without solutions, upstream history, Docker access or credentials |
 
 ## Boundaries
 
-`Model` owns discovery and native token accounting. `Pi` launches the external Pi CLI and records its events. `PiGateway` enforces budgets while forwarding Pi's complete native requests. `Fixtures` prepares pinned Docker environments. `Sandbox` owns isolated workspaces and dependent services. `Grader` qualifies cases and evaluates repairs. `Agent` persists Pi submissions and independently grades them. `Runner` supplies operations to the bounded `Pipeline`; `Runs` supervises one active run and persists its state independently of browser connections. `Store` owns local artifacts. The website presents these operations.
+`Model` owns discovery and native token accounting. `Pi` launches the external Pi CLI and records its events. `PiGateway` enforces budgets while forwarding Pi's complete native requests. `Fixtures` prepares pinned Docker environments. `Sandbox` owns isolated workspaces and dependent services. `Grader` qualifies cases and evaluates repairs. `Agent` persists Pi submissions and independently grades them. `Runner` supplies operations to the bounded `Pipeline`; `Runs` supervises one active run and persists its state independently of browser connections. `Release` freezes comparison inputs, `Checkpoints` verifies durable submissions/completions, `Retention` protects shared cache state and `Evidence` summarizes factual grading results. `Store` owns local artifacts and compact history summaries. The website presents these operations.
 
 Docker host networking allows the controller to reach loopback model endpoints. The website itself binds only to loopback; fixture containers have no external network. Execution begins when the user clicks Run. Source inspection, builds, synthetic correctness tests and metadata discovery work without benchmark execution.
 
@@ -43,7 +43,7 @@ The first case is prepared and qualified before other preparations begin. Once i
 | Capacity | Four upcoming cases, two preparation jobs, one waiting workspace, one grader and one queued submission; preparation bounds are configurable |
 | Failure | Record case errors and continue unrelated cases; no automatic retry or final score for an incomplete/error run |
 | Cancellation | Stop all workers and drain subprocesses before removing installation-owned containers |
-| Restart | Preserve submissions and evidence, mark unfinished attempts interrupted, clean up, then start a new run |
+| Restart | Preserve evidence, mark unfinished work interrupted and clean up; explicitly resume under unchanged release/model/settings |
 | Cache scope | Same Docker host across runs, model changes and restarts |
 | Cache identity | Independent project, service baseline and Pi inputs; grading evidence has its own relevant baseline/contract/evaluator identity |
 | Reusable state | Pristine source snapshots, compatible pristine build seeds, shared package downloads, immutable broken-source and database images, separate Pi attachments and matching qualification receipts |
@@ -83,7 +83,7 @@ The saved Plausible runtimes use PostgreSQL 16 for cases 5939/5956 and PostgreSQ
 
 The prepared-application contract deliberately changes grading order: the original broken revision initializes service data before a submitted or reference repair is applied. A patch therefore does not retroactively affect that original initialization. Requalify the existing cases once under this contract; future installation/migration cases retain an explicit fresh-setup policy. See [the starting-state decision](adr/0006-grade-repairs-from-prepared-baselines.md).
 
-Cache identities previously coupled unrelated changes: Pi package/bridge changes entered the project recipe, while qualification included broad runtime, case-directory and controller inputs. Project, service and Pi artifacts now have separate identities; executable qualification covers relevant baseline, case-contract and evaluator inputs. Model, budget, UI, logs or descriptive metadata do not recreate the application/database baseline. Unknown case-contract fields invalidate qualification by default. Public prompt changes still belong in run provenance and future immutable case/review identities even when executable controls remain unchanged.
+Cache identities previously coupled unrelated changes: Pi package/bridge changes entered the project recipe, while qualification included broad runtime, case-directory and controller inputs. Project, service and Pi artifacts now have separate identities; executable qualification covers relevant baseline, case-contract and evaluator inputs. Model, budget, UI, logs or descriptive metadata do not recreate the application/database baseline. Unknown case-contract fields invalidate qualification by default. Public prompt changes enter the immutable release identity even when executable controls remain unchanged; independent review/admission records remain future work.
 
 ### Component structure
 
@@ -159,6 +159,8 @@ Capture from a stopped preparation container only after verifying that every dur
 The user confirmed this design on 2026-10-13, including persistent baselines on disk, services starting on Run, and preparation of the next workspace during the current attempt. The original baseline design no longer requires another confirmation. The user then requested a plan to expand toward 250 PRs each from Plausible and Livebook; see [the expansion plan](benchmark-expansion-plan.md) for the additional catalog, storage and execution work and the confirmed scope. The baseline foundation is now implemented with bounded correctness coverage; the running controller remains unchanged and real fixtures still need qualification under this contract. [SWE-bench research](research/swe-bench.md) is complete and incorporated into the plan; no new cases were added.
 
 The expansion scope is now confirmed: bug fixes, features and objectively checkable refactors, including offline-testable JavaScript/browser work, with completed-case recovery for interrupted runs. Task kinds need distinct acceptance/coverage contracts, while the original twelve-case release stays intact. See [the grading decision](adr/0007-grade-features-and-refactors-by-explicit-contracts.md) and [the recovery decision](adr/0008-resume-completed-case-checkpoints.md).
+
+The research follow-through implements immutable release fixtures, exact source export receipts, identity-bound resume, retained baseline roots and shared-reference removal, pre-build free-space checks, compact history/case pages and named failure evidence. Saved patches resume grading; unfinished Pi generations are archived before fresh execution. Completed passes, failures and evaluation errors are not silently retried. Project/task breakdowns use the frozen case metadata. These controls are covered by synthetic checks; candidate admission, broader task adapters and real-case qualification are still required before expansion.
 
 ### Correctness criteria for implementation
 

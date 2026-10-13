@@ -5,6 +5,10 @@ defmodule Eab.Cache do
   def key(inputs), do: Inventory.hash(:erlang.term_to_binary(inputs, [:deterministic]))
 
   def fetch(kind, inputs, build, opts \\ []) do
+    Eab.Retention.with_use(fn -> do_fetch(kind, inputs, build, opts) end)
+  end
+
+  defp do_fetch(kind, inputs, build, opts) do
     id = key(inputs)
 
     locked({kind, id}, fn ->
@@ -13,6 +17,8 @@ defmodule Eab.Cache do
           {artifact, :reused}
 
         {:missing, reason} ->
+          File.mkdir_p!(Store.root())
+          Eab.Retention.ensure_space!(opts)
           artifact = build.(reason) |> Map.put_new("images", [])
           images = Map.get(artifact, "images", [])
           exists? = Keyword.get(opts, :image_exists?, &Eab.Fixtures.image_exists?/1)

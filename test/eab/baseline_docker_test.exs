@@ -1,7 +1,7 @@
 defmodule Eab.BaselineDockerTest do
   use ExUnit.Case, async: false
   @moduletag :docker
-  alias Eab.{Command, Sandbox, ServiceImages, Store}
+  alias Eab.{Cache, Command, Sandbox, ServiceImages, Store}
 
   # Tiny synthetic databases only. These are isolation/durability checks, not
   # benchmark cases or measurements of preparation/startup performance.
@@ -19,8 +19,20 @@ defmodule Eab.BaselineDockerTest do
       # Remove only tags this check created, never previously existing ones.
       after_ = docker(["image", "ls", "--format", "{{.Repository}}:{{.Tag}}"]) |> String.split()
 
-      for tag <- after_ -- before,
-          String.starts_with?(tag, id <> ":") or String.contains?(tag, id) do
+      declared =
+        case File.read(Path.join(root, "cleanup-tags")) do
+          {:ok, body} -> String.split(body)
+          _ -> []
+        end
+
+      tags =
+        Enum.filter(after_ -- before, fn tag ->
+          String.starts_with?(tag, id <> ":") or String.contains?(tag, id) or tag in declared
+        end)
+
+      # A child may initially keep its parent alive. Both passes are restricted
+      # to these test-owned tags; pre-existing images are never removed.
+      for _ <- 1..2, tag <- tags do
         Command.run("docker", ["image", "rm", tag])
       end
 
@@ -109,21 +121,43 @@ defmodule Eab.BaselineDockerTest do
           before_test: false
         )
 
+      rebased =
+        Map.new([{"postgres", pg}, {"clickhouse", ch}], fn {name, engine} ->
+          {name, rebase(root, name, saved[name], engine)}
+        end)
+
       Sandbox.with_runtime(
         id,
         spec,
-        runtime,
+        Map.put(runtime, "services", rebased),
         id,
         fn box ->
           assert pg(box, "SELECT value FROM baseline WHERE id=1") == "pristine"
           assert ch(box, "SELECT count(*) FROM baseline.values") == "1"
           assert ch(box, "SELECT dictGet('baseline.lookup', 'value', toUInt64(1))") == "pristine"
+          assert ch(box, "SELECT eab_identity(9)") == "9"
           refute ch(box, "SELECT serverUUID()") == uuid
           ServiceImages.validate!(box)
         end,
         before_test: false
       )
     end
+  end
+
+  defp rebase(root, name, seed, engine) do
+    cleanup = Path.join(root, "cleanup-tags")
+    layout = "elixir-agent-benchmark:layout-" <> Cache.key(ServiceImages.recipe(name, engine))
+    File.write!(cleanup, layout <> "\n", [:append])
+    base = ServiceImages.ensure(name, engine)
+
+    tags = [
+      "elixir-agent-benchmark:checkpoint-" <> Cache.key([name, seed, base]),
+      "elixir-agent-benchmark:database-parent-" <> String.replace_prefix(seed, "sha256:", ""),
+      "elixir-agent-benchmark:database-layout-" <> String.replace_prefix(base, "sha256:", "")
+    ]
+
+    File.write!(cleanup, Enum.join(tags, "\n") <> "\n", [:append])
+    ServiceImages.rebase(name, seed, engine)
   end
 
   defp build(root, tag, recipe) do

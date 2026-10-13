@@ -1,6 +1,6 @@
 defmodule EabWeb.DashboardLive do
   use Phoenix.LiveView
-  alias Eab.{Inventory, Model, Runner, Runs, Store}
+  alias Eab.{Evidence, Inventory, Model, Retention, Runner, Runs, Store}
 
   @defaults %{
     "window_tokens" => "",
@@ -27,12 +27,23 @@ defmodule EabWeb.DashboardLive do
        error: nil,
        detecting: false,
        selected: selected,
+       selected_run: if(selected, do: Store.run(selected)),
+       history_offset: 0,
+       history_page: Store.run_page(),
+       case_offset: 0,
+       cache_status: Retention.status(),
+       cache_preview: nil,
+       cache_busy: false,
+       cache_message: nil,
+       cache_failures: [],
        selected_case: nil,
        log_case: nil,
+       case_attempt: nil,
        log_text: "",
        log_available: false,
        follow_output: true,
-       artifacts: if(selected, do: Store.artifacts(selected), else: []),
+       evidence_links: [],
+       report_available: false,
        cases: Enum.map(Inventory.all(), &Inventory.spec/1)
      )
      |> load_log()}
@@ -78,13 +89,70 @@ defmodule EabWeb.DashboardLive do
     {:noreply, refresh(socket)}
   end
 
+  def handle_event("cache_preview", %{"cache" => %{"case" => id}}, socket) do
+    try do
+      {:noreply,
+       assign(socket,
+         cache_preview: Retention.preview(id),
+         cache_message: nil,
+         cache_failures: [],
+         error: nil
+       )}
+    rescue
+      error -> {:noreply, assign(socket, error: Exception.message(error))}
+    end
+  end
+
+  def handle_event("cache_remove", _, %{assigns: %{cache_preview: nil}} = socket),
+    do: {:noreply, socket}
+
+  def handle_event("cache_remove", _, socket) do
+    plan = socket.assigns.cache_preview
+
+    {:noreply,
+     socket
+     |> assign(cache_busy: true, error: nil)
+     |> start_async(:cache_remove, fn ->
+       try do
+         {:ok, Retention.remove(plan["case"], plan["id"])}
+       rescue
+         error -> {:error, Exception.message(error)}
+       end
+     end)}
+  end
+
+  def handle_event("resume", _, %{assigns: %{endpoint: nil}} = socket),
+    do: {:noreply, assign(socket, error: "Reconnect the same model before resuming")}
+
+  def handle_event("resume", _, socket) do
+    case Runs.resume(
+           socket.assigns.selected,
+           socket.assigns.endpoint,
+           socket.assigns.key,
+           socket.assigns.settings
+         ) do
+      {:ok, _} -> {:noreply, refresh(assign(socket, error: nil))}
+      {:error, message} -> {:noreply, assign(socket, error: message)}
+    end
+  end
+
+  def handle_event("history_page", %{"direction" => direction}, socket) do
+    offset = max(socket.assigns.history_offset + if(direction == "next", do: 20, else: -20), 0)
+    {:noreply, refresh(assign(socket, history_offset: offset))}
+  end
+
+  def handle_event("case_page", %{"direction" => direction}, socket) do
+    offset = max(socket.assigns.case_offset + if(direction == "next", do: 25, else: -25), 0)
+    {:noreply, assign(socket, case_offset: offset)}
+  end
+
   def handle_event("retry_cleanup", _, socket) do
     Runs.retry_cleanup()
     {:noreply, refresh(socket)}
   end
 
   def handle_event("select", %{"id" => id}, socket),
-    do: {:noreply, refresh(assign(socket, selected: id, selected_case: nil))}
+    do: {:noreply, refresh(assign(socket, selected: id, selected_case: nil, case_offset: 0))}
 
   def handle_event("select_case", %{"id" => id}, socket) do
     run = selected(socket.assigns)
@@ -99,6 +167,31 @@ defmodule EabWeb.DashboardLive do
 
   def handle_async(:discovery, {:ok, {:ok, endpoint}}, socket),
     do: {:noreply, assign(socket, endpoint: endpoint, detecting: false, error: nil)}
+
+  def handle_async(:cache_remove, {:ok, {:ok, result}}, socket) do
+    message =
+      "Removed #{result["removed_images"]} images. #{length(result["retained_images"])} images could not be removed and were left untouched."
+
+    {:noreply,
+     assign(socket,
+       cache_busy: false,
+       cache_preview: nil,
+       cache_status: Retention.status(),
+       cache_failures: result["retained_images"],
+       cache_message: message
+     )}
+  end
+
+  def handle_async(:cache_remove, {:ok, {:error, error}}, socket),
+    do: {:noreply, assign(socket, cache_busy: false, error: error)}
+
+  def handle_async(:cache_remove, {:exit, _}, socket),
+    do:
+      {:noreply,
+       assign(socket,
+         cache_busy: false,
+         error: "Cache removal stopped; review the remaining artifacts before retrying"
+       )}
 
   def handle_async(:discovery, {:ok, {:error, error}}, socket),
     do: {:noreply, assign(socket, detecting: false, error: error)}
@@ -122,7 +215,9 @@ defmodule EabWeb.DashboardLive do
     assign(socket,
       snapshot: snapshot,
       selected: selected,
-      artifacts: if(selected, do: Store.artifacts(selected), else: [])
+      selected_run: if(selected && Store.valid_id?(selected), do: Store.run(selected)),
+      history_page: Store.run_page(socket.assigns.history_offset),
+      cache_status: Retention.status()
     )
     |> load_log()
   end
@@ -130,6 +225,14 @@ defmodule EabWeb.DashboardLive do
   defp load_log(socket) do
     run = selected(socket.assigns)
     id = run && (socket.assigns.selected_case || run["current_case"] || List.first(run["cases"]))
+    attempt = if run && id, do: case_attempt(run, id)
+    socket = assign(socket, case_attempt: attempt)
+
+    socket =
+      assign(socket,
+        evidence_links: if(run && id, do: Evidence.links(run["id"], id), else: []),
+        report_available: run && match?({:ok, _}, Store.artifact(run["id"], "report.md"))
+      )
 
     case run && id && Store.tail_artifact(run["id"], "#{id}/activity.log") do
       {:ok, text} ->
@@ -144,10 +247,26 @@ defmodule EabWeb.DashboardLive do
     end
   end
 
-  defp selected(assigns),
-    do:
-      Enum.find(assigns.snapshot.history, &(&1["id"] == assigns.selected)) ||
-        List.first(assigns.snapshot.history)
+  defp selected(assigns) do
+    if assigns.snapshot.active && assigns.snapshot.active["id"] == assigns.selected,
+      do: assigns.snapshot.active,
+      else: assigns.selected_run
+  end
+
+  defp case_attempt(run, id) do
+    record =
+      if run["experiment_id"],
+        do: Store.read("runs/#{run["id"]}/#{id}/attempt.json", get_in(run, ["attempts", id])),
+        else: get_in(run, ["attempts", id])
+
+    summary = get_in(run, ["attempts", id])
+
+    if summary && summary["status"] == "error" && record && record["status"] != "error",
+      do: summary,
+      else: record
+  rescue
+    _ -> get_in(run, ["attempts", id])
+  end
 
   defp outcome(nil), do: "Pending"
   defp outcome(%{"status" => "completed", "grade" => %{"passed" => true}}), do: "Passed"
@@ -160,13 +279,13 @@ defmodule EabWeb.DashboardLive do
     if run["status"] == "running" do
       case phase do
         "preparing" -> "Preparing"
-        "qualifying" -> "Checking tests"
+        "qualifying" -> "Qualifying baseline"
         "ready" -> "Image ready"
         "warming" -> "Starting workspace"
         "warm" -> "Ready for Pi"
         "running" -> "Pi running"
         "submitted" -> "Waiting for grading"
-        "grading" -> "Grading"
+        "grading" -> "Grading submission"
         _ -> outcome(run["attempts"][id])
       end
     else
@@ -191,6 +310,12 @@ defmodule EabWeb.DashboardLive do
   def render(assigns) do
     assigns = assign(assigns, run: selected(assigns))
 
+    assigns =
+      assign(assigns,
+        case_count: length(assigns.cases),
+        project_counts: Enum.frequencies_by(assigns.cases, &(&1["project"] || &1["suite"]))
+      )
+
     ~H"""
     <main>
       <header class="masthead">
@@ -203,11 +328,15 @@ defmodule EabWeb.DashboardLive do
             Put your model<br />to the test.
           </h1>
           <p class="lede">
-            Twelve historical pull requests. Pi in Docker.<br />Executable results you can inspect.
+            {length(@cases)} historical pull requests. Pi in Docker.<br />Executable results you can inspect.
           </p>
         </div>
         <div class="inventory-number">
-          <strong>12</strong><span>PR CASES</span><p>06 Plausible · 06 Livebook</p>
+          <strong>{@case_count}</strong><span>PR CASES</span><p>
+            {Enum.map_join(Enum.sort(@project_counts), " · ", fn {project, count} ->
+              "#{count} #{project}"
+            end)}
+          </p>
         </div>
       </section>
       <div :if={@error} class="notice error" role="alert">{@error}</div>
@@ -297,7 +426,8 @@ defmodule EabWeb.DashboardLive do
             class="primary"
             phx-click="run"
             disabled={
-              is_nil(@endpoint) or @detecting or not is_nil(@snapshot.active) or @snapshot.cleaning or
+              is_nil(@endpoint) or @detecting or @cache_busy or not is_nil(@snapshot.active) or
+                @snapshot.cleaning or
                 not is_nil(@snapshot.cleanup_error)
             }
           >Run benchmark <span>↗</span></button>
@@ -323,9 +453,27 @@ defmodule EabWeb.DashboardLive do
               <span class="badge">{String.upcase(@run["phase"])}</span><code>{@run["id"]}</code>
             </div>
             <h3>{@run["model"]["model"]}</h3><p role="status">{@run["message"]}</p>
+            <p :if={@run["release_id"]} class="fine-print">
+              Release <code>{String.slice(@run["release_id"], 0, 12)}</code>
+              · Experiment <code>{String.slice(@run["experiment_id"], 0, 12)}</code>
+              · {@run["resume_count"] || 0} resumptions
+            </p>
+            <button
+              :if={@run["release_id"] && @run["status"] in ["interrupted", "cancelled", "error"]}
+              id="resume"
+              class="secondary"
+              phx-click="resume"
+              disabled={
+                is_nil(@endpoint) or @detecting or @cache_busy or not is_nil(@snapshot.active) or
+                  @snapshot.cleaning or
+                  not is_nil(@snapshot.cleanup_error)
+              }
+            >
+              Resume unfinished cases
+            </button>
             <div class="scoreboard">
               <div>
-                <strong>{Runner.score(@run)["passed"]}<small>/12</small></strong><span>Passed</span>
+                <strong>{Runner.score(@run)["passed"]}<small>/{length(@run["cases"])}</small></strong><span>Passed</span>
               </div><div><strong>{Runner.score(@run)["failed"]}</strong><span>Failed</span></div><div>
                 <strong>{if Runner.score(@run)["score_percent"],
                   do: "#{Runner.score(@run)["score_percent"]}%",
@@ -333,7 +481,7 @@ defmodule EabWeb.DashboardLive do
               </div>
             </div>
             <p class="fine-print">Errors and incomplete attempts prevent a final score.</p>
-            <p :if={"report.md" in @artifacts}>
+            <p :if={@report_available}>
               <a href={"/artifacts/#{@run["id"]}/report.md"} download>Download report ↓</a>
             </p>
             <table>
@@ -342,14 +490,17 @@ defmodule EabWeb.DashboardLive do
                   <th>Case</th><th>Result</th>
                 </tr>
               </thead><tbody>
-                <tr :for={id <- @run["cases"]} class={if id == @log_case, do: "selected-case"}>
+                <tr
+                  :for={id <- Enum.slice(@run["cases"], @case_offset, 25)}
+                  class={if id == @log_case, do: "selected-case"}
+                >
                   <td>
                     <button
                       id={"case-#{id}"}
                       class="case-link"
                       phx-click={
                         Phoenix.LiveView.JS.push("select_case")
-                        |> Phoenix.LiveView.JS.focus(to: "#case-log")
+                        |> Phoenix.LiveView.JS.focus(to: "#case-verdict")
                       }
                       phx-value-id={id}
                       aria-controls="case-console"
@@ -364,6 +515,23 @@ defmodule EabWeb.DashboardLive do
                 </tr>
               </tbody>
             </table>
+            <nav :if={length(@run["cases"]) > 25} aria-label="Case pages">
+              <button
+                class="secondary"
+                phx-click="case_page"
+                phx-value-direction="previous"
+                disabled={@case_offset == 0}
+              >Previous cases</button>
+              <span>{@case_offset + 1}–{min(@case_offset + 25, length(@run["cases"]))} of {length(
+                @run["cases"]
+              )}</span>
+              <button
+                class="secondary"
+                phx-click="case_page"
+                phx-value-direction="next"
+                disabled={@case_offset + 25 >= length(@run["cases"])}
+              >Next cases</button>
+            </nav>
             <section
               :if={@log_case}
               id="case-console"
@@ -372,7 +540,7 @@ defmodule EabWeb.DashboardLive do
             >
               <div class="console-heading">
                 <div>
-                  <span class="eyebrow">COMMAND OUTPUT</span><h3>{@log_case}</h3>
+                  <span class="eyebrow">CASE EVIDENCE</span><h3>{@log_case}</h3>
                 </div><span class="badge">{case_status(@run, @log_case)}</span>
               </div>
               <p
@@ -385,6 +553,44 @@ defmodule EabWeb.DashboardLive do
               <p :if={get_in(@run, ["attempts", @log_case, "error"])} class="notice error">
                 {get_in(@run, ["attempts", @log_case, "error"])}
               </p>
+              <section id="case-verdict" aria-label="Case result explanation" tabindex="-1">
+                <h4>{Evidence.verdict(@case_attempt)}</h4>
+                <p :if={get_in(@run, ["case_phases", @log_case]) == "qualifying"} class="fine-print">
+                  Checking the unchanged application, reference repair and negative controls before Pi starts this case.
+                </p>
+                <p :if={get_in(@run, ["attempts", @log_case, "stop_reason"])} class="fine-print">
+                  Pi stopped: {get_in(@run, ["attempts", @log_case, "stop_reason"])}
+                </p>
+                <div
+                  :for={check <- Evidence.checks(@case_attempt)}
+                  class="check-result"
+                >
+                  <p>
+                    <strong>{check["label"]}: {if check["passed"], do: "passed", else: "did not pass"}</strong><span :if={
+                      check["completed"] == false
+                    }> — check execution did not complete</span>
+                  </p>
+                  <p :if={check["reason"]}>{check["reason"]}</p>
+                  <ul :if={check["failures"] != []}>
+                    <li :for={failure <- check["failures"]}>
+                      <code>{failure["name"]}</code>: expected {failure["expected"]}, observed {failure[
+                        "observed"
+                      ]}
+                    </li>
+                  </ul>
+                  <p :if={check["failure_count"] > length(check["failures"])} class="fine-print">
+                    {check["failure_count"] - length(check["failures"])} additional failures in full grading evidence.
+                  </p>
+                  <details :if={check["excerpt"]}>
+                    <summary>Error excerpt</summary><pre>{check["excerpt"]}</pre>
+                  </details>
+                </div>
+                <ul class="artifacts">
+                  <li :for={link <- @evidence_links}>
+                    <a href={"/artifacts/#{@run["id"]}/#{link["path"]}"} download>{link["label"]} ↓</a>
+                  </li>
+                </ul>
+              </section>
               <div class="console-actions">
                 <button class="secondary" phx-click="follow_output" aria-pressed={@follow_output}>Follow output: {if @follow_output,
                   do: "on",
@@ -410,13 +616,34 @@ defmodule EabWeb.DashboardLive do
             <details>
               <summary>Run settings and evidence</summary><pre>{Jason.encode!(@run["settings"], pretty: true)}</pre>
               <p class="fine-print">
-                Transcripts, submitted patches, fixture controls and grading output.
+                Select a case for its patch, transcript, environment and grading evidence. Resuming preserves completed failures and evaluation errors; it restarts only unfinished work.
               </p>
-              <ul class="artifacts">
-                <li :for={file <- @artifacts}>
-                  <a href={"/artifacts/#{@run["id"]}/#{URI.encode(file)}"} download>{file}</a>
-                </li>
-              </ul>
+              <table :if={@run["case_metadata"]} aria-label="Results by project and task">
+                <thead>
+                  <tr>
+                    <th>Group</th><th>Passed</th><th>Failed</th><th>Incomplete / error</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={row <- Runner.breakdowns(@run)}>
+                    <td>{String.replace(row["value"], "_", " ")}</td>
+                    <td>{row["passed"]}/{row["planned"]}</td>
+                    <td>{row["failed"]}</td><td>{row["pending_or_error"]}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <a href={"/artifacts/#{@run["id"]}/run.json"} download>Complete run record ↓</a>
+              <p :if={@run["release_id"]}>
+                <a href={"/artifacts/#{@run["id"]}/release.json"} download>Frozen release manifest ↓</a>
+              </p>
+              <div :if={(@run["attempt_history"] || []) != []}>
+                <h4>Interrupted generations</h4>
+                <p :for={entry <- @run["attempt_history"]}>
+                  {entry["case"]}, generation {entry["generation"]}: {entry["generated_tokens"] ||
+                    "unknown"} generated tokens, {entry["calls"] || "unknown"} model calls.
+                  <a href={"/artifacts/#{@run["id"]}/#{entry["artifacts"]}/activity.log"} download>Prior activity log</a>
+                </p>
+              </div>
             </details>
           </div>
         </section>
@@ -425,20 +652,78 @@ defmodule EabWeb.DashboardLive do
         <div class="section-title">
           <h2>Run history</h2><span class="muted">Each run stands on its own.</span>
         </div>
-        <p :if={@snapshot.history == []} class="muted">
+        <p :if={@history_page.total == 0} class="muted">
           Your completed and interrupted runs will be kept here.
         </p>
         <button
-          :for={run <- @snapshot.history}
+          :for={run <- @history_page.items}
           class="history-row"
           phx-click="select"
           phx-value-id={run["id"]}
         ><span><strong>{run["model"]["model"]}</strong><code>{run["id"]}</code></span><span>{run[
           "status"
         ]} →</span></button>
+        <nav :if={@history_page.total > 20} aria-label="History pages">
+          <button
+            class="secondary"
+            phx-click="history_page"
+            phx-value-direction="previous"
+            disabled={@history_offset == 0}
+          >Newer runs</button>
+          <button
+            class="secondary"
+            phx-click="history_page"
+            phx-value-direction="next"
+            disabled={@history_offset + 20 >= @history_page.total}
+          >Older runs</button>
+        </nav>
       </section>
+      <details
+        class="case-inventory"
+        id="cache-controls"
+        open={not is_nil(@cache_preview) or @cache_busy or not is_nil(@cache_message)}
+      >
+        <summary>Retained preparation</summary>
+        <p :if={@cache_status["error"]} class="notice error">{@cache_status["error"]}</p>
+        <p :if={!@cache_status["error"]}>
+          {@cache_status["baselines"]} retained baseline records · {@cache_status["images"]} distinct image references. Shared layers are not summed as storage usage.
+        </p>
+        <p class="fine-print">
+          Baselines persist across models. Removing a case's retained state may require preparation on its next run. Shared images and active work are protected. Engine images, package downloads and Docker build cache remain available.
+        </p>
+        <form id="cache-preview" phx-submit="cache_preview">
+          <label>Choose cached state<select name="cache[case]">
+            <option value="unused">Unreferenced application and database artifacts</option>
+            <option :for={id <- @cache_status["cases"]} value={id}>{id}</option>
+          </select></label>
+          <button
+            class="secondary"
+            type="submit"
+            disabled={@cache_busy or not is_nil(@cache_status["error"])}
+          >Preview removal</button>
+        </form>
+        <div :if={@cache_preview}>
+          <p>
+            Remove {@cache_preview["case"]}: {length(@cache_preview["images"])} image references eligible; {@cache_preview[
+              "shared_records_preserved"
+            ]} shared artifact records preserved.
+          </p>
+          <button
+            class="danger"
+            phx-click="cache_remove"
+            disabled={@cache_busy or not is_nil(@snapshot.active) or @snapshot.cleaning}
+          >Remove this cached state</button>
+        </div>
+        <p :if={@cache_busy} role="status">Removing unused cached state…</p>
+        <p :if={@cache_message} role="status">{@cache_message}</p>
+        <ul :if={@cache_failures != []}>
+          <li :for={failure <- @cache_failures}>
+            <code>{failure["image"]}</code>: {failure["reason"]}
+          </li>
+        </ul>
+      </details>
       <details class="case-inventory">
-        <summary>Explore the twelve historical cases</summary><div class="case-grid">
+        <summary>Explore the {@case_count} historical cases</summary><div class="case-grid">
           <article :for={spec <- @cases}>
             <span class="eyebrow">{spec["id"]}</span><h3>{spec["title"]}</h3><a
               href={spec["source_inspiration"]["url"]}

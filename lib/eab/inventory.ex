@@ -11,7 +11,26 @@ defmodule Eab.Inventory do
 
   def case_path(id, file), do: path("cases/#{id}/#{file}")
   def file(id, file), do: File.read!(case_path(id, file))
-  def hash_file(path), do: path |> File.read!() |> hash()
+
+  def hash_file(path) do
+    file = File.open!(path, [:read, :binary, :raw])
+
+    try do
+      hash_chunks(file, :crypto.hash_init(:sha256), path)
+      |> Base.encode16(case: :lower)
+    after
+      File.close(file)
+    end
+  end
+
+  defp hash_chunks(file, state, path) do
+    case :file.read(file, 1_048_576) do
+      {:ok, bytes} -> hash_chunks(file, :crypto.hash_update(state, bytes), path)
+      :eof -> :crypto.hash_final(state)
+      {:error, reason} -> raise File.Error, reason: reason, action: "hash", path: path
+    end
+  end
+
   def hash(data), do: :crypto.hash(:sha256, data) |> Base.encode16(case: :lower)
 
   def fixture_hashes(id) do

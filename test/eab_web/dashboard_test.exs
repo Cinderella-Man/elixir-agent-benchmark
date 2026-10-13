@@ -79,7 +79,7 @@ defmodule EabWeb.DashboardTest do
     on_exit(fn -> File.rm_rf!(Eab.Store.path("runs/#{id}")) end)
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "Pi running"
-    assert html =~ "Checking tests"
+    assert html =~ "Qualifying baseline"
     assert html =~ "Grading"
     view |> element("#case-#{b}") |> render_click()
     assert render(view) =~ "Checking upcoming fixture"
@@ -172,5 +172,45 @@ defmodule EabWeb.DashboardTest do
     assert render_async(view) =~ "CONNECTED · STRATA"
     refute has_element?(view, "[role=alert]")
     assert has_element?(view, "#run:not([disabled])")
+  end
+
+  test "a large synthetic inventory is paginated and failures explain named checks before raw logs" do
+    id = "large-inventory-test"
+    cases = for n <- 1..500, do: "synthetic-#{n}"
+
+    grade =
+      Eab.Evidence.summarize(%{
+        "passed" => false,
+        "hidden" => %{
+          "passed" => false,
+          "completed" => true,
+          "test_results" => %{"required behavior" => "failed"},
+          "output" => "  1) required behavior\nAssertion failed"
+        }
+      })
+
+    Eab.Store.write("runs/#{id}/run.json", %{
+      "id" => id,
+      "created_at" => "9999-01-01T00:00:00Z",
+      "status" => "cancelled",
+      "phase" => "cancelled",
+      "cases" => cases,
+      "attempts" => %{"synthetic-1" => %{"status" => "completed", "grade" => grade}},
+      "settings" => %{},
+      "model" => %{"model" => "fixture"}
+    })
+
+    Eab.Store.write("runs/#{id}/synthetic-1/grade.json", %{"full" => "output"})
+    on_exit(fn -> File.rm_rf!(Eab.Store.path("runs/#{id}")) end)
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "/500"
+    assert has_element?(view, "#case-synthetic-25")
+    refute has_element?(view, "#case-synthetic-26")
+    assert has_element?(view, "#case-verdict", "Acceptance did not pass")
+    assert has_element?(view, "#case-verdict", "required behavior")
+    assert has_element?(view, "#case-verdict a[href='/artifacts/#{id}/synthetic-1/grade.json']")
+    view |> element("button[phx-click='case_page'][phx-value-direction='next']") |> render_click()
+    assert has_element?(view, "#case-synthetic-26")
+    refute has_element?(view, "#case-synthetic-1")
   end
 end

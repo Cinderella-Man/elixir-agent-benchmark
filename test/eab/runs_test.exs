@@ -12,7 +12,9 @@ defmodule Eab.RunsTest do
     Supervisor.restart_child(Eab.Supervisor, Runs)
 
     on_exit(fn ->
+      Runs.subscribe()
       Runs.stop()
+      await_cleanup()
       Supervisor.terminate_child(Eab.Supervisor, Runs)
 
       for {k, v} <- old do
@@ -80,6 +82,23 @@ defmodule Eab.RunsTest do
     assert Store.read("runs/old/a/attempt.json")["status"] == "interrupted"
     assert Store.read("runs/old/run.json")["attempts"]["a"]["status"] == "interrupted"
     assert Runs.snapshot().active == nil
+  end
+
+  test "restart recovers orphan leases without overwriting corrupt run evidence" do
+    parent = self()
+    Runs.subscribe()
+    Application.put_env(:eab, :cleanup, fn id -> send(parent, {:cleaned, id}) end)
+    Eab.Retention.lease("orphan")
+    Eab.Retention.lease("damaged")
+    Store.write_text("runs/damaged/run.json", "corrupt original")
+    Supervisor.terminate_child(Eab.Supervisor, Runs)
+    Supervisor.restart_child(Eab.Supervisor, Runs)
+    assert_receive {:cleaned, "orphan"}, 3000
+    assert_receive {:cleaned, "damaged"}, 3000
+    await_cleanup()
+    assert Eab.Retention.leased_runs() == []
+    assert File.read!(Store.path("runs/damaged/run.json")) == "corrupt original"
+    refute File.exists?(Store.path("runs/orphan/run.json"))
   end
 
   test "worker errors are saved without the API credential" do
@@ -216,5 +235,90 @@ defmodule Eab.RunsTest do
         2000 -> flunk("Worker did not finish")
       end
     end
+  end
+
+  defp await_cleanup do
+    if Runs.snapshot().cleaning do
+      receive do
+        :runs_changed -> await_cleanup()
+      after
+        3000 -> flunk("Cleanup did not finish")
+      end
+    end
+  end
+
+  test "resume keeps completed failures and saved submissions, archives partial attempts, and rejects changed settings" do
+    parent = self()
+    Runs.subscribe()
+
+    Application.put_env(:eab, :runner, fn run, _, _ ->
+      [done, saved, partial | _] = run["cases"]
+
+      for id <- [done, saved],
+          do:
+            Store.write("runs/#{run["id"]}/#{id}/runtime.json", %{
+              "image" => "synthetic",
+              "services" => %{}
+            })
+
+      {record, _} =
+        Eab.Checkpoints.submit(run["id"], done, %{"case" => done}, "completed patch", "")
+
+      grade = Eab.Evidence.save(run["id"], done, %{"passed" => false}, "")
+
+      Eab.Checkpoints.complete(
+        run["id"],
+        done,
+        Map.merge(record, %{"status" => "completed", "grade" => grade}),
+        ""
+      )
+
+      Eab.Checkpoints.submit(
+        run["id"],
+        saved,
+        %{"case" => saved, "calls" => 9},
+        "saved patch",
+        ""
+      )
+
+      Store.write("runs/#{run["id"]}/#{partial}/attempt.json", %{
+        "status" => "running",
+        "calls" => 2
+      })
+
+      Store.write("runs/#{run["id"]}/#{partial}/agent-progress.json", %{
+        "calls" => 3,
+        "generated_tokens" => 51
+      })
+
+      send(parent, {:ready, done, saved, partial})
+
+      receive do
+        :wait -> :ok
+      end
+    end)
+
+    assert {:ok, id} = Runs.start(endpoint(), "", %{})
+    assert_receive {:ready, done, saved, partial}, 3000
+    Runs.stop()
+    await_cleanup()
+    assert {:error, mismatch} = Runs.resume(id, endpoint(), "", %{"seed" => "102"})
+    assert mismatch =~ "settings differ"
+
+    Application.put_env(:eab, :runner, fn run, _, _ ->
+      send(parent, {:resumed, run, Eab.Checkpoints.plan(run)})
+
+      receive do
+        :wait -> :ok
+      end
+    end)
+
+    assert {:ok, ^id} = Runs.resume(id, endpoint(), "", %{})
+    assert_receive {:resumed, resumed, plan}, 3000
+    assert resumed["attempts"][done]["grade"]["passed"] == false
+    assert plan.submissions[saved] |> elem(1) == "saved patch"
+    assert resumed["generations"][partial] == 2
+    assert hd(resumed["attempt_history"])["generated_tokens"] == 51
+    assert resumed["resume_count"] == 1
   end
 end

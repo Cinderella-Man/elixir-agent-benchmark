@@ -13,6 +13,9 @@ if config_env() != :test do
 
   config :eab,
     data_dir: data,
+    cache_reserve_bytes:
+      String.to_integer(System.get_env("EAB_CACHE_MIN_FREE_GB", "5")) * 1024 * 1024 * 1024,
+    docker_storage_path: System.get_env("EAB_DOCKER_STORAGE_PATH"),
     root: System.get_env("EAB_ROOT", File.cwd!())
 
   config :eab, :pipeline,

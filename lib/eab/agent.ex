@@ -1,6 +1,6 @@
 defmodule Eab.Agent do
   @moduledoc "Pi submission and independent grading, with durable handoff between them."
-  alias Eab.{Grader, Inventory, Model, Pi, Sandbox, Store}
+  alias Eab.{Checkpoints, Evidence, Grader, Inventory, Model, Pi, Sandbox, Store}
 
   def attempt(id, run_id, endpoint, key, settings, control, emit) do
     submission =
@@ -35,6 +35,7 @@ defmodule Eab.Agent do
       "case" => id,
       "settings" => settings,
       "agent" => Pi.identity(),
+      "agent_image" => box.runtime["image"],
       "calls" => 0,
       "generated_tokens" => 0,
       "status" => "running",
@@ -57,10 +58,7 @@ defmodule Eab.Agent do
         end
       end
 
-    Store.write_text("#{prefix}/model.patch", patch, key)
-    record = Map.put(record, "status", "submitted")
-    Store.write("#{prefix}/attempt.json", record, key)
-    {record, patch}
+    Checkpoints.submit(run_id, id, record, patch, key)
   end
 
   def grade(id, run_id, {record, patch}, endpoint, key, control, emit) do
@@ -69,20 +67,21 @@ defmodule Eab.Agent do
     emit.("Grading #{id}")
     grade = Grader.grade(id, patch, run_id, expected: control["reference_patch"])
     Model.unchanged!(endpoint, key)
-    record = Map.merge(record, %{"status" => "completed", "grade" => grade})
-    Store.write("#{prefix}/attempt.json", record, key)
-    record
+    summary = Evidence.save(run_id, id, grade, key)
+    record = Map.merge(record, %{"status" => "completed", "grade" => summary})
+    Checkpoints.complete(run_id, id, record, key) |> Evidence.compact()
   end
 
   def error(id, run_id, message, key) do
     prefix = "runs/#{run_id}/#{id}"
+    Store.write_text("#{prefix}/error.txt", message, key)
 
     record =
       Store.read("#{prefix}/attempt.json", %{"case" => id})
       |> Map.merge(Store.read("#{prefix}/agent-progress.json", %{}))
       |> Map.merge(%{
         "status" => "error",
-        "error" => Store.redact(message, key)
+        "error" => Store.redact(message, key) |> String.slice(0, 2000)
       })
 
     Store.write("#{prefix}/attempt.json", record, key)

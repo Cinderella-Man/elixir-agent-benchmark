@@ -11,6 +11,10 @@ defmodule Eab.Sandbox do
   end
 
   def with_runtime(id, spec, runtime, run_id, fun, opts \\ []) do
+    Eab.Retention.with_use(fn -> start_runtime(id, spec, runtime, run_id, fun, opts) end)
+  end
+
+  defp start_runtime(id, spec, runtime, run_id, fun, opts) do
     runtime =
       if opts[:agent],
         do: Map.put(runtime, "image", AgentImage.ensure(spec, runtime["image"])),
