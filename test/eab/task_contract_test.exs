@@ -61,14 +61,23 @@ defmodule Eab.TaskContractTest do
 
     empty = %{"passed" => false, "hidden" => failed, "regression" => %{"passed" => true}}
     gold = %{"passed" => true}
-    assert Grader.valid_controls?(contract, empty, gold, %{"passed" => false}, empty)
-    refute Grader.valid_controls?(contract, empty, gold, %{"passed" => true}, empty)
+    bypass = %{"passed" => false, "hidden" => %{"completed" => false}}
+    assert Grader.valid_controls?(contract, empty, gold, bypass, empty)
+    refute Grader.valid_controls?(contract, empty, gold, Map.put(bypass, "passed", true), empty)
+
+    refute Grader.valid_controls?(
+             contract,
+             empty,
+             gold,
+             %{"passed" => false, "reason" => "disallowed_patch"},
+             empty
+           )
 
     refute Grader.valid_controls?(
              contract,
              put_in(empty, ["hidden", "completed"], false),
              gold,
-             %{"passed" => false},
+             bypass,
              empty
            )
 
@@ -76,7 +85,7 @@ defmodule Eab.TaskContractTest do
              contract,
              put_in(empty, ["hidden", "failure_phases", "capability"], "setup"),
              gold,
-             %{"passed" => false},
+             bypass,
              empty
            )
 
@@ -84,7 +93,7 @@ defmodule Eab.TaskContractTest do
              TaskContract.read(spec("refactor")),
              put_in(empty, ["regression", "passed"], false),
              gold,
-             %{"passed" => false},
+             bypass,
              empty
            )
   end

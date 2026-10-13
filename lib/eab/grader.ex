@@ -116,9 +116,20 @@ defmodule Eab.Grader do
   end
 
   def validate_patch(patch, spec) do
+    blocks = String.split(patch, "diff --git ") |> Enum.drop(1)
+
+    touched =
+      blocks
+      |> Enum.flat_map(fn block ->
+        case OptionParser.split(hd(String.split(block, "\n"))) do
+          ["a/" <> a, "b/" <> b] -> Enum.uniq([a, b])
+          _ -> []
+        end
+      end)
+      |> Enum.frequencies()
+
     auxiliary =
-      String.split(patch, "diff --git ")
-      |> Enum.drop(1)
+      blocks
       |> Enum.flat_map(fn block ->
         lines = String.split(block, "\n")
 
@@ -128,7 +139,8 @@ defmodule Eab.Grader do
                  Enum.take(lines, 4),
                  &(&1 in ["new file mode 100644", "new file mode 100755"])
                ) and
-                 Path.basename(name) == name and not String.starts_with?(name, ".") and
+                 touched[name] == 1 and Path.basename(name) == name and
+                 not String.starts_with?(name, ".") and
                  Path.extname(name) in [".ex", ".exs", ".md", ".txt", ".json"],
                do: [name],
                else: []
@@ -403,10 +415,12 @@ defmodule Eab.Grader do
     starting_matches = starting == [] or Enum.sort(starting) == Enum.sort(empty_failures)
     incomplete_matches = starting == [] or Enum.any?(partial_failures, &(&1 in starting))
     preserved = contract["kind"] != "refactor" or get_in(empty, ["regression", "passed"]) == true
+    bypass_executed = is_boolean(get_in(bypass, ["hidden", "completed"]))
 
     not empty["passed"] and get_in(empty, ["hidden", "completed"]) == true and
       empty_failures != [] and starting_matches and preserved and gold["passed"] and
-      not bypass["passed"] and get_in(partial, ["hidden", "completed"]) == true and
+      not bypass["passed"] and bypass_executed and
+      get_in(partial, ["hidden", "completed"]) == true and
       partial_failures != [] and incomplete_matches
   end
 

@@ -88,4 +88,20 @@ defmodule Eab.GraderTest do
       assert File.exists?(Eab.Inventory.case_path(id, "acceptance.patch"))
     end
   end
+
+  test "delete-and-recreate patches cannot disguise configuration as a new helper" do
+    spec = %{"allowed_edit_prefixes" => ["lib/", "test/"]}
+
+    deleted =
+      "diff --git a/mix.exs b/mix.exs\ndeleted file mode 100644\n--- a/mix.exs\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+
+    added =
+      "diff --git a/mix.exs b/mix.exs\nnew file mode 100644\n--- /dev/null\n+++ b/mix.exs\n@@ -0,0 +1 @@\n+replacement\n"
+
+    assert {:error, _} = Grader.validate_patch(deleted <> added, spec)
+    assert {:error, _} = Grader.validate_patch(added <> deleted, spec)
+
+    assert {:ok, ["repro.exs"]} =
+             Grader.validate_patch(String.replace(added, "mix.exs", "repro.exs"), spec)
+  end
 end
