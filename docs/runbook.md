@@ -46,6 +46,8 @@ This implements the proposed "prepare one PR, update source/dependencies, migrat
 
 Warm planning validates component metadata and inspects image availability in batches of at most 200 unique images. It does not bootstrap a workspace. Migration identity construction parses each source file once and shares the dependency graph across migrations; cyclic and opaque dependencies remain conservative. These are implementation properties, not measured speed claims.
 
+Changing the migration scanner refreshes database analysis from the verified source archive while retaining an exact matching application image. Every other build input must still match, including source, environment patch, toolchain policy, Docker recipe and exporter. Changed database identities still select or prepare their own baseline and invalidate affected controls; this exception never reuses stale migration analysis.
+
 Qualification receipts live in `/data/qualifications/` and cover the baseline, relevant checks and evaluator. Pi, model and descriptive ticket changes do not repeat fixture controls. This baseline contract requires one-time requalification of the existing cases on the intended execution host; older raw-service records are not silently treated as prepared snapshots. Test aliases may still check for pending migrations when tests execute, and service/process startup still occurs. No startup-time claim has been measured on this shared machine.
 
 The same twelve cases now declare protocol `elixir-agent-benchmark-v2` because database initialization moves before repairs and the agent call cap has been removed. Existing run records preserve their original protocol; v1 and v2 results should not be silently merged into one comparison.

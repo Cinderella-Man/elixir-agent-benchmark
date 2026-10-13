@@ -100,6 +100,72 @@ defmodule Eab.FixturesTest do
     refute File.exists?(Store.path("runs/cache-test"))
   end
 
+  test "scanner changes refresh database analysis without rebuilding the exact project", %{
+    root: root
+  } do
+    fixture = Path.join(root, "candidate")
+    source = Path.join(root, "source")
+    File.mkdir_p!(fixture)
+    File.mkdir_p!(Path.join(source, "lib"))
+    File.write!(Path.join(source, "lib/app.ex"), "defmodule App do\nend\n")
+
+    repo = %{
+      "url" => "https://github.com/synthetic/app.git",
+      "revision" => String.duplicate("a", 40)
+    }
+
+    spec = %{
+      "id" => "synthetic-refresh",
+      "repository" => repo,
+      "runtime" => %{"image" => "synthetic"}
+    }
+
+    tree = String.duplicate("b", 40)
+    File.write!(Path.join(fixture, "case.json"), Jason.encode!(spec))
+    File.write!(Path.join(fixture, "provenance.json"), Jason.encode!(%{"broken_tree" => tree}))
+
+    # A synthetic, sealed archive stands in for Source's separately tested fetch.
+    key = Inventory.hash(Jason.encode!([repo["url"], repo["revision"]]))
+    archive = Store.path("sources/#{key}.tar")
+    File.mkdir_p!(Path.dirname(archive))
+    Command.run!("tar", ["-cf", archive, "-C", source, "."])
+
+    Store.write("sources/#{key}.json", %{
+      "version" => 1,
+      "repository" => repo,
+      "tree" => tree,
+      "archive_hash" => Inventory.hash_file(archive)
+    })
+
+    Inventory.with_case(spec["id"], fixture, fn ->
+      inputs = Fixtures.build_inputs(spec["id"], spec)
+      previous = Map.put(inputs, "database_scanner", "previous-scanner")
+      opts = [image_exists?: fn _ -> true end]
+
+      project = %{
+        "inputs" => previous,
+        "image" => "prepared-image",
+        "images" => ["prepared-image"],
+        "database_inputs" => "stale-analysis"
+      }
+
+      Cache.fetch("projects", previous, fn _ -> project end, opts)
+      assert Fixtures.reusable_project(inputs, opts) == project
+      refute Fixtures.reusable_project(inputs, image_exists?: fn _ -> false end)
+
+      for field <- Map.keys(inputs) -- ["database_scanner"] do
+        refute Fixtures.reusable_project(Map.put(inputs, field, "changed"), opts)
+      end
+
+      refreshed = Fixtures.ensure_project(spec["id"], fn _ -> :ok end, opts)
+      assert refreshed["image"] == "prepared-image"
+      assert refreshed["inputs"] == inputs
+      assert refreshed["database_inputs"] == Eab.DatabaseSeed.describe(source, spec)
+      File.rm!(archive)
+      assert Fixtures.ensure_project(spec["id"], fn _ -> :ok end, opts) == refreshed
+    end)
+  end
+
   test "recipes reconcile seeds before compilation and export an independent fixture" do
     for id <- Inventory.all() do
       spec = Inventory.spec(id)

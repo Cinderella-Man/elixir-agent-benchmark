@@ -87,14 +87,57 @@ defmodule Eab.Fixtures do
         "projects",
         inputs,
         fn reason ->
-          emit.("Building #{id}: #{reason}")
-          prepare(id, spec, inputs, emit)
+          case reusable_project(inputs, opts) do
+            nil ->
+              emit.("Building #{id}: #{reason}")
+              prepare(id, spec, inputs, emit)
+
+            project ->
+              emit.("Refreshing migration analysis for #{id}; reusing its exact prepared image")
+              source = Store.path("scratch/migration-analysis-#{Cache.key(inputs)}")
+              File.rm_rf!(source)
+              File.mkdir_p!(source)
+
+              try do
+                provenance = Inventory.read_json(Inventory.case_path(id, "provenance.json"))
+
+                receipt =
+                  Source.snapshot(spec["repository"], source, emit,
+                    expected_tree: provenance["broken_tree"]
+                  )
+
+                apply_environment(id, source)
+
+                project
+                |> Map.put("inputs", inputs)
+                |> Map.put("source_receipt", receipt)
+                |> Map.put("database_inputs", DatabaseSeed.describe(source, spec))
+              after
+                File.rm_rf!(source)
+              end
+          end
         end,
         opts
       )
 
     if status == :reused, do: emit.("Reusing prepared project for #{id}")
     project
+  end
+
+  # Scanner changes affect database compatibility, not the compiled application.
+  # All other image inputs must match, including the source, environment patch,
+  # runtime, Docker recipe and source-export implementation.
+  def reusable_project(inputs, opts \\ []) do
+    Cache.records("projects")
+    |> Enum.find_value(fn record ->
+      if Map.delete(record["inputs"], "database_scanner") ==
+           Map.delete(inputs, "database_scanner") do
+        case Cache.lookup("projects", record["id"], opts) do
+          {:ok, project} -> project
+          _ -> nil
+        end
+      end
+    end)
   end
 
   def build_inputs(id, spec) do
@@ -142,11 +185,7 @@ defmodule Eab.Fixtures do
 
     source_receipt = Source.snapshot(repo, source, emit, expected_tree: provenance["broken_tree"])
 
-    for file <- ["environment.patch"],
-        File.exists?(Inventory.case_path(id, file)),
-        File.stat!(Inventory.case_path(id, file)).size > 0 do
-      Command.run!("git", ["apply", Inventory.case_path(id, file)], cd: source)
-    end
+    apply_environment(id, source)
 
     previous = Enum.find(Cache.records("projects"), &(&1["id"] == Cache.key(inputs)))
     saved = if previous, do: previous["artifact"], else: %{}
@@ -191,6 +230,13 @@ defmodule Eab.Fixtures do
 
     BuildCache.publish(key, image, id, repo["revision"])
     runtime
+  end
+
+  defp apply_environment(id, source) do
+    path = Inventory.case_path(id, "environment.patch")
+
+    if File.regular?(path) and File.stat!(path).size > 0,
+      do: Command.run!("git", ["apply", path], cd: source)
   end
 
   defp build(dest, tag, target) do
