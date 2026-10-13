@@ -1,6 +1,6 @@
 # Expand toward 250 qualified PRs per project
 
-Status: baseline foundation and the first research-driven release/recovery/retention/evidence controls implemented, 2026-10-13; [SWE-bench research](research/swe-bench.md) completed and incorporated below. The existing cases are undergoing local functional qualification under the new prepared-baseline contract; final activation follows that check. The current executable inventory remains twelve cases. The target is approximately 250 Plausible and 250 Livebook cases, reused across 10–30 model runs.
+Status: baseline foundation and the first research-driven release/recovery/retention/evidence controls implemented, 2026-10-13; [SWE-bench research](research/swe-bench.md) completed and incorporated below. The updated controller is deployed. The user stopped functional qualification after two of twelve cases passed; four current pristine baselines are saved. See the [validation record](validation-2026-10-14.md) for the unfinished checks. The current executable inventory remains twelve cases. The target is approximately 250 Plausible and 250 Livebook cases, reused across 10–30 model runs.
 
 ## Scope and decisions
 
@@ -133,9 +133,9 @@ The research does not certify a 500-case inventory or establish local performanc
 
 ## Implementation sequence and acceptance gates
 
-**Research gate completed (2026-10-13):** The cache foundation passed bounded correctness checks, and deep primary-source SWE-bench research is saved in [the report](research/swe-bench.md). Resulting design changes are recorded above. No new PR cases were added. Real qualification of the existing twelve is in progress; completion of research or implementation does not admit candidates automatically.
+**Research gate completed (2026-10-13):** The cache foundation passed bounded correctness checks, and deep primary-source SWE-bench research is saved in [the report](research/swe-bench.md). Resulting design changes are recorded above. No new PR cases were added. Real qualification stopped at the user's request after two of twelve cases passed; completion of research or implementation does not admit candidates automatically.
 
-**Implementation follow-through:** Phase 1 and Phase 4's original retention/recovery/evidence controls have correctness coverage. Phase 2 now includes candidate loading, both-tree reconstruction, review records and admission gates. Phase 3 has explicit task contracts, ExUnit/Node adapters and optional pinned Chromium. Cold baseline construction orders missing PRs within runtime families independently of frozen Pi order. The twelve existing sources pass reconstruction; executable fixture qualification is in progress. Discovery, curation UI and corpus growth have not begun. Per-release removal and a comparison matrix now have correctness coverage. Storage snapshots show Docker-reported per-image shared/unique sizes, daemon totals and controller allocations without summing shared layers into a false total.
+**Implementation follow-through:** Phase 1 and Phase 4's original retention/recovery/evidence controls have correctness coverage. Phase 2 now includes candidate loading, both-tree reconstruction, review records and admission gates. Phase 3 has explicit task contracts, ExUnit/Node adapters and optional pinned Chromium. Cold baseline construction orders missing PRs within runtime families independently of frozen Pi order. The twelve existing sources pass reconstruction; two have current executable qualification and ten remain unverified under the deployed evaluator. Discovery, curation UI and corpus growth have not begun. Per-release removal and a comparison matrix now have correctness coverage. Storage snapshots show Docker-reported per-image shared/unique sizes, daemon totals and controller allocations without summing shared layers into a false total.
 
 | Phase | Deliverable | Completion evidence |
 | --- | --- | --- |
