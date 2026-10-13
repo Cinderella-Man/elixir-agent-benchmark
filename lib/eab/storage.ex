@@ -28,7 +28,10 @@ defmodule Eab.Storage do
           "--unix-socket",
           "/var/run/docker.sock",
           "http://localhost/v#{api}/system/df?type=image"
-        ], timeout: 65, limit: 8_388_608)
+        ],
+        timeout: 65,
+        limit: 8_388_608
+      )
 
     unless result["returncode"] == 0 and not result["output_truncated"],
       do:
@@ -45,7 +48,9 @@ defmodule Eab.Storage do
         value =
           Command.run!(
             "du",
-            ["--summarize", "--block-size=1", "--one-file-system", Store.path(name)], timeout: 30)
+            ["--summarize", "--block-size=1", "--one-file-system", Store.path(name)],
+            timeout: 30
+          )
           |> String.split()
           |> hd()
           |> String.to_integer()
