@@ -39,6 +39,8 @@ The bundle contains `ticket.md`, `case.json`, `provenance.json`, `reference.patc
 
 After approval and successful qualification, `Eab.Candidates.export(ref, destination)` produces a reviewable bundle including `admission.json`. Publishing it under `cases/` and adding its ID to a new inventory revision remains an explicit repository change. Release freezing rejects missing, stale or mismatched admission evidence for schema-v2 cases. Existing releases and saved scores are unchanged. Checksums detect corruption and mismatched artifacts; they are not signatures against a malicious curator.
 
+Admission and upstream-reconstruction artifacts version the release and remain subject to their own validation. Adding that audit evidence does not invalidate unchanged executable fixture controls. Explicit acceptance files and unknown future grading artifacts still invalidate those controls, regardless of filename.
+
 ## Offline browser tasks
 
 Set `runtime.browser: true` and declare a Node image for a browser case. The current browser recipe supports Ubuntu 24.04 toolchains and fails explicitly on other distributions. It installs the pinned Playwright lockfile and Chromium binaries from an immutable Playwright image during preparation. [Playwright requires matching browser and package versions](https://playwright.dev/docs/browsers); both are retained in the recipe identity. Non-browser recipes do not install these tools.

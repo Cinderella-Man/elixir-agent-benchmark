@@ -87,6 +87,12 @@ defmodule Eab.Inventory do
 
   def qualification_inputs(id) do
     spec = spec(id)
+    # Admission and exact-upstream reconstruction do not execute in the grader.
+    # They still bind the release and are verified before a baseline is used.
+    # An explicitly selected acceptance patch is executable regardless of name.
+    audit_files =
+      ~w(case.json ticket.md provenance.json admission.json upstream-tests.patch upstream-docs.patch) --
+        [spec["acceptance_patch"]]
 
     %{
       # Unknown future manifest fields invalidate controls by default. Only
@@ -96,7 +102,7 @@ defmodule Eab.Inventory do
         Map.drop(spec, ~w(id title family suite project domains repository runtime services
           clarifications source_inspiration)),
       "before_test_commands" => spec["runtime"]["before_test_commands"] || [],
-      "files" => Map.drop(fixture_hashes(id), ["case.json", "ticket.md", "provenance.json"])
+      "files" => Map.drop(fixture_hashes(id), audit_files)
     }
   end
 

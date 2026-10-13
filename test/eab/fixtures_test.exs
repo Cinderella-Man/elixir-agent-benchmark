@@ -254,6 +254,22 @@ defmodule Eab.FixturesTest do
 
     File.write!(path, Jason.encode!(Map.put(spec, "title", "New description")))
     assert Inventory.qualification_inputs(id) == original
+
+    hashes = Inventory.fixture_hashes(id)
+
+    for file <- ~w(admission.json upstream-tests.patch upstream-docs.patch) do
+      File.write!(Inventory.case_path(id, file), "changed audit record")
+      assert Inventory.qualification_inputs(id) == original
+      refute Inventory.fixture_hashes(id) == hashes
+    end
+
+    File.write!(Inventory.case_path(id, "future-grading.patch"), "new executable contract")
+    refute Inventory.qualification_inputs(id) == original
+
+    File.write!(path, Jason.encode!(Map.put(spec, "acceptance_patch", "upstream-tests.patch")))
+    explicit = Inventory.qualification_inputs(id)
+    File.write!(Inventory.case_path(id, "upstream-tests.patch"), "changed explicit acceptance")
+    refute Inventory.qualification_inputs(id) == explicit
   end
 
   test "seed compatibility excludes the PR revision but includes installed tools and build policy" do
