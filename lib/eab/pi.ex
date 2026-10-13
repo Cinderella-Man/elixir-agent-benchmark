@@ -108,7 +108,7 @@ defmodule Eab.Pi do
         ],
         state,
         &handle/2,
-        timeout: settings["max_calls"] * (1200 + box.spec["test_timeout"]) + 300
+        timeout: :infinity
       )
 
     finish(result)

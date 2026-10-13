@@ -108,11 +108,11 @@ defmodule Eab.PiTest do
     end
   end
 
-  test "real Pi stops at the call budget without retrying and keeps the edited file", %{
+  test "real Pi stops at the token budget without retrying and keeps the edited file", %{
     prefix: prefix
   } do
     model = endpoint("llama_cpp")
-    settings = Model.settings(model, %{"max_calls" => 1})
+    settings = Model.settings(model, %{"max_tokens" => 12})
     workspace = Store.path("#{prefix}/workspace")
     File.mkdir_p!(workspace)
 
@@ -141,9 +141,63 @@ defmodule Eab.PiTest do
         opts
       )
 
-    assert Pi.finish(result)["stop_reason"] == "call_budget"
+    assert Pi.finish(result)["stop_reason"] == "token_budget"
     assert Pi.finish(result)["calls"] == 1
+    assert Pi.finish(result)["generated_tokens"] == 12
     assert File.read!(Path.join(workspace, "repaired.txt")) == "fixed"
+  end
+
+  test "both adapters continue past 32 calls and stop exactly at the generation budget", %{
+    prefix: prefix
+  } do
+    parent = self()
+
+    for backend <- ["llama_cpp", "strata"] do
+      model = endpoint(backend)
+      settings = Model.settings(model, %{"max_tokens" => 473, "response_tokens" => 12})
+
+      frame = %{
+        "type" => "request",
+        "id" => "1",
+        "method" => "POST",
+        "path" => if(backend == "strata", do: "/v1/messages", else: "/v1/chat/completions"),
+        "body" => %{"messages" => [%{"role" => "user", "content" => "ticket"}], "tools" => []}
+      }
+
+      Application.put_env(:eab, :http_request, fn opts ->
+        if String.ends_with?(opts[:url], "tokens") do
+          {:ok, %{status: 200, body: %{"input_tokens" => 42}}}
+        else
+          allowance = opts[:json]["max_tokens"]
+          send(parent, {:allowance, allowance})
+          {:ok, %{status: 200, body: response(backend, false, allowance)}}
+        end
+      end)
+
+      state = Pi.state(model, "", settings, "#{prefix}/#{backend}", fn _ -> :ok end)
+
+      state =
+        Enum.reduce(1..40, state, fn call, state ->
+          {reply, state} = PiGateway.request(frame, state)
+          assert reply["status"] == 200
+          assert state.calls == call
+          assert state.stop_reason == nil
+          assert_receive {:allowance, allowance}
+          assert allowance == if(call == 40, do: 5, else: 12)
+          state
+        end)
+
+      assert state.generated_tokens == 473
+
+      Application.put_env(:eab, :http_request, fn _ ->
+        flunk("Exhausted generation budget must prevent network access")
+      end)
+
+      {reply, stopped} = PiGateway.request(frame, state)
+      assert reply["status"] == 429
+      assert stopped.calls == 40
+      assert stopped.stop_reason == "token_budget"
+    end
   end
 
   test "budgets stop forwarding, count exact Pi requests and retain endpoint errors", %{
@@ -166,14 +220,11 @@ defmodule Eab.PiTest do
       flunk("Budget must prevent network access")
     end)
 
-    for {state, reason} <- [
-          {%{state | calls: settings["max_calls"]}, "call_budget"},
-          {%{state | generated_tokens: settings["max_tokens"]}, "token_budget"}
-        ] do
-      {reply, stopped} = PiGateway.request(frame, state)
-      assert reply["status"] == 429
-      assert stopped.stop_reason == reason
-    end
+    {reply, stopped} =
+      PiGateway.request(frame, %{state | generated_tokens: settings["max_tokens"]})
+
+    assert reply["status"] == 429
+    assert stopped.stop_reason == "token_budget"
 
     Application.put_env(:eab, :http_request, fn opts ->
       assert String.ends_with?(opts[:url], "input_tokens")
@@ -204,7 +255,9 @@ defmodule Eab.PiTest do
 
   defp sse(events), do: Enum.map_join(events, fn e -> "data: " <> Jason.encode!(e) <> "\n\n" end)
 
-  defp response("llama_cpp", done) do
+  defp response(backend, done, tokens \\ 12)
+
+  defp response("llama_cpp", done, tokens) do
     delta =
       if done,
         do: %{"role" => "assistant", "content" => "Done."},
@@ -247,12 +300,12 @@ defmodule Eab.PiTest do
             "finish_reason" => if(done, do: "stop", else: "tool_calls")
           }
         ],
-        "usage" => %{"prompt_tokens" => 42, "completion_tokens" => 12}
+        "usage" => %{"prompt_tokens" => 42, "completion_tokens" => tokens}
       }
     ]) <> "data: [DONE]\n\n"
   end
 
-  defp response("strata", done) do
+  defp response("strata", done, tokens) do
     block =
       if done,
         do: %{"type" => "text", "text" => ""},
@@ -298,7 +351,11 @@ defmodule Eab.PiTest do
           "stop_reason" => if(done, do: "end_turn", else: "tool_use"),
           "stop_sequence" => nil
         },
-        "usage" => %{"input_tokens" => 32, "cache_read_input_tokens" => 10, "output_tokens" => 12}
+        "usage" => %{
+          "input_tokens" => 32,
+          "cache_read_input_tokens" => 10,
+          "output_tokens" => tokens
+        }
       },
       %{"type" => "message_stop"}
     ]

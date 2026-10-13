@@ -1,17 +1,26 @@
 defmodule Eab.Sandbox do
-  alias Eab.{Command, Inventory, Store}
+  alias Eab.{AgentImage, Command, Inventory, Store}
 
-  def with_box(id, run_id, fun) do
+  def with_box(id, run_id, fun, opts \\ []) do
     runtime = Store.read("runtimes/#{id}.json") || raise "Fixture is not prepared"
 
     unless runtime["fixture_hashes"] == Inventory.fixture_hashes(id),
       do: raise("Fixture changed after preparation")
 
+    with_runtime(id, Inventory.spec(id), runtime, run_id, fun, opts)
+  end
+
+  def with_runtime(id, spec, runtime, run_id, fun, opts \\ []) do
+    runtime =
+      if opts[:agent],
+        do: Map.put(runtime, "image", AgentImage.ensure(spec, runtime["image"])),
+        else: runtime
+
     name = "eab-" <> Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
-    box = %{name: name, id: id, spec: Inventory.spec(id), runtime: runtime, run_id: run_id}
+    box = %{name: name, id: id, spec: spec, runtime: runtime, run_id: run_id}
 
     try do
-      start(box)
+      start(box, opts)
       fun.(box)
     after
       for suffix <- ["", "-ch", "-db"],
@@ -19,7 +28,7 @@ defmodule Eab.Sandbox do
     end
   end
 
-  defp start(box) do
+  defp start(box, opts) do
     services = box.runtime["services"]
     labels = ["--label", "eab.installation=#{installation()}", "--label", "eab.run=#{box.run_id}"]
     network = if services["postgres"], do: "container:#{box.name}-db", else: "none"
@@ -38,7 +47,7 @@ defmodule Eab.Sandbox do
           box.name <> "-db",
           "sh",
           "-c",
-          "for i in $(seq 1 60); do pg_isready -U postgres && exit 0; sleep 1; done; exit 1"
+          "for i in $(seq 1 60); do pg_isready -h 127.0.0.1 -U postgres && exit 0; sleep 1; done; exit 1"
         ],
         timeout: 90
       )
@@ -93,7 +102,12 @@ defmodule Eab.Sandbox do
       ] ++ labels ++ [box.runtime["image"]]
     )
 
-    for cmd <- box.spec["runtime"]["before_test_commands"] || [],
+    commands =
+      if Keyword.get(opts, :before_test, true),
+        do: box.spec["runtime"]["before_test_commands"] || [],
+        else: []
+
+    for cmd <- commands,
         do: command!(box, cmd, timeout: 240)
   end
 

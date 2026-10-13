@@ -16,9 +16,6 @@ defmodule Eab.PiGateway do
       state.stop_reason ->
         stopped(frame, state, state.stop_reason)
 
-      state.calls >= state.settings["max_calls"] ->
-        stopped(frame, state, "call_budget")
-
       state.generated_tokens >= state.settings["max_tokens"] ->
         stopped(frame, state, "token_budget")
 

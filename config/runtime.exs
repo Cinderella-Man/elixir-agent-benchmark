@@ -15,6 +15,10 @@ if config_env() != :test do
     data_dir: data,
     root: System.get_env("EAB_ROOT", File.cwd!())
 
+  config :eab, :pipeline,
+    lookahead: String.to_integer(System.get_env("EAB_PREPARE_AHEAD", "4")),
+    preparation_workers: String.to_integer(System.get_env("EAB_PREPARE_WORKERS", "2"))
+
   config :eab, EabWeb.Endpoint,
     secret_key_base: File.read!(secret_path),
     http: [ip: {127, 0, 0, 1}, port: String.to_integer(System.get_env("PORT", "4000"))],

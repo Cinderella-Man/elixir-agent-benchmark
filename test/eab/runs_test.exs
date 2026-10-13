@@ -94,6 +94,120 @@ defmodule Eab.RunsTest do
     refute File.read!(Store.path("runs/#{id}/report.md")) =~ "secret-key"
   end
 
+  test "background progress cannot replace active Pi or regress a case phase" do
+    parent = self()
+
+    Application.put_env(:eab, :runner, fn _, _, _ ->
+      send(parent, {:worker, self()})
+
+      receive do
+        :finish -> :ok
+      end
+    end)
+
+    assert {:ok, id} = Runs.start(endpoint(), "", %{})
+    assert_receive {:worker, _}
+    [a, b, c | _] = Runs.snapshot().active["cases"]
+
+    progress = fn case_id, phase, message ->
+      send(
+        Runs,
+        {:progress, id,
+         %{"case_phase" => %{"case" => case_id, "phase" => phase, "message" => message}}}
+      )
+    end
+
+    progress.(a, "running", "Pi editing")
+    progress.(b, "qualifying", "Checking next case")
+    progress.(c, "preparing", "Building later case")
+    run = Runs.snapshot().active
+    assert run["current_case"] == a
+    assert run["message"] == "Pi editing"
+    assert run["case_phases"][b] == "qualifying"
+    assert run["case_phases"][c] == "preparing"
+
+    progress.(a, "grading", "Grading submitted patch")
+    progress.(b, "running", "Pi editing next case")
+    progress.(b, "ready", "Delayed earlier event")
+    run = Runs.snapshot().active
+    assert run["current_case"] == b
+    assert run["case_phases"][a] == "grading"
+    assert run["case_phases"][b] == "running"
+    assert run["case_messages"][b] == "Pi editing next case"
+
+    send(
+      Runs,
+      {:progress, id,
+       %{"case_result" => {a, %{"status" => "completed", "grade" => %{"passed" => true}}}}}
+    )
+
+    progress.(a, "grading", "Delayed grader event")
+    assert Runs.snapshot().active["case_phases"][a] == "completed"
+  end
+
+  test "restart finalizes submitted and grading attempts as interrupted" do
+    Store.write("runs/handoff/run.json", %{
+      "id" => "handoff",
+      "created_at" => "2026-01-01",
+      "status" => "running",
+      "cases" => ["a", "b"],
+      "attempts" => %{}
+    })
+
+    for {id, status} <- [{"a", "submitted"}, {"b", "grading"}] do
+      Store.write("runs/handoff/#{id}/attempt.json", %{"case" => id, "status" => status})
+      Store.write_text("runs/handoff/#{id}/model.patch", "saved #{id}")
+    end
+
+    Supervisor.terminate_child(Eab.Supervisor, Runs)
+    Supervisor.restart_child(Eab.Supervisor, Runs)
+
+    for id <- ["a", "b"] do
+      assert Store.read("runs/handoff/#{id}/attempt.json")["status"] == "interrupted"
+      assert File.read!(Store.path("runs/handoff/#{id}/model.patch")) == "saved #{id}"
+    end
+
+    assert Store.read("runs/handoff/run.json")["score"]["score_percent"] == nil
+  end
+
+  test "stop drains all pipeline workers before installation container cleanup" do
+    parent = self()
+
+    Application.put_env(:eab, :runner, fn _, _, _ ->
+      Eab.Pipeline.run(["a", "b"], %{
+        prepare: fn
+          "a" ->
+            :ready
+
+          "b" ->
+            send(parent, {:preparing, self()})
+
+            receive do
+              :never -> :ready
+            end
+        end,
+        workspace: fn _, use -> use.(:box) end,
+        attempt: fn _, _, _ ->
+          send(parent, {:pi, self()})
+
+          receive do
+            :never -> :submission
+          end
+        end
+      })
+    end)
+
+    Application.put_env(:eab, :cleanup, fn id -> send(parent, {:cleanup, id}) end)
+    assert {:ok, id} = Runs.start(endpoint(), "", %{})
+    assert_receive {:pi, pi}, 3000
+    assert_receive {:preparing, preparing}, 3000
+    Runs.stop()
+    assert_receive {:cleanup, ^id}, 3000
+    refute Process.alive?(pi)
+    refute Process.alive?(preparing)
+    assert Store.read("runs/#{id}/run.json")["status"] == "cancelled"
+  end
+
   defp await_terminal(id) do
     if Store.read("runs/#{id}/run.json")["status"] == "running" do
       receive do

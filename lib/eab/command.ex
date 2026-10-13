@@ -2,14 +2,27 @@ defmodule Eab.Command do
   @moduledoc "Bounded subprocess output and watchdogs. Watchdogs are never performance evidence."
   alias Eab.Activity
 
+  def with_scope(scope, fun) do
+    previous = Process.put(:eab_command_scope, scope)
+
+    try do
+      fun.()
+    after
+      Process.put(:eab_command_scope, previous)
+    end
+  end
+
   def run(executable, args, opts \\ []) do
     owner = self()
     ref = make_ref()
     activity = Activity.context()
+    scope = Process.get(:eab_command_scope) || owner
 
     {pid, monitor} =
       spawn_monitor(fn ->
-        Activity.inherit(activity, fn -> execute(owner, ref, executable, args, opts) end)
+        with_scope(scope, fn ->
+          Activity.inherit(activity, fn -> execute(owner, ref, executable, args, opts) end)
+        end)
       end)
 
     receive do
@@ -37,9 +50,10 @@ defmodule Eab.Command do
 
   defp execute(owner, ref, executable, args, opts) do
     Registry.register(Eab.Commands, owner, nil)
+    Registry.register(Eab.Commands, {:scope, Process.get(:eab_command_scope)}, nil)
     monitor = Process.monitor(owner)
     unless Process.alive?(owner), do: exit(:owner_stopped)
-    timeout = Keyword.get(opts, :timeout, 900) * 1000
+    timeout = Keyword.get(opts, :timeout, 900)
     limit = Keyword.get(opts, :limit, 20_000)
 
     setsid =
@@ -73,7 +87,11 @@ defmodule Eab.Command do
         nil -> nil
       end
 
-    timer = Process.send_after(self(), :watchdog, timeout)
+    timer =
+      case timeout do
+        :infinity -> nil
+        seconds -> Process.send_after(self(), :watchdog, seconds * 1000)
+      end
 
     try do
       result =
@@ -86,7 +104,7 @@ defmodule Eab.Command do
       send(owner, {ref, result})
     after
       Activity.flush({:command, self()})
-      Process.cancel_timer(timer)
+      if timer, do: Process.cancel_timer(timer)
 
       if Port.info(port) do
         kill(os_pid)
@@ -142,9 +160,14 @@ defmodule Eab.Command do
     parent = self()
     ref = make_ref()
     activity = Activity.context()
+    scope = Process.get(:eab_command_scope)
 
     {pid, monitor} =
-      spawn_monitor(fn -> Activity.inherit(activity, fn -> send(parent, {ref, fun.()}) end) end)
+      spawn_monitor(fn ->
+        with_scope(scope, fn ->
+          Activity.inherit(activity, fn -> send(parent, {ref, fun.()}) end)
+        end)
+      end)
 
     try do
       receive do
@@ -181,6 +204,8 @@ defmodule Eab.Command do
       end
     end
   end
+
+  def await_scope(scope), do: await_owner({:scope, scope})
 
   defp collect(port, monitor, os_pid, limit, head, tail, size) do
     receive do

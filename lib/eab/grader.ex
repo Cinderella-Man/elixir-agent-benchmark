@@ -275,14 +275,43 @@ defmodule Eab.Grader do
 
   def qualify(id, run_id, emit) do
     runtime = Store.read("runtimes/#{id}.json")
-    identity = %{"runtime" => runtime, "grader" => Inventory.qualification_hash()}
-    cached = Store.read("controls/#{id}.json")
+    identity = qualification_identity(id, runtime)
+    path = "qualifications/#{Eab.Cache.key(identity)}.json"
+    Eab.Cache.locked({:qualification, path}, fn -> qualify(id, run_id, emit, identity, path) end)
+  end
+
+  def qualification_identity(id, runtime) do
+    %{
+      "runtime" => Map.take(runtime, ["image", "services", "baseline"]),
+      "case" => Inventory.qualification_inputs(id),
+      "grader" => Inventory.qualification_hash()
+    }
+  end
+
+  defp qualify(id, run_id, emit, identity, path) do
+    cached = Store.read(path)
 
     if cached && cached["valid"] && cached["identity"] == identity do
       emit.("Reusing checked fixture for #{id}")
+      Store.write("controls/#{id}.json", cached)
       cached
     else
-      emit.("Checking broken, reference, bypass and partial repairs for #{id}")
+      reason =
+        cond do
+          is_nil(cached) ->
+            "no saved qualification"
+
+          not cached["valid"] ->
+            "previous qualification was invalid"
+
+          get_in(cached, ["identity", "grader"]) != identity["grader"] ->
+            "grading implementation changed"
+
+          true ->
+            "fixture or runtime identity changed"
+        end
+
+      emit.("Checking broken, reference, bypass and partial repairs for #{id}: #{reason}")
 
       reference =
         Inventory.file(id, "reference.patch") <>
@@ -321,6 +350,7 @@ defmodule Eab.Grader do
       }
 
       Store.write("controls/#{id}.json", control)
+      Store.write(path, control)
 
       unless valid,
         do: raise("Fixture qualification failed for #{id}; see its saved control evidence")

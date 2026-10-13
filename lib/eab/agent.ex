@@ -1,8 +1,19 @@
 defmodule Eab.Agent do
-  @moduledoc "One Pi attempt followed by independent grading in fresh containers."
+  @moduledoc "Pi submission and independent grading, with durable handoff between them."
   alias Eab.{Grader, Inventory, Model, Pi, Sandbox, Store}
 
   def attempt(id, run_id, endpoint, key, settings, control, emit) do
+    submission =
+      Sandbox.with_box(id, run_id, &submit(id, run_id, &1, endpoint, key, settings, emit),
+        agent: true
+      )
+
+    grade(id, run_id, submission, endpoint, key, control, emit)
+  rescue
+    error -> error(id, run_id, Exception.message(error), key)
+  end
+
+  def submit(id, run_id, box, endpoint, key, settings, emit) do
     prefix = "runs/#{run_id}/#{id}"
     spec = Inventory.spec(id)
     prompt = Inventory.file(id, "ticket.md")
@@ -14,7 +25,7 @@ defmodule Eab.Agent do
     Test command: #{spec["regression_command"]}.
     Add or change a *_test.exs test that fails behaviorally on broken source and passes after repair. Compilation/setup failures do not count.
     When finished, give a short summary. Your current patch is then checked in a fresh workspace.
-    Limits: #{settings["max_calls"]} model calls, #{settings["max_tokens"]} generated tokens total,
+    Model and tool calls are unlimited. Limits: #{settings["max_tokens"]} generated tokens total,
     #{settings["window_tokens"]} context tokens including up to #{settings["response_tokens"]} response tokens.
     History is never compacted. If a budget is exhausted, the current patch is graded.
     Task details: #{Jason.encode!(spec["clarifications"] || %{})}
@@ -35,40 +46,47 @@ defmodule Eab.Agent do
     Store.write_text("#{prefix}/instructions.md", instructions, key)
 
     {record, patch} =
-      Sandbox.with_box(id, run_id, fn box ->
+      try do
+        result = Pi.run(box, endpoint, key, settings, prefix, prompt, instructions, emit)
+        {Map.merge(base, result), Sandbox.patch(box)}
+      after
         try do
-          result = Pi.run(box, endpoint, key, settings, prefix, prompt, instructions, emit)
-          {Map.merge(base, result), Sandbox.patch(box)}
-        after
-          try do
-            Store.write_text("#{prefix}/model.patch", Sandbox.patch(box), key)
-          rescue
-            _ -> :ok
-          end
+          Store.write_text("#{prefix}/model.patch", Sandbox.patch(box), key)
+        rescue
+          _ -> :ok
         end
-      end)
+      end
 
     Store.write_text("#{prefix}/model.patch", patch, key)
+    record = Map.put(record, "status", "submitted")
+    Store.write("#{prefix}/attempt.json", record, key)
+    {record, patch}
+  end
+
+  def grade(id, run_id, {record, patch}, endpoint, key, control, emit) do
+    prefix = "runs/#{run_id}/#{id}"
+    Store.write("#{prefix}/attempt.json", Map.put(record, "status", "grading"), key)
     emit.("Grading #{id}")
     grade = Grader.grade(id, patch, run_id, expected: control["reference_patch"])
     Model.unchanged!(endpoint, key)
     record = Map.merge(record, %{"status" => "completed", "grade" => grade})
     Store.write("#{prefix}/attempt.json", record, key)
     record
-  rescue
-    error ->
-      prefix = "runs/#{run_id}/#{id}"
+  end
 
-      record =
-        Store.read("#{prefix}/attempt.json", %{"case" => id})
-        |> Map.merge(Store.read("#{prefix}/agent-progress.json", %{}))
-        |> Map.merge(%{
-          "status" => "error",
-          "error" => Store.redact(Exception.message(error), key)
-        })
+  def error(id, run_id, message, key) do
+    prefix = "runs/#{run_id}/#{id}"
 
-      Store.write("#{prefix}/attempt.json", record, key)
-      Eab.Activity.note("ERROR: " <> record["error"])
-      record
+    record =
+      Store.read("#{prefix}/attempt.json", %{"case" => id})
+      |> Map.merge(Store.read("#{prefix}/agent-progress.json", %{}))
+      |> Map.merge(%{
+        "status" => "error",
+        "error" => Store.redact(message, key)
+      })
+
+    Store.write("#{prefix}/attempt.json", record, key)
+    Eab.Activity.note("ERROR: " <> record["error"])
+    record
   end
 end

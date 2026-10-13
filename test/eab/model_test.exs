@@ -18,7 +18,8 @@ defmodule Eab.ModelTest do
       Model.settings(endpoint(), %{"window_tokens" => "50000"})
     end
 
-    assert_raise ArgumentError, fn -> Model.settings(endpoint(), %{"max_calls" => "1oops"}) end
+    assert_raise ArgumentError, fn -> Model.settings(endpoint(), %{"max_tokens" => "1oops"}) end
+    refute Map.has_key?(Model.settings(endpoint(), %{"max_calls" => "32"}), "max_calls")
   end
 
   test "stream accounting includes cached input and rejects missing or excessive usage" do

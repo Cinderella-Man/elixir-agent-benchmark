@@ -45,9 +45,45 @@ defmodule EabWeb.DashboardTest do
   test "local setup page shows twelve PR cases and waits for a model connection" do
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "Put your model"
+    assert html =~ "Model and tool calls are unlimited."
+    refute has_element?(view, "input[name='settings[max_calls]']")
     assert has_element?(view, "#run[disabled]")
     assert html =~ "plausible-pr-6300"
     assert length(Eab.Inventory.all()) == 12
+  end
+
+  test "concurrent case stages and selected background messages remain visible" do
+    id = "concurrent-progress-test"
+    [a, b, c | _] = Eab.Inventory.all()
+
+    Eab.Store.write("runs/#{id}/run.json", %{
+      "id" => id,
+      "created_at" => "9999-01-01T00:00:00Z",
+      "status" => "running",
+      "phase" => "running",
+      "message" => "Pi editing",
+      "current_case" => a,
+      "cases" => [a, b, c],
+      "attempts" => %{},
+      "settings" => %{},
+      "model" => %{"model" => "synthetic"},
+      "case_phases" => %{a => "running", b => "qualifying", c => "grading"},
+      "case_messages" => %{
+        a => "Pi editing",
+        b => "Checking upcoming fixture",
+        c => "Grading prior patch"
+      }
+    })
+
+    Eab.Store.write_text("runs/#{id}/#{b}/activity.log", "qualification output")
+    on_exit(fn -> File.rm_rf!(Eab.Store.path("runs/#{id}")) end)
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Pi running"
+    assert html =~ "Checking tests"
+    assert html =~ "Grading"
+    view |> element("#case-#{b}") |> render_click()
+    assert render(view) =~ "Checking upcoming fixture"
+    assert has_element?(view, "#case-log", "qualification output")
   end
 
   test "a connected model enables Run without host configuration" do

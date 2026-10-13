@@ -1,0 +1,260 @@
+defmodule Eab.Pipeline do
+  @moduledoc "Ordered Pi attempts with bounded preparation, workspace prewarming and grading."
+  use GenServer
+  alias Eab.Command
+
+  def run(cases, callbacks, opts \\ []) do
+    unless cases == Enum.uniq(cases), do: raise(ArgumentError, "Duplicate pipeline cases")
+    {:ok, pid} = GenServer.start(__MODULE__, {self(), cases, callbacks, opts})
+    GenServer.call(pid, :run, :infinity)
+  end
+
+  # The coordinator outlives a cancelled runner until every worker and its
+  # subprocesses have stopped. Container cleanup must wait for this barrier.
+  def await_owner(owner) do
+    for {pid, _} <- Registry.lookup(Eab.Commands, {:pipeline, owner}) do
+      monitor = Process.monitor(pid)
+
+      receive do
+        {:DOWN, ^monitor, :process, ^pid, reason} when reason in [:normal, :noproc] ->
+          :ok
+
+        {:DOWN, ^monitor, :process, ^pid, reason} ->
+          raise "Pipeline cleanup failed: #{inspect(reason)}"
+      after
+        60_000 ->
+          Process.demonitor(monitor, [:flush])
+          raise "Pipeline cleanup watchdog expired"
+      end
+    end
+
+    Command.await_owner(owner)
+    Command.await_scope(owner)
+  end
+
+  @impl true
+  def init({owner, cases, callbacks, opts}) do
+    Registry.register(Eab.Commands, {:pipeline, owner}, nil)
+    monitor = Process.monitor(owner)
+    lookahead = Keyword.get(opts, :lookahead, 4)
+    workers = Keyword.get(opts, :preparation_workers, 2)
+
+    unless is_integer(lookahead) and lookahead in 1..12 and is_integer(workers) and
+             workers in 1..4,
+           do: raise(ArgumentError, "Invalid preparation limits")
+
+    {:ok,
+     %{
+       owner: monitor,
+       command_scope: owner,
+       cases: cases,
+       pending: cases,
+       callbacks: callbacks,
+       lookahead: lookahead,
+       workers: workers,
+       first_started: false,
+       prepared: %{},
+       tasks: %{},
+       warm: nil,
+       active: nil,
+       grading: nil,
+       submissions: [],
+       results: %{},
+       from: nil
+     }}
+  end
+
+  @impl true
+  def handle_call(:run, from, state), do: advance(%{state | from: from})
+
+  @impl true
+  def handle_info({:workspace_ready, pid}, state) do
+    case state.warm do
+      %{pid: ^pid} = warm -> advance(%{state | warm: %{warm | ready: true}})
+      _ -> {:noreply, state}
+    end
+  end
+
+  def handle_info({ref, result}, state) when is_reference(ref) do
+    case Map.pop(state.tasks, ref) do
+      {nil, _} ->
+        {:noreply, state}
+
+      {%{task: task, kind: kind, id: id}, tasks} ->
+        Process.demonitor(task.ref, [:flush])
+        Command.await_owner(task.pid)
+        state = %{state | tasks: tasks}
+        advance(completed(state, kind, id, result))
+    end
+  end
+
+  def handle_info({:DOWN, ref, :process, _, _}, %{owner: ref} = state),
+    do: {:stop, :normal, state}
+
+  def handle_info({:DOWN, ref, :process, _, reason}, state) do
+    case Map.pop(state.tasks, ref) do
+      {nil, _} ->
+        {:noreply, state}
+
+      {%{kind: kind, id: id, task: task}, tasks} ->
+        Command.await_owner(task.pid)
+
+        advance(
+          completed(
+            %{state | tasks: tasks},
+            kind,
+            id,
+            {:error, "Worker stopped: #{inspect(reason)}"}
+          )
+        )
+    end
+  end
+
+  @impl true
+  def terminate(_, state) do
+    # Kill all workers first, then join and drain them. No new Docker command
+    # can race with Runs' subsequent label-based container cleanup.
+    for {_, %{task: task}} <- state.tasks, do: Process.exit(task.pid, :kill)
+
+    for {_, %{task: task}} <- state.tasks do
+      Task.shutdown(task, :brutal_kill)
+      Command.await_owner(task.pid)
+    end
+  end
+
+  defp advance(state) do
+    state =
+      state
+      |> start_grade()
+      |> start_workspace()
+      |> start_attempt()
+      |> start_workspace()
+      |> start_preparations()
+
+    if map_size(state.results) == length(state.cases) and map_size(state.tasks) == 0 do
+      GenServer.reply(state.from, Enum.map(state.cases, &Map.fetch!(state.results, &1)))
+      {:stop, :normal, state}
+    else
+      {:noreply, state}
+    end
+  end
+
+  defp start_preparations(state) do
+    preparing = for {_, %{kind: :prepare, id: id}} <- state.tasks, do: id
+    window = Enum.take(state.pending, if(state.first_started, do: state.lookahead, else: 1))
+    prepare = state.callbacks.prepare
+
+    window
+    |> Enum.reject(&(&1 in preparing or Map.has_key?(state.prepared, &1)))
+    |> Enum.take(max(state.workers - length(preparing), 0))
+    |> Enum.reduce(state, fn id, state ->
+      launch(state, :prepare, id, fn -> prepare.(id) end)
+    end)
+  end
+
+  defp start_workspace(%{warm: nil, pending: [id | _]} = state) do
+    if Map.has_key?(state.prepared, id) do
+      parent = self()
+      control = Map.fetch!(state.prepared, id)
+      workspace = state.callbacks.workspace
+      attempt = state.callbacks.attempt
+
+      state =
+        launch(state, :attempt, id, fn ->
+          workspace.(id, fn box ->
+            send(parent, {:workspace_ready, self()})
+
+            receive do
+              :attempt -> attempt.(id, box, control)
+            end
+          end)
+        end)
+
+      {_, %{task: task}} =
+        Enum.find(state.tasks, fn {_, job} -> job.kind == :attempt and job.id == id end)
+
+      %{state | warm: %{id: id, pid: task.pid, ready: false}}
+    else
+      state
+    end
+  end
+
+  defp start_workspace(state), do: state
+
+  # At most one submission may queue behind the grader. Once that slot is
+  # occupied, keep the next workspace waiting instead of accumulating work.
+  defp start_attempt(%{active: nil, submissions: [], warm: %{ready: true} = warm} = state) do
+    send(warm.pid, :attempt)
+    %{state | active: warm, warm: nil, pending: tl(state.pending), first_started: true}
+  end
+
+  defp start_attempt(state), do: state
+
+  defp start_grade(%{grading: nil, submissions: [{id, submission} | rest]} = state) do
+    control = Map.fetch!(state.prepared, id)
+    grade = state.callbacks.grade
+    state = launch(state, :grade, id, fn -> grade.(id, submission, control) end)
+    %{state | grading: id, submissions: rest}
+  end
+
+  defp start_grade(state), do: state
+
+  defp launch(state, kind, id, fun) do
+    scope = state.command_scope
+
+    task =
+      Task.Supervisor.async_nolink(Eab.Tasks, fn ->
+        Command.with_scope(scope, fn ->
+          try do
+            {:ok, fun.()}
+          rescue
+            error -> {:error, Exception.message(error)}
+          catch
+            kind, reason -> {:error, Exception.format_banner(kind, reason)}
+          end
+        end)
+      end)
+
+    put_in(state.tasks[task.ref], %{task: task, kind: kind, id: id})
+  end
+
+  defp completed(state, :prepare, id, {:ok, control}),
+    do: put_in(state.prepared[id], control)
+
+  defp completed(state, :attempt, id, {:ok, submission}),
+    do: %{state | active: nil, submissions: state.submissions ++ [{id, submission}]}
+
+  defp completed(state, :grade, id, {:ok, result}),
+    do: record(%{state | grading: nil}, id, result)
+
+  defp completed(state, kind, id, {:error, message}) do
+    state =
+      case kind do
+        :prepare ->
+          state
+
+        :grade ->
+          %{state | grading: nil}
+
+        :attempt ->
+          %{
+            state
+            | active: if(state.active && state.active.id == id, do: nil, else: state.active),
+              warm: if(state.warm && state.warm.id == id, do: nil, else: state.warm)
+          }
+      end
+
+    result = state.callbacks.error.(id, message)
+    record(%{state | pending: List.delete(state.pending, id)}, id, result)
+  end
+
+  defp record(state, id, result) do
+    state.callbacks.result.(id, result)
+
+    %{
+      state
+      | results: Map.put(state.results, id, result),
+        prepared: Map.delete(state.prepared, id)
+    }
+  end
+end

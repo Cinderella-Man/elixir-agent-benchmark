@@ -1,38 +1,75 @@
 defmodule Eab.Runner do
-  alias Eab.{Activity, Agent, Fixtures, Grader, Inventory, Model, Store}
+  alias Eab.{Activity, Agent, Fixtures, Grader, Inventory, Model, Pipeline, Sandbox, Store}
 
   def execute(run, key, emit) do
     endpoint = run["model"]
     Model.unchanged!(endpoint, key)
     protocol = run["protocol"]
 
-    results =
-      Enum.map(run["cases"], fn id ->
-        Activity.with_case(run["id"], id, key, fn ->
+    context = fn id, fun -> Activity.with_case(run["id"], id, key, fun) end
+
+    callbacks = %{
+      prepare: fn id ->
+        context.(id, fn ->
           verify!(protocol, endpoint, key)
-          control = prepare(run, id, key, emit)
-          progress(emit, "running", id, "Starting Pi for #{id}")
-
-          result =
-            Agent.attempt(
-              id,
-              run["id"],
-              endpoint,
-              key,
-              run["settings"],
-              control,
-              &progress(
-                emit,
-                if(String.starts_with?(&1, "Grading"), do: "grading", else: "running"),
-                id,
-                &1
-              )
-            )
-
-          emit.(%{"case_result" => {id, result}})
-          result
+          prepare(run, id, key, emit)
         end)
-      end)
+      end,
+      workspace: fn id, use ->
+        context.(id, fn ->
+          progress(emit, "warming", id, "Starting workspace and services for #{id}")
+
+          Sandbox.with_box(
+            id,
+            run["id"],
+            fn box ->
+              progress(emit, "warm", id, "Workspace ready for Pi")
+              use.(box)
+            end,
+            agent: true
+          )
+        end)
+      end,
+      attempt: fn id, box, _control ->
+        verify!(protocol, endpoint, key)
+        progress(emit, "running", id, "Starting Pi for #{id}")
+
+        submission =
+          Agent.submit(
+            id,
+            run["id"],
+            box,
+            endpoint,
+            key,
+            run["settings"],
+            &progress(emit, "running", id, &1)
+          )
+
+        progress(emit, "submitted", id, "Submission saved; waiting for grading")
+        submission
+      end,
+      grade: fn id, submission, control ->
+        context.(id, fn ->
+          verify!(protocol, endpoint, key)
+
+          Agent.grade(
+            id,
+            run["id"],
+            submission,
+            endpoint,
+            key,
+            control,
+            &progress(emit, "grading", id, &1)
+          )
+        end)
+      end,
+      error: fn id, message ->
+        context.(id, fn -> Agent.error(id, run["id"], message, key) end)
+      end,
+      result: fn id, result -> emit.(%{"case_result" => {id, result}}) end
+    }
+
+    results = Pipeline.run(run["cases"], callbacks, Application.get_env(:eab, :pipeline, []))
 
     verify!(protocol, endpoint, key)
 
@@ -45,10 +82,10 @@ defmodule Eab.Runner do
     progress(emit, "preparing", id, "Preparing #{id}")
 
     try do
-      Fixtures.ensure(id, &progress(emit, "preparing", id, &1))
+      Fixtures.ensure(id, &progress(emit, "preparing", id, &1), run_id: run["id"])
       control = Grader.qualify(id, run["id"], &progress(emit, "qualifying", id, &1))
       Store.write("runs/#{run["id"]}/#{id}/qualification.json", control)
-      progress(emit, "ready", id, "#{id} is ready for Pi")
+      progress(emit, "ready", id, "Image and fixture checks ready for #{id}")
       control
     rescue
       error ->
@@ -56,7 +93,8 @@ defmodule Eab.Runner do
         reraise error, __STACKTRACE__
     after
       for {source, target} <- [
-            {"build/#{id}/build.log", "build.log"},
+            {(Store.read("runtimes/#{id}.json") || %{})["build_log"] || "build/#{id}/build.log",
+             "build.log"},
             {"runtimes/#{id}.json", "runtime.json"},
             {"controls/#{id}.json", "qualification.json"}
           ] do
@@ -70,7 +108,7 @@ defmodule Eab.Runner do
 
   defp progress(emit, phase, id, message) do
     Activity.note(message)
-    emit.(%{"phase" => phase, "message" => message, "current_case" => id})
+    emit.(%{"case_phase" => %{"case" => id, "phase" => phase, "message" => message}})
   end
 
   defp verify!(protocol, endpoint, key) do

@@ -22,17 +22,23 @@ The website is available only from the computer running it. The model endpoint c
 
 ## How it runs
 
-For each PR, in order:
+Pi attempts follow the inventory order, with preparation and grading running alongside them:
 
-1. **Prepare:** Docker builds each problem's image with the broken project, its Elixir/OTP version, dependencies, Node and Pi. Existing images are reused. The application checks the reference repair and tests before starting Pi; the model is not used during this setup.
-2. **Repair:** Each problem gets a fresh container. Pi is installed in `/opt/pi` and edits the project in `/workspace`, using your model endpoint and the supplied ticket prompt. The source is copied into the image. Plausible cases also get separate PostgreSQL and ClickHouse containers.
-3. **Grade:** The application saves Pi's patch, tests it in fresh containers, records the result and removes the temporary containers. Results and logs remain in the `benchmark-data` Docker volume.
+1. **Prepare:** The first case is prepared and checked first. Once its attempt starts, two workers prepare up to four upcoming cases. Cached artifacts hold the broken project, its Elixir/OTP version, compiled dependencies and initialized databases. Pi is attached separately. Existing artifacts and valid fixture checks are reused; the model is not used during setup.
+2. **Repair:** Exactly one Pi attempt runs at a time. Pi is installed in `/opt/pi` and edits the project in `/workspace`, using your model endpoint and the supplied ticket prompt. At most one additional fresh workspace waits for the next attempt, with separate PostgreSQL and ClickHouse containers for Plausible cases.
+3. **Grade:** The application saves Pi's patch and grades it in fresh containers while the next Pi attempt runs. There is one grader and room for one queued submission; if grading falls behind, the next attempt waits. Temporary containers are removed, while results and logs remain in the `benchmark-data` Docker volume.
+
+The case list shows preparation, workspace startup, Pi activity and grading separately. Cache messages explain reuse or rebuilding. A case that is not ready can still cause a wait; inventory order is preserved.
+
+Compatible PRs reuse pristine dependency and compilation artifacts from completed preparation builds. Each revision gets its exact source, with changed dependencies and affected code rebuilt; compilation-setting changes invalidate broader state. Hex/npm downloads are cached separately across builds. Existing case images still skip preparation entirely, and agent or grader changes never enter these caches.
+
+Plausible cases save clean PostgreSQL and ClickHouse snapshots after the original revision's migrations. Both Pi and grading get independent writable copies. Compatible migration histories can seed new baselines; subsequent model runs restore the exact saved state. Service startup still happens, so this is not a promise of zero wait. Docker images and the persistent controller data must both remain available.
 
 Pi and the project run on the benchmark's Docker host. The model server can run elsewhere. Click a case in **Follow the run** to see its current command, live output and Pi activity.
 
 ## Run settings and results
 
-Defaults: all twelve cases, seed 101, 32 model calls per case, up to 8,192 tokens per response and 65,536 generated tokens per case. Context is detected automatically and capped at 262,144 tokens. Advanced settings allow explicit overrides within the server's capacity. History is retained without compaction; exhausted budgets submit the current patch for grading.
+Defaults: all twelve cases, seed 101, unlimited model and tool calls, up to 8,192 tokens per response and 65,536 generated tokens per case. Context is detected automatically and capped at 262,144 tokens. Advanced settings allow explicit overrides within the server's capacity. History is retained without compaction; exhausting either the generation budget or context window submits the current patch for grading.
 
 One run is active at a time. Closing the browser does not stop it. **Stop run** cancels execution and cleans up this installation's containers. An application restart records active work as interrupted; start a fresh run rather than resuming it. Existing results are never overwritten.
 
@@ -40,4 +46,4 @@ All cases have equal weight. A final score requires a completed pass/fail outcom
 
 When a run ends, **Download report** saves its summary and per-case results. Data persists in the `benchmark-data` Docker volume.
 
-[Setup, development and troubleshooting](docs/runbook.md) · [Evaluation contract](docs/evaluation.md) · [Inventory](config/benchmark.json) · [Design decisions](docs/design-tree.md)
+[Setup, development and troubleshooting](docs/runbook.md) · [Evaluation contract](docs/evaluation.md) · [Inventory](config/benchmark.json) · [Design decisions](docs/design-tree.md) · [SWE-bench research](docs/research/swe-bench.md)

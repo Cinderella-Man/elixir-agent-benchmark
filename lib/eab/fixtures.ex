@@ -1,31 +1,56 @@
 defmodule Eab.Fixtures do
-  alias Eab.{Command, Inventory, Pi, Store}
+  alias Eab.{
+    Baseline,
+    BuildCache,
+    Cache,
+    Command,
+    DatabaseSeed,
+    Inventory,
+    ServiceImages,
+    Source,
+    Store
+  }
 
-  def ensure(id, emit) do
+  def ensure(id, emit, opts \\ []) do
     spec = Inventory.spec(id)
-    inputs = inputs(id, spec)
-    runtime = Store.read("runtimes/#{id}.json")
-
-    if runtime && runtime["inputs"] == inputs && image_exists?(runtime["image"]) &&
-         Enum.all?(Map.values(runtime["services"]), &image_exists?/1) do
-      runtime = Map.put(runtime, "fixture_hashes", Inventory.fixture_hashes(id))
-      Store.write("runtimes/#{id}.json", runtime)
-      runtime
-    else
-      emit.("Building #{id}")
-      prepare(id, spec, inputs)
-    end
+    project = ensure_project(id, emit, opts)
+    engines = ServiceImages.resolve(spec["services"] || %{}, opts)
+    runtime = Map.put(project, "services", engines)
+    run_id = Keyword.get(opts, :run_id, "preparation")
+    runtime = Baseline.ensure(id, spec, runtime, run_id, emit, opts)
+    runtime = Map.put(runtime, "fixture_hashes", Inventory.fixture_hashes(id))
+    Store.write("runtimes/#{id}.json", runtime)
+    runtime
   end
 
-  defp inputs(id, spec) do
+  def ensure_project(id, emit, opts \\ []) do
+    spec = Inventory.spec(id)
+    inputs = build_inputs(id, spec)
+
+    {project, status} =
+      Cache.fetch(
+        "projects",
+        inputs,
+        fn reason ->
+          emit.("Building #{id}: #{reason}")
+          prepare(id, spec, inputs, emit)
+        end,
+        opts
+      )
+
+    if status == :reused, do: emit.("Reusing prepared project for #{id}")
+    project
+  end
+
+  def build_inputs(id, spec) do
     %{
+      "version" => 2,
       "repository" => spec["repository"],
-      "runtime" => spec["runtime"],
-      "services" => spec["services"] || %{},
-      "recipe_version" => 3,
-      "pi" => Pi.identity(),
-      "pi_node_image" => Pi.node_image(spec),
-      "pi_bridge" => Inventory.hash_file(Inventory.path("priv/pi/bridge.mjs")),
+      "runtime" => Map.drop(spec["runtime"], ["before_test_commands"]),
+      "recipe_hash" =>
+        Inventory.hash(dockerfile(spec, spec["runtime"]["image"], spec["runtime"]["node_image"])),
+      "seed_script" => Inventory.hash_file(BuildCache.script()),
+      "database_scanner" => Inventory.hash_file(Inventory.path("lib/eab/database_seed.ex")),
       "patches" =>
         Map.new(["environment.patch"], fn file ->
           path = Inventory.case_path(id, file)
@@ -34,15 +59,13 @@ defmodule Eab.Fixtures do
     }
   end
 
-  defp prepare(id, spec, inputs) do
-    dest = Store.path("build/#{id}")
-    File.rm_rf!(dest)
+  defp prepare(id, spec, inputs, emit) do
+    dest = Store.path("build/projects/#{Cache.key(inputs)}")
     source = Path.join(dest, "source")
+    File.rm_rf!(source)
     File.mkdir_p!(source)
-    File.mkdir_p!(Path.join(dest, "pi"))
 
-    for file <- ["package.json", "package-lock.json", "bridge.mjs"],
-        do: File.cp!(Inventory.path("priv/pi/#{file}"), Path.join(dest, "pi/#{file}"))
+    File.cp!(BuildCache.script(), Path.join(dest, "build_seed.exs"))
 
     repo = spec["repository"]
 
@@ -50,14 +73,7 @@ defmodule Eab.Fixtures do
              String.starts_with?(repo["url"], "https://github.com/"),
            do: raise("Unpinned repository")
 
-    Command.run!("git", ["init", "--quiet", source])
-
-    Command.run!("git", ["fetch", "--quiet", "--depth=1", repo["url"], repo["revision"]],
-      cd: source
-    )
-
-    Command.run!("git", ["checkout", "--quiet", "--detach", "FETCH_HEAD"], cd: source)
-    File.rm_rf!(Path.join(source, ".git"))
+    Source.snapshot(repo, source, emit)
 
     for file <- ["environment.patch"],
         File.exists?(Inventory.case_path(id, file)),
@@ -65,42 +81,76 @@ defmodule Eab.Fixtures do
       Command.run!("git", ["apply", Inventory.case_path(id, file)], cd: source)
     end
 
-    base = pin(spec["runtime"]["image"])
-    node = if spec["runtime"]["node_image"], do: pin(spec["runtime"]["node_image"])
-    recipe = dockerfile(spec, base, node)
-    File.write!(Path.join(dest, "Dockerfile"), recipe)
-    tag = "elixir-agent-benchmark:#{id}"
+    previous = Enum.find(Cache.records("projects"), &(&1["id"] == Cache.key(inputs)))
+    saved = if previous, do: previous["artifact"], else: %{}
+    base = pin(saved["base_image"] || spec["runtime"]["image"])
 
+    node =
+      if spec["runtime"]["node_image"],
+        do: pin(saved["node_image"] || spec["runtime"]["node_image"])
+
+    File.write!(Path.join(dest, "Dockerfile"), dockerfile(spec, base, node))
+
+    # Resolve the *installed* toolchain, not just its base image. Package updates
+    # after Docker cache eviction must not inherit incompatible native objects.
+    toolchain = build(dest, "elixir-agent-benchmark:toolchain-#{id}", "toolchain")
+    toolchain_tag = BuildCache.tag(toolchain, "toolchain")
+    key = BuildCache.key(spec, toolchain, node, inputs["recipe_hash"])
+    seed = BuildCache.find(key)
+    seed = if seed, do: Map.put(seed, "tag", BuildCache.tag(seed["image"], "seed"))
+
+    if seed,
+      do: emit.("Seeding #{id} from pristine build of #{seed["case"]} at #{seed["revision"]}"),
+      else: emit.("No compatible build seed for #{id}; package download caches remain available")
+
+    recipe = dockerfile(spec, base, node, toolchain: toolchain_tag, seed: seed && seed["tag"])
+    File.write!(Path.join(dest, "Dockerfile"), recipe)
+    tag = "elixir-agent-benchmark:project-#{Cache.key(inputs)}"
+    image = build(dest, tag, "fixture")
+
+    runtime = %{
+      "image" => image,
+      "images" => [image],
+      "inputs" => inputs,
+      "base_image" => base,
+      "node_image" => node,
+      "toolchain_image" => toolchain,
+      "build_seed" => seed,
+      "dockerfile" => recipe,
+      "build_log" => Path.relative_to(Path.join(dest, "build.log"), Store.root()),
+      "database_inputs" => DatabaseSeed.describe(source, spec)
+    }
+
+    BuildCache.publish(key, image, id, repo["revision"])
+    runtime
+  end
+
+  defp build(dest, tag, target) do
     result =
-      Command.run("docker", ["build", "-t", tag, dest],
+      Command.run(
+        "docker",
+        [
+          "buildx",
+          "build",
+          "--load",
+          "--provenance=false",
+          "--progress=plain",
+          "--target",
+          target,
+          "-t",
+          tag,
+          dest
+        ],
         timeout: 3600,
         limit: 2_000_000
       )
 
-    Store.write_text("build/#{id}/build.log", result["output"])
-    if result["returncode"] != 0, do: raise("Fixture build failed for #{id}: #{result["output"]}")
+    log = if target == "fixture", do: "build.log", else: "toolchain.log"
+    File.write!(Path.join(dest, log), result["output"])
+    if result["returncode"] != 0, do: raise("#{target} build failed: #{result["output"]}")
 
-    image =
-      Command.run!("docker", ["image", "inspect", tag, "--format", "{{.Id}}"], timeout: 30)
-      |> String.trim()
-
-    services =
-      Map.new(spec["services"] || %{}, fn {name, config} -> {name, pin(config["image"])} end)
-
-    runtime = %{
-      "image" => image,
-      "inputs" => inputs,
-      "base_image" => base,
-      "node_image" => node,
-      "pi" => Pi.identity(),
-      "pi_node_image" => Pi.node_image(spec),
-      "services" => services,
-      "fixture_hashes" => Inventory.fixture_hashes(id),
-      "dockerfile" => recipe
-    }
-
-    Store.write("runtimes/#{id}.json", runtime)
-    runtime
+    Command.run!("docker", ["image", "inspect", tag, "--format", "{{.Id}}"], timeout: 30)
+    |> String.trim()
   end
 
   def image_exists?(image),
@@ -112,7 +162,7 @@ defmodule Eab.Fixtures do
     List.first(info["RepoDigests"] || []) || raise "Image has no immutable digest"
   end
 
-  def dockerfile(spec, base, node \\ nil) do
+  def dockerfile(spec, base, node \\ nil, opts \\ []) do
     runtime = spec["runtime"]
 
     env =
@@ -127,22 +177,12 @@ defmodule Eab.Fixtures do
       )
 
     lines =
-      [
-        "FROM #{Pi.node_image(spec)} AS pi",
-        "WORKDIR /opt/pi",
-        "COPY pi/package.json pi/package-lock.json ./",
-        "RUN npm ci --ignore-scripts --no-audit --no-fund",
-        "COPY pi/bridge.mjs ./"
-      ] ++
-        if(node, do: ["FROM #{node} AS nodejs"], else: []) ++
+      if(node, do: ["FROM #{node} AS nodejs"], else: []) ++
         [
-          "FROM #{base}",
+          "FROM #{base} AS toolchain",
           "USER root",
           "RUN if command -v apk; then apk add --no-cache git bash ca-certificates build-base brotli libstdc++ cmake grep ripgrep coreutils findutils diffutils; else apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git bash ca-certificates build-essential brotli cmake grep ripgrep coreutils findutils diffutils && rm -rf /var/lib/apt/lists/*; fi",
-          "RUN if command -v useradd; then existing=$(getent passwd 1000 | cut -d: -f1); groupadd -f agent; if [ -n \"$existing\" ]; then usermod -l agent -d /home/agent -m -g agent \"$existing\"; else useradd -m -u 1000 -g agent agent; fi; else adduser -D -u 1000 agent; fi",
-          "COPY --from=pi /opt/pi /opt/pi",
-          "COPY --from=pi /usr/local/bin/node /opt/pi/node",
-          "RUN /opt/pi/node /opt/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js --version"
+          "RUN if command -v useradd; then existing=$(getent passwd 1000 | cut -d: -f1); groupadd -f agent; if [ -n \"$existing\" ]; then usermod -l agent -d /home/agent -m -g agent \"$existing\"; else useradd -m -u 1000 -g agent agent; fi; else adduser -D -u 1000 agent; fi"
         ]
 
     lines =
@@ -160,38 +200,71 @@ defmodule Eab.Fixtures do
       lines ++
         [
           "WORKDIR /workspace",
-          "RUN mkdir -p /opt/mix /opt/hex && chown agent:agent /workspace /opt/mix /opt/hex",
+          "RUN mkdir -p /opt/mix /opt/hex /opt/eab-seed && chown agent:agent /workspace /opt/mix /opt/hex /opt/eab-seed",
           "USER agent"
         ] ++
         Enum.map(Enum.sort(env), fn {k, v} -> "ENV #{k}=#{Jason.encode!(v)}" end) ++
         ["RUN mix local.hex --force && mix local.rebar --force"]
 
     lines =
+      if opts[:toolchain] do
+        Enum.take_while(lines, &(&1 != "FROM #{base} AS toolchain")) ++
+          ["FROM #{opts[:toolchain]} AS toolchain"]
+      else
+        lines
+      end
+
+    lines =
       lines ++
-        if runtime["profile"] == "plausible_ce" do
-          [
-            "COPY --chown=agent:agent source/mix.exs source/mix.lock ./",
-            "COPY --chown=agent:agent source/config/ config/",
-            "RUN mix deps.get --only ce_test && mix deps.compile",
-            "COPY --chown=agent:agent source/tracker/package.json source/tracker/package-lock.json tracker/",
-            "RUN npm ci --prefix tracker --no-audit --no-fund"
-          ]
-        else
-          []
-        end
+        ["FROM toolchain AS prepared"] ++
+        if(opts[:seed],
+          do: [
+            "COPY --from=#{opts[:seed]} --chown=agent:agent /workspace/ /workspace/",
+            "COPY --from=#{opts[:seed]} --chown=agent:agent /opt/eab-seed/ /opt/eab-seed/"
+          ],
+          else: []
+        ) ++
+        [
+          "COPY --chown=agent:agent build_seed.exs /opt/eab-build-seed.exs",
+          "COPY --chown=agent:agent source/ /incoming/",
+          ~s|RUN elixir -r /opt/eab-build-seed.exs -e 'Eab.FixtureSeed.sync("/incoming", "/workspace")'|,
+          "RUN --mount=type=cache,id=eab-hex-packages-v1,target=/opt/hex/packages,sharing=locked,uid=1000,gid=1000 " <>
+            "mix deps.get --only #{env["MIX_ENV"]}",
+          "RUN elixir -r /opt/eab-build-seed.exs -S mix eab.seed",
+          "RUN --mount=type=cache,id=eab-hex-packages-v1,target=/opt/hex/packages,sharing=locked,uid=1000,gid=1000 " <>
+            "mix deps.get --only #{env["MIX_ENV"]} && mix deps.clean --unused",
+          "RUN mix deps.loadpaths"
+        ] ++
+        if(runtime["profile"] == "plausible_ce",
+          do: [
+            "RUN --mount=type=cache,id=eab-npm-packages-v1,target=/opt/npm-cache,sharing=locked,uid=1000,gid=1000 npm ci --prefix tracker --cache /opt/npm-cache --no-audit --no-fund"
+          ],
+          else: []
+        )
 
     Enum.join(
       lines ++
-        ["COPY --chown=agent:agent source/ /workspace/"] ++
         Enum.map(
-          runtime["setup_commands"] || ["mix deps.get", "mix deps.compile"],
+          setup_commands(runtime),
           &("RUN " <> &1)
         ) ++
         [
           "RUN rm -rf .git && git init && git config user.name Benchmark && git config user.email benchmark@localhost && git add . && git commit -m 'Initial task workspace'",
+          "FROM toolchain AS fixture",
+          "COPY --from=prepared --chown=agent:agent /workspace/ /workspace/",
+          "COPY --from=prepared --chown=agent:agent /opt/eab-seed/ /opt/eab-seed/",
           "CMD [\"sleep\", \"infinity\"]"
         ],
       "\n"
     ) <> "\n"
+  end
+
+  defp setup_commands(runtime) do
+    commands = runtime["setup_commands"] || ["mix deps.get", "mix deps.compile"]
+
+    Enum.reject(
+      commands,
+      &(&1 in ["mix deps.get", "mix deps.get --only test", "mix deps.compile"])
+    )
   end
 end

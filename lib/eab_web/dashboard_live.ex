@@ -5,7 +5,6 @@ defmodule EabWeb.DashboardLive do
   @defaults %{
     "window_tokens" => "",
     "response_tokens" => "",
-    "max_calls" => "32",
     "max_tokens" => "65536",
     "seed" => "101"
   }
@@ -156,11 +155,17 @@ defmodule EabWeb.DashboardLive do
   defp outcome(attempt), do: String.capitalize(attempt["status"] || "incomplete")
 
   defp case_status(run, id) do
-    if run["status"] == "running" and run["current_case"] == id do
-      case run["phase"] do
+    phase = get_in(run, ["case_phases", id]) || if(run["current_case"] == id, do: run["phase"])
+
+    if run["status"] == "running" do
+      case phase do
         "preparing" -> "Preparing"
         "qualifying" -> "Checking tests"
+        "ready" -> "Image ready"
+        "warming" -> "Starting workspace"
+        "warm" -> "Ready for Pi"
         "running" -> "Pi running"
+        "submitted" -> "Waiting for grading"
         "grading" -> "Grading"
         _ -> outcome(run["attempts"][id])
       end
@@ -169,8 +174,8 @@ defmodule EabWeb.DashboardLive do
         run["status"] == "error" and run["current_case"] == id ->
           "Error"
 
-        is_nil(run["attempts"][id]) and get_in(run, ["case_phases", id]) == "ready" ->
-          "Ready for Pi"
+        is_nil(run["attempts"][id]) ->
+          "Not attempted"
 
         true ->
           outcome(run["attempts"][id])
@@ -268,13 +273,13 @@ defmodule EabWeb.DashboardLive do
               <summary>Advanced run settings</summary>
               <p class="fine-print">
                 Defaults use the detected context up to 262,144 tokens. Full history is retained.
+                Model and tool calls are unlimited.
               </p>
               <div class="settings-grid">
                 <label :for={
                   {key, title} <- [
                     {"window_tokens", "Context tokens (blank = automatic)"},
                     {"response_tokens", "Tokens per response (blank = up to 8,192)"},
-                    {"max_calls", "Model calls per case"},
                     {"max_tokens", "Generated tokens per case"},
                     {"seed", "Seed"}
                   ]
@@ -297,7 +302,7 @@ defmodule EabWeb.DashboardLive do
             }
           >Run benchmark <span>↗</span></button>
           <p class="fine-print">
-            Each case is prepared, attempted by Pi and graded before the next starts. First setup downloads the required images and dependencies.
+            Pi repairs one case at a time. Upcoming cases prepare in the background, and submitted repairs are graded independently. Prepared images and fixture checks are reused across runs.
           </p>
         </section>
         <section class="panel results">
@@ -371,10 +376,11 @@ defmodule EabWeb.DashboardLive do
                 </div><span class="badge">{case_status(@run, @log_case)}</span>
               </div>
               <p
-                :if={@run["status"] == "running" and @run["current_case"] == @log_case}
+                :if={@run["status"] == "running"}
                 class="fine-print"
               >
-                {@run["message"]}
+                {get_in(@run, ["case_messages", @log_case]) ||
+                  if(@run["current_case"] == @log_case, do: @run["message"])}
               </p>
               <p :if={get_in(@run, ["attempts", @log_case, "error"])} class="notice error">
                 {get_in(@run, ["attempts", @log_case, "error"])}

@@ -1,0 +1,3 @@
+# Reuse pristine builds across compatible revisions
+
+Prepare each PR independently, seeding it from a completed pristine build with the same repository, installed toolchain and build policy. Preserve Mix's incremental state, reconcile the exact target source (including deletions), and invalidate changed dependencies and their dependents; changes to compilation settings or configuration discard compiled artifacts and dependency worktrees. Shared Hex/npm download caches survive these invalidations, while a fresh final image stage excludes superseded source layers; this retains parallel preparation without imposing a chronological chain or admitting agent/grader state into reusable builds.

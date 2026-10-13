@@ -1,6 +1,6 @@
 defmodule Eab.Runs do
   use GenServer
-  alias Eab.{Inventory, Model, Runner, Sandbox, Store}
+  alias Eab.{Inventory, Model, Pipeline, Runner, Sandbox, Store}
   @terminal ~w(completed error cancelled interrupted)
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   def subscribe, do: Phoenix.PubSub.subscribe(Eab.PubSub, "runs")
@@ -126,7 +126,7 @@ defmodule Eab.Runs do
 
     task =
       Task.Supervisor.async_nolink(Eab.Tasks, fn ->
-        Eab.Command.await_owner(owner)
+        Pipeline.await_owner(owner)
         cleanup(run["id"])
       end)
 
@@ -146,7 +146,7 @@ defmodule Eab.Runs do
           }
 
         _ ->
-          Map.take(event, ["phase", "message", "current_case"])
+          Map.take(event, ["phase", "message", "current_case", "case_phase"])
       end
 
     Store.event(id, log)
@@ -154,7 +154,13 @@ defmodule Eab.Runs do
     run =
       case event do
         %{"case_result" => {case_id, result}} ->
-          put_in(state.active, ["attempts", case_id], result)
+          state.active
+          |> put_in(["attempts", case_id], result)
+          |> case_progress(case_id, result["status"], result["error"] || "Case finished")
+          |> foreground()
+
+        %{"case_phase" => %{"case" => case_id, "phase" => phase, "message" => message}} ->
+          state.active |> case_progress(case_id, phase, message) |> foreground()
 
         _ ->
           Map.merge(state.active, event)
@@ -204,7 +210,14 @@ defmodule Eab.Runs do
   defp finish(state, status, message) do
     run = Map.merge(state.active, %{"status" => status, "phase" => status, "message" => message})
     persist(run)
-    task = Task.Supervisor.async_nolink(Eab.Tasks, fn -> cleanup(run["id"]) end)
+    owner = state.worker.pid
+
+    task =
+      Task.Supervisor.async_nolink(Eab.Tasks, fn ->
+        Pipeline.await_owner(owner)
+        cleanup(run["id"])
+      end)
+
     broadcast()
     {:noreply, %{state | active: nil, worker: nil, cleanup: task}}
   end
@@ -222,7 +235,7 @@ defmodule Eab.Runs do
         record = Store.read(path, get_in(run, ["attempts", id]))
 
         record =
-          if is_map(record) and record["status"] == "running" do
+          if is_map(record) and record["status"] in ["running", "submitted", "grading"] do
             status = if run["status"] == "completed", do: "error", else: run["status"]
             record = Map.merge(record, %{"status" => status, "error" => run["message"]})
             Store.write(path, record)
@@ -239,6 +252,48 @@ defmodule Eab.Runs do
   end
 
   defp broadcast, do: Phoenix.PubSub.broadcast(Eab.PubSub, "runs", :runs_changed)
+
+  defp case_progress(run, id, phase, message) do
+    phases =
+      ~w(pending preparing qualifying ready warming warm running submitted grading completed error)
+
+    previous = get_in(run, ["case_phases", id]) || "pending"
+
+    # Worker events may arrive after a later stage's event from another process.
+    if Enum.find_index(phases, &(&1 == phase)) >= Enum.find_index(phases, &(&1 == previous)) do
+      run
+      |> Map.put("case_phases", Map.put(run["case_phases"] || %{}, id, phase))
+      |> Map.put("case_messages", Map.put(run["case_messages"] || %{}, id, message))
+    else
+      run
+    end
+  end
+
+  defp foreground(run) do
+    priorities = ~w(running grading submitted warming qualifying preparing warm ready)
+
+    active =
+      for id <- run["cases"],
+          phase = get_in(run, ["case_phases", id]),
+          phase in priorities,
+          do: {Enum.find_index(priorities, &(&1 == phase)), id, phase}
+
+    case Enum.min_by(active, &elem(&1, 0), fn -> nil end) do
+      nil ->
+        Map.merge(run, %{
+          "current_case" => nil,
+          "phase" => "waiting",
+          "message" => "Finalizing results or waiting for the next case"
+        })
+
+      {_, id, phase} ->
+        Map.merge(run, %{
+          "current_case" => id,
+          "phase" => phase,
+          "message" => get_in(run, ["case_messages", id])
+        })
+    end
+  end
 
   defp cleanup(id) do
     Application.get_env(:eab, :cleanup, &Sandbox.cleanup/1).(id)

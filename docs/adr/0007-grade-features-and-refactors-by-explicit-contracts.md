@@ -1,0 +1,3 @@
+# Grade features and refactors by explicit task contracts
+
+Expanded benchmark releases include bug fixes, features and refactors, including offline-testable full-stack work, so qualification must distinguish task acceptance from behavior preservation and model-added test coverage. Require executable, declared criteria that reject unchanged code and accept the reference solution; refactors preserve behavior and additionally meet an explicit structural or interface requirement rather than inventing a behavioral defect or receiving a subjective score. Freeze task kinds and grading contracts in new releases, keeping the original repair-only inventory and results unchanged.

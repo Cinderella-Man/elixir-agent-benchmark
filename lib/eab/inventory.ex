@@ -24,7 +24,7 @@ defmodule Eab.Inventory do
     files =
       Path.wildcard(path("lib/**/*.ex")) ++
         Enum.filter(Path.wildcard(path("priv/pi/*")), &File.regular?/1) ++
-        [path("mix.lock"), path("priv/fixtures/grade_formatter.exs")]
+        [path("mix.lock")] ++ Path.wildcard(path("priv/fixtures/*.exs"))
 
     files
     |> Enum.sort()
@@ -35,13 +35,31 @@ defmodule Eab.Inventory do
   def qualification_hash do
     # Agent, endpoint and presentation changes cannot change fixture controls.
     # Runtime image identities independently invalidate controls after rebuilds.
-    files = ~w(activity command fixtures grader inventory sandbox store)
+    files = ~w(command grader inventory sandbox)
 
     (Enum.map(files, &path("lib/eab/#{&1}.ex")) ++
-       [path("mix.lock"), path("priv/fixtures/grade_formatter.exs")])
+       [
+         path("mix.lock"),
+         path("priv/fixtures/grade_formatter.exs")
+       ])
     |> Enum.sort()
     |> Enum.map_join(fn p -> Path.relative_to(p, root()) <> hash_file(p) end)
     |> hash()
+  end
+
+  def qualification_inputs(id) do
+    spec = spec(id)
+
+    %{
+      # Unknown future manifest fields invalidate controls by default. Only
+      # known descriptive fields and inputs already covered by the images are
+      # excluded; a new grading rule must never silently reuse old controls.
+      "contract" =>
+        Map.drop(spec, ~w(id title family suite project domains repository runtime services
+          clarifications source_inspiration)),
+      "before_test_commands" => spec["runtime"]["before_test_commands"] || [],
+      "files" => Map.drop(fixture_hashes(id), ["case.json", "ticket.md", "provenance.json"])
+    }
   end
 
   def protocol do

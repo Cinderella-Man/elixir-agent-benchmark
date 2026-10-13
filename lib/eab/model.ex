@@ -77,7 +77,6 @@ defmodule Eab.Model do
       "window_tokens" => window,
       "response_tokens" => response,
       "safety_tokens" => 8,
-      "max_calls" => integer(input, "max_calls", defaults["max_calls"], 1, 10_000),
       "max_tokens" => integer(input, "max_tokens", defaults["max_tokens"], 1, 10_000_000),
       "seed" => integer(input, "seed", defaults["seed"], 0, 2_147_483_647),
       "compaction" => false

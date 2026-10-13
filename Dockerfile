@@ -6,7 +6,7 @@ COPY priv/pi/bridge.mjs ./
 
 FROM hexpm/elixir@sha256:73e79b5a183c6ba8c060a664a430b30f571a890907f899a66ed13b0bd4aa03c2 AS tooling
 ENV ERL_FLAGS="+S 2:2"
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git docker.io util-linux build-essential && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git docker.io docker-buildx util-linux build-essential && rm -rf /var/lib/apt/lists/*
 ENV MIX_HOME=/opt/mix HEX_HOME=/opt/hex
 RUN mix local.hex --force && mix local.rebar --force && mkdir -p /opt/hex && chmod -R a+rX /opt/mix /opt/hex
 COPY --from=pi /usr/local/bin/node /opt/pi/node
@@ -24,7 +24,7 @@ COPY priv priv
 RUN mix compile --warnings-as-errors && mix assets && mix release
 
 FROM ubuntu:24.04 AS app
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git docker.io util-linux libstdc++6 libssl3t64 libncurses6 locales && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git docker.io docker-buildx util-linux libstdc++6 libssl3t64 libncurses6 locales && rm -rf /var/lib/apt/lists/*
 ENV LANG=C.UTF-8 EAB_ROOT=/app EAB_DATA_DIR=/data ERL_FLAGS="+S 2:2"
 WORKDIR /app
 COPY --from=build /app/.local/docker-build/prod/rel/eab ./

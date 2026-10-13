@@ -1,0 +1,150 @@
+# Expand toward 250 qualified PRs per project
+
+Status: baseline foundation implemented and bounded correctness checks passing, 2026-10-13; [SWE-bench research](research/swe-bench.md) completed and incorporated below. The running controller has not been replaced and the existing cases still require qualification under the new prepared-baseline contract. The current executable inventory remains twelve cases. The target is approximately 250 Plausible and 250 Livebook cases, reused across 10–30 model runs.
+
+## Scope and decisions
+
+Preserve the agreed behavior: Run automatically prepares missing state; Pi, grading and regression probes use independent clones; ordinary repairs start from an installed application; installation/migration cases declare fresh setup; one Pi runs at a time against a remote model; preparation and grading stay bounded; baselines persist until explicitly removed. Services start during runs, with the next workspace prepared ahead.
+
+Confirmed expansion choices:
+
+- **Q6, eligible tasks:** include bug fixes, feature work and refactors. Label task kinds and adapt their acceptance contracts rather than forcing every task into the original bug-repair rules.
+- **Q7, recovery:** resume completed-case checkpoints under matching benchmark/model/settings identities. Preserve prior evidence and restart unfinished Pi work in fresh workspaces. This replaces fresh-run-only behavior for the expanded run model; it does not change existing saved outcomes.
+
+Further confirmed choices:
+
+- **Q8, refactor acceptance:** require objective acceptance checks for every scored refactor; vague subjective improvement remains outside the executable score.
+- **Q9, implementation languages:** include testable offline full-stack work, including JavaScript/browser-facing changes, with language/task breakdowns.
+
+The proposal below allows a curator to author missing tests when the requested outcome is unambiguous and the tests pass the relevant qualification gates; upstream test additions prioritize discovery but are not a substitute for validation. Broader platform requirements remain deferred unless their supported execution contract is added explicitly. These are planning recommendations, not evidence that more qualified cases already exist.
+
+Increasing case count improves coverage of these projects, but two repositories still cover two codebases. Deduplicate equivalent tasks and report results by project, task kind and task family. Do not pad the inventory with trivial, duplicate or inadequately specified tasks to hit a number, or select cases based on which target models pass them. Count distinct admitted PRs; splitting one large PR into several tasks does not increase the distinct-PR target.
+
+## Acceptance contracts for the expanded task types
+
+The current twelve cases remain repair tasks. Historical results retain their original protocol; the prepared-baseline implementation declares `elixir-agent-benchmark-v2` with the same case list. Add a versioned `task_kind` and explicit acceptance contract for future releases:
+
+| Kind | Required change | Checks that distinguish a valid submission from unchanged code |
+| --- | --- | --- |
+| Bug fix | Repair specified observable behavior | A trusted defect test fails on the starting revision and passes after repair; protected behavior stays valid |
+| Feature | Implement specified new behavior or public capability | New behavior/capability checks fail on the starting revision and pass on the reference; existing behavior remains valid |
+| Refactor | Preserve behavior while meeting an explicitly requested design constraint | Preservation tests pass before and after; a separate declared interface/structural check rejects unchanged code and accepts compliant alternatives |
+
+For refactors, examples of objective requirements include extracting a specified public interface, removing a declared dependency or breaking a stated module dependency cycle. A merely different file layout, resemblance to the reference patch or an unspecified judgment of code quality is not enough. Purely subjective refactors are deferred rather than given an AI-judge score. Required structural constraints must be stated in the task so valid alternative implementations are not rejected by hidden preferences.
+
+Feature checks must turn an expected missing capability into a named assertion/precheck failure. Do not accept arbitrary compiler, setup or harness failures as proof that the starting revision lacks the feature. A feature introducing a struct or macro may need an acceptance adapter to inspect availability before compiling code that depends on it. The reference must still execute the actual feature checks successfully.
+
+Keep no-op rejection, reference success, integrity-bypass rejection and meaningful incomplete-solution controls for all kinds. Separate those admission controls from the requirement for model-authored tests: bug fixes/features need tests that detect the defect or missing capability; refactors need useful contract/preservation tests and the explicit structural gate. Do not force a behavior-preserving refactor to invent a behavioral regression. Freeze each case's test requirement in its manifest before any model sees it.
+
+This needs changes in `Grader`, which currently requires completed ExUnit behavioral failures for qualification and regression coverage, and in `Agent`, whose task instructions always ask for a repair and a test failing on broken code. Extend trusted check adapters with named outcomes and explicit failure categories; preserve complete-execution and protected-check integrity instead of broadening 'pass' to arbitrary exit codes. JavaScript/browser test adapters need the same trusted result/completion contract as the existing ExUnit formatter. Negative controls must fail the declared task checks, not merely any unrelated test. The manifest defines acceptance, preservation and structural check IDs, expected starting-state outcomes, model-test policy, protected test roots and one or more incomplete-solution controls.
+
+Features can introduce dependencies or change assets/configuration. Define permitted paths per case rather than retaining the current blanket `lib/`/`test/` restriction. Prepare necessary package artifacts in an offline package cache or a declared task-neutral environment overlay; never fetch dependencies during an attempt or preinstall the feature implementation. Reference dependency changes must be represented explicitly in the environment/test contract, not silently baked into the task's source. Unsupported external services, desktop-only behavior or unavailable historical packages remain deferred with reasons.
+
+For browser-facing cases, prefer functional DOM, interaction and accessibility assertions with stable local fixtures. Cache pinned browser binaries, Node/package dependencies and relevant system libraries in shared runtime artifacts; start browser processes only for active workspaces/checks. Keep application/browser communication inside the case's isolated network and prepare any required assets before freezing the baseline. Pin locale, viewport and other relevant environment inputs, and use deterministic test data. No external accounts, live third-party services or subjective screenshot scoring enter admission. Source inspection must establish which test runner each historical revision supports; do not assume all 500 cases use the current upstream runner.
+
+See [the task-contract decision](adr/0007-grade-features-and-refactors-by-explicit-contracts.md). The original repair-only release remains intact; mixed-task scores belong to a new release and must not be presented as directly equivalent to the old twelve-case score.
+
+## Cache structure at this scale
+
+A case is a manifest referencing shared immutable artifacts, not a dedicated permanently running set of containers:
+
+| Artifact | Reuse boundary |
+| --- | --- |
+| Source snapshot | Exact repository tree; controller-side Git objects may share history, but exported attempt workspaces contain only the intended source |
+| Toolchain/dependency preparation | Compatible runtime, platform, lockfiles and build inputs; historical compiled artifacts require the existing dependency/configuration invalidation rules |
+| Project artifact | Exact pristine case source, assets and compiled application; separate from Pi and database state |
+| Database artifact | Engine identities, configuration, ordered migrations and their helper/data/dependency inputs; several PRs may reference the same database state |
+| Case baseline | References to the exact project and service artifacts plus the initialization contract |
+| Qualification receipt | Baseline and relevant test/evaluator identities; independent of model, Pi version, UI or logs |
+| Pi runtime | Independently versioned agent attachment |
+
+Therefore a new PR can reuse the same database image when its database initialization contract is unchanged. A database change creates a compatible successor state; a runtime, dependency, source or asset change can independently require a new application artifact. Livebook's current cases have no PostgreSQL/ClickHouse services: their reusable baseline is the prepared project filesystem, with fresh process-local state.
+
+Use the oldest suitable database seed within each compatible engine/bootstrap family, then apply the target's missing migrations to a disposable preparation clone. Save the completed target baseline once. Prefer an existing nearer compatible seed when available; a later model goes directly to the exact target baseline, without traversing or rerunning that migration history. See [the source audit and compatibility rules](design-tree.md#database-seeds-across-prs), including helper changes, unversioned Oban migrations and cross-repository ordering.
+
+Separate **logical preparation ancestry** from **physical Docker layer depth**. Do not create a chain of 250 `FROM previous-PR` images. Keep shallow image families and introduce new sealed checkpoints before the configured depth or size policy is exceeded. Compact only during initial preparation/publication; never insert this work into an unchanged case's model-run cache hit. Docker layers copy changed files, not SQL-row deltas, so even a small migration can produce a substantial layer. Docker's [OverlayFS documentation](https://docs.docker.com/engine/storage/drivers/overlayfs-driver/) describes file copy-up and classic-driver layer limits; the actual backend must be inspected rather than assuming this host uses the classic driver.
+
+All source, build and database caches remain pristine. A seed from another revision must not leave future source, stale compiled modules, grader tests or reference repairs in the final workspace. Preserve exact target source and clean final image composition. Database reuse is forward-only under verified compatibility; do not roll a newer database back to prepare an older case.
+
+Keep a content-addressed artifact catalog with ownership, component references, completed publication markers and per-run leases. Share one in-progress preparation for identical inputs. A published case references existing database artifacts rather than reinitializing equivalent states just to assign a per-case tag. Use atomic publication and distinguish missing physical artifacts from stale qualification.
+
+## Storage and resource policy
+
+The number of retained artifacts can grow with the corpus; live workspaces grow only with configured worker limits. Keep one Pi, one waiting workspace, one grader and the existing bounded preparation workers. A larger inventory does not automatically increase those limits. Account for service containers started by qualification workers as well as preparation itself.
+
+Show logical case coverage and actual shared/unique storage separately. Do not sum image virtual sizes as if every shared layer were unique. Include build cache, source archives, scratch preparation and run evidence in capacity reporting. A 500-case corpus evaluated by 10–30 models creates 5,000–15,000 attempts, even though it need not create 5,000–15,000 pristine baselines.
+
+Retain selected baselines across completed runs, cancellation and controller replacement. Keep explicit per-case/release/all-unused removal, with a preview of affected cases and reference-aware deletion; shared components and active leases must survive removal of one case. A configured free-space reserve stops admission/preparation with a clear reason instead of silently evicting the user's warm corpus. External Docker pruning remains detectable loss, not an application-controlled retention guarantee. No storage-size or startup-time estimate is justified before representative artifacts exist.
+
+## Candidate discovery and admission
+
+Create a separate candidate catalog and resumable curation jobs; discovery must not change the benchmark used by a running model. Current `Inventory.spec/1` only loads already-admitted IDs, so candidate loading needs its own boundary.
+
+A bounded metadata audit on 2026-10-13 found a substantial discovery pool, but did not establish eligible supply:
+
+| Repository | Merged PRs reported by GitHub | Merged PRs with `fix` in the title |
+| --- | ---: | ---: |
+| Plausible | 3,264 | 443 |
+| Livebook | 1,779 | 225 |
+
+These came from four public `GET /search/issues` metadata requests with `repo:<repository> is:pr is:merged`, optionally `fix in:title`, fetching only one or five rows; all reported `incomplete_results: false`. A four-PR/file-list sample included an existing case ([Plausible 6763](https://github.com/plausible/analytics/pull/6763)), a workflow-only change ([6725](https://github.com/plausible/analytics/pull/6725)), a Windows-reported race without an added test ([Livebook 3222](https://github.com/livebook-dev/livebook/pull/3222)) and comment spelling ([3204](https://github.com/livebook-dev/livebook/pull/3204)). Title matches both omit real bugs and include unsuitable PRs. Do not treat these totals as eligible counts or estimate admission yield from this sample.
+
+1. **Discover:** incrementally enumerate merged PR metadata from both repositories, caching raw responses and pagination cursors. Preserve linked issues, descriptions, labels, file lists, merge/head/base metadata and source URLs. Use labels/title terms for prioritization, not as proof of task kind or quality; feature/refactor discovery must not be restricted to `fix` matches. Follow pagination and rate-limit responses; avoid search-result truncation by using repository enumeration or partitioned search with a recorded coverage boundary.
+2. **Screen:** retain actionable bug fixes, features and objective refactors with supported offline execution, including full-stack cases. Reject or defer documentation-only edits, mechanical dependency bumps without a defined implementation task, subjective cleanup, unsupported external-service/platform requirements, performance-only work requiring timing-based grading, mixed unrelated changes, unexplained requirements, and duplicate/revert/backport instances. Record every disposition and reason. Revisit remediable runtime failures rather than counting them as model failures.
+3. **Extract:** identify and verify the actual broken source and accepted repair, respecting squash, merge and rebase topology. Do not assume that the current base branch or a blind base-to-merge diff isolates the PR. Verify source-tree identities and patch application; separate the implementation repair from reference/acceptance tests. Preserve licenses and provenance. A controller-owned Git object cache may reduce repeated fetches, but no upstream history enters the attempt image.
+4. **Author and independently review:** create a task-kind-appropriate ticket, exact runtime/setup profile, permitted edit paths, preservation checks, grader-only task acceptance checks and meaningful incomplete-solution controls. Implement the acceptance contract described above: declared task checks reject the starting state and accept the reference, with preservation checks retained. Map every enforced assertion to a solver-visible requirement and record requirements without coverage. An independent reviewer reads the public contract before inspecting checks/reference code; record disagreements and adjudication. Complex features/refactors should receive a blind alternative implementation as additional evidence that the contract is sufficient. Curator automation may draft artifacts; generated text or a merged PR is not qualification evidence.
+5. **Prepare:** build the pristine baseline using compatible project and database seeds. Classify edition, platform and supported service requirements explicitly. Verify the final workspace contains no solution, hidden checks or external history and can execute offline.
+6. **Qualify:** run unchanged/reference/integrity/incomplete-solution controls and verify the task-kind-specific test policy. Where dates, concurrency or randomness make results suspect, use bounded repeatability checks and quarantine unstable cases. Record setup errors, weak checks and flaky behavior separately.
+7. **Admit:** publish qualified immutable case versions into a benchmark release. Preserve the selected case list, ordering and recipe/evaluator identities before comparing models. Adding candidates or correcting a case creates a new release rather than changing an existing comparison's denominator.
+
+The existing evaluator already implements the core four controls and regression-test coverage check, but the discovery/importer, candidate store, manifest validation, admission queue and rejection ledger are missing. Normalize the current `suite` versus `project` manifest fields in a versioned schema. Recorded `broken_tree`/`fixed_tree` provenance also needs executable verification during import; fetching a matching commit SHA alone does not check the reconstructed repair.
+
+This separation of candidate collection from executable qualification is consistent with the pinned [SWE-bench collection implementation](https://github.com/SWE-bench/SWE-bench/blob/02e7a74ffd0b707aab73d203fe87bdc7c76afc8e/swebench/collect/README.md). The [SWE-bench Multilingual construction description](https://www.swebench.com/multilingual) also distinguishes defect-detecting tests from preserved-behavior checks and reviews issue/test suitability. These are methodological references, not a drop-in Elixir case generator. The [research report](research/swe-bench.md) distinguishes historical and current harness behavior and documents subsequent Verified/Pro validity concerns.
+
+Use GitHub's [repository pull-request API](https://docs.github.com/en/rest/pulls/pulls), [pagination contract](https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api) and [conditional-request/rate-limit guidance](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api). Search has a [1,000-result retrieval ceiling](https://docs.github.com/en/rest/search/search), so a single search cannot harvest these complete histories. Freeze discovery cutoffs, persist cursors and API responses, and bound requests per batch. A merged PR's [merge SHA has different meanings for merge, squash and rebase](https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request); ambiguous provenance is deferred rather than guessed.
+
+## Controller and interface work
+
+The pipeline already accepts an arbitrary case list. Its `1..12` bound limits preparation lookahead, not total run size, and need not grow with the inventory. `Runner.score/1` already calculates its denominator from selected cases. The website, descriptions and some tests still hard-code twelve and need to read the frozen selection.
+
+Freeze a validated release manifest and immutable artifact references once per run. Current `Runner.verify!/3` reconstructs `Inventory.protocol/0` at preparation, attempt and grading boundaries, rereading every case and implementation file. Replace repeated whole-corpus reads with frozen identities and relevant boundary checks while preserving detection of changed inputs and model identity.
+
+Separate compact run/case summaries from large grading outputs and transcripts. Today progress updates rewrite a growing `run.json`, and dashboard refreshes load all historical runs and enumerate the selected run's full artifact tree. Retain full evidence as per-attempt files, append progress records and maintain queryable summaries. Use paginated history/case lists and fetch a case's artifact list/log tail only when viewed. A small persistent index can support these queries without moving large evidence blobs into it; choose its implementation after the record schema is defined.
+
+Keep only compact result references in `Pipeline` state, and reference immutable qualification/build evidence from each run instead of copying the same bodies into every model's results. Commit the final evidence before publishing a case-completion marker; reconcile a crash after that marker but before coordinator notification without rerunning the case. Historical corrupt records should be reported individually rather than breaking the complete history view.
+
+Expose distinct states: discovered, awaiting review, preparing baseline, qualifying fixture, ready, restoring workspace, Pi running, grading submission and complete/error. Show cache reuse and exact rebuild/requalification reasons. Keep bulk curation/preparation independent of model availability; clicking Run still prepares any missing required artifacts automatically. No mandatory manual prepare-all gate is added.
+
+Resume is an explicit action after model/settings/release/agent/evaluator validation and cleanup. Reuse completed outcomes under the original run identity; do not rerun completed failures to seek a better result. The proposed handling of a durably saved submission is to finish grading that exact patch without rerunning Pi. If Pi was interrupted before a durable submission, preserve that evidence and start a fresh attempt generation with the same seed and budget. Attempt generations, interruption counts and discarded usage remain visible, with only the designated final generation scored. An infrastructure-error retry is separately explicit, never silently enabled by resume. Changed identities require a new run, and unverified model provenance must remain visible rather than implying a stable endpoint URL proves the same weights. Credentials are supplied again when needed, never saved into a baseline. Cross-model reuse is restricted to pristine artifacts and qualification, never model-produced outcomes.
+
+Keep equal case weighting within each fixed release and display project/family breakdowns. Incomplete runs show coverage and errors without a final score, as today. Named development subsets can support checks, but their results must identify the subset and cannot be compared as full-release scores. More cases do not remove possible prior model exposure to these public PRs.
+
+## Changes resulting from SWE-bench research
+
+The [primary-source research](research/swe-bench.md) supports the cache architecture and adds the following requirements to the expansion work:
+
+- **Retain completed artifacts, not just build layers.** A valid exact-case hit bypasses installation, baseline compilation, migrations and already-valid controls. Services still start; edited code compiles and grading still executes. Historical SWE-bench cache defaults sometimes removed newly built instance images, so retention must be an explicit lifecycle rule here.
+- **Version executable evidence separately from editorial review.** Public task text, assertion mapping and reviewer decisions belong to immutable case/release identities. Descriptive edits need renewed contract review but need not repeat unchanged executable controls. Model, prompt, Pi, budgets, network policy and submitted patch belong to attempt provenance; an existing report filename is insufficient for resume.
+- **Check both false negatives and false positives.** Review reasonable alternative implementations and targeted incomplete solutions, not only the original repair. Audit samples of passing as well as failing results. Version or quarantine faulty tasks without silently altering old scores; do not choose the main release based on target-model failures.
+- **Expose evidence before raw logs.** Give each case named acceptance/preservation/coverage outcomes and a failure card with stage, short excerpt and links to patch, trajectory, full test output and preparation evidence. Show qualification separately from submission grading. Declare all attempts, infrastructure retries and discarded usage.
+- **Audit every solver-visible artifact.** Check nested Git history, hooks, patches, logs and compiled outputs as well as the working tree. Keep hidden checks/reference repairs out of all agent-visible layers and retain the offline attempt policy. This prevents runtime leakage; public-PR training contamination remains a stated limitation.
+
+The research does not certify a 500-case inventory or establish local performance. Existing-case qualification, release/provenance records, storage retention, completed-case recovery and compact evidence remain prerequisites to a reliable expanded comparison.
+
+## Implementation sequence and acceptance gates
+
+**Research gate completed (2026-10-13):** The cache foundation passed bounded correctness checks, and deep primary-source SWE-bench research is saved in [the report](research/swe-bench.md). Resulting design changes are recorded above. No new PR cases were added. Real qualification of the existing twelve and the implementation gates below remain outstanding; completion of research does not admit candidates automatically.
+
+| Phase | Deliverable | Completion evidence |
+| --- | --- | --- |
+| 1. Baseline foundation | Implement the approved component catalog, pristine service capture/cloning, Pi separation and relevant cache identities for the current twelve cases | Bounded isolation, cancellation, missing-artifact, publication and semantic checks; a valid hit invokes no install/build/migration/qualification work |
+| 2. Case and release records | Candidate loader, versioned task/manifest schema, immutable releases, durable job records, provenance validation and independent review records | A candidate can be qualified before admission; old releases remain unchanged; invalid or mixed source identities are rejected; requirement/assertion mapping and review decisions are retained |
+| 3. Expanded task grading | Feature/refactor contracts, ExUnit/JavaScript/browser adapters, task-specific Pi instructions, protected overlays and offline dependency policy | Bounded representative synthetic tasks verify named no-op/incomplete/integrity rejection, alternative solutions and preservation checks for every supported task kind |
+| 4. Long-run storage/UI | Artifact leases/reference-aware removal/free-space guard, compact progress records, semantic failure cards, paginated queries, dynamic counts and completed-case recovery | Synthetic 500-case records demonstrate correct ordering, scoring, bounded work and identity-bound recovery without elapsed-time assertions; removal preserves shared/leased artifacts |
+| 5. Discovery and pilot admission | Incremental PR collector and curation workflow; first target approximately 25 qualified cases per project across task kinds and representative runtime/schema families | Document accepted/rejected/deferred counts and reasons, qualification evidence, actual unique artifact storage and supported compatibility groups; do not promise a fixed yield |
+| 6. Corpus growth | Expand toward 100 and then 250 qualified cases per project, preserving frozen intermediate releases | Each case passes admission; duplicate/task-family coverage review and storage capacity gates; shortfall remains explicit |
+| 7. Model comparison | User-triggered runs reuse the same selected release, with identical agent/settings policy | Cross-model warm-state reuse, independent attempts, complete per-case evidence and honest incomplete-run handling |
+
+Discovery and record-schema work can proceed alongside baseline implementation, but new cases must not become an official comparison set before qualification. Cache the original twelve first so this infrastructure provides value before corpus expansion is complete. Runtime-family grouping may reorder preparation jobs for reuse; Pi follows the frozen release order.
+
+This plan does not authorize a benchmark campaign or performance measurements on the shared development machine. Work here is source inspection, builds and bounded correctness/semantic checks. Performance qualification needs a separately suitable environment and explicit authorization; bulk admission/model execution must also respect the machine constraint. No new benchmark runs, builds or timing measurements were performed while producing this plan.
