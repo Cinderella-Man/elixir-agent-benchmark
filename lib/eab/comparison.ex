@@ -1,0 +1,52 @@
+defmodule Eab.Comparison do
+  @moduledoc "Side-by-side functional outcomes for explicitly selected, comparable runs."
+  alias Eab.{Cache, Runner, Store}
+
+  def load(ids) when is_list(ids) do
+    unless length(ids) in 2..30 and ids == Enum.uniq(ids) and Enum.all?(ids, &Store.valid_id?/1),
+      do: raise("Choose between 2 and 30 distinct runs")
+
+    build(Enum.map(ids, &(Store.run(&1) || raise("Run not found: #{&1}"))))
+  end
+
+  def build(runs) do
+    identities = Enum.map(runs, &identity/1) |> Enum.uniq()
+
+    unless length(runs) in 2..30 and length(identities) == 1,
+      do: raise("Comparison requires the same frozen release, case order and effective settings")
+
+    [first | _] = runs
+
+    %{
+      "cohort" => Cache.key(hd(identities)),
+      "release" => first["release_id"],
+      "runs" =>
+        Enum.map(runs, fn run ->
+          %{
+            "id" => run["id"],
+            "model" => get_in(run, ["model", "model"]) || "Unknown",
+            "backend" => get_in(run, ["model", "backend"]),
+            "status" => run["status"],
+            "score" => Runner.score(run)
+          }
+        end),
+      "cases" =>
+        Enum.map(first["cases"], fn id ->
+          %{"case" => id, "outcomes" => Enum.map(runs, &outcome(get_in(&1, ["attempts", id])))}
+        end)
+    }
+  end
+
+  defp identity(run) do
+    unless is_binary(run["release_id"]) and is_map(run["settings"]) and is_list(run["cases"]) and
+             run["cases"] != [],
+           do: raise("Legacy or corrupt runs without a frozen release cannot join a comparison")
+
+    Map.take(run, ~w(release_id cases settings))
+  end
+
+  defp outcome(%{"status" => "completed", "grade" => %{"passed" => true}}), do: "Passed"
+  defp outcome(%{"status" => "completed", "grade" => %{"passed" => false}}), do: "Failed"
+  defp outcome(%{"status" => "error"}), do: "Evaluation error"
+  defp outcome(_), do: "Incomplete"
+end

@@ -70,6 +70,11 @@ defmodule Eab.FixturesTest do
     end
 
     result = Fixtures.ensure(id, &send(parent, {:progress, &1}), image_exists?: exists?)
+    assert Fixtures.cached?(id, opts)
+    refute Fixtures.cached?(id, image_exists?: &(&1 != "database"))
+    File.rm!(Store.path("runtimes/#{id}.json"))
+    assert Fixtures.cached?(id, opts)
+    Store.write("runtimes/#{id}.json", result)
     assert_receive {:inspected, "fixture"}
     assert_receive {:inspected, "database"}
     assert_receive {:progress, "Reusing prepared project for plausible-pr-6300"}

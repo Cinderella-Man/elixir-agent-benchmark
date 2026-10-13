@@ -356,7 +356,7 @@ defmodule Eab.Runs do
 
   defp case_progress(run, id, phase, message) do
     phases =
-      ~w(pending preparing qualifying ready warming warm running submitted grading completed error)
+      ~w(pending preparing prepared qualifying ready warming warm running submitted grading completed error)
 
     previous = get_in(run, ["case_phases", id]) || "pending"
 
@@ -371,7 +371,7 @@ defmodule Eab.Runs do
   end
 
   defp foreground(run) do
-    priorities = ~w(running grading submitted warming qualifying preparing warm ready)
+    priorities = ~w(running grading submitted warming qualifying preparing warm ready prepared)
 
     active =
       for id <- run["cases"],

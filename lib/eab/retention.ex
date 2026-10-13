@@ -39,11 +39,23 @@ defmodule Eab.Retention do
     |> Enum.filter(&Store.valid_id?/1)
   end
 
-  def retain(id, runtime) do
+  def retain(id, runtime, release \\ nil) do
     unless Store.valid_id?(id), do: raise("Invalid retained case")
+    if release, do: validate_release!(release)
     images = runtime_images(runtime)
     key = Cache.key(images)
-    Store.write("retained/#{id}/#{key}.json", %{"case" => id, "images" => images})
+    path = "retained/#{id}/#{key}.json"
+
+    Cache.locked(:retention, fn ->
+      previous = Store.read(path) || %{}
+
+      releases =
+        ((previous["releases"] || []) ++ if(release, do: [release], else: []))
+        |> Enum.uniq()
+        |> Enum.sort()
+
+      Store.write(path, %{"case" => id, "images" => images, "releases" => releases})
+    end)
   end
 
   def ensure_space!(opts \\ []) do
@@ -83,6 +95,7 @@ defmodule Eab.Retention do
 
     %{
       "cases" => roots |> Enum.map(& &1["case"]) |> Enum.uniq() |> Enum.sort(),
+      "releases" => roots |> Enum.flat_map(&(&1["releases"] || [])) |> Enum.uniq() |> Enum.sort(),
       "baselines" => length(roots),
       "images" => roots |> Enum.flat_map(& &1["images"]) |> Enum.uniq() |> length(),
       "leases" => length(leased_runs())
@@ -91,6 +104,7 @@ defmodule Eab.Retention do
     error ->
       %{
         "cases" => [],
+        "releases" => [],
         "baselines" => nil,
         "images" => nil,
         "error" => "Cache records need attention: #{Exception.message(error)}"
@@ -98,19 +112,43 @@ defmodule Eab.Retention do
   end
 
   def preview(id) do
-    unless id == "unused" or Store.valid_id?(id), do: raise("Invalid cache selection")
+    release =
+      case id do
+        "release:" <> release ->
+          validate_release!(release)
+          release
+
+        _ ->
+          unless id == "unused" or Store.valid_id?(id), do: raise("Invalid cache selection")
+          nil
+      end
 
     records =
       for kind <- @managed, record <- Cache.records(kind), do: Map.put(record, "kind", kind)
 
     roots = roots()
-    {removed, retained} = Enum.split_with(roots, &(&1["case"] == id))
+
+    {affected, retained} =
+      Enum.split_with(roots, fn root ->
+        if release, do: release in (root["releases"] || []), else: root["case"] == id
+      end)
+
+    {updated, removed} =
+      if release do
+        affected
+        |> Enum.map(&Map.update(&1, "releases", [], fn ids -> List.delete(ids, release) end))
+        |> Enum.split_with(&(&1["releases"] != []))
+      else
+        {[], affected}
+      end
+
+    retained = retained ++ updated
     keep = closure(Enum.flat_map(retained, & &1["images"]), records)
 
     selected =
       if id == "unused",
         do: MapSet.new(Enum.map(records, &ref/1)),
-        else: closure(Enum.flat_map(removed, & &1["images"]), records)
+        else: closure(Enum.flat_map(affected, & &1["images"]), records)
 
     victims =
       Enum.filter(
@@ -133,6 +171,8 @@ defmodule Eab.Retention do
     plan = %{
       "case" => id,
       "roots" => removed,
+      "updated_roots" => updated,
+      "affected_cases" => Enum.map(affected, & &1["case"]) |> Enum.uniq() |> Enum.sort(),
       "records" => victims,
       "images" => images,
       "shared_records_preserved" =>
@@ -189,7 +229,19 @@ defmodule Eab.Retention do
       end
 
       for root <- plan["roots"], do: File.rm!(Store.path(root["path"]))
-      if id != "unused", do: File.rm(Store.path("runtimes/#{id}.json"))
+      for root <- plan["updated_roots"], do: Store.write(root["path"], Map.delete(root, "path"))
+
+      for case_id <- plan["affected_cases"] do
+        runtime = Store.read("runtimes/#{case_id}.json")
+
+        if runtime &&
+             (runtime["image"] in plan["images"] or
+                not Enum.any?(
+                  roots(),
+                  &(&1["case"] == case_id and &1["path"] != "runtimes/#{case_id}.json")
+                )),
+           do: File.rm(Store.path("runtimes/#{case_id}.json"))
+      end
 
       failures =
         for {image, {:error, message}} <- results, do: %{"image" => image, "reason" => message}
@@ -220,6 +272,11 @@ defmodule Eab.Retention do
       end
 
     retained ++ legacy
+  end
+
+  defp validate_release!(release) do
+    unless is_binary(release) and Regex.match?(~r/^[a-f0-9]{64}$/, release),
+      do: raise("Invalid retained release")
   end
 
   defp runtime_images(runtime),

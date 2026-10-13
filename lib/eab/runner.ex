@@ -7,6 +7,8 @@ defmodule Eab.Runner do
     Grader,
     Model,
     Pipeline,
+    Preparation,
+    Provenance,
     Release,
     Sandbox,
     Store
@@ -16,6 +18,7 @@ defmodule Eab.Runner do
     endpoint = run["model"]
     check_model = Keyword.get(opts, :check_model, &Model.unchanged!/2)
     prepare_case = Keyword.get(opts, :prepare, &prepare/4)
+    baseline = Keyword.get(opts, :baseline, &baseline/4)
 
     workspace =
       Keyword.get(opts, :workspace, fn id, run_id, use ->
@@ -33,6 +36,12 @@ defmodule Eab.Runner do
     context = fn id, fun -> Activity.with_case(run["id"], id, key, fun) end
 
     callbacks = %{
+      baseline: fn id ->
+        context.(id, fn ->
+          verify!(release, endpoint, key, id, check_model)
+          baseline.(run, id, key, emit)
+        end)
+      end,
       prepare: fn id ->
         context.(id, fn ->
           verify!(release, endpoint, key, id, check_model)
@@ -103,7 +112,11 @@ defmodule Eab.Runner do
       result: fn id, result -> emit.(%{"case_result" => {id, result}}) end
     }
 
-    results = Pipeline.run(pending, callbacks, Application.get_env(:eab, :pipeline, []))
+    pipeline_opts =
+      Application.get_env(:eab, :pipeline, [])
+      |> Keyword.put(:preparation_plan, Preparation.plan(pending))
+
+    results = Pipeline.run(pending, callbacks, pipeline_opts)
 
     verify!(release, endpoint, key, nil, check_model)
 
@@ -112,16 +125,16 @@ defmodule Eab.Runner do
       else: {:error, "One or more cases could not be evaluated. See their saved errors."}
   end
 
-  defp prepare(run, id, key, emit) do
+  defp baseline(run, id, key, emit) do
     progress(emit, "preparing", id, "Preparing #{id}")
 
     try do
+      Provenance.verify(id, &progress(emit, "preparing", id, &1))
       runtime = Fixtures.ensure(id, &progress(emit, "preparing", id, &1), run_id: run["id"])
+      Eab.Retention.retain(id, runtime, run["release_id"])
       Checkpoints.bind_runtime!(run["id"], id, runtime)
-      control = Grader.qualify(id, run["id"], &progress(emit, "qualifying", id, &1))
-      Store.write("runs/#{run["id"]}/#{id}/qualification.json", control)
-      progress(emit, "ready", id, "Image and fixture checks ready for #{id}")
-      control
+      progress(emit, "prepared", id, "Pristine baseline saved for #{id}; fixture checks pending")
+      runtime
     rescue
       error ->
         Activity.note("ERROR: " <> Exception.message(error))
@@ -129,13 +142,28 @@ defmodule Eab.Runner do
     after
       for {source, target} <- [
             {(Store.read("runtimes/#{id}.json") || %{})["build_log"] || "build/#{id}/build.log",
-             "build.log"},
-            {"controls/#{id}.json", "qualification.json"}
+             "build.log"}
           ] do
         case File.read(Store.path(source)) do
           {:ok, content} -> Store.write_text("runs/#{run["id"]}/#{id}/#{target}", content, key)
           _ -> :ok
         end
+      end
+    end
+  end
+
+  defp prepare(run, id, key, emit) do
+    try do
+      control = Grader.qualify(id, run["id"], &progress(emit, "qualifying", id, &1))
+      progress(emit, "ready", id, "Image and fixture checks ready for #{id}")
+      control
+    after
+      case File.read(Store.path("controls/#{id}.json")) do
+        {:ok, content} ->
+          Store.write_text("runs/#{run["id"]}/#{id}/qualification.json", content, key)
+
+        _ ->
+          :ok
       end
     end
   end

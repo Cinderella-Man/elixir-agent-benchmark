@@ -135,4 +135,24 @@ defmodule Eab.DatabaseSeedTest do
     put(root, "lib/helper.ex", "defmodule Demo.Helper do\n def run, do: :another\nend")
     refute DatabaseSeed.compatible?(first, DatabaseSeed.describe(root, spec))
   end
+
+  test "shared cyclic helpers preserve every transitive dependency", %{root: root, spec: spec} do
+    put(root, "lib/one.ex", "defmodule One do\n def run, do: Two.run()\nend")
+    put(root, "lib/two.ex", "defmodule Two do\n def run, do: One.run()\nend")
+
+    for n <- 1..3 do
+      put(root, "priv/repo/migrations/00#{n}_change.exs", "One.run()")
+    end
+
+    first = DatabaseSeed.describe(root, spec)
+    put(root, "lib/two.ex", "defmodule Two do\n def run, do: {One.run(), :changed}\nend")
+    second = DatabaseSeed.describe(root, spec)
+    refute DatabaseSeed.compatible?(first, second)
+
+    for {before, after_} <-
+          Enum.zip(first["migrations"]["postgres"], second["migrations"]["postgres"]) do
+      assert before["content"] == after_["content"]
+      refute before["dependencies"] == after_["dependencies"]
+    end
+  end
 end

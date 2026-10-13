@@ -38,6 +38,16 @@ defmodule Eab.Pipeline do
     monitor = Process.monitor(owner)
     lookahead = Keyword.get(opts, :lookahead, 4)
     workers = Keyword.get(opts, :preparation_workers, 2)
+    ancestry = Keyword.get(opts, :preparation_plan, %{})
+
+    unless Enum.all?(ancestry, fn {id, earlier} ->
+             id in cases and is_list(earlier) and earlier == Enum.uniq(earlier) and
+               Enum.all?(earlier, &(&1 in cases and &1 != id)) and
+               Enum.all?(earlier, fn parent ->
+                 Map.get(ancestry, parent, []) == Enum.take_while(earlier, &(&1 != parent))
+               end)
+           end),
+           do: raise(ArgumentError, "Invalid baseline preparation ancestry")
 
     unless is_integer(lookahead) and lookahead in 1..12 and is_integer(workers) and
              workers in 1..4,
@@ -52,6 +62,8 @@ defmodule Eab.Pipeline do
        callbacks: callbacks,
        lookahead: lookahead,
        workers: workers,
+       ancestry: ancestry,
+       baselines: MapSet.new(),
        first_started: false,
        prepared: %{},
        tasks: %{},
@@ -140,15 +152,30 @@ defmodule Eab.Pipeline do
   end
 
   defp start_preparations(state) do
-    preparing = for {_, %{kind: :prepare, id: id}} <- state.tasks, do: id
+    preparing =
+      for {_, %{kind: kind, id: id}} <- state.tasks, kind in [:baseline, :prepare], do: id
+
     window = Enum.take(state.pending, if(state.first_started, do: state.lookahead, else: 1))
-    prepare = state.callbacks.prepare
 
     window
     |> Enum.reject(&(&1 in preparing or Map.has_key?(state.prepared, &1)))
+    |> Enum.map(fn id ->
+      next =
+        if Map.has_key?(state.callbacks, :baseline) do
+          (Map.get(state.ancestry, id, []) ++ [id])
+          |> Enum.find(
+            &(not MapSet.member?(state.baselines, &1) and not Map.has_key?(state.results, &1))
+          )
+        end
+
+      if next, do: {:baseline, next}, else: {:prepare, id}
+    end)
+    |> Enum.uniq()
+    |> Enum.reject(fn {_, id} -> id in preparing end)
     |> Enum.take(max(state.workers - length(preparing), 0))
-    |> Enum.reduce(state, fn id, state ->
-      launch(state, :prepare, id, fn -> prepare.(id) end)
+    |> Enum.reduce(state, fn {kind, id}, state ->
+      callback = Map.fetch!(state.callbacks, kind)
+      launch(state, kind, id, fn -> callback.(id) end)
     end)
   end
 
@@ -218,6 +245,9 @@ defmodule Eab.Pipeline do
     put_in(state.tasks[task.ref], %{task: task, kind: kind, id: id})
   end
 
+  defp completed(state, :baseline, id, {:ok, _}),
+    do: %{state | baselines: MapSet.put(state.baselines, id)}
+
   defp completed(state, :prepare, id, {:ok, control}),
     do: put_in(state.prepared[id], control)
 
@@ -230,7 +260,7 @@ defmodule Eab.Pipeline do
   defp completed(state, kind, id, {:error, message}) do
     state =
       case kind do
-        :prepare ->
+        kind when kind in [:prepare, :baseline] ->
           state
 
         :grade ->

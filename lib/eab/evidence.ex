@@ -39,7 +39,11 @@ defmodule Eab.Evidence do
 
         %{
           "id" => field,
-          "label" => label,
+          "label" =>
+            if(field == "regression_coverage" and result["policy"] == "preservation",
+              do: "Added contract tests",
+              else: label
+            ),
           "passed" => result["passed"] == true,
           "completed" => result["completed"],
           "test_count" => map_size(tests),
@@ -48,7 +52,11 @@ defmodule Eab.Evidence do
           "reason" => result["reason"],
           "excerpt" =>
             if(result["passed"] != true,
-              do: excerpt(result["output"] || get_in(result, ["broken_test_probe", "output"]))
+              do:
+                excerpt(
+                  result["output"] || get_in(result, ["test_probe", "output"]) ||
+                    get_in(result, ["broken_test_probe", "output"])
+                )
             )
         }
       end

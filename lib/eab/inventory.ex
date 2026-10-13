@@ -5,11 +5,29 @@ defmodule Eab.Inventory do
   def all, do: read_json(path("config/benchmark.json"))["cases"]
 
   def spec(id) do
-    unless id in all(), do: raise(ArgumentError, "Unknown benchmark case")
+    unless Process.get({__MODULE__, id}) || id in all(),
+      do: raise(ArgumentError, "Unknown benchmark case")
+
     read_json(case_path(id, "case.json"))
   end
 
-  def case_path(id, file), do: path("cases/#{id}/#{file}")
+  def case_path(id, file),
+    do: Path.join(Process.get({__MODULE__, id}) || path("cases/#{id}"), file)
+
+  # Candidate qualification uses the same evaluator without adding the case to
+  # the published inventory. Overrides are scoped to this process and restored
+  # even on failure; model workers never inherit candidate files.
+  def with_case(id, directory, fun) do
+    key = {__MODULE__, id}
+    previous = Process.put(key, Path.expand(directory))
+
+    try do
+      fun.()
+    after
+      if previous, do: Process.put(key, previous), else: Process.delete(key)
+    end
+  end
+
   def file(id, file), do: File.read!(case_path(id, file))
 
   def hash_file(path) do
@@ -43,7 +61,7 @@ defmodule Eab.Inventory do
     files =
       Path.wildcard(path("lib/**/*.ex")) ++
         Enum.filter(Path.wildcard(path("priv/pi/*")), &File.regular?/1) ++
-        [path("mix.lock")] ++ Path.wildcard(path("priv/fixtures/*.exs"))
+        [path("mix.lock")] ++ Path.wildcard(path("priv/fixtures/**/*.{exs,mjs,json}"))
 
     files
     |> Enum.sort()
@@ -54,12 +72,13 @@ defmodule Eab.Inventory do
   def qualification_hash do
     # Agent, endpoint and presentation changes cannot change fixture controls.
     # Runtime image identities independently invalidate controls after rebuilds.
-    files = ~w(command grader inventory sandbox)
+    files = ~w(command grader inventory sandbox task_contract test_adapter)
 
     (Enum.map(files, &path("lib/eab/#{&1}.ex")) ++
        [
          path("mix.lock"),
-         path("priv/fixtures/grade_formatter.exs")
+         path("priv/fixtures/grade_formatter.exs"),
+         path("priv/fixtures/node_runner.mjs")
        ])
     |> Enum.sort()
     |> Enum.map_join(fn p -> Path.relative_to(p, root()) <> hash_file(p) end)

@@ -61,6 +61,85 @@ defmodule Eab.PipelineTest do
     pid
   end
 
+  test "baseline ancestry outside lookahead finishes in order without warming or qualifying ancestors" do
+    parent = self()
+
+    baseline = fn id ->
+      send(parent, {:baseline, id, self()})
+
+      receive do
+        :continue -> :ok
+        :fail -> raise "synthetic seed failure"
+      after
+        10_000 -> raise "Baseline test watchdog expired"
+      end
+    end
+
+    start_pipeline(
+      ~w(new other middle old),
+      [
+        lookahead: 1,
+        preparation_workers: 2,
+        preparation_plan: %{
+          "new" => ~w(old middle),
+          "middle" => ["old"],
+          "old" => [],
+          "other" => []
+        }
+      ],
+      %{baseline: baseline}
+    )
+
+    release(:baseline, "old")
+    release(:baseline, "middle")
+    release(:baseline, "new")
+    release(:prepare, "new")
+    refute_receive {:prepare, _, _}
+    release(:workspace, "new")
+    release(:attempt, "new")
+    release(:grade, "new")
+    release(:baseline, "other")
+
+    for id <- ~w(other middle old) do
+      release(:prepare, id)
+      release(:workspace, id)
+      release(:attempt, id)
+      release(:grade, id)
+    end
+
+    refute_receive {:baseline, _, _}
+    assert_receive {:finished, results}, 3000
+    assert Enum.map(results, & &1["case"]) == ~w(new other middle old)
+  end
+
+  test "a failed ancestor is recorded once and later baselines may build independently" do
+    parent = self()
+
+    start_pipeline(
+      ~w(new old),
+      [preparation_plan: %{"new" => ["old"], "old" => []}],
+      %{
+        baseline: fn id ->
+          send(parent, {:built, id})
+          if id == "old", do: raise("seed unavailable")
+          :ok
+        end
+      }
+    )
+
+    assert_receive {:result, "old", %{"status" => "error"}}, 3000
+    release(:prepare, "new")
+    release(:workspace, "new")
+    release(:attempt, "new")
+    release(:grade, "new")
+    assert_receive {:finished, [new, old]}, 3000
+    assert new["status"] == "completed"
+    assert old["status"] == "error"
+    assert_receive {:built, "old"}
+    assert_receive {:built, "new"}
+    refute_receive {:built, _}
+  end
+
   test "first case starts alone, then preparation, one warm workspace and grading overlap in order" do
     start_pipeline(~w(a b c), lookahead: 2, preparation_workers: 2)
     assert_receive {:prepare, "a", prep_a}, 3000

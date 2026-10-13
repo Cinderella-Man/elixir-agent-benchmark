@@ -9,6 +9,11 @@ defmodule Eab.Release do
     unless cases != [] and cases == Enum.uniq(cases) and Enum.all?(cases, &Store.valid_id?/1),
       do: raise("Invalid release case inventory")
 
+    for id <- cases, Inventory.spec(id)["schema_version"] == 2 do
+      Eab.TaskContract.read(Inventory.spec(id))
+      Eab.Candidates.verify_admission!(id)
+    end
+
     id = Cache.key(protocol)
 
     Cache.locked({:release, id}, fn ->

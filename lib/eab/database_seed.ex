@@ -7,10 +7,54 @@ defmodule Eab.DatabaseSeed do
   def describe(source, spec) do
     files = Path.wildcard(Path.join(source, "{lib,extra,src}/**/*.{ex,exs,erl,hrl}"))
 
+    migration_files =
+      Map.new(@repos, fn {service, directory} ->
+        {service, Path.wildcard(Path.join([source, directory, "*.exs"])) |> Enum.sort()}
+      end)
+
+    # Every file is read and parsed once. Opaque dependencies require all app
+    # source, so there is no reason to traverse the rest of that graph first.
+    analysis =
+      Map.new(Enum.uniq(files ++ List.flatten(Map.values(migration_files))), fn file ->
+        text = File.read!(file)
+        ast = Code.string_to_quoted(text)
+
+        {file,
+         %{
+           modules: Regex.scan(~r/\bdefmodule\s+([A-Z][A-Za-z0-9_.]*)\b/, text),
+           names: aliases(ast),
+           opaque: opaque?(text, ast),
+           cross_service: String.contains?(text, "IngestRepo"),
+           hash: Inventory.hash(text)
+         }}
+      end)
+
     modules =
       Enum.reduce(files, %{}, fn file, index ->
-        Regex.scan(~r/\bdefmodule\s+([A-Z][A-Za-z0-9_.]*)\b/, File.read!(file))
+        analysis[file].modules
         |> Enum.reduce(index, fn [_, name], acc -> Map.put(acc, name, file) end)
+      end)
+
+    aliases =
+      analysis
+      |> Enum.flat_map(fn {_, info} -> info.names end)
+      |> Enum.uniq()
+      |> Map.new(fn alias_name ->
+        children =
+          for {name, path} <- modules,
+              name == alias_name or String.ends_with?(name, "." <> alias_name) or
+                String.ends_with?(alias_name, "." <> name) or
+                String.starts_with?(name, alias_name <> "."),
+              into: MapSet.new(),
+              do: path
+
+        {alias_name, children}
+      end)
+
+    graph =
+      Map.new(analysis, fn {file, info} ->
+        children = Enum.reduce(info.names, MapSet.new(), &MapSet.union(aliases[&1], &2))
+        {file, Map.put(info, :children, children)}
       end)
 
     shared =
@@ -27,26 +71,21 @@ defmodule Eab.DatabaseSeed do
       end)
 
     migrations =
-      Map.new(@repos, fn {service, directory} ->
+      Map.new(migration_files, fn {service, migration_files} ->
         entries =
-          Path.wildcard(Path.join([source, directory, "*.exs"]))
-          |> Enum.sort()
+          migration_files
           |> Enum.map(fn file ->
             [_, version] = Regex.run(~r/^(\d+)_/, Path.basename(file))
-            dependencies = closure([file], modules, MapSet.new())
-            # Dynamic module loading cannot be proven independent of the rest
-            # of the application. Hash all source in that case, never guess.
-            dependencies =
-              if opaque?(dependencies), do: Enum.uniq(dependencies ++ files), else: dependencies
+            dependencies = closure(MapSet.new([file]), graph, MapSet.new(), [file | files])
 
             %{
               "version" => String.to_integer(version),
               "file" => Path.relative_to(file, source),
-              "content" => Inventory.hash_file(file),
-              "dependencies" => fingerprint(dependencies -- [file], source),
+              "content" => analysis[file].hash,
+              "dependencies" => fingerprint(dependencies -- [file], source, analysis),
               "cross_service" =>
                 service == "postgres" and
-                  Enum.any?(dependencies, &String.contains?(File.read!(&1), "IngestRepo"))
+                  Enum.any?(dependencies, &analysis[&1].cross_service)
             }
           end)
           |> Enum.sort_by(& &1["version"])
@@ -86,42 +125,43 @@ defmodule Eab.DatabaseSeed do
     description["migrations"] |> Map.values() |> Enum.map(&length/1) |> Enum.sum()
   end
 
-  defp fingerprint(files, root) do
+  defp fingerprint(files, root, analysis \\ %{}) do
     files
     |> Enum.uniq()
     |> Enum.sort()
-    |> Map.new(&{Path.relative_to(&1, root), Inventory.hash_file(&1)})
+    |> Map.new(fn file ->
+      hash = if info = analysis[file], do: info.hash, else: Inventory.hash_file(file)
+      {Path.relative_to(file, root), hash}
+    end)
     |> Cache.key()
   end
 
-  defp closure([], _modules, visited), do: MapSet.to_list(visited)
+  defp closure(pending, graph, visited, all_source) do
+    case Enum.take(pending, 1) do
+      [] ->
+        MapSet.to_list(visited)
 
-  defp closure([file | rest], modules, visited) do
-    if MapSet.member?(visited, file) do
-      closure(rest, modules, visited)
-    else
-      text = File.read!(file)
-      names = aliases(text)
+      [file] ->
+        info = graph[file]
 
-      # Resolve aliases conservatively across scopes, including shortened and
-      # renamed namespace prefixes. Extra dependencies only reduce reuse.
-      children =
-        Enum.flat_map(modules, fn {name, path} ->
-          if Enum.any?(names, fn alias_name ->
-               name == alias_name or String.ends_with?(name, "." <> alias_name) or
-                 String.ends_with?(alias_name, "." <> name) or
-                 String.starts_with?(name, alias_name <> ".")
-             end),
-             do: [path],
-             else: []
-        end)
+        if info.opaque do
+          Enum.uniq(all_source)
+        else
+          visited = MapSet.put(visited, file)
 
-      closure(rest ++ children, modules, MapSet.put(visited, file))
+          pending =
+            pending
+            |> MapSet.delete(file)
+            |> MapSet.union(info.children)
+            |> MapSet.difference(visited)
+
+          closure(pending, graph, visited, all_source)
+        end
     end
   end
 
-  defp aliases(text) do
-    case Code.string_to_quoted(text) do
+  defp aliases(quoted) do
+    case quoted do
       {:ok, ast} ->
         {_, names} =
           Macro.prewalk(ast, [], fn
@@ -140,27 +180,23 @@ defmodule Eab.DatabaseSeed do
               {node, names}
           end)
 
-        names
+        Enum.uniq(names)
 
       _ ->
         []
     end
   end
 
-  defp opaque?(files) do
-    Enum.any?(files, fn file ->
-      text = File.read!(file)
-
-      match?({:error, _}, Code.string_to_quoted(text)) or
-        Regex.match?(
-          ~r/\b(apply\s*\(|Module\.concat|Code\.(eval|require|compile)|File\.|System\.|__MODULE__|unquote|quote\b)/,
-          text
-        ) or dynamic_call?(text)
-    end)
+  defp opaque?(text, quoted) do
+    match?({:error, _}, quoted) or
+      Regex.match?(
+        ~r/\b(apply\s*\(|Module\.concat|Code\.(eval|require|compile)|File\.|System\.|__MODULE__|unquote|quote\b)/,
+        text
+      ) or dynamic_call?(quoted)
   end
 
-  defp dynamic_call?(text) do
-    case Code.string_to_quoted(text) do
+  defp dynamic_call?(quoted) do
+    case quoted do
       {:ok, ast} ->
         {_, dynamic?} =
           Macro.prewalk(ast, false, fn

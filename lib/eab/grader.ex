@@ -1,5 +1,5 @@
 defmodule Eab.Grader do
-  alias Eab.{Command, Inventory, Sandbox, Store}
+  alias Eab.{Command, Inventory, Sandbox, Store, TaskContract, TestAdapter}
 
   def parse(result, permitted \\ []) do
     output = result["output"]
@@ -105,8 +105,10 @@ defmodule Eab.Grader do
   end
 
   def run_tests(box, command, extra \\ []) do
+    contract = TaskContract.read(box.spec)
+
     box
-    |> Sandbox.command(test_command(command, extra),
+    |> Sandbox.command(TestAdapter.command(contract["adapter"], command, extra),
       timeout: box.spec["test_timeout"] || 240,
       limit: 2_097_152
     )
@@ -175,6 +177,9 @@ defmodule Eab.Grader do
   end
 
   defp do_grade(id, patch, run_id, opts, auxiliary) do
+    contract = TaskContract.read(Inventory.spec(id))
+    paths = Enum.map_join(contract["protected_paths"], " ", &Command.quote/1)
+
     {result, test_patch, changed} =
       Sandbox.with_box(id, run_id, fn box ->
         Sandbox.apply_patch(box, patch)
@@ -190,31 +195,33 @@ defmodule Eab.Grader do
           do: raise("Submitted paths violate the case contract")
 
         changed =
-          Sandbox.command!(box, "git diff --cached --name-only --diff-filter=ACMRT HEAD -- test",
+          Sandbox.command!(
+            box,
+            "git diff --cached --name-only --diff-filter=ACMRT HEAD -- #{paths}",
             limit: 2_097_152
           )
           |> String.split("\n", trim: true)
-          |> Enum.filter(&String.ends_with?(&1, "_test.exs"))
+          |> Enum.filter(&TaskContract.test_file?(contract, &1))
 
         test_patch =
-          Sandbox.command!(box, "git diff --cached --binary HEAD -- test", limit: 1_048_576)
+          Sandbox.command!(box, "git diff --cached --binary HEAD -- #{paths}", limit: 1_048_576)
 
-        Sandbox.formatter(box)
-        submission = run_tests(box, box.spec["regression_command"], changed)
+        TestAdapter.install(box)
+        submission = run_tests(box, contract["preservation"], changed)
         restore_tests(box)
         Sandbox.apply_patch(box, Inventory.file(id, box.spec["acceptance_patch"]))
-        hidden = run_tests(box, box.spec["acceptance_command"])
+        hidden = run_tests(box, contract["acceptance"])
 
         required =
           Enum.all?(
-            box.spec["required_acceptance_tests"] || [],
+            contract["required"],
             &(hidden["test_results"][&1] == "passed")
           )
 
         hidden = Map.update!(hidden, "passed", &(&1 and required))
-        Sandbox.command!(box, "git add -A -- test")
+        Sandbox.command!(box, "git add -A -- #{paths}")
         restore_tests(box)
-        regression = run_tests(box, box.spec["regression_command"])
+        regression = run_tests(box, contract["preservation"])
 
         {hidden, regression} =
           if opts[:expected] do
@@ -234,13 +241,17 @@ defmodule Eab.Grader do
          }, test_patch, changed}
       end)
 
-    if Inventory.spec(id)["require_regression_test"] and Keyword.get(opts, :coverage, true) do
+    if contract["model_tests"] != "optional" and Keyword.get(opts, :coverage, true) do
       coverage =
         if changed != [] and result["submission"]["passed"] do
           Sandbox.with_box(id, run_id, fn box ->
-            Sandbox.apply_patch(box, test_patch)
-            Sandbox.formatter(box)
-            probe = run_tests(box, "mix test " <> Enum.map_join(changed, " ", &Command.quote/1))
+            Sandbox.apply_patch(
+              box,
+              if(contract["model_tests"] == "preservation", do: patch, else: test_patch)
+            )
+
+            TestAdapter.install(box)
+            probe = run_tests(box, TestAdapter.selected(contract["adapter"], changed))
 
             detected =
               Enum.filter(
@@ -249,9 +260,11 @@ defmodule Eab.Grader do
               )
 
             %{
-              "passed" => probe["completed"] and detected != [] and probe["returncode"] != 0,
+              "passed" => coverage_passed?(contract, probe, detected, result["submission"]),
+              "policy" => contract["model_tests"],
               "detected_tests" => detected,
-              "broken_test_probe" => probe
+              "test_probe" => probe,
+              "broken_test_probe" => if(contract["model_tests"] == "behavioral", do: probe)
             }
           end)
         else
@@ -266,12 +279,25 @@ defmodule Eab.Grader do
     end
   end
 
-  defp restore_tests(box),
-    do:
-      Sandbox.command!(
-        box,
-        "git restore --source=HEAD --staged --worktree -- test && git clean -fd -- test"
-      )
+  defp coverage_passed?(%{"model_tests" => "preservation"}, probe, _detected, submission) do
+    probe["passed"] and
+      Enum.any?(probe["test_results"], fn {id, state} ->
+        state == "passed" and submission["test_results"][id] == "passed"
+      end)
+  end
+
+  defp coverage_passed?(_, probe, detected, _),
+    do: probe["completed"] and detected != [] and probe["returncode"] != 0
+
+  defp restore_tests(box) do
+    paths = TaskContract.read(box.spec)["protected_paths"] |> Enum.map_join(" ", &Command.quote/1)
+    # Restore tracked paths individually: a newly introduced test directory need
+    # not exist at HEAD. Clean also removes newly added submitted/overlay tests.
+    Sandbox.command!(
+      box,
+      "git reset -q HEAD -- #{paths} && git ls-tree -rz --name-only HEAD -- #{paths} | xargs -0 -r git restore --source=HEAD --staged --worktree -- && git clean -fd -- #{paths}"
+    )
+  end
 
   def qualify(id, run_id, emit) do
     runtime = Store.read("runtimes/#{id}.json")
@@ -289,6 +315,8 @@ defmodule Eab.Grader do
   end
 
   defp qualify(id, run_id, emit, identity, path) do
+    spec = Inventory.spec(id)
+    contract = TaskContract.read(spec)
     cached = Store.read(path)
 
     if cached && cached["valid"] && cached["identity"] == identity do
@@ -326,18 +354,19 @@ defmodule Eab.Grader do
       gold = grade(id, reference, run_id)
 
       halt =
-        "diff --git a/lib/eab_halt.ex b/lib/eab_halt.ex\nnew file mode 100644\n--- /dev/null\n+++ b/lib/eab_halt.ex\n@@ -0,0 +1 @@\n+System.halt(0)\n"
+        if spec["schema_version"] == 2 do
+          Inventory.file(id, "integrity.patch")
+        else
+          "diff --git a/lib/eab_halt.ex b/lib/eab_halt.ex\nnew file mode 100644\n--- /dev/null\n+++ b/lib/eab_halt.ex\n@@ -0,0 +1 @@\n+System.halt(0)\n"
+        end
 
       emit.("Checking early-exit rejection for #{id}")
-      bypass = grade(id, reference <> halt, run_id)
+      bypass = grade(id, reference <> halt, run_id, expected: gold)
       emit.("Checking partial-repair rejection for #{id}")
       partial = grade(id, partial_patch(id), run_id, expected: gold, coverage: false)
 
       valid =
-        not empty["passed"] and get_in(empty, ["hidden", "completed"]) == true and
-          behavioral_failures(empty["hidden"]) != [] and gold["passed"] and not bypass["passed"] and
-          get_in(partial, ["hidden", "completed"]) == true and
-          behavioral_failures(partial["hidden"]) != [] and
+        valid_controls?(contract, empty, gold, bypass, partial) and
           identity["grader"] == Inventory.qualification_hash()
 
       control = %{
@@ -360,6 +389,28 @@ defmodule Eab.Grader do
   end
 
   def partial_patch(id) do
+    if Inventory.spec(id)["schema_version"] == 2 do
+      Inventory.file(id, "incomplete.patch")
+    else
+      legacy_partial_patch(id)
+    end
+  end
+
+  def valid_controls?(contract, empty, gold, bypass, partial) do
+    starting = contract["starting_failures"]
+    empty_failures = behavioral_failures(empty["hidden"] || %{})
+    partial_failures = behavioral_failures(partial["hidden"] || %{})
+    starting_matches = starting == [] or Enum.sort(starting) == Enum.sort(empty_failures)
+    incomplete_matches = starting == [] or Enum.any?(partial_failures, &(&1 in starting))
+    preserved = contract["kind"] != "refactor" or get_in(empty, ["regression", "passed"]) == true
+
+    not empty["passed"] and get_in(empty, ["hidden", "completed"]) == true and
+      empty_failures != [] and starting_matches and preserved and gold["passed"] and
+      not bypass["passed"] and get_in(partial, ["hidden", "completed"]) == true and
+      partial_failures != [] and incomplete_matches
+  end
+
+  defp legacy_partial_patch(id) do
     patch = Inventory.file(id, "reference.patch")
     probe = Inventory.spec(id)["partial_repair_probe"]
 

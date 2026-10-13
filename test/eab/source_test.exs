@@ -62,4 +62,48 @@ defmodule Eab.SourceTest do
 
     assert Path.wildcard(Store.path("sources/*.json")) == []
   end
+
+  test "retained implementation and tests must reconstruct the exact fixed tree", %{
+    repo: repo,
+    tree: tree
+  } do
+    File.write!(Path.join(repo["url"], "app.ex"), "fixed source")
+    File.write!(Path.join(repo["url"], "test.exs"), "reference test")
+    Command.run!("git", ["add", "."], cd: repo["url"])
+
+    implementation =
+      Command.run!("git", ["diff", "--cached", "--binary", "--", "app.ex"], cd: repo["url"])
+
+    tests =
+      Command.run!("git", ["diff", "--cached", "--binary", "--", "test.exs"], cd: repo["url"])
+
+    fixed_tree = Command.run!("git", ["write-tree"], cd: repo["url"]) |> String.trim()
+    Command.run!("git", ["commit", "--quiet", "-m", "Accepted change"], cd: repo["url"])
+    fixed_revision = Command.run!("git", ["rev-parse", "HEAD"], cd: repo["url"]) |> String.trim()
+    patches = [Store.path("implementation.patch"), Store.path("tests.patch")]
+
+    Enum.zip(patches, [implementation, tests])
+    |> Enum.each(fn {path, body} -> File.write!(path, body) end)
+
+    provenance = %{
+      "broken_tree" => tree,
+      "fixed_tree" => fixed_tree,
+      "fixed_revision" => fixed_revision
+    }
+
+    receipt =
+      Eab.Provenance.verify_pair(%{"repository" => repo}, provenance, patches, fn _ -> :ok end)
+
+    assert receipt["verified"]
+    assert receipt["reconstructed_tree"] == fixed_tree
+
+    assert_raise RuntimeError, ~r/do not reconstruct/, fn ->
+      Eab.Provenance.verify_pair(
+        %{"repository" => repo},
+        provenance,
+        Enum.take(patches, 1),
+        fn _ -> :ok end
+      )
+    end
+  end
 end

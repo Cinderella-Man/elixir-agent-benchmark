@@ -1,6 +1,6 @@
 defmodule EabWeb.DashboardLive do
   use Phoenix.LiveView
-  alias Eab.{Evidence, Inventory, Model, Retention, Runner, Runs, Store}
+  alias Eab.{Comparison, Evidence, Inventory, Model, Retention, Runner, Runs, Storage, Store}
 
   @defaults %{
     "window_tokens" => "",
@@ -29,6 +29,9 @@ defmodule EabWeb.DashboardLive do
        selected: selected,
        selected_run: if(selected, do: Store.run(selected)),
        history_offset: 0,
+       comparison: nil,
+       comparison_ids: [],
+       comparison_offset: 0,
        history_page: Store.run_page(),
        case_offset: 0,
        cache_status: Retention.status(),
@@ -36,6 +39,8 @@ defmodule EabWeb.DashboardLive do
        cache_busy: false,
        cache_message: nil,
        cache_failures: [],
+       storage: nil,
+       storage_busy: false,
        selected_case: nil,
        log_case: nil,
        case_attempt: nil,
@@ -103,6 +108,22 @@ defmodule EabWeb.DashboardLive do
     end
   end
 
+  def handle_event("storage", _, %{assigns: %{storage_busy: true}} = socket),
+    do: {:noreply, socket}
+
+  def handle_event("storage", _, socket) do
+    {:noreply,
+     socket
+     |> assign(storage_busy: true)
+     |> start_async(:storage, fn ->
+       try do
+         {:ok, Storage.read()}
+       rescue
+         error -> {:error, Exception.message(error)}
+       end
+     end)}
+  end
+
   def handle_event("cache_remove", _, %{assigns: %{cache_preview: nil}} = socket),
     do: {:noreply, socket}
 
@@ -141,6 +162,31 @@ defmodule EabWeb.DashboardLive do
     {:noreply, refresh(assign(socket, history_offset: offset))}
   end
 
+  def handle_event("compare", params, socket) do
+    try do
+      ids = comparison_selection(socket, params)
+      comparison = Comparison.load(ids)
+
+      {:noreply,
+       assign(socket,
+         comparison: comparison,
+         comparison_ids: ids,
+         comparison_offset: 0,
+         error: nil
+       )}
+    rescue
+      error -> {:noreply, assign(socket, error: Exception.message(error))}
+    end
+  end
+
+  def handle_event("comparison_select", params, socket),
+    do: {:noreply, assign(socket, comparison_ids: comparison_selection(socket, params))}
+
+  def handle_event("comparison_page", %{"direction" => direction}, socket) do
+    offset = max(socket.assigns.comparison_offset + if(direction == "next", do: 25, else: -25), 0)
+    {:noreply, assign(socket, comparison_offset: offset)}
+  end
+
   def handle_event("case_page", %{"direction" => direction}, socket) do
     offset = max(socket.assigns.case_offset + if(direction == "next", do: 25, else: -25), 0)
     {:noreply, assign(socket, case_offset: offset)}
@@ -167,6 +213,15 @@ defmodule EabWeb.DashboardLive do
 
   def handle_async(:discovery, {:ok, {:ok, endpoint}}, socket),
     do: {:noreply, assign(socket, endpoint: endpoint, detecting: false, error: nil)}
+
+  def handle_async(:storage, {:ok, {:ok, storage}}, socket),
+    do: {:noreply, assign(socket, storage: storage, storage_busy: false)}
+
+  def handle_async(:storage, {:ok, {:error, error}}, socket),
+    do: {:noreply, assign(socket, storage_busy: false, error: error)}
+
+  def handle_async(:storage, {:exit, _}, socket),
+    do: {:noreply, assign(socket, storage_busy: false, error: "Storage inspection stopped")}
 
   def handle_async(:cache_remove, {:ok, {:ok, result}}, socket) do
     message =
@@ -220,6 +275,15 @@ defmodule EabWeb.DashboardLive do
       cache_status: Retention.status()
     )
     |> load_log()
+  end
+
+  defp comparison_selection(socket, params) do
+    visible = Enum.map(socket.assigns.history_page.items, & &1["id"])
+    selected = get_in(params, ["comparison", "ids"]) || []
+
+    Enum.uniq(
+      (socket.assigns.comparison_ids -- visible) ++ Enum.filter(selected, &(&1 in visible))
+    )
   end
 
   defp load_log(socket) do
@@ -279,6 +343,7 @@ defmodule EabWeb.DashboardLive do
     if run["status"] == "running" do
       case phase do
         "preparing" -> "Preparing"
+        "prepared" -> "Baseline saved"
         "qualifying" -> "Qualifying baseline"
         "ready" -> "Image ready"
         "warming" -> "Starting workspace"
@@ -680,8 +745,87 @@ defmodule EabWeb.DashboardLive do
       </section>
       <details
         class="case-inventory"
+        id="comparison"
+        open={not is_nil(@comparison) or @comparison_ids != []}
+      >
+        <summary>Compare model runs</summary>
+        <p class="fine-print">
+          Choose runs with the same frozen release and effective settings. Repeated runs stay separate; incomplete runs have no final score. Model identities are server-reported.
+        </p>
+        <p class="fine-print">Selections stay checked when you change history pages.</p>
+        <form id="compare-runs" phx-submit="compare" phx-change="comparison_select">
+          <label
+            :for={run <- @history_page.items}
+            class="run-choice"
+          >
+            <input
+              type="checkbox"
+              name="comparison[ids][]"
+              value={run["id"]}
+              checked={run["id"] in @comparison_ids}
+            />
+            {run["model"]["model"]} · {run["id"]} · {run["status"]}
+          </label>
+          <button class="secondary" type="submit">Compare selected runs</button>
+        </form>
+        <div :if={@comparison}>
+          <table aria-label="Selected model runs">
+            <thead>
+              <tr>
+                <th>Run</th><th>Passed</th><th>Final score</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr :for={run <- @comparison["runs"]}>
+                <td>{run["model"]}<br /><code>{run["id"]}</code></td>
+                <td>{run["score"]["passed"]}/{run["score"]["planned"]}</td>
+                <td>
+                  {if is_number(run["score"]["score_percent"]),
+                    do: "#{run["score"]["score_percent"]}%",
+                    else: "Incomplete / error"}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="comparison-scroll">
+            <table aria-label="Case outcomes across models">
+              <thead>
+                <tr>
+                  <th>Case</th><th :for={run <- @comparison["runs"]}>
+                    {run["model"]}<br /><code>{run["id"]}</code>
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr :for={row <- Enum.slice(@comparison["cases"], @comparison_offset, 25)}>
+                  <td>{row["case"]}</td><td :for={outcome <- row["outcomes"]}>{outcome}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <nav :if={length(@comparison["cases"]) > 25} aria-label="Comparison case pages">
+            <button
+              class="secondary"
+              phx-click="comparison_page"
+              phx-value-direction="previous"
+              disabled={@comparison_offset == 0}
+            >Previous cases</button>
+            <button
+              class="secondary"
+              phx-click="comparison_page"
+              phx-value-direction="next"
+              disabled={@comparison_offset + 25 >= length(@comparison["cases"])}
+            >Next cases</button>
+          </nav>
+        </div>
+      </details>
+      <details
+        class="case-inventory"
         id="cache-controls"
-        open={not is_nil(@cache_preview) or @cache_busy or not is_nil(@cache_message)}
+        open={
+          not is_nil(@cache_preview) or @cache_busy or not is_nil(@cache_message) or @storage_busy or
+            not is_nil(@storage)
+        }
       >
         <summary>Retained preparation</summary>
         <p :if={@cache_status["error"]} class="notice error">{@cache_status["error"]}</p>
@@ -691,9 +835,67 @@ defmodule EabWeb.DashboardLive do
         <p class="fine-print">
           Baselines persist across models. Removing a case's retained state may require preparation on its next run. Shared images and active work are protected. Engine images, package downloads and Docker build cache remain available.
         </p>
+        <button class="secondary" phx-click="storage" disabled={@storage_busy}>Refresh storage usage</button>
+        <p :if={@storage_busy} role="status">Reading Docker and controller storage…</p>
+        <div :if={@storage}>
+          <p>
+            Unique to benchmark-tagged images: {Storage.bytes(@storage["owned_unique_bytes"])}. Docker image storage across all projects: {Storage.bytes(
+              @storage["daemon_image_bytes"]
+            )}.
+          </p>
+          <p class="fine-print">
+            Shared layers are excluded from the unique figure, including layers shared only among benchmark images. Per-image shared sizes must not be added together. These figures are not an estimate of space freed by removal. Snapshot: {@storage[
+              "recorded_at"
+            ]}.
+          </p>
+          <table aria-label="Docker storage totals">
+            <thead>
+              <tr>
+                <th>Docker area (all projects)</th><th>Reported size</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr :for={row <- @storage["docker_totals"]}>
+                <td>{row["Type"]}</td><td>{row["Size"]}</td>
+              </tr>
+            </tbody>
+          </table>
+          <table aria-label="Controller storage">
+            <thead>
+              <tr>
+                <th>Controller area</th><th>Allocated storage</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr :for={{name, bytes} <- Enum.sort(@storage["controller_areas"])}>
+                <td>{name}</td><td>{Storage.bytes(bytes)}</td>
+              </tr>
+            </tbody>
+          </table>
+          <details>
+            <summary>Shared and unique storage per image</summary>
+            <table>
+              <thead>
+                <tr>
+                  <th>Image</th><th>Shared</th><th>Unique</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr :for={image <- @storage["images"]}>
+                  <td><code>{String.slice(image["image"], 0, 19)}</code></td><td>
+                    {Storage.bytes(image["shared"])}
+                  </td><td>{Storage.bytes(image["unique"])}</td>
+                </tr>
+              </tbody>
+            </table>
+          </details>
+        </div>
         <form id="cache-preview" phx-submit="cache_preview">
           <label>Choose cached state<select name="cache[case]">
             <option value="unused">Unreferenced application and database artifacts</option>
+            <option :for={id <- @cache_status["releases"] || []} value={"release:" <> id}>
+              Release {String.slice(id, 0, 12)}
+            </option>
             <option :for={id <- @cache_status["cases"]} value={id}>{id}</option>
           </select></label>
           <button
@@ -707,6 +909,9 @@ defmodule EabWeb.DashboardLive do
             Remove {@cache_preview["case"]}: {length(@cache_preview["images"])} image references eligible; {@cache_preview[
               "shared_records_preserved"
             ]} shared artifact records preserved.
+          </p>
+          <p class="fine-print">
+            Affected cases: {Enum.join(@cache_preview["affected_cases"], ", ")}. Other retained releases keep their shared artifacts.
           </p>
           <button
             class="danger"

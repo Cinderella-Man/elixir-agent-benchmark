@@ -1,6 +1,6 @@
 defmodule Eab.Agent do
   @moduledoc "Pi submission and independent grading, with durable handoff between them."
-  alias Eab.{Checkpoints, Evidence, Grader, Inventory, Model, Pi, Sandbox, Store}
+  alias Eab.{Checkpoints, Evidence, Grader, Inventory, Model, Pi, Sandbox, Store, TaskContract}
 
   def attempt(id, run_id, endpoint, key, settings, control, emit) do
     submission =
@@ -19,11 +19,10 @@ defmodule Eab.Agent do
     prompt = Inventory.file(id, "ticket.md")
 
     instructions = """
-    Repair the ticket in /workspace. Investigate the source, edit it, add a regression test and run the relevant tests.
+    #{TaskContract.instructions(spec)}
     Dependencies are prepared. The workspace is offline. Preserve existing behavior and do not weaken tests.
+    #{if Eab.Browser.enabled?(spec), do: "Chromium and Playwright are preinstalled. Node tests can import process.env.EAB_BROWSER_MODULE. Bind any test web server to loopback and close browsers/servers after each suite.", else: ""}
     Allowed edit prefixes: #{Enum.join(spec["allowed_edit_prefixes"], ", ")}.
-    Test command: #{spec["regression_command"]}.
-    Add or change a *_test.exs test that fails behaviorally on broken source and passes after repair. Compilation/setup failures do not count.
     When finished, give a short summary. Your current patch is then checked in a fresh workspace.
     Model and tool calls are unlimited. Limits: #{settings["max_tokens"]} generated tokens total,
     #{settings["window_tokens"]} context tokens including up to #{settings["response_tokens"]} response tokens.

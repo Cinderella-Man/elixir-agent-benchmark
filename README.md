@@ -24,7 +24,7 @@ The website is available only from the computer running it. The model endpoint c
 
 Pi attempts follow the inventory order, with preparation and grading running alongside them:
 
-1. **Prepare:** The first case is prepared and checked first. Once its attempt starts, two workers prepare up to four upcoming cases. Cached artifacts hold the broken project, its Elixir/OTP version, compiled dependencies and initialized databases. Pi is attached separately. Existing artifacts and valid fixture checks are reused; the model is not used during setup.
+1. **Prepare:** Missing baselines prepare oldest-PR-first within runtime families, independently of frozen Pi order. The first case may need an earlier seed; exact cached baselines skip that ancestry. Once its attempt starts, two workers prepare/check a four-case lookahead window. Cached artifacts hold the broken project, its Elixir/OTP version, compiled dependencies and initialized databases. Pi is attached separately. Existing artifacts and valid fixture checks are reused; the model is not used during setup.
 2. **Repair:** Exactly one Pi attempt runs at a time. Pi is installed in `/opt/pi` and edits the project in `/workspace`, using your model endpoint and the supplied ticket prompt. At most one additional fresh workspace waits for the next attempt, with separate PostgreSQL and ClickHouse containers for Plausible cases.
 3. **Grade:** The application saves Pi's patch and grades it in fresh containers while the next Pi attempt runs. There is one grader and room for one queued submission; if grading falls behind, the next attempt waits. Temporary containers are removed, while results and logs remain in the `benchmark-data` Docker volume.
 
@@ -49,3 +49,5 @@ Each run freezes a checksummed release and experiment identity. Select a case fo
 Under **Retained preparation**, preview removal of one case's cached state or unreferenced artifacts. Shared state and active work are protected; nothing is automatically evicted. Missing builds stop if the data filesystem is below the configured free-space reserve (5 GiB by default). When a run ends, **Download report** saves its summary and per-case results. Data persists in the `benchmark-data` Docker volume.
 
 [Setup, development and troubleshooting](docs/runbook.md) · [Evaluation contract](docs/evaluation.md) · [Inventory](config/benchmark.json) · [Design decisions](docs/design-tree.md) · [SWE-bench research](docs/research/swe-bench.md)
+
+New case drafts use [versioned admission contracts](docs/case-admission.md), with exact upstream reconstruction, recorded independent review and executable qualification before entering the inventory. The website also supports comparable-run matrices and reference-aware release cache removal. Storage snapshots distinguish per-image shared/unique bytes from Docker-wide totals.

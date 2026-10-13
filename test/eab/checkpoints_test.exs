@@ -192,6 +192,7 @@ defmodule Eab.CheckpointsTest do
     assert :ok =
              Eab.Runner.execute(run, "", &send(parent, {:result, &1}),
                check_model: fn _, _ -> :ok end,
+               baseline: fn _, _, _, _ -> :ok end,
                prepare: fn _, id, _, _ ->
                  send(parent, {:prepare, id})
                  %{}

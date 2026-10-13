@@ -213,4 +213,52 @@ defmodule EabWeb.DashboardTest do
     assert has_element?(view, "#case-synthetic-26")
     refute has_element?(view, "#case-synthetic-1")
   end
+
+  test "comparison keeps choices across history pages and paginates case outcomes" do
+    cases = for n <- 1..26, do: "synthetic-#{n}"
+    ids = for n <- 1..21, do: "comparison-ui-#{n}"
+    on_exit(fn -> Enum.each(ids, &File.rm_rf!(Eab.Store.path("runs/#{&1}"))) end)
+
+    for {id, n} <- Enum.with_index(ids, 1) do
+      Eab.Store.write("runs/#{id}/run.json", %{
+        "id" => id,
+        "created_at" => "9999-01-#{String.pad_leading(to_string(n), 2, "0")}T00:00:00Z",
+        "status" => "completed",
+        "cases" => cases,
+        "attempts" =>
+          Map.new(cases, &{&1, %{"status" => "completed", "grade" => %{"passed" => n == 21}}}),
+        "settings" => %{"max_tokens" => 65536},
+        "release_id" => String.duplicate("a", 64),
+        "experiment_id" => String.duplicate("b", 64),
+        "model" => %{"model" => "Synthetic #{n}"}
+      })
+    end
+
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> form("#compare-runs", comparison: %{ids: ["comparison-ui-21"]}) |> render_change()
+
+    view
+    |> element("button[phx-click='history_page'][phx-value-direction='next']")
+    |> render_click()
+
+    view |> form("#compare-runs", comparison: %{ids: ["comparison-ui-1"]}) |> render_change()
+    view |> form("#compare-runs", comparison: %{ids: ["comparison-ui-1"]}) |> render_submit()
+    assert has_element?(view, "table[aria-label='Selected model runs']", "Synthetic 21")
+    assert has_element?(view, "table[aria-label='Selected model runs']", "Synthetic 1")
+    assert has_element?(view, "table[aria-label='Case outcomes across models']", "Passed")
+    assert has_element?(view, "table[aria-label='Case outcomes across models']", "Failed")
+    refute has_element?(view, "table[aria-label='Case outcomes across models']", "synthetic-26")
+
+    view
+    |> element("button[phx-click='comparison_page'][phx-value-direction='next']")
+    |> render_click()
+
+    assert has_element?(view, "table[aria-label='Case outcomes across models']", "synthetic-26")
+
+    view
+    |> element("button[phx-click='history_page'][phx-value-direction='previous']")
+    |> render_click()
+
+    assert has_element?(view, "input[value='comparison-ui-21'][checked]")
+  end
 end

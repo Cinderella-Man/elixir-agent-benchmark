@@ -1,6 +1,7 @@
 defmodule Eab.Fixtures do
   alias Eab.{
     Baseline,
+    Browser,
     BuildCache,
     Cache,
     Command,
@@ -13,6 +14,55 @@ defmodule Eab.Fixtures do
 
   def ensure(id, emit, opts \\ []) do
     Eab.Retention.with_use(fn -> do_ensure(id, emit, opts) end)
+  end
+
+  # Planning can skip all ancestry for exact, physically present baselines.
+  # ensure/3 still validates each component before use. No build or bootstrap
+  # occurs during this probe, and a partial/missing record goes down the cold path.
+  def cached?(id, opts \\ []) do
+    exists? = Keyword.get(opts, :image_exists?, &image_exists?/1)
+
+    case cached_images(id) do
+      {:ok, images} -> Enum.all?(images, exists?)
+      _ -> false
+    end
+  end
+
+  def cached_cases(ids) do
+    candidates = for id <- ids, {:ok, images} <- [cached_images(id)], do: {id, images}
+    present = Eab.ImagePresence.existing(Enum.flat_map(candidates, &elem(&1, 1)))
+
+    for {id, images} <- candidates,
+        Enum.all?(images, &MapSet.member?(present, &1)),
+        into: MapSet.new(),
+        do: id
+  end
+
+  defp cached_images(id) do
+    spec = Inventory.spec(id)
+    inputs = build_inputs(id, spec)
+    engines = %{"services" => spec["services"] || %{}}
+    opts = [image_exists?: fn _ -> true end]
+
+    with {:ok, project} <- Cache.lookup("projects", Cache.key(inputs), opts),
+         {:ok, engines} <- Cache.lookup("engines", Cache.key(engines), opts) do
+      policy = Baseline.policy(spec)
+
+      if policy["mode"] == "fresh" or map_size(engines["services"]) == 0 do
+        {:ok, Enum.uniq(project["images"] ++ engines["images"])}
+      else
+        baseline_inputs =
+          Baseline.inputs(Map.put(project, "services", engines["services"]), policy)
+
+        with {:ok, database} <- Cache.lookup("databases", Cache.key(baseline_inputs), opts) do
+          {:ok, Enum.uniq(project["images"] ++ engines["images"] ++ database["images"])}
+        end
+      end
+    else
+      _ -> :missing
+    end
+  rescue
+    Jason.DecodeError -> :missing
   end
 
   defp do_ensure(id, emit, opts) do
@@ -76,6 +126,7 @@ defmodule Eab.Fixtures do
     File.mkdir_p!(source)
 
     File.cp!(BuildCache.script(), Path.join(dest, "build_seed.exs"))
+    Browser.copy_bundle(spec, dest)
 
     repo = spec["repository"]
 
@@ -195,6 +246,7 @@ defmodule Eab.Fixtures do
 
     lines =
       if(node, do: ["FROM #{node} AS nodejs"], else: []) ++
+        Browser.stages(spec) ++
         [
           "FROM #{base} AS toolchain",
           "USER root",
@@ -215,6 +267,7 @@ defmodule Eab.Fixtures do
 
     lines =
       lines ++
+        Browser.install(spec) ++
         [
           "WORKDIR /workspace",
           "RUN mkdir -p /opt/mix /opt/hex /opt/eab-seed && chown agent:agent /workspace /opt/mix /opt/hex /opt/eab-seed",

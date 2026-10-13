@@ -65,6 +65,32 @@ defmodule Eab.RetentionTest do
     end
   end
 
+  test "removing one release detaches its ownership but preserves another release's exact baseline" do
+    first = String.duplicate("a", 64)
+    second = String.duplicate("b", 64)
+    cache("projects", %{"source" => "same"}, %{"image" => "shared", "images" => ["shared"]})
+    runtime = %{"image" => "shared"}
+    Retention.retain("case", runtime, first)
+    Retention.retain("case", runtime, second)
+    Retention.retain("case", runtime)
+    Eab.Store.write("runtimes/case.json", runtime)
+    plan = Retention.preview("release:" <> first)
+    assert plan["images"] == []
+    assert plan["affected_cases"] == ["case"]
+
+    Retention.remove("release:" <> first, plan["id"],
+      remove_image: fn _ -> flunk("shared release image") end
+    )
+
+    assert Retention.status()["releases"] == [second]
+    assert Eab.Store.read("runtimes/case.json") == runtime
+    plan = Retention.preview("release:" <> second)
+    assert plan["images"] == ["shared"]
+    Retention.remove("release:" <> second, plan["id"], remove_image: fn _ -> :ok end)
+    assert Retention.status()["baselines"] == 0
+    assert Eab.Store.read("runtimes/case.json") == nil
+  end
+
   test "retained descendants protect their database seed and eviction failures stay visible" do
     cache("databases", %{"migrations" => 1}, %{"images" => ["base"], "depth" => 1})
 
