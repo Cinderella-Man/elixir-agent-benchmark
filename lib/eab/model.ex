@@ -1,0 +1,287 @@
+defmodule Eab.Model do
+  @moduledoc "Discovery and native request/accounting adapters for llama.cpp and stock Strata."
+  def discover(url, key \\ "") do
+    url = normalize_url!(url)
+    health = http(url, key, :get, "/health")
+    models = http(url, key, :get, "/v1/models")
+    props = http(url, key, :get, "/props")
+
+    backend =
+      if health["service"] == "strata" or
+           String.contains?(String.downcase(to_string(props["build_info"])), "strata"),
+         do: "strata",
+         else: "llama_cpp"
+
+    alias_name = props["model_alias"]
+
+    unless is_binary(alias_name) and Enum.any?(models["data"] || [], &(&1["id"] == alias_name)),
+      do: raise("Endpoint has no unambiguous active model")
+
+    if health["loaded"] == false or health["status"] in ["loading", "error"],
+      do: raise("Model is not ready")
+
+    capacity = get_in(props, ["default_generation_settings", "n_ctx"]) || health["context_length"]
+
+    unless is_integer(capacity) and capacity > 16,
+      do: raise("Endpoint must report its active context capacity")
+
+    profile =
+      Map.take(props, [
+        "model_alias",
+        "model_path",
+        "model_ftype",
+        "build_info",
+        "default_generation_settings",
+        "chat_template",
+        "chat_template_caps",
+        "total_slots"
+      ])
+
+    row = Enum.find(models["data"], &(&1["id"] == alias_name))
+
+    %{
+      "url" => url,
+      "backend" => backend,
+      "model" => alias_name,
+      "context" => capacity,
+      "profile" => profile,
+      "metadata" => %{"model" => row, "props" => props},
+      "identity_note" =>
+        "Server-reported identity; artifact checksum and provenance are unverified."
+    }
+    |> Eab.Store.scrub(key)
+  end
+
+  def settings(endpoint, input \\ %{}) do
+    defaults = Eab.Inventory.read_json(Eab.Inventory.path("config/benchmark.json"))["defaults"]
+
+    window =
+      integer(
+        input,
+        "window_tokens",
+        min(endpoint["context"], defaults["context_cap_tokens"]),
+        32,
+        endpoint["context"]
+      )
+
+    response =
+      integer(
+        input,
+        "response_tokens",
+        min(defaults["response_tokens"], window - 9),
+        1,
+        window - 9
+      )
+
+    %{
+      "window_tokens" => window,
+      "response_tokens" => response,
+      "safety_tokens" => 8,
+      "max_calls" => integer(input, "max_calls", defaults["max_calls"], 1, 10_000),
+      "max_tokens" => integer(input, "max_tokens", defaults["max_tokens"], 1, 10_000_000),
+      "seed" => integer(input, "seed", defaults["seed"], 0, 2_147_483_647),
+      "compaction" => false
+    }
+  end
+
+  def count(endpoint, key, payload) do
+    route =
+      if endpoint["backend"] == "strata",
+        do: "/v1/messages/count_tokens",
+        else: "/v1/chat/completions/input_tokens"
+
+    count = http(endpoint["url"], key, :post, route, payload)["input_tokens"]
+
+    unless is_integer(count) and count > 0,
+      do: raise("Endpoint did not return an exact prompt count")
+
+    count
+  end
+
+  def stream(endpoint, key, payload) do
+    route = if endpoint["backend"] == "strata", do: "/v1/messages", else: "/v1/chat/completions"
+    http(endpoint["url"], key, :post, route, payload, 1_200_000, :stream)
+  end
+
+  # Parse the server's actual usage, independently of Pi's display estimates.
+  def stream_usage(endpoint, body, expected_input, allowance) do
+    events =
+      body
+      |> String.split(~r/\r?\n\r?\n/)
+      |> Enum.flat_map(fn block ->
+        data =
+          for "data:" <> line <- String.split(block, ~r/\r?\n/), do: String.trim_leading(line)
+
+        case Enum.join(data, "\n") do
+          value when value in ["", "[DONE]"] -> []
+          value -> [Jason.decode!(value)]
+        end
+      end)
+
+    if Enum.any?(events, &(Map.has_key?(&1, "error") or &1["type"] == "error")),
+      do: raise("Model stream reported an error")
+
+    {usage, complete} =
+      if endpoint["backend"] == "strata" do
+        usage =
+          Enum.reduce(events, %{}, fn event, acc ->
+            Map.merge(acc, get_in(event, ["message", "usage"]) || event["usage"] || %{})
+          end)
+
+        {usage, Enum.any?(events, &(&1["type"] == "message_stop"))}
+      else
+        usage =
+          Enum.reduce(events, %{}, fn event, acc -> Map.merge(acc, event["usage"] || %{}) end)
+
+        {usage,
+         String.contains?(body, "data: [DONE]") and
+           Enum.any?(events, fn event ->
+             Enum.any?(event["choices"] || [], &is_binary(&1["finish_reason"]))
+           end)}
+      end
+
+    {input, output} =
+      if endpoint["backend"] == "strata",
+        do:
+          {add_usage(usage["input_tokens"], usage["cache_read_input_tokens"] || 0),
+           usage["output_tokens"]},
+        else: {usage["prompt_tokens"], usage["completion_tokens"]}
+
+    unless complete, do: raise("Model stream ended without a completion marker")
+    unless input == expected_input, do: raise("Prompt count differs from generation accounting")
+
+    unless is_integer(output) and output >= 0 and output <= allowance,
+      do: raise("Missing or out-of-budget output accounting")
+
+    reasoning = get_in(usage, ["completion_tokens_details", "reasoning_tokens"]) || 0
+
+    unless is_integer(reasoning) and reasoning >= 0 and reasoning <= output,
+      do: raise("Invalid reasoning-token accounting")
+
+    %{"input_tokens" => input, "output_tokens" => output}
+  end
+
+  def unchanged!(endpoint, key) do
+    current = discover(endpoint["url"], key)
+
+    unless current["profile"] == endpoint["profile"] and current["backend"] == endpoint["backend"],
+      do: raise("Serving model or configuration changed during this run")
+
+    :ok
+  end
+
+  def normalize_url!(url) do
+    uri = URI.parse(String.trim(url))
+
+    unless uri.scheme in ["http", "https"] and is_binary(uri.host) and uri.userinfo == nil and
+             uri.query == nil and uri.fragment == nil,
+           do:
+             raise(
+               ArgumentError,
+               "Enter an HTTP endpoint without embedded credentials, query or fragment"
+             )
+
+    url = URI.to_string(%{uri | path: String.trim_trailing(uri.path || "", "/")})
+    String.replace_suffix(url, "/v1", "")
+  end
+
+  def http(url, key, method, route, payload \\ nil, timeout \\ 30_000, format \\ :json) do
+    headers =
+      [{"anthropic-version", "2023-06-01"}] ++
+        if(key == "", do: [], else: [{"authorization", "Bearer " <> key}, {"x-api-key", key}])
+
+    opts = [
+      method: method,
+      url: url <> route,
+      headers: headers,
+      retry: false,
+      redirect: false,
+      receive_timeout: timeout,
+      connect_options: [timeout: 10_000],
+      decode_body: format != :stream
+    ]
+
+    opts = if payload, do: Keyword.put(opts, :json, payload), else: opts
+    request = Application.get_env(:eab, :http_request, &Req.request/1)
+    activity = Eab.Activity.context()
+    stream = make_ref()
+
+    into = fn {:data, data}, {req, response} ->
+      if response.status in 200..299 do
+        Eab.Activity.inherit(activity, fn -> Eab.Activity.model_chunk(stream, data) end)
+      end
+
+      chunks = [data | Map.get(response.private, :eab_chunks, [])]
+      {:cont, {req, %{response | private: Map.put(response.private, :eab_chunks, chunks)}}}
+    end
+
+    opts = if format == :stream, do: Keyword.put(opts, :into, into), else: opts
+
+    result =
+      try do
+        request.(opts)
+      after
+        Eab.Activity.model_end(stream)
+      end
+
+    result =
+      case result do
+        {:ok, %{private: %{eab_chunks: chunks}} = response} ->
+          {:ok, %{response | body: chunks |> Enum.reverse() |> IO.iodata_to_binary()}}
+
+        other ->
+          other
+      end
+
+    case result do
+      {:ok, %{status: code, body: body}}
+      when code in 200..299 and (is_map(body) or (is_binary(body) and format == :stream)) ->
+        body
+
+      {:ok, %{status: 401}} when key == "" ->
+        raise "Endpoint #{route} requires an API key (HTTP 401). Enter the server's API key under Server credentials and reconnect."
+
+      {:ok, %{status: 401}} ->
+        raise "Endpoint #{route} rejected the API key (HTTP 401). Check Server credentials and reconnect."
+
+      {:ok, %{status: code}} when code in 200..299 ->
+        expected = if format == :stream, do: "an event stream", else: "a JSON object"
+
+        raise "Endpoint #{route} returned HTTP #{code} with an unexpected response format; expected #{expected}"
+
+      {:ok, %{status: code}} ->
+        raise "Endpoint #{route} returned HTTP #{code}"
+
+      {:error, _} ->
+        raise "Cannot reach endpoint #{route}; check its address, readiness and credentials"
+    end
+  end
+
+  defp integer(input, key, default, min, max) do
+    value =
+      case input[key] do
+        nil ->
+          default
+
+        "" ->
+          default
+
+        v when is_integer(v) ->
+          v
+
+        v ->
+          case Integer.parse(v) do
+            {n, ""} -> n
+            _ -> nil
+          end
+      end
+
+    unless is_integer(value) and value >= min and value <= max,
+      do: raise(ArgumentError, "#{key} must be between #{min} and #{max}")
+
+    value
+  end
+
+  defp add_usage(a, b) when is_integer(a) and is_integer(b), do: a + b
+  defp add_usage(_, _), do: nil
+end

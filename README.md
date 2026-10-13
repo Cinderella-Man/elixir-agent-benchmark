@@ -1,42 +1,43 @@
-# Elixir agent benchmark
+# Elixir Agent Benchmark
 
-Compare local coding models and quantizations by having them diagnose and repair Elixir projects. Each agent gets a bug report, a full repository, terminal tools and tests in an isolated, offline Docker environment.
+A local Elixir website that evaluates one served coding model against **twelve historical PR repairs**: six Plausible and six Livebook cases. Enter a llama.cpp or Strata endpoint, inspect the automatically discovered model, and click **Run benchmark**.
 
-**One benchmark, 16 cases:** six real Plausible PRs, six real Livebook PRs, and four authored regressions in NimbleOptions, GenStage and LiveBeats. Every case runs by default. Repairs are scored by executable acceptance and regression checks, including useful regression tests where coverage is missing. **No AI judge or subjective code-quality score.**
+The application prepares Docker images, checks the fixtures, runs the [Pi coding agent](https://github.com/earendil-works/pi) in isolated Docker workspaces, and grades its repairs with executable tests. There is no AI judge or speed score.
 
-## Run
+## Start
 
-Use a dedicated **Linux x86-64** machine with **Python 3.12+, Git and Docker**, Docker access for your user, and disk space for the application images and dependencies. Preparation needs internet access; agent containers have none. Elixir, PostgreSQL and ClickHouse run in containers.
+Use Linux x86-64 with **Docker Engine and Docker Compose**. Elixir/OTP, Pi, its Node runtime, Git, build tools, PostgreSQL and ClickHouse are provided by containers. Serve the model separately; the application does not download, start or switch models.
 
-Serve your models separately. The current adapters support **llama.cpp with `/v1/chat/completions/input_tokens`**, plus the reviewed Strata adapter described in the [runbook](docs/runbook.md#model-endpoints). An arbitrary OpenAI-compatible endpoint is insufficient. Every server must support native tool calls and at least **262,144 context tokens**. This repository does not download or start models.
+From this checkout:
 
-```bash
-git clone https://github.com/Cinderella-Man/elixir-agent-benchmark.git
-cd elixir-agent-benchmark
-
-# Edit config/candidates.json: one entry per model + quantization you serve.
-# Set the endpoint URL, served model alias, reasoning setting and artifact pins.
-# For llama.cpp use token_counter: "llama_cpp"; pin your own expected_build.
-# If authentication is required, put the key in .local/api-key (chmod 600),
-# or set api_key_env on each candidate to an environment-variable name.
-
-python3 scripts/benchmark.py init
-python3 scripts/check_endpoints.py
-python3 scripts/qualify_suite.py --prepare
-python3 scripts/run_suite.py --campaign comparison-001
-python3 scripts/report.py --campaign comparison-001
+```sh
+docker compose up --build -d
 ```
 
-`init` records the execution host and existing GPU power limits. Endpoint checks make two small, unscored requests per model. `qualify_suite` builds all 16 fixtures and verifies that broken code fails, reference repairs pass, and invalid repairs are rejected. Reuse prepared images on later runs; rerun qualification after changing the evaluator or cases.
+Open [http://localhost:4000](http://localhost:4000). Enter the server root, for example `http://localhost:8080`, and an optional API key. Model details load automatically. Click **Run benchmark**; first preparation downloads project dependencies and fixture images. The website shows each stage, case results and downloadable evidence.
 
-The campaign runs **all configured candidates × all 16 cases**, using seed 101. For repeated attempts, add `--seeds 101 202 303`. Each run needs a new campaign name; existing attempts are never overwritten. `--candidates <id> ...` selects models; `--cases <id> ...` is for diagnostics and receives no full-benchmark score.
+Execution starts only when you click **Run benchmark**. Connecting to an endpoint reads model metadata without generating output.
 
-## Budgets and results
+The website is available only from the computer running it. The model endpoint can be on that computer or another reachable machine. If the server requires an API key, enter it under **Server credentials**.
 
-All candidates get **262,144 context tokens**, **8,192 tokens per response**, **65,536 generated tokens per attempt** and **32 model calls**. Reasoning and tool-call syntax count toward generation. History is retained without compaction. The runner counts each complete prompt, reserves response space plus eight safety tokens, and grades the current patch when a budget is exhausted. `--max-calls` and `--max-tokens` change the attempt budgets; the context policy lives in [config/benchmark.json](config/benchmark.json).
+## How it runs
 
-Open **`results/reports/benchmark-results.md`** for the comparison and per-project breakdown. Scores are **passed attempts / planned attempts × 100**, with equal case weight and all declared seeds included. Missing attempts and infrastructure/API errors remain visible and block a final score. Model/quantization identities, server profiles, fixtures and budgets are frozen for each campaign.
+For each PR, in order:
 
-Transcripts, patches and raw checks stay in `.local/results/<campaign>/`; the report command exports evidence to `results/<campaign>/`. Both directories are ignored by Git. Historical PRs and solutions are public, so prior training exposure is possible. A 256k allowance does not mean every case consumes or validates all 256k tokens.
+1. **Prepare:** Docker builds each problem's image with the broken project, its Elixir/OTP version, dependencies, Node and Pi. Existing images are reused. The application checks the reference repair and tests before starting Pi; the model is not used during this setup.
+2. **Repair:** Each problem gets a fresh container. Pi is installed in `/opt/pi` and edits the project in `/workspace`, using your model endpoint and the supplied ticket prompt. The source is copied into the image. Plausible cases also get separate PostgreSQL and ClickHouse containers.
+3. **Grade:** The application saves Pi's patch, tests it in fresh containers, records the result and removes the temporary containers. Results and logs remain in the `benchmark-data` Docker volume.
 
-[Detailed setup and troubleshooting](docs/runbook.md) · [Scoring protocol](docs/comparison-protocol.md) · [Case inventory](config/benchmark.json)
+Pi and the project run on the benchmark's Docker host. The model server can run elsewhere. Click a case in **Follow the run** to see its current command, live output and Pi activity.
+
+## Run settings and results
+
+Defaults: all twelve cases, seed 101, 32 model calls per case, up to 8,192 tokens per response and 65,536 generated tokens per case. Context is detected automatically and capped at 262,144 tokens. Advanced settings allow explicit overrides within the server's capacity. History is retained without compaction; exhausted budgets submit the current patch for grading.
+
+One run is active at a time. Closing the browser does not stop it. **Stop run** cancels execution and cleans up this installation's containers. An application restart records active work as interrupted; start a fresh run rather than resuming it. Existing results are never overwritten.
+
+All cases have equal weight. A final score requires a completed pass/fail outcome for every case; errors, cancellations and interrupted work remain visible and prevent a final score. The model's reported identity, effective budgets, requests, responses, patches and controls accompany each run. Missing identity metadata stays explicitly unverified; manual artifact pins are not required.
+
+When a run ends, **Download report** saves its summary and per-case results. Data persists in the `benchmark-data` Docker volume.
+
+[Setup, development and troubleshooting](docs/runbook.md) · [Evaluation contract](docs/evaluation.md) · [Inventory](config/benchmark.json) · [Design decisions](docs/design-tree.md)

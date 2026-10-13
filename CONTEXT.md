@@ -1,76 +1,33 @@
-# Elixir agent benchmark
-
-Language for comparing coding models through realistic work in Elixir projects.
+# Elixir Agent Benchmark
 
 ## Language
 
-**Source task**:
-A published task from the source collection that may inform a benchmark scenario. Its suitability as independent evaluation evidence is not assumed.
+**Case**: A defined repair task with an exact broken project revision, a symptom-focused ticket and executable acceptance criteria. Every case comes from an actual upstream PR.
 
-**Task family**:
-Related source tasks or scenarios that share an underlying problem, template or solution structure. Variants from one family are not automatically independent evidence.
+**Reference repair**: An accepted solution used to qualify a case's checks. Submissions may use another implementation that satisfies the same behavior.
 
-**Benchmark scenario**:
-A defined piece of agent work with an initial project state, a user request and acceptance criteria.
-_Avoid_: Prompt, unit test when referring to the whole scenario.
+**Model profile**: The served model, quantization, context capacity and serving configuration reported by an endpoint. Missing metadata remains unknown; aliases do not establish exact artifact identity.
 
-**Repository baseline**:
-The particular project state from which a set of scenarios is constructed. Calling it a healthy baseline means its declared correctness checks have passed.
+**Run**: An evaluation of one model profile across the entire twelve-case inventory, using frozen inputs, budgets and one declared seed.
 
-**Historical repair**:
-A scenario drawn from an actual upstream defect and its accepted repair, preserving the original broken project state and the repair's provenance.
-_Avoid_: Seeded regression when no defect was introduced by the benchmark author.
+**Attempt**: One agent's investigation, edits, tool calls and submission for a case. Each run contains one attempt per case.
 
-**Reference repair**:
-A known solution used to qualify a scenario's acceptance checks. Other implementations can satisfy the same behavioral contract.
+**Workspace**: A fresh offline Docker environment containing broken project source and prepared dependencies. It excludes reference repairs, grader-only checks, upstream Git history and controller credentials.
 
-**Seeded regression**:
-A behavior-breaking change intentionally introduced into a previously correct project state for a repair scenario. It is authored evaluation material, not evidence of a historical upstream defect.
-_Avoid_: Upstream bug when referring to a defect introduced by the benchmark author.
+**Context budget**: The maximum combined input and response space for one model interaction, including a small safety allowance.
 
-**Authoring repository**:
-The project history used to construct and maintain scenario starting states and reference repairs.
+**Generation budget**: The cumulative tokens generated during an attempt, including reasoning and tool syntax.
 
-**Attempt workspace**:
-The project state made available to an agent for one attempt. Its accessible material is part of the scenario contract and can differ from the authoring repository.
+**Agent**: The pinned Pi coding agent running inside a case workspace. Pi owns the model conversation and built-in tools; Elixir launches it and grades its changes.
 
-**Attempt**:
-One independent agent run on a scenario, including its investigation, edits, tool calls and self-corrections.
-_Avoid_: Test when referring to an entire agent run.
+**Model transport**: The restricted connection between an agent and the configured model, enforcing budgets and accounting while keeping endpoint credentials outside the workspace.
 
-**Attempt context budget**:
-The limit on the combined input and response space available to a candidate in one interaction during an attempt. It is distinct from the allowance for generation across the whole attempt.
+**Grader**: The independent executable checks applied to a submission in fresh workspaces.
 
-**Attempt generation budget**:
-The cumulative allowance for tokens generated across an attempt's interactions, under the declared accounting rules.
+**Grader-only check**: An acceptance check withheld from the attempt workspace. Its source is public in this repository.
 
-**Candidate**:
-The particular model, quantization and serving configuration being evaluated. A changed quantization or behavior-changing runtime configuration is a different candidate. Candidate identity includes pinned model artifacts; endpoint aliases alone do not identify a model.
+**Fixture qualification**: Controls proving that the current environment and grader reject the broken state, plausible incomplete repairs and integrity bypasses, while accepting the reference repair.
 
-**Benchmark inventory**:
-The versioned list of admitted scenarios executed by default in one benchmark. Repository and domain breakdowns describe parts of this inventory, not separately selected benchmarks.
+**Case outcome**: A completed pass or fail from the grader. Infrastructure and accounting errors remain errors.
 
-**Campaign**:
-A frozen matrix of candidates, scenarios and seeds under one declared agent and grading protocol. A focused subset is a diagnostic campaign and does not receive a full-benchmark score.
-
-**Case score**:
-The mean of binary executable outcomes across the declared seeds for one scenario. A complete benchmark score gives each scenario equal weight. Missing, unqualified and errored attempts block a final score rather than disappearing from the denominator.
-
-**Agent scaffold**:
-The interaction rules and tools through which a candidate performs a scenario.
-
-**Verifier**:
-The independent checks that determine whether a submitted project state satisfies a scenario's acceptance criteria.
-
-**Fixture qualification**:
-Recorded controls establishing that a particular environment and evaluator reject the broken state and plausible incomplete repairs, accept the reference repair, and reject integrity bypasses. It establishes executable case behavior, not model ability.
-
-**Campaign qualification**:
-The additional validation of the chosen candidates, shared agent contract, context and generation limits, and task feasibility needed before a comparative model campaign.
-
-**Grader-only check**:
-An acceptance check withheld from the agent during an attempt and made available to the verifier. Its source may still be publicly available outside the attempt.
-_Avoid_: Private test when its source is published.
-
-**Quality evidence**:
-Recorded outcomes that show how reliably a candidate completes defined work, with the scenario, agent setup and assessment method identified.
+**Score**: The percentage of cases passed, with equal case weight. A final score requires a valid outcome for all twelve cases; missing, errored, cancelled and interrupted attempts prevent a final score.

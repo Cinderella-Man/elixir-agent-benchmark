@@ -1,0 +1,140 @@
+defmodule EabWeb.DashboardTest do
+  use ExUnit.Case, async: false
+  import Phoenix.ConnTest
+  import Phoenix.LiveViewTest
+  @endpoint EabWeb.Endpoint
+  test "clicking a case opens its command output and follows newly written output" do
+    id = "live-log-test"
+    case_id = "plausible-pr-6300"
+
+    Eab.Store.write("runs/#{id}/run.json", %{
+      "id" => id,
+      "created_at" => "9999-01-01T00:00:00Z",
+      "status" => "running",
+      "phase" => "qualifying",
+      "message" => "Checking tests",
+      "current_case" => case_id,
+      "cases" => [case_id],
+      "attempts" => %{},
+      "settings" => %{},
+      "model" => %{"model" => "synthetic"}
+    })
+
+    Eab.Store.write_text("runs/#{id}/#{case_id}/activity.log", "$ mix test\nCompiling project\n")
+    on_exit(fn -> File.rm_rf!(Eab.Store.path("runs/#{id}")) end)
+    {:ok, view, _} = live(build_conn(), "/")
+    assert has_element?(view, "#case-#{case_id}")
+    view |> element("#case-#{case_id}") |> render_click()
+    assert has_element?(view, "#case-log", "Compiling project")
+    assert has_element?(view, "#case-log", "$ mix test")
+
+    Eab.Store.write_text(
+      "runs/#{id}/#{case_id}/activity.log",
+      "$ mix test\nCompiling project\nTests finished\n"
+    )
+
+    send(view.pid, :poll_log)
+    assert render(view) =~ "Tests finished"
+
+    assert has_element?(
+             view,
+             "#case-log-download[href='/artifacts/#{id}/#{case_id}/activity.log']"
+           )
+  end
+
+  test "local setup page shows twelve PR cases and waits for a model connection" do
+    {:ok, view, html} = live(build_conn(), "/")
+    assert html =~ "Put your model"
+    assert has_element?(view, "#run[disabled]")
+    assert html =~ "plausible-pr-6300"
+    assert length(Eab.Inventory.all()) == 12
+  end
+
+  test "a connected model enables Run without host configuration" do
+    Application.put_env(:eab, :http_request, fn opts ->
+      body =
+        case URI.parse(opts[:url]).path do
+          "/health" ->
+            %{"status" => "ok"}
+
+          "/v1/models" ->
+            %{"data" => [%{"id" => "test-model"}]}
+
+          "/props" ->
+            %{"model_alias" => "test-model", "default_generation_settings" => %{"n_ctx" => 32768}}
+        end
+
+      {:ok, %{status: 200, body: body}}
+    end)
+
+    on_exit(fn -> Application.delete_env(:eab, :http_request) end)
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> form("#connection", connection: %{url: "http://fixture", key: ""}) |> render_change()
+    assert render_async(view) =~ "test-model"
+    assert has_element?(view, "#run:not([disabled])")
+  end
+
+  test "clearing an endpoint cancels pending discovery and cannot restore its stale model" do
+    parent = self()
+
+    Application.put_env(:eab, :http_request, fn _ ->
+      send(parent, {:discovering, self()})
+
+      receive do
+        :release -> {:error, :unavailable}
+      end
+    end)
+
+    on_exit(fn -> Application.delete_env(:eab, :http_request) end)
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> form("#connection", connection: %{url: "http://fixture", key: ""}) |> render_change()
+    assert_receive {:discovering, pid}
+    ref = Process.monitor(pid)
+    view |> form("#connection", connection: %{url: "", key: ""}) |> render_change()
+    assert_receive {:DOWN, ^ref, :process, ^pid, _}
+    html = render_async(view)
+    refute html =~ "Reading model details"
+    refute html =~ "Model discovery stopped"
+    assert has_element?(view, "#run[disabled]")
+  end
+
+  test "entering server credentials recovers from Strata's authentication error" do
+    Application.put_env(:eab, :http_request, fn opts ->
+      if URI.parse(opts[:url]).path == "/health" or
+           {"authorization", "Bearer synthetic-key"} in opts[:headers] do
+        body =
+          case URI.parse(opts[:url]).path do
+            "/health" ->
+              %{"status" => "ok", "service" => "strata", "loaded" => true}
+
+            "/v1/models" ->
+              %{"data" => [%{"id" => "test-model"}]}
+
+            "/props" ->
+              %{
+                "model_alias" => "test-model",
+                "default_generation_settings" => %{"n_ctx" => 32768}
+              }
+          end
+
+        {:ok, %{status: 200, body: body}}
+      else
+        {:ok, %{status: 401, body: %{"error" => %{"message" => "missing or wrong API key"}}}}
+      end
+    end)
+
+    on_exit(fn -> Application.delete_env(:eab, :http_request) end)
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> form("#connection", connection: %{url: "http://fixture", key: ""}) |> render_change()
+    assert render_async(view) =~ "requires an API key (HTTP 401)"
+    assert has_element?(view, "#run[disabled]")
+
+    view
+    |> form("#connection", connection: %{url: "http://fixture", key: "synthetic-key"})
+    |> render_change()
+
+    assert render_async(view) =~ "CONNECTED · STRATA"
+    refute has_element?(view, "[role=alert]")
+    assert has_element?(view, "#run:not([disabled])")
+  end
+end

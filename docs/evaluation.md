@@ -1,0 +1,15 @@
+# Evaluation contract
+
+A benchmark run evaluates the single model currently served by one endpoint. It freezes the twelve-case inventory, controller and fixture hashes, reported model profile, seed and budgets.
+
+Each case begins in a fresh offline workspace at the actual historical broken revision. The agent receives the ticket, broken source and prepared dependencies. Reference repairs, grader-only checks and upstream Git history remain outside its workspace. Preparation and verification are performed in separate Docker containers.
+
+The pinned Pi agent receives the ticket and fixed task clarification details upfront. It uses its standard read, bash, edit and write tools and finishes with a summary. Its current patch is the submission. The controller forwards Pi's native messages, including tool results and reasoning history. No generated setup answer is required before a problem starts. Prompt counts include the complete rendered request, and the response allowance plus eight safety tokens must fit in the selected context. Generation accounting includes reasoning and tool syntax. There is no compaction or best-of selection. A budget limit grades the current patch; infrastructure and accounting errors block a final score.
+
+Qualification requires the broken state to fail behaviorally, the reference repair to pass, an early-exit bypass to fail, and a declared incomplete repair to fail behaviorally. Qualification receipts are tied to current grading code, runtime and fixture identities. Source-only inspection cannot establish fixture qualification.
+
+Grading checks the submitted tests, restores original tests before grader overlays, and restores them again before protected regressions. It rejects missing, changed, skipped or incomplete protected checks, except for the manifest's declared edition exclusions. Required regression tests must fail in a test body on broken source and pass on the repaired submission; compilation and setup failures do not count. Reference patch similarity is not scored.
+
+Every case has equal weight. The default contains one attempt per case at seed 101. Only a fully completed run with valid pass/fail outcomes for all twelve cases receives a final score. Missing, errored, cancelled and interrupted attempts remain in the planned denominator and prevent a final score. Changing advanced settings creates a separately recorded run, not evidence of improvement under the same settings.
+
+The website retains each run's model metadata, settings, exchanges, transcript, patch and controls. Identity is explicitly server-reported when exact artifact provenance is unavailable. Cases and solutions are public; prior model exposure is possible. No AI judge, subjective code-quality grade or throughput/latency score is used.
