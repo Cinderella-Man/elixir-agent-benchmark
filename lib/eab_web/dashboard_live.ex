@@ -620,6 +620,20 @@ defmodule EabWeb.DashboardLive do
               </p>
               <section id="case-verdict" aria-label="Case result explanation" tabindex="-1">
                 <h4>{Evidence.verdict(@case_attempt)}</h4>
+                <p
+                  :if={
+                    @case_attempt && @case_attempt["status"] in ["completed", "error"] &&
+                      is_integer(@case_attempt["generated_tokens"]) &&
+                      is_integer(@run["settings"]["max_tokens"])
+                  }
+                  class="fine-print"
+                >
+                  Generated tokens: {@case_attempt["generated_tokens"]} / {@run["settings"][
+                    "max_tokens"
+                  ]}.
+                  Context limit: {@run["settings"]["window_tokens"]} tokens.
+                  Prompt tokens include conversation history and tool output; the generation budget counts model output.
+                </p>
                 <p :if={get_in(@run, ["case_phases", @log_case]) == "qualifying"} class="fine-print">
                   Checking the unchanged application, reference repair and negative controls before Pi starts this case.
                 </p>
@@ -636,6 +650,9 @@ defmodule EabWeb.DashboardLive do
                     }> — check execution did not complete</span>
                   </p>
                   <p :if={check["reason"]}>{check["reason"]}</p>
+                  <p :if={check["label"] == "Regression coverage"} class="fine-print">
+                    This check runs submitted tests against the original broken code. Failing tests here are expected; they must pass with the submitted repair.
+                  </p>
                   <ul :if={check["failures"] != []}>
                     <li :for={failure <- check["failures"]}>
                       <code>{failure["name"]}</code>: expected {failure["expected"]}, observed {failure[

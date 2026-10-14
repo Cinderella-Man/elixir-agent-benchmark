@@ -1,5 +1,42 @@
 defmodule Eab.Model do
   @moduledoc "Discovery and native request/accounting adapters for llama.cpp and stock Strata."
+  @retry_delays [1_000, 2_000, 4_000, 8_000, 16_000]
+  @connect_errors [:econnrefused, :nxdomain, :enetunreach, :ehostunreach]
+  @transient_errors @connect_errors ++ [:timeout, :closed, :econnreset]
+  @request_phase {__MODULE__, :request_phase}
+
+  @doc false
+  def install_transport_observer do
+    # One permanent handler avoids leaking per-request handlers when Stop kills
+    # a worker. Only request phase is used; telemetry measurements are ignored.
+    case :telemetry.attach_many(
+           @request_phase,
+           [[:finch, :connect, :stop], [:finch, :send, :start]],
+           &__MODULE__.observe_transport/4,
+           nil
+         ) do
+      :ok -> :ok
+      {:error, :already_exists} -> :ok
+    end
+  end
+
+  @doc false
+  def observe_transport(event, _measurements, metadata, _config) do
+    # Finch's synchronous HTTP/1 adapter emits these in the requesting process.
+    # Other workers cannot authorize a retry here; unobserved adapters stay conservative.
+    if Process.get(@request_phase) do
+      phase =
+        case event do
+          [:finch, :connect, :stop] -> if metadata[:error], do: :connect_failed, else: :connected
+          [:finch, :send, :start] -> :sent
+        end
+
+      Process.put(@request_phase, phase)
+    end
+
+    :ok
+  end
+
   def discover(url, key \\ "") do
     url = normalize_url!(url)
     health = http(url, key, :get, "/health")
@@ -218,7 +255,7 @@ defmodule Eab.Model do
 
     result =
       try do
-        request.(opts)
+        request_with_retry(request, opts, route, key, @retry_delays)
       after
         Eab.Activity.model_end(stream)
       end
@@ -251,8 +288,75 @@ defmodule Eab.Model do
       {:ok, %{status: code}} ->
         raise "Endpoint #{route} returned HTTP #{code}"
 
+      {:error, %Req.TransportError{} = error} ->
+        detail = Eab.Store.redact(Exception.message(error), key)
+
+        raise "Cannot reach endpoint #{route}: #{detail}. Check the server and network connection."
+
       {:error, _} ->
         raise "Cannot reach endpoint #{route}; check its address, readiness and credentials"
+    end
+  end
+
+  defp request_with_retry(request, opts, route, key, delays) do
+    {result, phase} = request_once(request, opts)
+
+    case {result, delays} do
+      {{:error, %Req.TransportError{reason: reason} = error}, [delay | remaining]} ->
+        if retryable?(reason, opts[:method], route, phase) do
+          detail = Eab.Store.redact(Exception.message(error), key)
+          detail = if phase == :connect_failed, do: detail <> " before request send", else: detail
+          retry = length(@retry_delays) - length(remaining)
+
+          Eab.Activity.note(
+            "Endpoint #{route}: #{detail}; retry #{retry}/#{length(@retry_delays)} in #{div(delay, 1_000)}s"
+          )
+
+          # Remain in the caller so Stop run drains retries with the owning worker.
+          sleep = Application.get_env(:eab, :http_retry_sleep, &Process.sleep/1)
+          sleep.(delay)
+          request_with_retry(request, opts, route, key, remaining)
+        else
+          if phase == :sent and route in ["/v1/messages", "/v1/chat/completions"] do
+            Eab.Activity.note(
+              "Endpoint #{route} failed after request send; generation may have started, so it was not replayed."
+            )
+          end
+
+          result
+        end
+
+      _ ->
+        result
+    end
+  end
+
+  defp request_once(request, opts) do
+    previous = Process.put(@request_phase, :unobserved)
+
+    try do
+      result = request.(opts)
+      {result, Process.get(@request_phase)}
+    after
+      if previous,
+        do: Process.put(@request_phase, previous),
+        else: Process.delete(@request_phase)
+    end
+  end
+
+  defp retryable?(reason, method, route, phase) do
+    non_generating =
+      method == :get or
+        (method == :post and
+           route in ["/v1/messages/count_tokens", "/v1/chat/completions/input_tokens"])
+
+    # A generation timeout/reset may follow a submitted request even before the
+    # first response chunk. Only definite connection failures are safe to replay.
+    if phase == :sent and not non_generating do
+      false
+    else
+      reason in @connect_errors or
+        ((non_generating or phase == :connect_failed) and reason in @transient_errors)
     end
   end
 

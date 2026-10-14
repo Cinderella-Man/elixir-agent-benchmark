@@ -41,7 +41,7 @@ Cold baseline preparation follows ascending PR number within each repository/run
 | First case | Prepare it exclusively until its attempt starts |
 | Ordering | Inventory order; wait for the next case when necessary |
 | Capacity | Four upcoming cases, two preparation jobs, one waiting workspace, one grader and one queued submission; preparation bounds are configurable |
-| Failure | Record case errors and continue unrelated cases; no automatic retry or final score for an incomplete/error run |
+| Failure | Retry safe transient connection failures within a request up to five times; record terminal case errors and continue unrelated cases; no automatic case retry or final score for an incomplete/error run |
 | Cancellation | Stop all workers and drain subprocesses before removing installation-owned containers |
 | Restart | Preserve evidence, mark unfinished work interrupted and clean up; explicitly resume under unchanged release/model/settings |
 | Cache scope | Same Docker host across runs, model changes and restarts |

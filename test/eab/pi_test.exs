@@ -5,9 +5,11 @@ defmodule Eab.PiTest do
   setup do
     prefix = "runs/pi-test-#{System.unique_integer([:positive])}/case"
     Store.write("#{prefix}/attempt.json", %{})
+    Application.put_env(:eab, :http_retry_sleep, fn _ -> :ok end)
 
     on_exit(fn ->
       Application.delete_env(:eab, :http_request)
+      Application.delete_env(:eab, :http_retry_sleep)
       File.rm_rf!(Store.path(Path.dirname(prefix)))
     end)
 
@@ -22,7 +24,7 @@ defmodule Eab.PiTest do
       "context" => 32768
     }
 
-  test "real Pi edits a workspace and finishes using both native adapters, without a setup prompt",
+  test "real Pi reconnects during token counting and finishes using both native adapters",
        %{prefix: prefix} do
     parent = self()
 
@@ -42,12 +44,17 @@ defmodule Eab.PiTest do
         )
 
       Store.write("#{path}/config.json", config)
+      counts = :counters.new(1, [])
 
       Application.put_env(:eab, :http_request, fn opts ->
         payload = opts[:json]
 
         if String.ends_with?(opts[:url], "tokens") do
-          {:ok, %{status: 200, body: %{"input_tokens" => 42}}}
+          :counters.add(counts, 1, 1)
+
+          if :counters.get(counts, 1) == 1,
+            do: {:error, %Req.TransportError{reason: :timeout}},
+            else: {:ok, %{status: 200, body: %{"input_tokens" => 42}}}
         else
           send(parent, {:generation, backend, payload})
 
@@ -89,6 +96,8 @@ defmodule Eab.PiTest do
       assert activity =~ "write"
       assert activity =~ "repaired.txt"
       assert activity =~ "Model call 1"
+      assert activity =~ "retry 1/5 in 1s"
+      assert :counters.get(counts, 1) == 3
       assert_receive {:generation, ^backend, first}
 
       if backend == "strata" do
@@ -106,6 +115,57 @@ defmodule Eab.PiTest do
       assert File.read!(Store.path("#{path}/pi-events.jsonl")) =~ "tool_execution_end"
       refute File.read!(Store.path("#{path}/config.json")) =~ "secret"
     end
+  end
+
+  test "cancelling a Pi exchange drains a pending connection retry", %{prefix: prefix} do
+    parent = self()
+    model = endpoint("strata")
+    state = Pi.state(model, "", Model.settings(model), prefix, fn _ -> :ok end)
+
+    Application.put_env(:eab, :http_request, fn _ ->
+      send(parent, :request)
+      {:error, %Req.TransportError{reason: :timeout}}
+    end)
+
+    Application.put_env(:eab, :http_retry_sleep, fn _ ->
+      send(parent, {:retry_wait, self()})
+
+      receive do
+        :continue -> :ok
+      after
+        10_000 -> raise "Retry cancellation test watchdog expired"
+      end
+    end)
+
+    frame = %{
+      "type" => "request",
+      "id" => "1",
+      "method" => "POST",
+      "path" => "/v1/messages",
+      "body" => %{"messages" => [%{"role" => "user", "content" => "ticket"}]}
+    }
+
+    script = "printf '%s\\n' " <> Command.quote(Jason.encode!(frame)) <> "; read reply"
+
+    {owner, monitor} =
+      spawn_monitor(fn ->
+        Command.exchange("sh", ["-c", script], state, &Pi.handle/2, timeout: 15)
+      end)
+
+    on_exit(fn ->
+      Process.exit(owner, :kill)
+      Command.await_scope(owner)
+    end)
+
+    assert_receive :request, 3000
+    assert_receive {:retry_wait, callback}, 3000
+    callback_monitor = Process.monitor(callback)
+    Process.exit(owner, :kill)
+    Command.await_owner(owner)
+    Command.await_scope(owner)
+    assert_receive {:DOWN, ^monitor, :process, ^owner, :killed}, 3000
+    assert_receive {:DOWN, ^callback_monitor, :process, ^callback, _}, 3000
+    refute_receive :request
   end
 
   test "real Pi stops at the token budget without retrying and keeps the edited file", %{
@@ -240,6 +300,95 @@ defmodule Eab.PiTest do
     assert reply["status"] == 502
     assert failed.error == "server failure [REDACTED]"
     assert Store.read("#{prefix}/agent-progress.json")["error"] == failed.error
+  end
+
+  test "exhausted token-count retries retain the cause without starting generation", %{
+    prefix: prefix
+  } do
+    parent = self()
+    model = endpoint("strata")
+    state = Pi.state(model, "private-key", Model.settings(model), prefix, fn _ -> :ok end)
+
+    Application.put_env(:eab, :http_request, fn opts ->
+      send(parent, {:request, opts[:url]})
+      {:error, %Req.TransportError{reason: :timeout}}
+    end)
+
+    frame = %{
+      "type" => "request",
+      "id" => "1",
+      "method" => "POST",
+      "path" => "/v1/messages",
+      "body" => %{"messages" => [%{"role" => "user", "content" => "ticket"}]}
+    }
+
+    {reply, failed} = PiGateway.request(frame, state)
+    assert reply["status"] == 502
+    assert failed.error =~ "count_tokens: timeout"
+    refute failed.error =~ "private-key"
+    assert failed.calls == 0
+    assert failed.generated_tokens == 0
+    assert Store.read("#{prefix}/agent-progress.json")["error"] == failed.error
+    assert Jason.decode!(reply["body"])["error"]["message"] == failed.error
+
+    for _ <- 1..6,
+        do: assert_receive({:request, "http://synthetic/v1/messages/count_tokens"})
+
+    refute_receive {:request, _}
+
+    # Pi cannot retry past exhausted transport retries and start a generation.
+    {_, failed_again} = PiGateway.request(frame, failed)
+    assert failed_again == failed
+    refute_receive {:request, _}
+  end
+
+  test "a recovered token count continues the same Pi call and records retries", %{prefix: prefix} do
+    parent = self()
+    attempts = :counters.new(1, [])
+    model = endpoint("strata")
+    state = Pi.state(model, "private-key", Model.settings(model), prefix, fn _ -> :ok end)
+
+    Application.put_env(:eab, :http_request, fn opts ->
+      send(parent, {:request, opts[:url]})
+
+      if String.ends_with?(opts[:url], "count_tokens") do
+        :counters.add(attempts, 1, 1)
+
+        if :counters.get(attempts, 1) == 1,
+          do: {:error, %Req.TransportError{reason: :timeout}},
+          else: {:ok, %{status: 200, body: %{"input_tokens" => 42}}}
+      else
+        {:ok, %{status: 200, body: response("strata", true)}}
+      end
+    end)
+
+    frame = %{
+      "type" => "request",
+      "id" => "1",
+      "method" => "POST",
+      "path" => "/v1/messages",
+      "body" => %{"messages" => [%{"role" => "user", "content" => "ticket"}]}
+    }
+
+    run_id = prefix |> String.split("/") |> Enum.at(1)
+
+    {reply, recovered} =
+      Eab.Activity.with_case(run_id, "case", "private-key", fn ->
+        PiGateway.request(frame, state)
+      end)
+
+    assert reply["status"] == 200
+    assert recovered.error == nil
+    assert recovered.calls == 1
+    assert recovered.generated_tokens == 12
+    assert Store.read("#{prefix}/agent-progress.json")["error"] == nil
+    assert_receive {:request, "http://synthetic/v1/messages/count_tokens"}
+    assert_receive {:request, "http://synthetic/v1/messages/count_tokens"}
+    assert_receive {:request, "http://synthetic/v1/messages"}
+    refute_receive {:request, _}
+    activity = File.read!(Store.path("#{prefix}/activity.log"))
+    assert activity =~ "count_tokens: timeout; retry 1/5 in 1s"
+    refute activity =~ "private-key"
   end
 
   test "Pi config cannot inherit credentials, compaction, retries or extra tools" do

@@ -2,6 +2,8 @@ defmodule Eab.Application do
   use Application
 
   def start(_type, _args) do
+    Eab.Model.install_transport_observer()
+
     children = [
       {Phoenix.PubSub, name: Eab.PubSub},
       {Registry, keys: :duplicate, name: Eab.Commands},

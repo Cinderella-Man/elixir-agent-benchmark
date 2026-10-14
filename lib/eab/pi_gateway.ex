@@ -67,7 +67,10 @@ defmodule Eab.PiGateway do
 
       try do
         Activity.note(
-          "Model call #{state.calls}: #{count} prompt tokens. Waiting for model response…"
+          "Model call #{state.calls}: #{count} prompt tokens " <>
+            "(context limit #{state.settings["window_tokens"]}). " <>
+            "Generated so far: #{state.generated_tokens}/#{state.settings["max_tokens"]} tokens. " <>
+            "Waiting for model response…"
         )
 
         body = Model.stream(state.endpoint, state.key, payload)
