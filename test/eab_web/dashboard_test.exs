@@ -23,9 +23,11 @@ defmodule EabWeb.DashboardTest do
     Eab.Store.write_text("runs/#{id}/#{case_id}/activity.log", "$ mix test\nCompiling project\n")
     on_exit(fn -> File.rm_rf!(Eab.Store.path("runs/#{id}")) end)
     {:ok, view, _} = live(build_conn(), "/")
-    assert has_element?(view, "#case-#{case_id}")
+    assert has_element?(view, "#case-#{case_id}[aria-expanded=false]")
+    refute has_element?(view, "#case-log")
     view |> element("#case-#{case_id}") |> render_click()
-    assert has_element?(view, "#case-log", "Compiling project")
+    assert has_element?(view, "#case-#{case_id}[aria-expanded=true]")
+    assert has_element?(view, "#case-panel-#{case_id} #case-log", "Compiling project")
     assert has_element?(view, "#case-log", "$ mix test")
 
     Eab.Store.write_text(
@@ -40,16 +42,54 @@ defmodule EabWeb.DashboardTest do
              view,
              "#case-log-download[href='/artifacts/#{id}/#{case_id}/activity.log']"
            )
+
+    view |> element("#case-#{case_id}") |> render_click()
+    assert has_element?(view, "#case-#{case_id}[aria-expanded=false]")
+    refute has_element?(view, "#case-panel-#{case_id}")
+    send(view.pid, :poll_log)
+    refute has_element?(view, "#case-log")
+    view |> element("#case-#{case_id}") |> render_click()
+    assert has_element?(view, "#case-panel-#{case_id} #case-log", "Tests finished")
   end
 
   test "local setup page shows twelve PR cases and waits for a model connection" do
     {:ok, view, html} = live(build_conn(), "/")
-    assert html =~ "Put your model"
+    assert html =~ "Benchmark dashboard"
     assert html =~ "Model and tool calls are unlimited."
     refute has_element?(view, "input[name='settings[max_calls]']")
     assert has_element?(view, "#run[disabled]")
     assert html =~ "plausible-pr-6300"
     assert length(Eab.Inventory.all()) == 12
+  end
+
+  test "run summary separates failed repairs from evaluation errors" do
+    id = "score-summary-test"
+    [a, b, c | _] = Eab.Inventory.all()
+
+    Eab.Store.write("runs/#{id}/run.json", %{
+      "id" => id,
+      "created_at" => "9999-01-01T00:00:00Z",
+      "status" => "completed",
+      "cases" => [a, b, c],
+      "attempts" => %{
+        a => %{"status" => "completed", "grade" => %{"passed" => true}},
+        b => %{"status" => "completed", "grade" => %{"passed" => false}},
+        c => %{"status" => "error", "error" => "Endpoint unavailable"}
+      },
+      "settings" => %{},
+      "model" => %{"model" => "synthetic"}
+    })
+
+    on_exit(fn -> File.rm_rf!(Eab.Store.path("runs/#{id}")) end)
+    {:ok, view, _} = live(build_conn(), "/")
+    assert has_element?(view, ".metric.passed strong", "1")
+    assert has_element?(view, ".metric.failed strong", "1")
+    assert has_element?(view, ".metric.error strong", "1")
+    assert has_element?(view, ".metric.final-score strong", "—")
+    assert has_element?(view, "[role=progressbar][aria-valuenow='2'][aria-valuemax='3']")
+    view |> element("#case-#{c}") |> render_click()
+    assert has_element?(view, "#case-panel-#{c}", "Endpoint unavailable")
+    assert has_element?(view, "#case-panel-#{c} #case-verdict", "Evaluation error")
   end
 
   test "concurrent case stages and selected background messages remain visible" do
@@ -83,7 +123,14 @@ defmodule EabWeb.DashboardTest do
     assert html =~ "Grading"
     view |> element("#case-#{b}") |> render_click()
     assert render(view) =~ "Checking upcoming fixture"
-    assert has_element?(view, "#case-log", "qualification output")
+    assert has_element?(view, "#case-panel-#{b} #case-log", "qualification output")
+    view |> element("button[phx-click=follow_output]") |> render_click()
+    assert has_element?(view, "#case-log[data-follow=false]")
+    view |> element("#case-#{a}") |> render_click()
+    refute has_element?(view, "#case-panel-#{b}")
+    assert has_element?(view, "#case-#{b}[aria-expanded=false]")
+    assert has_element?(view, "#case-panel-#{a}", "Pi editing")
+    assert has_element?(view, "#case-log[data-follow=true]")
   end
 
   test "a connected model enables Run without host configuration" do
@@ -206,12 +253,14 @@ defmodule EabWeb.DashboardTest do
     assert html =~ "/500"
     assert has_element?(view, "#case-synthetic-25")
     refute has_element?(view, "#case-synthetic-26")
-    assert has_element?(view, "#case-verdict", "Acceptance did not pass")
+    view |> element("#case-synthetic-1") |> render_click()
+    assert has_element?(view, "#case-panel-synthetic-1 #case-verdict", "Acceptance did not pass")
     assert has_element?(view, "#case-verdict", "required behavior")
     assert has_element?(view, "#case-verdict a[href='/artifacts/#{id}/synthetic-1/grade.json']")
     view |> element("button[phx-click='case_page'][phx-value-direction='next']") |> render_click()
     assert has_element?(view, "#case-synthetic-26")
     refute has_element?(view, "#case-synthetic-1")
+    refute has_element?(view, "#case-log")
   end
 
   test "comparison keeps choices across history pages and paginates case outcomes" do

@@ -189,7 +189,7 @@ defmodule EabWeb.DashboardLive do
 
   def handle_event("case_page", %{"direction" => direction}, socket) do
     offset = max(socket.assigns.case_offset + if(direction == "next", do: 25, else: -25), 0)
-    {:noreply, assign(socket, case_offset: offset)}
+    {:noreply, load_log(assign(socket, case_offset: offset, selected_case: nil))}
   end
 
   def handle_event("retry_cleanup", _, socket) do
@@ -204,7 +204,14 @@ defmodule EabWeb.DashboardLive do
     run = selected(socket.assigns)
 
     if run && id in run["cases"],
-      do: {:noreply, load_log(assign(socket, selected_case: id))},
+      do:
+        {:noreply,
+         load_log(
+           assign(socket,
+             selected_case: if(socket.assigns.selected_case == id, do: nil, else: id),
+             follow_output: true
+           )
+         )},
       else: {:noreply, socket}
   end
 
@@ -288,7 +295,7 @@ defmodule EabWeb.DashboardLive do
 
   defp load_log(socket) do
     run = selected(socket.assigns)
-    id = run && (socket.assigns.selected_case || run["current_case"] || List.first(run["cases"]))
+    id = run && socket.assigns.selected_case
     attempt = if run && id, do: case_attempt(run, id)
     socket = assign(socket, case_attempt: attempt)
 
@@ -367,6 +374,26 @@ defmodule EabWeb.DashboardLive do
     end
   end
 
+  defp case_tone(run, id) do
+    case case_status(run, id) do
+      "Passed" ->
+        "passed"
+
+      "Failed" ->
+        "failed"
+
+      "Error" ->
+        "error"
+
+      status
+      when status in ["Pending", "Not attempted", "Incomplete", "Interrupted", "Cancelled"] ->
+        "pending"
+
+      _ ->
+        "active"
+    end
+  end
+
   defp model_detail(endpoint, field) do
     metadata = endpoint["metadata"]["model"]
     get_in(metadata, ["meta", field]) || metadata[field] || "Not reported"
@@ -378,6 +405,13 @@ defmodule EabWeb.DashboardLive do
     assigns =
       assign(assigns,
         case_count: length(assigns.cases),
+        case_specs: Map.new(assigns.cases, &{&1["id"], &1}),
+        score: if(assigns.run, do: Runner.score(assigns.run)),
+        error_count:
+          if(assigns.run,
+            do: Enum.count(assigns.run["cases"], &(case_status(assigns.run, &1) == "Error")),
+            else: 0
+          ),
         project_counts: Enum.frequencies_by(assigns.cases, &(&1["project"] || &1["suite"]))
       )
 
@@ -389,19 +423,15 @@ defmodule EabWeb.DashboardLive do
       </header>
       <section class="intro">
         <div>
-          <p class="eyebrow">REAL REPOSITORIES. REAL REPAIRS.</p><h1>
-            Put your model<br />to the test.
-          </h1>
-          <p class="lede">
-            {length(@cases)} historical pull requests. Pi in Docker.<br />Executable results you can inspect.
-          </p>
+          <p class="eyebrow">MODEL EVALUATION</p>
+          <h1>Benchmark dashboard</h1>
+          <p class="lede">Real pull requests. Executable checks. Inspect every result.</p>
         </div>
-        <div class="inventory-number">
-          <strong>{@case_count}</strong><span>PR CASES</span><p>
-            {Enum.map_join(Enum.sort(@project_counts), " · ", fn {project, count} ->
-              "#{count} #{project}"
-            end)}
-          </p>
+        <div class="inventory-summary">
+          <strong>{@case_count} cases</strong>
+          <span>{Enum.map_join(Enum.sort(@project_counts), " · ", fn {project, count} ->
+            "#{count} #{project}"
+          end)}</span>
         </div>
       </section>
       <div :if={@error} class="notice error" role="alert">{@error}</div>
@@ -412,7 +442,7 @@ defmodule EabWeb.DashboardLive do
       <div class="workspace">
         <section class="panel setup">
           <div class="section-title">
-            <span class="step">01</span><h2>Connect a model</h2>
+            <span class="section-icon" aria-hidden="true">⌘</span><h2>Run configuration</h2>
           </div>
           <p class="muted">
             A running llama.cpp or Strata server. We’ll read its model details automatically.
@@ -502,7 +532,7 @@ defmodule EabWeb.DashboardLive do
         </section>
         <section class="panel results">
           <div class="section-title">
-            <span class="step">02</span><h2>Follow the run</h2><button
+            <span class="section-icon" aria-hidden="true">▤</span><h2>Benchmark results</h2><button
               :if={@snapshot.active}
               class="danger"
               phx-click="stop"
@@ -515,9 +545,11 @@ defmodule EabWeb.DashboardLive do
           </div>
           <div :if={@run}>
             <div class="run-heading">
-              <span class="badge">{String.upcase(@run["phase"])}</span><code>{@run["id"]}</code>
+              <span class="badge">{String.upcase(@run["status"])}</span><code>{@run["id"]}</code>
             </div>
-            <h3>{@run["model"]["model"]}</h3><p role="status">{@run["message"]}</p>
+            <h3 class="run-model">{@run["model"]["model"]}</h3><p class="run-message" role="status">
+              {@run["message"]}
+            </p>
             <p :if={@run["release_id"]} class="fine-print">
               Release <code>{String.slice(@run["release_id"], 0, 12)}</code>
               · Experiment <code>{String.slice(@run["experiment_id"], 0, 12)}</code>
@@ -536,50 +568,193 @@ defmodule EabWeb.DashboardLive do
             >
               Resume unfinished cases
             </button>
-            <div class="scoreboard">
-              <div>
-                <strong>{Runner.score(@run)["passed"]}<small>/{length(@run["cases"])}</small></strong><span>Passed</span>
-              </div><div><strong>{Runner.score(@run)["failed"]}</strong><span>Failed</span></div><div>
-                <strong>{if Runner.score(@run)["score_percent"],
-                  do: "#{Runner.score(@run)["score_percent"]}%",
-                  else: "—"}</strong><span>Final score</span>
+            <div class="scoreboard" aria-label="Run score">
+              <div class="metric passed">
+                <span>Passed</span><strong>{@score["passed"]}</strong>
+              </div>
+              <div class="metric failed">
+                <span>Failed</span><strong>{@score["failed"]}</strong>
+              </div>
+              <div class="metric error">
+                <span>Errors</span><strong>{@error_count}</strong>
+              </div>
+              <div class="metric final-score">
+                <span>Final score</span>
+                <strong>{if @score["score_percent"], do: "#{@score["score_percent"]}%", else: "—"}</strong>
               </div>
             </div>
-            <p class="fine-print">Errors and incomplete attempts prevent a final score.</p>
-            <p :if={@report_available}>
-              <a href={"/artifacts/#{@run["id"]}/report.md"} download>Download report ↓</a>
-            </p>
-            <table>
-              <thead>
-                <tr>
-                  <th>Case</th><th>Result</th>
-                </tr>
-              </thead><tbody>
-                <tr
-                  :for={id <- Enum.slice(@run["cases"], @case_offset, 25)}
-                  class={if id == @log_case, do: "selected-case"}
-                >
-                  <td>
-                    <button
-                      id={"case-#{id}"}
-                      class="case-link"
-                      phx-click={
-                        Phoenix.LiveView.JS.push("select_case")
-                        |> Phoenix.LiveView.JS.focus(to: "#case-verdict")
-                      }
-                      phx-value-id={id}
-                      aria-controls="case-console"
-                      aria-pressed={id == @log_case}
-                    >{id} <span aria-hidden="true">↗</span></button>
-                  </td><td>
-                    <span class={"outcome " <> String.downcase(outcome(@run["attempts"][id]))}>{case_status(
+            <div class="progress-heading">
+              <span>Cases graded</span><strong>{@score["passed"] + @score["failed"]}/{@score[
+                "planned"
+              ]}</strong>
+            </div>
+            <svg
+              class="run-progress"
+              viewBox={"0 0 #{max(@score["planned"], 1)} 1"}
+              preserveAspectRatio="none"
+              role="progressbar"
+              aria-label="Cases graded"
+              aria-valuenow={@score["passed"] + @score["failed"]}
+              aria-valuemin="0"
+              aria-valuemax={max(@score["planned"], 1)}
+            >
+              <rect class="progress-passed" width={@score["passed"]} height="1" />
+              <rect class="progress-failed" x={@score["passed"]} width={@score["failed"]} height="1" />
+            </svg>
+            <div class="score-note">
+              <p class="fine-print">Errors and incomplete attempts prevent a final score.</p>
+              <a :if={@report_available} href={"/artifacts/#{@run["id"]}/report.md"} download>Download report ↓</a>
+            </div>
+            <div class="cases-heading">
+              <h3>Cases <span>{@score["planned"]}</span></h3>
+              <span>Expand a case to inspect its evidence</span>
+            </div>
+            <div class="case-list">
+              <article
+                :for={
+                  {id, index} <-
+                    Enum.with_index(Enum.slice(@run["cases"], @case_offset, 25), @case_offset + 1)
+                }
+                class={["case-item", id == @log_case && "is-expanded"]}
+              >
+                <h4 class="case-heading">
+                  <button
+                    id={"case-#{id}"}
+                    class="case-toggle"
+                    phx-click="select_case"
+                    phx-value-id={id}
+                    aria-controls={"case-panel-#{id}"}
+                    aria-expanded={to_string(id == @log_case)}
+                  >
+                    <span class="case-index">{String.pad_leading(to_string(index), 2, "0")}</span>
+                    <span class="case-name">
+                      <span class="case-id">{id}</span>
+                      <span :if={@case_specs[id]} class="case-description">{@case_specs[id]["title"]}</span>
+                    </span>
+                    <span class={"case-status " <> case_tone(@run, id)}><i aria-hidden="true"></i>{case_status(
                       @run,
                       id
                     )}</span>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
+                    <svg
+                      class="case-chevron"
+                      width="16"
+                      height="16"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.8"
+                      aria-hidden="true"
+                    ><path d="m6 9 6 6 6-6" /></svg>
+                  </button>
+                </h4>
+                <section
+                  :if={id == @log_case}
+                  id={"case-panel-#{id}"}
+                  class="case-console"
+                  role="region"
+                  aria-labelledby={"case-#{id}"}
+                >
+                  <p
+                    :if={@run["status"] == "running"}
+                    class="fine-print"
+                  >
+                    {get_in(@run, ["case_messages", @log_case]) ||
+                      if(@run["current_case"] == @log_case, do: @run["message"])}
+                  </p>
+                  <p :if={get_in(@run, ["attempts", @log_case, "error"])} class="notice error">
+                    {get_in(@run, ["attempts", @log_case, "error"])}
+                  </p>
+                  <section id="case-verdict" aria-label="Case result explanation" tabindex="-1">
+                    <h4>
+                      {if is_nil(@case_attempt) and case_tone(@run, id) == "active",
+                        do: "Awaiting evaluation",
+                        else: Evidence.verdict(@case_attempt)}
+                    </h4>
+                    <p
+                      :if={
+                        @case_attempt && @case_attempt["status"] in ["completed", "error"] &&
+                          is_integer(@case_attempt["generated_tokens"]) &&
+                          is_integer(@run["settings"]["max_tokens"])
+                      }
+                      class="fine-print"
+                    >
+                      Generated tokens: {@case_attempt["generated_tokens"]} / {@run["settings"][
+                        "max_tokens"
+                      ]}.
+                      Context limit: {@run["settings"]["window_tokens"]} tokens.
+                      Prompt tokens include conversation history and tool output; the generation budget counts model output.
+                    </p>
+                    <p
+                      :if={get_in(@run, ["case_phases", @log_case]) == "qualifying"}
+                      class="fine-print"
+                    >
+                      Checking the unchanged application, reference repair and negative controls before Pi starts this case.
+                    </p>
+                    <p :if={get_in(@run, ["attempts", @log_case, "stop_reason"])} class="fine-print">
+                      Pi stopped: {get_in(@run, ["attempts", @log_case, "stop_reason"])}
+                    </p>
+                    <div
+                      :for={check <- Evidence.checks(@case_attempt)}
+                      class="check-result"
+                    >
+                      <p>
+                        <strong>{check["label"]}: {if check["passed"],
+                          do: "passed",
+                          else: "did not pass"}</strong><span :if={check["completed"] == false}> — check execution did not complete</span>
+                      </p>
+                      <p :if={check["reason"]}>{check["reason"]}</p>
+                      <p :if={check["label"] == "Regression coverage"} class="fine-print">
+                        This check runs submitted tests against the original broken code. Failing tests here are expected; they must pass with the submitted repair.
+                      </p>
+                      <ul :if={check["failures"] != []}>
+                        <li :for={failure <- check["failures"]}>
+                          <code>{failure["name"]}</code>: expected {failure["expected"]}, observed {failure[
+                            "observed"
+                          ]}
+                        </li>
+                      </ul>
+                      <p :if={check["failure_count"] > length(check["failures"])} class="fine-print">
+                        {check["failure_count"] - length(check["failures"])} additional failures in full grading evidence.
+                      </p>
+                      <details :if={check["excerpt"]}>
+                        <summary>Error excerpt</summary><pre>{check["excerpt"]}</pre>
+                      </details>
+                    </div>
+                    <ul class="artifacts">
+                      <li :for={link <- @evidence_links}>
+                        <a href={"/artifacts/#{@run["id"]}/#{link["path"]}"} download>{link["label"]} ↓</a>
+                      </li>
+                    </ul>
+                  </section>
+                  <div class="console-actions">
+                    <span class="console-label">COMMAND OUTPUT</span>
+                    <button
+                      class="secondary"
+                      phx-click="follow_output"
+                      aria-pressed={to_string(@follow_output)}
+                    >Follow output: {if @follow_output,
+                      do: "on",
+                      else: "off"}</button>
+                    <a
+                      :if={@log_available}
+                      id="case-log-download"
+                      href={"/artifacts/#{@run["id"]}/#{@log_case}/activity.log"}
+                      download
+                    >Download full log ↓</a>
+                  </div>
+                  <pre
+                    id="case-log"
+                    phx-hook="LogTail"
+                    data-follow={to_string(@follow_output)}
+                    data-case={"#{@run["id"]}/#{@log_case}"}
+                    tabindex="0"
+                  >{@log_text}</pre>
+                  <p class="fine-print">
+                    Updates every second. Docker setup, test output, model responses and Pi tool commands appear here.
+                  </p>
+                </section>
+              </article>
+            </div>
             <nav :if={length(@run["cases"]) > 25} aria-label="Case pages">
               <button
                 class="secondary"
@@ -597,104 +772,6 @@ defmodule EabWeb.DashboardLive do
                 disabled={@case_offset + 25 >= length(@run["cases"])}
               >Next cases</button>
             </nav>
-            <section
-              :if={@log_case}
-              id="case-console"
-              class="case-console"
-              aria-label="Case command output"
-            >
-              <div class="console-heading">
-                <div>
-                  <span class="eyebrow">CASE EVIDENCE</span><h3>{@log_case}</h3>
-                </div><span class="badge">{case_status(@run, @log_case)}</span>
-              </div>
-              <p
-                :if={@run["status"] == "running"}
-                class="fine-print"
-              >
-                {get_in(@run, ["case_messages", @log_case]) ||
-                  if(@run["current_case"] == @log_case, do: @run["message"])}
-              </p>
-              <p :if={get_in(@run, ["attempts", @log_case, "error"])} class="notice error">
-                {get_in(@run, ["attempts", @log_case, "error"])}
-              </p>
-              <section id="case-verdict" aria-label="Case result explanation" tabindex="-1">
-                <h4>{Evidence.verdict(@case_attempt)}</h4>
-                <p
-                  :if={
-                    @case_attempt && @case_attempt["status"] in ["completed", "error"] &&
-                      is_integer(@case_attempt["generated_tokens"]) &&
-                      is_integer(@run["settings"]["max_tokens"])
-                  }
-                  class="fine-print"
-                >
-                  Generated tokens: {@case_attempt["generated_tokens"]} / {@run["settings"][
-                    "max_tokens"
-                  ]}.
-                  Context limit: {@run["settings"]["window_tokens"]} tokens.
-                  Prompt tokens include conversation history and tool output; the generation budget counts model output.
-                </p>
-                <p :if={get_in(@run, ["case_phases", @log_case]) == "qualifying"} class="fine-print">
-                  Checking the unchanged application, reference repair and negative controls before Pi starts this case.
-                </p>
-                <p :if={get_in(@run, ["attempts", @log_case, "stop_reason"])} class="fine-print">
-                  Pi stopped: {get_in(@run, ["attempts", @log_case, "stop_reason"])}
-                </p>
-                <div
-                  :for={check <- Evidence.checks(@case_attempt)}
-                  class="check-result"
-                >
-                  <p>
-                    <strong>{check["label"]}: {if check["passed"], do: "passed", else: "did not pass"}</strong><span :if={
-                      check["completed"] == false
-                    }> — check execution did not complete</span>
-                  </p>
-                  <p :if={check["reason"]}>{check["reason"]}</p>
-                  <p :if={check["label"] == "Regression coverage"} class="fine-print">
-                    This check runs submitted tests against the original broken code. Failing tests here are expected; they must pass with the submitted repair.
-                  </p>
-                  <ul :if={check["failures"] != []}>
-                    <li :for={failure <- check["failures"]}>
-                      <code>{failure["name"]}</code>: expected {failure["expected"]}, observed {failure[
-                        "observed"
-                      ]}
-                    </li>
-                  </ul>
-                  <p :if={check["failure_count"] > length(check["failures"])} class="fine-print">
-                    {check["failure_count"] - length(check["failures"])} additional failures in full grading evidence.
-                  </p>
-                  <details :if={check["excerpt"]}>
-                    <summary>Error excerpt</summary><pre>{check["excerpt"]}</pre>
-                  </details>
-                </div>
-                <ul class="artifacts">
-                  <li :for={link <- @evidence_links}>
-                    <a href={"/artifacts/#{@run["id"]}/#{link["path"]}"} download>{link["label"]} ↓</a>
-                  </li>
-                </ul>
-              </section>
-              <div class="console-actions">
-                <button class="secondary" phx-click="follow_output" aria-pressed={@follow_output}>Follow output: {if @follow_output,
-                  do: "on",
-                  else: "off"}</button>
-                <a
-                  :if={@log_available}
-                  id="case-log-download"
-                  href={"/artifacts/#{@run["id"]}/#{@log_case}/activity.log"}
-                  download
-                >Download full log ↓</a>
-              </div>
-              <pre
-                id="case-log"
-                phx-hook="LogTail"
-                data-follow={to_string(@follow_output)}
-                data-case={"#{@run["id"]}/#{@log_case}"}
-                tabindex="0"
-              >{@log_text}</pre>
-              <p class="fine-print">
-                Updates every second. Docker setup, test output, model responses and Pi tool commands appear here.
-              </p>
-            </section>
             <details>
               <summary>Run settings and evidence</summary><pre>{Jason.encode!(@run["settings"], pretty: true)}</pre>
               <p class="fine-print">
