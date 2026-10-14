@@ -1,0 +1,71 @@
+diff --git a/test/benchmark_audit_test.exs b/test/benchmark_audit_test.exs
+new file mode 100644
+--- /dev/null
++++ b/test/benchmark_audit_test.exs
+@@ -0,0 +1,66 @@
++defmodule Plausible.Benchmark.AuditImportedGoalBoundariesTest do
++  use PlausibleWeb.ConnCase, async: false
++  alias Plausible.Goals
++
++  setup [:create_user, :create_site, :create_api_key, :use_api_key, :create_site_import]
++
++  test "ordinary special-event URL filters retain supported imports", %{conn: conn, site: site, site_import: site_import} do
++    {:ok, _} = Goals.create(site, %{"event_name" => "Outbound Link: Click"})
++    populate_stats(site, site_import.id, [
++      build(:event, name: "Outbound Link: Click", "meta.key": ["url"],
++        "meta.value": ["https://example.com"], timestamp: ~N[2023-01-01 00:00:00]),
++      build(:imported_custom_events, name: "Outbound Link: Click", link_url: "https://example.com",
++        visitors: 3, events: 5, date: ~D[2023-01-01]),
++      build(:imported_custom_events, name: "Outbound Link: Click", link_url: "https://excluded.example",
++        visitors: 7, events: 11, date: ~D[2023-01-01])
++    ])
++    resp = query(conn, site, %{
++      "metrics" => ["visitors", "events"],
++      "filters" => [["is", "event:goal", ["Outbound Link: Click"]],
++                    ["is", "event:props:url", ["https://example.com"]]]
++    })
++    assert resp["results"] == [%{"dimensions" => [], "metrics" => [4, 6]}]
++    assert resp["meta"]["imports_included"]
++  end
++
++  test "page-goal filters exclude unsupported imports and nonmatching native properties", %{conn: conn, site: site, site_import: site_import} do
++    {:ok, _} = Goals.create(site, %{"page_path" => "/checkout", "custom_props" => %{"variant" => "A"}})
++    populate_stats(site, site_import.id, [
++      build(:pageview, pathname: "/checkout", user_id: 1, "meta.key": ["variant"],
++        "meta.value": ["A"], timestamp: ~N[2023-01-01 00:00:00]),
++      build(:pageview, pathname: "/checkout", user_id: 2, "meta.key": ["variant"],
++        "meta.value": ["B"], timestamp: ~N[2023-01-01 00:01:00]),
++      build(:imported_pages, page: "/checkout", visitors: 3, pageviews: 5, date: ~D[2023-01-01])
++    ])
++    for dimensions <- [[], ["event:goal"]] do
++      resp = query(conn, site, %{
++        "metrics" => ["visitors"], "dimensions" => dimensions,
++        "filters" => [["is", "event:goal", ["Visit /checkout"]]]
++      })
++      result_dimensions = if dimensions == [], do: [], else: ["Visit /checkout"]
++      assert resp["results"] == [%{"dimensions" => result_dimensions, "metrics" => [1]}]
++      refute resp["meta"]["imports_included"]
++    end
++  end
++
++  test "mixed page-goal breakdown retains ordinary imports under the correct goal", %{conn: conn, site: site, site_import: site_import} do
++    {:ok, _} = Goals.create(site, %{"page_path" => "/ordinary"})
++    {:ok, _} = Goals.create(site, %{"page_path" => "/restricted", "custom_props" => %{"variant" => "A"}})
++    populate_stats(site, site_import.id, [
++      build(:pageview, pathname: "/restricted", "meta.key": ["variant"],
++        "meta.value": ["A"], timestamp: ~N[2023-01-01 00:00:00]),
++      build(:imported_pages, page: "/restricted", visitors: 7, pageviews: 11, date: ~D[2023-01-01]),
++      build(:imported_pages, page: "/ordinary", visitors: 3, pageviews: 5, date: ~D[2023-01-01])
++    ])
++    resp = query(conn, site, %{"metrics" => ["visitors"], "dimensions" => ["event:goal"]})
++    assert Map.new(resp["results"], &{&1["dimensions"], &1["metrics"]}) == %{
++      ["Visit /ordinary"] => [3], ["Visit /restricted"] => [1]
++    }
++    assert resp["meta"]["imports_included"]
++  end
++
++  defp query(conn, site, params) do
++    params = Map.merge(%{"site_id" => site.domain, "date_range" => "all", "include" => %{"imports" => true}}, params)
++    conn |> post("/api/v2/query", params) |> json_response(200)
++  end
++end

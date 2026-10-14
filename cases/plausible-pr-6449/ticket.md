@@ -12,3 +12,5 @@ Expected behavior:
 - Renaming a link must retain its submitted same-site segment even if that segment was changed from site-wide to personal after the link was created.
 
 Repair these boundaries through the real create/edit flow, keep ordinary editing and permission checks working, and add regression coverage.
+
+An invalid segment submitted while editing an already-associated link must clear the old association, just as it does when creating a new link.

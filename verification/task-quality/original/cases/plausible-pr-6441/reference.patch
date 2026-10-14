@@ -1,0 +1,211 @@
+diff --git a/lib/plausible/stats/goals.ex b/lib/plausible/stats/goals.ex
+index 806635f3509e7e4a4b7bd257fc06ef58ff2b10fa..7733233793cd8f923f452d4284e469e2b32859f8 100644
+--- a/lib/plausible/stats/goals.ex
++++ b/lib/plausible/stats/goals.ex
+@@ -65,8 +65,6 @@ defmodule Plausible.Stats.Goals do
+ 
+   @type goal_join_data() :: %{
+           indices: [non_neg_integer()],
+-          types: [String.t()],
+-          event_names_imports: [String.t()],
+           event_names_by_type: [String.t()],
+           page_regexes: [String.t()],
+           scroll_thresholds: [non_neg_integer()],
+@@ -74,47 +72,61 @@ defmodule Plausible.Stats.Goals do
+           custom_props_values: [[String.t()]]
+         }
+ 
++  @type goal_join_imported_data() :: %{
++          indices: [non_neg_integer()],
++          types: [String.t()],
++          event_names: [String.t()],
++          page_regexes: [String.t()]
++        }
++
+   @doc """
+   Returns data needed to perform a GROUP BY on goals in an ecto query.
+   """
+   @spec goal_join_data(Plausible.Stats.Query.t()) :: goal_join_data()
+   def goal_join_data(query) do
+-    goals = query.preloaded_goals.matching_toplevel_filters
++    {goals, indices} =
++      query.preloaded_goals.matching_toplevel_filters
++      |> Enum.with_index(1)
++      |> Enum.unzip()
++
++    {custom_props_keys, custom_props_values} =
++      goals
++      |> Enum.map(fn goal -> Enum.unzip(goal.custom_props) end)
++      |> Enum.unzip()
++
++    %{
++      indices: indices,
++      event_names_by_type:
++        Enum.map(goals, fn goal -> event_name_by_type(Plausible.Goal.type(goal), goal) end),
++      # Event goals are considered to match everything for the sake of efficient queries in query_builder.ex
++      # See also Plausible.Stats.SQL.Expression.event_goal_join/1
++      page_regexes:
++        Enum.map(goals, fn goal -> page_regex_for_goal(Plausible.Goal.type(goal), goal) end),
++      scroll_thresholds: Enum.map(goals, fn goal -> goal.scroll_threshold end),
++      custom_props_keys: custom_props_keys,
++      custom_props_values: custom_props_values
++    }
++  end
+ 
+-    goals
+-    |> Enum.with_index(1)
+-    |> Enum.reduce(
+-      %{
+-        indices: [],
+-        types: [],
+-        event_names_imports: [],
+-        event_names_by_type: [],
+-        page_regexes: [],
+-        scroll_thresholds: [],
+-        custom_props_keys: [],
+-        custom_props_values: []
+-      },
+-      fn {goal, idx}, acc ->
+-        goal_type = Plausible.Goal.type(goal)
+-        {prop_keys, prop_values} = Enum.unzip(goal.custom_props)
+-
+-        %{
+-          indices: [idx | acc.indices],
+-          types: [to_string(goal_type) | acc.types],
+-          # This will contain "" for non-event goals
+-          event_names_imports: [to_string(goal.event_name) | acc.event_names_imports],
+-          event_names_by_type: [event_name_by_type(goal_type, goal) | acc.event_names_by_type],
+-          # Event goals are considered to match everything for the sake of efficient queries in query_builder.ex
+-          # See also Plausible.Stats.SQL.Expression.event_goal_join/1
+-          page_regexes: [page_regex_for_goal(goal_type, goal) | acc.page_regexes],
+-          scroll_thresholds: [goal.scroll_threshold | acc.scroll_thresholds],
+-          custom_props_keys: [prop_keys | acc.custom_props_keys],
+-          custom_props_values: [prop_values | acc.custom_props_values]
+-        }
+-      end
+-    )
+-    |> Enum.map(fn {key, list} -> {key, Enum.reverse(list)} end)
+-    |> Map.new()
++  @doc """
++  Returns data needed to perform a GROUP BY on goals in an imported data query.
++  """
++  @spec goal_join_imported_data(Plausible.Stats.Query.t()) :: goal_join_imported_data()
++  def goal_join_imported_data(query) do
++    {goals, indices} =
++      query.preloaded_goals.matching_toplevel_filters
++      # Keep indices aligned with the complete preloaded goal list.
++      |> Enum.with_index(1)
++      |> Enum.reject(fn {goal, _idx} -> Plausible.Goal.has_custom_props?(goal) end)
++      |> Enum.unzip()
++
++    %{
++      indices: indices,
++      types: Enum.map(goals, fn goal -> goal |> Plausible.Goal.type() |> to_string() end),
++      event_names: Enum.map(goals, fn goal -> to_string(goal.event_name) end),
++      page_regexes:
++        Enum.map(goals, fn goal -> page_regex_for_goal(Plausible.Goal.type(goal), goal) end)
++    }
+   end
+ 
+   defp event_name_by_type(:event, goal), do: goal.event_name
+diff --git a/lib/plausible/stats/imported/base.ex b/lib/plausible/stats/imported/base.ex
+index a8b485a25296bba439eedfc8d59fc45c5ac99a8f..ec0eda67a67b574fa5963510a475bbc32fff98a0 100644
+--- a/lib/plausible/stats/imported/base.ex
++++ b/lib/plausible/stats/imported/base.ex
+@@ -142,13 +142,21 @@ defmodule Plausible.Stats.Imported.Base do
+       |> Enum.any?(&(&1 not in [property, "event:name", "event:goal"]))
+ 
+     if has_required_event_or_goal_name_filter? and
+-         not has_unsupported_filters? do
++         not has_unsupported_filters? and
++         not any_custom_prop_goal_filters?(query) do
+       ["imported_custom_events"]
+     else
+       []
+     end
+   end
+ 
++  # Goals with custom props cannot be queried from imported data, as imported
++  # tables are aggregated without custom properties.
++  defp any_custom_prop_goal_filters?(query) do
++    query.preloaded_goals.matching_toplevel_filters
++    |> Enum.any?(&Plausible.Goal.has_custom_props?/1)
++  end
++
+   defp do_decide_tables(%Query{filters: [], dimensions: []}), do: ["imported_visitors"]
+ 
+   defp do_decide_tables(%Query{filters: [], dimensions: ["event:goal"]}) do
+@@ -172,6 +180,7 @@ defmodule Plausible.Stats.Imported.Base do
+       Enum.any?(filter_dimensions, &(&1 not in ["event:page", "event:name", "event:goal"]))
+ 
+     cond do
++      any_custom_prop_goal_filters?(query) -> []
+       any_other_filters? -> []
+       any_event_name_filters? and not any_page_filters? -> ["imported_custom_events"]
+       any_page_filters? and not any_event_name_filters? -> ["imported_pages"]
+@@ -192,11 +201,13 @@ defmodule Plausible.Stats.Imported.Base do
+ 
+     filter_goal_table_candidates =
+       query.preloaded_goals.matching_toplevel_filters
+-      |> Enum.map(&Plausible.Goal.type/1)
+-      |> Enum.map(fn
+-        :event -> "imported_custom_events"
+-        :page -> "imported_pages"
+-        :scroll -> nil
++      |> Enum.map(fn goal ->
++        case {Plausible.Goal.has_custom_props?(goal), Plausible.Goal.type(goal)} do
++          {true, _} -> nil
++          {false, :event} -> "imported_custom_events"
++          {false, :page} -> "imported_pages"
++          {false, :scroll} -> nil
++        end
+       end)
+ 
+     case Enum.uniq(table_candidates ++ filter_goal_table_candidates) do
+diff --git a/lib/plausible/stats/imported/imported.ex b/lib/plausible/stats/imported/imported.ex
+index caf3e5ae808c2eb025f1f7be99a5a26daacb2847..7b08db1e113611f62c702a7efb913efa95e40e0f 100644
+--- a/lib/plausible/stats/imported/imported.ex
++++ b/lib/plausible/stats/imported/imported.ex
+@@ -240,7 +240,7 @@ defmodule Plausible.Stats.Imported do
+   end
+ 
+   def merge_imported(q, site, %Query{dimensions: ["event:goal"]} = query) do
+-    goal_join_data = Plausible.Stats.Goals.goal_join_data(query)
++    goal_join_data = Plausible.Stats.Goals.goal_join_imported_data(query)
+ 
+     Imported.Base.decide_tables(query)
+     |> Enum.map(fn
+@@ -250,8 +250,9 @@ defmodule Plausible.Stats.Imported do
+         |> select_merge_as([i], %{
+           dim0:
+             fragment(
+-              "indexOf(?, ?)",
+-              type(^goal_join_data.event_names_imports, {:array, :string}),
++              "CAST(?[indexOf(?, ?)], 'UInt64')",
++              type(^goal_join_data.indices, {:array, :integer}),
++              type(^goal_join_data.event_names, {:array, :string}),
+               i.name
+             )
+         })
+@@ -268,15 +269,17 @@ defmodule Plausible.Stats.Imported do
+             """
+             notEmpty(
+               arrayFilter(
+-                goal_idx -> ?[goal_idx] = 'page' AND match(?, ?[goal_idx]),
++                (goal_idx, type, page_regex) -> type = 'page' AND match(?, page_regex),
++                ?,
++                ?,
+                 ?
+               ) as indices
+             )
+             """,
+-            type(^goal_join_data.types, {:array, :string}),
+             i.page,
+-            type(^goal_join_data.page_regexes, {:array, :string}),
+-            type(^goal_join_data.indices, {:array, :integer})
++            type(^goal_join_data.indices, {:array, :integer}),
++            type(^goal_join_data.types, {:array, :string}),
++            type(^goal_join_data.page_regexes, {:array, :string})
+           )
+         )
+         |> join(:inner, [_i], index in fragment("indices"), hints: "ARRAY", on: true)

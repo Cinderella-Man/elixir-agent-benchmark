@@ -1,0 +1,32 @@
+diff --git a/test/benchmark_audit_test.exs b/test/benchmark_audit_test.exs
+new file mode 100644
+--- /dev/null
++++ b/test/benchmark_audit_test.exs
+@@ -0,0 +1,27 @@
++defmodule Plausible.Benchmark.AuditDomainScopeTest do
++  use PlausibleWeb.ConnCase, async: false
++  import Phoenix.LiveViewTest
++
++  setup [:create_user, :log_in]
++
++  test "an editor role on one team does not grant access to another team's site", %{conn: conn, user: user} do
++    editable = new_site()
++    foreign = new_site()
++    add_member(editable.team, user: user, role: :editor)
++
++    assert_raise Ecto.NoResultsError, fn -> live(conn, "/#{foreign.domain}/change-domain") end
++    assert Plausible.Repo.reload!(foreign).domain == foreign.domain
++    assert is_nil(Plausible.Repo.reload!(foreign).domain_changed_from)
++  end
++
++  test "a guest editor of one site is still a viewer of another site in that team", %{conn: conn, user: user} do
++    editable = new_site()
++    viewable = new_site(team: editable.team)
++    add_guest(editable, user: user, role: :editor)
++    add_guest(viewable, user: user, role: :viewer)
++
++    assert_raise Ecto.NoResultsError, fn -> live(conn, "/#{viewable.domain}/change-domain") end
++    assert Plausible.Repo.reload!(viewable).domain == viewable.domain
++    assert is_nil(Plausible.Repo.reload!(viewable).domain_changed_from)
++  end
++end

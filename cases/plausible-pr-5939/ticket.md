@@ -7,3 +7,5 @@ Reproduce this with a site named old.example.com, first as its guest Editor and 
 Both editors should be able to complete the change. The persisted site should have the new domain and retain old.example.com as its previous domain, as it already does for a successful owner change. Team Admins and Owners must continue to work. Viewers and people without access to the site must remain unable to change it.
 
 Fix the permission regression and add coverage for these role boundaries.
+
+An Editor role on an unrelated site or team must not grant permission to change this site.

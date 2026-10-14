@@ -1,0 +1,51 @@
+diff --git a/test/benchmark_erlang_diagnostics_test.exs b/test/benchmark_erlang_diagnostics_test.exs
+new file mode 100644
+--- /dev/null
++++ b/test/benchmark_erlang_diagnostics_test.exs
+@@ -0,0 +1,46 @@
++defmodule Livebook.Benchmark.ErlangDiagnosticsTest do
++  use ExUnit.Case, async: true
++  import Livebook.TestHelpers
++  alias Livebook.Runtime.Evaluator
++
++  setup do
++    {:ok, object_tracker} = start_supervised(Evaluator.ObjectTracker)
++    {:ok, client_tracker} = start_supervised(Evaluator.ClientTracker)
++    {:ok, _pid, evaluator} = start_supervised({Evaluator,
++      send_to: self(), object_tracker: object_tracker, client_tracker: client_tracker})
++    %{evaluator: evaluator}
++  end
++
++  for {name, source, type, line, column, offending, reason} <- [
++        {"incomplete", "X =", "TokenMissingError", 1, 4, "X =", "syntax error"},
++        {"parser", "X ==/== a.", "SyntaxError", 1, 5, "X ==/== a.", "syntax error"},
++        {"tokenizer", "$a$", "SyntaxError", 1, 3, "$a$", "unterminated character"},
++        {"multiline incomplete", "\nX =", "TokenMissingError", 2, 4, "X =", "syntax error"},
++        {"multiline parser", "\n  X ==/== a.", "SyntaxError", 2, 7, "X ==/== a.", "syntax error"},
++        {"multiline tokenizer", "\n  $a$", "SyntaxError", 2, 5, "$a$", "unterminated character"}
++      ] do
++    test "#{name} reports its source and location", %{evaluator: evaluator} do
++      Evaluator.evaluate_code(evaluator, :erlang, unquote(source), :audit, [], file: "audit.erl")
++      assert_receive {:runtime_evaluation_response, :audit, %{type: :error, message: message}, metadata}
++      message = clean_message(message)
++      assert message =~ unquote(type)
++      assert message =~ unquote(reason)
++      assert message =~ unquote(offending)
++      assert message =~ unquote("audit.erl:#{line}:#{column}")
++      refute message =~ "ArgumentError"
++      refute message =~ "retrieving Exception.message"
++      assert metadata.errored
++      assert Enum.any?(metadata.code_markers, &(&1.line == unquote(line) and &1.severity == :error))
++    end
++  end
++
++  test "ordinary runtime errors retain the failing function and argument", %{evaluator: evaluator} do
++    Evaluator.evaluate_code(evaluator, :erlang, "list_to_binary(1).", :audit, [])
++    assert_receive {:runtime_evaluation_response, :audit, %{type: :error, message: message}, metadata}
++    message = clean_message(message)
++    assert message =~ "bad argument"
++    assert message =~ "list_to_binary/1"
++    assert message =~ "list_to_binary(1)"
++    assert metadata.errored
++  end
++end

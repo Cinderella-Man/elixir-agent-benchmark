@@ -1,5 +1,7 @@
 # Prepared-baseline validation — 2026-10-14
 
+**Later evidence:** the [task-quality audit](verification/task-quality-audit-2026-10-14.md) validated matching original qualification receipts for all twelve cases and replayed every reference acceptance suite in a fresh workspace. It also found coverage gaps and a reference-contract mismatch in Plausible 6300. The interrupted-job record below remains historical evidence, not the current task-quality verdict.
+
 The updated controller is deployed. The user stopped the model-free, twelve-case qualification job before completion. No Pi attempts, model generations or speed benchmarks ran, and no new PR cases were added. The website is idle with cleanup complete. Completed caches and evidence remain on disk.
 
 ## Completed checks

@@ -5,3 +5,5 @@ Evaluating an Erlang cell with a syntax error can raise an additional ArgumentEr
 Examples include incomplete input `X =`, invalid syntax `X ==/== a.`, and an unterminated character literal `$a$`. The evaluation response should contain a readable diagnostic for the original Erlang error, with the offending source line and location. It must not fail while rendering that diagnostic. Ordinary Erlang runtime exceptions should still be reported correctly.
 
 Repair the error reporting and add regression coverage through cell evaluation.
+
+The offending line may occur after the first line of the cell. Diagnostic layout may vary as long as the original error, its source line and its location remain readable and correct.

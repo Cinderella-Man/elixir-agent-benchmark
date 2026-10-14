@@ -1,0 +1,25 @@
+diff --git a/test/benchmark_audit_test.exs b/test/benchmark_audit_test.exs
+new file mode 100644
+--- /dev/null
++++ b/test/benchmark_audit_test.exs
+@@ -0,0 +1,20 @@
++defmodule Plausible.Benchmark.AuditLegacyAggregateTest do
++  use Plausible.DataCase
++  alias Plausible.Stats.QueryBuilder
++
++  setup [:create_user, :create_site]
++
++  test "supported page-filtered aggregate retains legacy time on page without a cutoff", %{site: site} do
++    site = Plausible.Sites.update_legacy_time_on_page_cutoff!(site, nil)
++    populate_stats(site, [
++      build(:pageview, user_id: 42, pathname: "/blog", timestamp: ~N[2020-01-05 12:00:00]),
++      build(:pageview, user_id: 42, pathname: "/next", timestamp: ~N[2020-01-05 12:01:00])
++    ])
++    query = QueryBuilder.build!(site,
++      metrics: [:visitors, :time_on_page], input_date_range: :all,
++      filters: [[:is, "event:page", ["/blog"]]], dimensions: []
++    )
++    result = Plausible.Stats.query(site, query)
++    assert [%{dimensions: [], metrics: [1, 60]}] = result.results
++  end
++end

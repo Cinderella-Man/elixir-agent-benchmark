@@ -3,7 +3,7 @@ defmodule EabWeb.DashboardTest do
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
   @endpoint EabWeb.Endpoint
-  test "clicking a case opens its command output and follows newly written output" do
+  test "a retired case in a saved run still shows and follows its command output" do
     id = "live-log-test"
     case_id = "plausible-pr-6300"
 
@@ -52,14 +52,15 @@ defmodule EabWeb.DashboardTest do
     assert has_element?(view, "#case-panel-#{case_id} #case-log", "Tests finished")
   end
 
-  test "local setup page shows twelve PR cases and waits for a model connection" do
+  test "local setup page shows eleven PR cases and waits for a model connection" do
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "Benchmark dashboard"
     assert html =~ "Model and tool calls are unlimited."
     refute has_element?(view, "input[name='settings[max_calls]']")
     assert has_element?(view, "#run[disabled]")
-    assert html =~ "plausible-pr-6300"
-    assert length(Eab.Inventory.all()) == 12
+    assert html =~ "plausible-pr-5939"
+    refute html =~ "plausible-pr-6300"
+    assert length(Eab.Inventory.all()) == 11
   end
 
   test "run summary separates failed repairs from evaluation errors" do

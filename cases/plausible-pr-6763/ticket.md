@@ -7,3 +7,5 @@ For a concrete reproduction, use a site without that cutoff, record visits to /b
 The export should succeed and produce valid CSV with the usual date, visitors, pageviews, visits, bounce_rate, time_on_page and scroll_depth columns. Each of those two days should retain its one visitor, pageview and visit. Time-on-page values unavailable for this report should remain empty, consistent with existing exports; do not drop the column or invent values to avoid the error.
 
 Fix the regression, preserve other export modes, and add a test reproducing this site configuration.
+
+Keep the same report totals when exporting without a page filter or with a supported page or goal breakdown; repairing the filtered case must not discard other export modes.

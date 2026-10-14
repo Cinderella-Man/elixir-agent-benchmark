@@ -1,6 +1,6 @@
 # Elixir Agent Benchmark
 
-A local Elixir website that evaluates one served coding model against **twelve historical PR repairs**: six Plausible and six Livebook cases. Enter a llama.cpp or Strata endpoint, inspect the automatically discovered model, and click **Run benchmark**.
+A local Elixir website that evaluates one served coding model against **eleven historical PR repairs**: five Plausible and six Livebook cases. Enter a llama.cpp or Strata endpoint, inspect the automatically discovered model, and click **Run benchmark**.
 
 The application prepares Docker images, checks the fixtures, runs the [Pi coding agent](https://github.com/earendil-works/pi) in isolated Docker workspaces, and grades its repairs with executable tests. There is no AI judge or speed score.
 
@@ -38,7 +38,7 @@ Pi and the project run on the benchmark's Docker host. The model server can run 
 
 ## Run settings and results
 
-Defaults: all twelve cases, seed 101, unlimited model and tool calls, up to 8,192 tokens per response and 65,536 generated tokens per case. Context is detected automatically and capped at 262,144 tokens. Advanced settings allow explicit overrides within the server's capacity. History is retained without compaction; exhausting either the generation budget or context window submits the current patch for grading.
+Defaults: all eleven cases, seed 101, unlimited model and tool calls, up to 8,192 tokens per response and 65,536 generated tokens per case. Context is detected automatically and capped at 262,144 tokens. Advanced settings allow explicit overrides within the server's capacity. History is retained without compaction; exhausting either the generation budget or context window submits the current patch for grading.
 
 One run is active at a time. Closing the browser does not stop it. **Stop run** cancels execution and cleans up this installation's containers. After interruption, reconnect the same model with the same settings and choose **Resume unfinished cases**. Completed passes, failures and evaluation errors stay fixed; saved submissions resume grading, and unfinished Pi work starts in a fresh workspace with its prior evidence preserved. Changed release, model or settings require a new run. Historical runs without checkpoint receipts cannot resume.
 
@@ -49,5 +49,7 @@ Each run freezes a checksummed release and experiment identity. Select a case fo
 Under **Retained preparation**, preview removal of one case's cached state or unreferenced artifacts. Shared state and active work are protected; nothing is automatically evicted. Missing builds stop if the data filesystem is below the configured free-space reserve (5 GiB by default). When a run ends, **Download report** saves its summary and per-case results. Data persists in the `benchmark-data` Docker volume.
 
 [Setup, development and troubleshooting](docs/runbook.md) · [Evaluation contract](docs/evaluation.md) · [Inventory](config/benchmark.json) · [Design decisions](docs/design-tree.md) · [SWE-bench research](docs/research/swe-bench.md)
+
+[Task-quality research and the twelve-PR audit](docs/verification/task-quality-audit-2026-10-14.md) assess whether these fixtures measure their stated tasks. Protocol `elixir-agent-benchmark-v3` removes Plausible 6300 because its reference fails the timezone contract, promotes custom checks for all eleven remaining cases, and accepts equivalent readable Erlang diagnostic layouts. See the [promotion verification](docs/verification/task-quality-promotion-2026-10-14.md) for final-fixture qualification and challenge replays. Historical scores keep their original inventory and checks.
 
 New case drafts use [versioned admission contracts](docs/case-admission.md), with exact upstream reconstruction, recorded independent review and executable qualification before entering the inventory. The website also supports comparable-run matrices and reference-aware release cache removal. Storage snapshots distinguish per-image shared/unique bytes from Docker-wide totals.

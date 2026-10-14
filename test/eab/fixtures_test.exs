@@ -28,7 +28,7 @@ defmodule Eab.FixturesTest do
   end
 
   test "matching image records reuse prepared dependencies and refresh fixture evidence" do
-    id = "plausible-pr-6300"
+    id = "plausible-pr-6441"
     inputs = Fixtures.build_inputs(id, Inventory.spec(id))
 
     runtime = %{
@@ -77,14 +77,14 @@ defmodule Eab.FixturesTest do
     Store.write("runtimes/#{id}.json", result)
     assert_receive {:inspected, "fixture"}
     assert_receive {:inspected, "database"}
-    assert_receive {:progress, "Reusing prepared project for plausible-pr-6300"}
+    assert_receive {:progress, "Reusing prepared project for plausible-pr-6441"}
     assert result["fixture_hashes"] == Inventory.fixture_hashes(id)
     assert Store.read("runtimes/#{id}.json") == result
     refute File.exists?(Store.path("build/#{id}"))
   end
 
   test "matching qualification receipts are reused without running controls" do
-    id = "plausible-pr-6300"
+    id = "plausible-pr-6441"
     runtime = %{"image" => "synthetic-prepared-image"}
 
     control = %{
@@ -96,7 +96,7 @@ defmodule Eab.FixturesTest do
     Store.write("qualifications/#{Cache.key(control["identity"])}.json", control)
     parent = self()
     assert Eab.Grader.qualify(id, "cache-test", &send(parent, {:qualification, &1})) == control
-    assert_receive {:qualification, "Reusing checked fixture for plausible-pr-6300"}
+    assert_receive {:qualification, "Reusing checked fixture for plausible-pr-6441"}
     refute File.exists?(Store.path("runs/cache-test"))
   end
 
@@ -190,7 +190,7 @@ defmodule Eab.FixturesTest do
   end
 
   test "project, database and control identities ignore unrelated runtime metadata" do
-    id = "plausible-pr-6300"
+    id = "plausible-pr-6441"
     spec = Inventory.spec(id)
     changed = spec |> put_in(["services", "postgres", "image"], "new-db")
     assert Fixtures.build_inputs(id, spec) == Fixtures.build_inputs(id, changed)
@@ -226,7 +226,7 @@ defmodule Eab.FixturesTest do
   test "required acceptance checks and unknown future grading rules invalidate controls", %{
     root: root
   } do
-    id = "plausible-pr-6300"
+    id = "plausible-pr-6441"
     original_root = Inventory.root()
     fixture_root = Path.join(root, "inventory")
     File.mkdir_p!(Path.join(fixture_root, "config"))

@@ -2,11 +2,13 @@
 
 The benchmark is a local, single-user Elixir application. Enter a llama.cpp or Strata endpoint, inspect its automatically discovered model details, and start a run. Phoenix LiveView provides setup, preparation, fixture checks, progress, cancellation and saved results.
 
+Current inventory update, 2026-10-14: the [task-quality audit](verification/task-quality-audit-2026-10-14.md) led to an eleven-case v3 revision. Plausible 6300 is retired, and the remaining cases use the verified custom checks. See [promotion verification](verification/task-quality-promotion-2026-10-14.md); older qualification counts in the design history below describe earlier checkpoints.
+
 ## Contract
 
 | Area | Decision |
 | --- | --- |
-| Cases | Twelve actual upstream PR repairs: six Plausible, six Livebook |
+| Cases | Eleven actual upstream PR repairs: five Plausible, six Livebook |
 | Model | One endpoint and its currently served model per run |
 | Identification | Server-reported metadata; unknown properties stay explicit; no manual artifact pins |
 | Agent | Pinned Pi CLI inside each problem container, using read, bash, edit and write |
@@ -65,7 +67,7 @@ The intended use is evaluating 10–30 models against the same PR cases on one D
 | --- | --- |
 | Missing or stale preparation | Run automatically prepares what is missing; no mandatory separate preparation step or cache-only run mode |
 | Consumers | Independent Pi workspaces, grading workspaces and broken-source regression probes share a pristine baseline through isolated writable clones |
-| Model sequence | Complete the twelve-case benchmark for one model, then run the same inventory for the next model; every case's baseline persists across those runs |
+| Model sequence | Complete the eleven-case benchmark for one model, then run the same inventory for the next model; every case's baseline persists across those runs |
 | Starting-state contract | Application repairs start after the original broken revision's installation and migrations; future installation/migration cases explicitly request fresh setup |
 | Database seeding across PRs | Prepare an oldest compatible pristine database base, clone it for later cases, apply only their missing migrations, then retain each case's completed baseline for all model runs |
 | Existing scheduling | Keep one active Pi, the bounded preparation window, one waiting workspace and independent grading |

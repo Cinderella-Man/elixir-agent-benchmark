@@ -1,6 +1,6 @@
 # Expand toward 250 qualified PRs per project
 
-Status: baseline foundation and the first research-driven release/recovery/retention/evidence controls implemented, 2026-10-13; [SWE-bench research](research/swe-bench.md) completed and incorporated below. The updated controller is deployed. The user stopped functional qualification after two of twelve cases passed; four current pristine baselines are saved. See the [validation record](validation-2026-10-14.md) for the unfinished checks. The current executable inventory remains twelve cases. The target is approximately 250 Plausible and 250 Livebook cases, reused across 10–30 model runs.
+Status, 2026-10-14: release/recovery/retention/evidence controls are implemented. The [twelve-case task-quality audit](verification/task-quality-audit-2026-10-14.md) led to an eleven-case v3 inventory: Plausible 6300 is retired and the remaining cases have stronger checks. See [promotion verification](verification/task-quality-promotion-2026-10-14.md) for final-fixture evidence. Older counts in this planning history refer to earlier checkpoints. The expansion target remains approximately 250 Plausible and 250 Livebook cases, reused across 10–30 model runs.
 
 ## Scope and decisions
 
@@ -22,7 +22,7 @@ Increasing case count improves coverage of these projects, but two repositories 
 
 ## Acceptance contracts for the expanded task types
 
-The current twelve cases remain repair tasks. Historical results retain their original protocol; the prepared-baseline implementation declares `elixir-agent-benchmark-v2` with the same case list. Add a versioned `task_kind` and explicit acceptance contract for future releases:
+The current eleven cases remain repair tasks. Historical results retain their original protocol; the task-quality revision declares `elixir-agent-benchmark-v3`. Add a versioned `task_kind` and explicit acceptance contract for future releases:
 
 | Kind | Required change | Checks that distinguish a valid submission from unchanged code |
 | --- | --- | --- |

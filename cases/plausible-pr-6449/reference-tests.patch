@@ -201,3 +201,61 @@ diff --git a/test/plausible_web/live/shared_link_settings/form_test.exs b/test/p
      test "shows upgrade required error when subscription doesn't include Shared Links", %{
        conn: conn,
        site: site,
+diff --git a/test/benchmark_audit_test.exs b/test/benchmark_audit_test.exs
+new file mode 100644
+--- /dev/null
++++ b/test/benchmark_audit_test.exs
+@@ -0,0 +1,53 @@
++defmodule Plausible.Benchmark.AuditSharedLinkEditingTest do
++  use PlausibleWeb.ConnCase, async: false
++  import Phoenix.LiveViewTest
++
++  setup [:create_user, :log_in, :create_site]
++
++  setup %{user: user, site: site} do
++    subscribe_to_growth_plan(user)
++    {:ok, session: %{"site_id" => site.id, "domain" => site.domain}}
++  end
++
++  for membership <- [:guest_viewer, :team_viewer, :unrelated] do
++    test "#{membership} cannot open shared-link settings", %{conn: conn, site: site, session: session} do
++      denied_user = new_user()
++
++      case unquote(membership) do
++        :guest_viewer -> add_guest(site, user: denied_user, role: :viewer)
++        :team_viewer -> add_member(site.team, user: denied_user, role: :viewer)
++        :unrelated -> :ok
++      end
++
++      existing = insert(:shared_link, site: site, name: "Protected link")
++      {:ok, conn: denied_conn} = log_in(%{user: denied_user, conn: conn})
++
++      assert_raise Ecto.NoResultsError, fn ->
++        live_isolated(denied_conn, PlausibleWeb.Live.SharedLinkSettings, session: session)
++      end
++
++      assert Plausible.Repo.reload!(existing).slug == existing.slug
++      assert Plausible.Repo.reload!(existing).name == "Protected link"
++    end
++  end
++
++  test "malformed and nonexistent segment selections clear existing associations on edit", %{conn: conn, site: site, session: session} do
++    segment = insert(:segment, type: :site, site: site, name: "Original segment")
++
++    for {value, index} <- Enum.with_index(["not-an-id", "-1", "999999999"]) do
++      link = insert(:shared_link, site: site, name: "Original #{index}", segment: segment)
++      {:ok, lv, _} = live_isolated(conn, PlausibleWeb.Live.SharedLinkSettings, session: session)
++      lv
++      |> element(~s/button[phx-click="edit-shared-link"][phx-value-slug="#{link.slug}"]/)
++      |> render_click()
++      lv
++      |> element("#shared-links-form-modalseq0 form")
++      |> render_submit(%{shared_link: %{name: "Renamed #{index}", segment_id: value}})
++      assert render(lv) =~ "Shared link saved"
++      updated = Plausible.Repo.reload!(link)
++      assert updated.name == "Renamed #{index}"
++      assert updated.slug == link.slug
++      assert is_nil(updated.segment_id)
++    end
++  end
++end
