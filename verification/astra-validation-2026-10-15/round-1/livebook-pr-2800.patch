@@ -1,0 +1,75 @@
+diff --git a/lib/livebook/runtime/evaluator.ex b/lib/livebook/runtime/evaluator.ex
+index 518e90c..76a6029 100644
+--- a/lib/livebook/runtime/evaluator.ex
++++ b/lib/livebook/runtime/evaluator.ex
+@@ -785,29 +785,14 @@ defmodule Livebook.Runtime.Evaluator do
+   end
+ 
+   defp make_snippet(code, location) do
+-    start_line = 1
+-    start_column = 1
+-    line = :erl_anno.line(location)
+-
+     case :erl_anno.column(location) do
+       :undefined ->
+         nil
+ 
+-      column ->
+-        lines = :string.split(code, "\n", :all)
+-        snippet = :lists.nth(line - start_line + 1, lines)
+-
+-        offset =
+-          if line == start_line do
+-            column - start_column
+-          else
+-            column - 1
+-          end
+-
+-        case :string.trim(code, :leading) do
+-          [] -> nil
+-          _ -> %{content: snippet, offset: offset}
+-        end
++      _column ->
++        code
++        |> String.split("\n")
++        |> Enum.at(:erl_anno.line(location) - 1)
+     end
+   end
+ 
+diff --git a/test/livebook/runtime/evaluator_test.exs b/test/livebook/runtime/evaluator_test.exs
+index e3541c7..14e4ee8 100644
+--- a/test/livebook/runtime/evaluator_test.exs
++++ b/test/livebook/runtime/evaluator_test.exs
+@@ -1369,6 +1369,32 @@ defmodule Livebook.Runtime.EvaluatorTest do
+       assert metadata.code_markers == []
+     end
+ 
++    test "formats syntax errors with source snippets", %{evaluator: evaluator} do
++      for {source, exception, description, column, module} <- [
++            {"X ==/== a.", "SyntaxError", "syntax error before: /=", 5, :erl_parse},
++            {"X =", "TokenMissingError", "syntax error before: ", 4, :erl_parse},
++            {"$a$", "SyntaxError", "unterminated character", 3, :erl_scan}
++          ] do
++        Evaluator.evaluate_code(evaluator, :erlang, "ok,\n" <> source, :code, [],
++          file: "cell.erl"
++        )
++
++        assert_receive {:runtime_evaluation_response, :code, error(message),
++                        metadata() = metadata}
++
++        assert message =~ "** (#{exception})"
++        assert message =~ "error: #{description}"
++        assert message =~ "2 │ #{source}"
++        assert message =~ "│ #{String.duplicate(" ", column - 1)}^"
++        assert message =~ "cell.erl:2:#{column}"
++        refute message =~ "ArgumentError"
++
++        assert metadata.code_markers == [
++                 %{line: 2, severity: :error, description: "#{module}: #{description}"}
++               ]
++      end
++    end
++
+     test "syntax and tokenizer errors are converted", %{evaluator: evaluator} do
+       # Incomplete input
+       Evaluator.evaluate_code(evaluator, :erlang, "X =", :code_1, [])

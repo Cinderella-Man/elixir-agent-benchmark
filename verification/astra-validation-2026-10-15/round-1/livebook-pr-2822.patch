@@ -1,0 +1,91 @@
+diff --git a/lib/livebook/runtime/evaluator.ex b/lib/livebook/runtime/evaluator.ex
+index 2343b84..644a887 100644
+--- a/lib/livebook/runtime/evaluator.ex
++++ b/lib/livebook/runtime/evaluator.ex
+@@ -468,8 +468,20 @@ defmodule Livebook.Runtime.Evaluator do
+           identifiers_used = :unknown
+           identifiers_defined = %{}
+           identifier_definitions = []
+-          # Empty context
++          # Discard changes from the failed evaluation, but preserve imports
++          # and process dictionary, which are stored in full rather than diffed.
+           new_context = initial_context()
++
++          new_context = %{
++            new_context
++            | env: %{
++                new_context.env
++                | functions: context.env.functions,
++                  macros: context.env.macros
++              },
++              pdict: context.pdict
++          }
++
+           {new_context, result, identifiers_used, identifiers_defined, identifier_definitions}
+       end
+ 
+diff --git a/test/livebook/runtime/evaluator_test.exs b/test/livebook/runtime/evaluator_test.exs
+index 6d2fe89..2f76127 100644
+--- a/test/livebook/runtime/evaluator_test.exs
++++ b/test/livebook/runtime/evaluator_test.exs
+@@ -362,6 +362,60 @@ defmodule Livebook.Runtime.EvaluatorTest do
+                       metadata()}
+     end
+ 
++    test "preserves imports from successful cells after an error", %{evaluator: evaluator} do
++      code1 = """
++      import Integer, only: [digits: 1, is_even: 1]
++      """
++
++      code2 = """
++      import Integer, only: []
++      raise "failed"
++      """
++
++      Evaluator.evaluate_code(evaluator, :elixir, code1, :code_1, [])
++      assert_receive {:runtime_evaluation_response, :code_1, _, %{errored: false}}
++
++      Evaluator.evaluate_code(evaluator, :elixir, code2, :code_2, [:code_1])
++      assert_receive {:runtime_evaluation_response, :code_2, error(_), metadata()}
++
++      code3 = "if is_even(42), do: hd(digits(42))"
++      Evaluator.evaluate_code(evaluator, :elixir, code3, :code_3, [:code_2, :code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_3, terminal_text(ansi_number(4)),
++                      metadata()}
++    end
++
++    test "preserves process dictionary from successful cells after an error",
++         %{evaluator: evaluator} do
++      code1 = """
++      Process.put(:x, 1)
++      Process.put(:y, 2)
++      """
++
++      code2 = """
++      Process.put(:x, 3)
++      Process.delete(:y)
++      Process.put(:z, 4)
++      raise "failed"
++      """
++
++      Evaluator.evaluate_code(evaluator, :elixir, code1, :code_1, [])
++      assert_receive {:runtime_evaluation_response, :code_1, _, %{errored: false}}
++
++      Evaluator.evaluate_code(evaluator, :elixir, code2, :code_2, [:code_1])
++      assert_receive {:runtime_evaluation_response, :code_2, error(_), metadata()}
++
++      code3 = """
++      {1, 2, nil} = {Process.get(:x), Process.get(:y), Process.get(:z)}
++      42
++      """
++
++      Evaluator.evaluate_code(evaluator, :elixir, code3, :code_3, [:code_2, :code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_3, terminal_text(ansi_number(42)),
++                      metadata()}
++    end
++
+     test "given file option sets it in evaluation environment", %{evaluator: evaluator} do
+       code = """
+       __DIR__

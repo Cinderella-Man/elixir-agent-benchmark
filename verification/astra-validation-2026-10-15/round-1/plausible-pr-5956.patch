@@ -1,0 +1,66 @@
+diff --git a/lib/plausible/application.ex b/lib/plausible/application.ex
+index 2bae31a..0fc99be 100644
+--- a/lib/plausible/application.ex
++++ b/lib/plausible/application.ex
+@@ -164,7 +164,7 @@ defmodule Plausible.Application do
+           adapter_opts: [
+             n_lock_partitions: 1,
+             ttl_check_interval: false,
+-            ets_options: [:bag, read_concurrency: true]
++            ets_options: [read_concurrency: true]
+           ],
+           warmers: [
+             refresh_all:
+diff --git a/test/plausible_web/plugs/tracker_plug_test.exs b/test/plausible_web/plugs/tracker_plug_test.exs
+index 488b5b2..3aa94c8 100644
+--- a/test/plausible_web/plugs/tracker_plug_test.exs
++++ b/test/plausible_web/plugs/tracker_plug_test.exs
+@@ -135,3 +135,48 @@ defmodule PlausibleWeb.TrackerPlugTest do
+     |> response(200)
+   end
+ end
++
++defmodule PlausibleWeb.TrackerPlugCacheTest do
++  use PlausibleWeb.ConnCase
++
++  alias PlausibleWeb.{Tracker, TrackerScriptCache}
++
++  @moduletag :ce_build_only
++
++  setup_patch_env(Plausible.Cache, enabled: true)
++
++  test "dedicated scripts remain available after configuration updates", %{conn: conn} do
++    site = new_site()
++
++    config =
++      Tracker.get_or_create_tracker_script_configuration!(site, %{
++        installation_type: :manual,
++        outbound_links: false
++      })
++
++    on_exit(fn ->
++      Plausible.Cache.Adapter.delete(TrackerScriptCache.name(), config.id)
++    end)
++
++    original_script = Tracker.build_script(config)
++
++    assert eventually(fn ->
++             {TrackerScriptCache.get(config.id) == original_script, :ok}
++           end)
++
++    path = "/js/#{config.id}.js"
++    assert get(conn, path) |> response(200) == original_script
++    refute original_script =~ "outboundLinks:!0"
++
++    updated_config =
++      Tracker.update_script_configuration!(site, %{outbound_links: true}, :installation)
++
++    assert eventually(fn ->
++             {TrackerScriptCache.get(config.id) != original_script, :ok}
++           end)
++
++    updated_script = get(conn, path) |> response(200)
++    assert updated_script == Tracker.build_script(updated_config)
++    assert updated_script =~ "outboundLinks:!0"
++  end
++end

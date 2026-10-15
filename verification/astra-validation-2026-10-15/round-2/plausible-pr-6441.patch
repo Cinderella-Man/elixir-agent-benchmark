@@ -1,0 +1,183 @@
+diff --git a/lib/plausible/stats/imported/base.ex b/lib/plausible/stats/imported/base.ex
+index a8b485a..31f1d31 100644
+--- a/lib/plausible/stats/imported/base.ex
++++ b/lib/plausible/stats/imported/base.ex
+@@ -82,6 +82,10 @@ defmodule Plausible.Stats.Imported.Base do
+       behavioral_filters != [] ->
+         []
+ 
++      # Imported aggregates cannot enforce custom property filters defined on goals.
++      custom_prop_goal_query?(query) ->
++        []
++
+       custom_prop_query?(query) ->
+         do_decide_custom_prop_table(query)
+ 
+@@ -90,6 +94,18 @@ defmodule Plausible.Stats.Imported.Base do
+     end
+   end
+ 
++  defp custom_prop_goal_query?(query) do
++    goal_query? =
++      "event:goal" in query.dimensions or
++        "event:goal" in dimensions_used_in_filters(query.filters)
++
++    goal_query? and
++      Enum.any?(
++        query.preloaded_goals.matching_toplevel_filters,
++        &Plausible.Goal.has_custom_props?/1
++      )
++  end
++
+   defp custom_prop_query?(query) do
+     dimensions_used_in_filters(query.filters)
+     |> Enum.concat(query.dimensions)
+diff --git a/test/plausible_web/controllers/api/external_stats_controller/query_goal_custom_props_test.exs b/test/plausible_web/controllers/api/external_stats_controller/query_goal_custom_props_test.exs
+index 360e00a..619eba2 100644
+--- a/test/plausible_web/controllers/api/external_stats_controller/query_goal_custom_props_test.exs
++++ b/test/plausible_web/controllers/api/external_stats_controller/query_goal_custom_props_test.exs
+@@ -5,6 +5,144 @@ defmodule PlausibleWeb.Api.ExternalStatsController.QueryGoalCustomPropsTest do
+ 
+   alias Plausible.Goals
+ 
++  describe "goals with custom property filters and imported data" do
++    setup :create_site_import
++
++    setup %{site: site, site_import: site_import} do
++      for attrs <- [%{"event_name" => "Purchase"}, %{"page_path" => "/checkout"}] do
++        {:ok, _} = Goals.create(site, Map.put(attrs, "display_name", goal_name(attrs, "All")))
++
++        {:ok, _} =
++          Goals.create(
++            site,
++            Map.merge(attrs, %{
++              "display_name" => goal_name(attrs, "Filtered"),
++              "custom_props" => %{"variant" => "A"}
++            })
++          )
++      end
++
++      populate_stats(site, site_import.id, [
++        build(:event,
++          name: "Purchase",
++          user_id: 1,
++          "meta.key": ["variant"],
++          "meta.value": ["A"],
++          timestamp: ~N[2021-01-01 00:00:00]
++        ),
++        build(:event, name: "Purchase", user_id: 2, timestamp: ~N[2021-01-01 00:00:00]),
++        build(:pageview,
++          pathname: "/checkout",
++          user_id: 1,
++          "meta.key": ["variant"],
++          "meta.value": ["A"],
++          timestamp: ~N[2021-01-01 00:00:00]
++        ),
++        build(:pageview, pathname: "/checkout", user_id: 2, timestamp: ~N[2021-01-01 00:00:00]),
++        build(:imported_custom_events,
++          name: "Purchase",
++          visitors: 10,
++          events: 20,
++          date: ~D[2021-01-01]
++        ),
++        build(:imported_pages,
++          page: "/checkout",
++          visitors: 10,
++          pageviews: 20,
++          date: ~D[2021-01-01]
++        ),
++        build(:imported_visitors, visitors: 10, date: ~D[2021-01-01])
++      ])
++
++      :ok
++    end
++
++    for goal <- ["Filtered event", "Filtered page"],
++        dimensions <- [[], ["event:goal"], ["time:day"]] do
++      test "skips imports when filtering #{goal} with dimensions #{inspect(dimensions)}", %{
++        conn: conn,
++        site: site
++      } do
++        goal = unquote(goal)
++        dimensions = unquote(dimensions)
++
++        response =
++          conn
++          |> post("/api/v2/query", %{
++            "site_id" => site.domain,
++            "date_range" => ["2021-01-01", "2021-01-01"],
++            "metrics" => ["visitors", "events", "conversion_rate"],
++            "dimensions" => dimensions,
++            "filters" => [["is", "event:goal", [goal]]],
++            "include" => %{"imports" => true}
++          })
++          |> json_response(200)
++
++        expected_dimensions =
++          case dimensions do
++            [] -> []
++            ["event:goal"] -> [goal]
++            ["time:day"] -> ["2021-01-01"]
++          end
++
++        assert response["results"] == [
++                 %{"dimensions" => expected_dimensions, "metrics" => [1, 1, 50.0]}
++               ]
++
++        refute response["meta"]["imports_included"]
++        assert response["meta"]["imports_skip_reason"] == "unsupported_query"
++      end
++    end
++
++    test "skips imports for an unfiltered goal breakdown", %{conn: conn, site: site} do
++      response =
++        conn
++        |> post("/api/v2/query", %{
++          "site_id" => site.domain,
++          "date_range" => "all",
++          "metrics" => ["visitors", "events"],
++          "dimensions" => ["event:goal"],
++          "include" => %{"imports" => true}
++        })
++        |> json_response(200)
++
++      assert Enum.sort_by(response["results"], & &1["dimensions"]) == [
++               %{"dimensions" => ["All event"], "metrics" => [2, 2]},
++               %{"dimensions" => ["All page"], "metrics" => [2, 2]},
++               %{"dimensions" => ["Filtered event"], "metrics" => [1, 1]},
++               %{"dimensions" => ["Filtered page"], "metrics" => [1, 1]}
++             ]
++
++      refute response["meta"]["imports_included"]
++      assert response["meta"]["imports_skip_reason"] == "unsupported_query"
++    end
++
++    for goal <- ["All event", "All page"] do
++      test "still includes imports for #{goal}", %{conn: conn, site: site} do
++        response =
++          conn
++          |> post("/api/v2/query", %{
++            "site_id" => site.domain,
++            "date_range" => "all",
++            "metrics" => ["visitors", "events"],
++            "dimensions" => ["event:goal"],
++            "filters" => [["is", "event:goal", [unquote(goal)]]],
++            "include" => %{"imports" => true}
++          })
++          |> json_response(200)
++
++        assert response["results"] == [
++                 %{"dimensions" => [unquote(goal)], "metrics" => [12, 22]}
++               ]
++
++        assert response["meta"]["imports_included"]
++      end
++    end
++  end
++
++  defp goal_name(%{"event_name" => _}, prefix), do: prefix <> " event"
++  defp goal_name(%{"page_path" => _}, prefix), do: prefix <> " page"
++
+   describe "goals with custom property filters" do
+     test "filters custom event goals by custom properties", %{conn: conn, site: site} do
+       {:ok, _goal} =

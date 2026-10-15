@@ -1,0 +1,66 @@
+diff --git a/lib/plausible/application.ex b/lib/plausible/application.ex
+index 2bae31a..65f8c43 100644
+--- a/lib/plausible/application.ex
++++ b/lib/plausible/application.ex
+@@ -164,7 +164,7 @@ defmodule Plausible.Application do
+           adapter_opts: [
+             n_lock_partitions: 1,
+             ttl_check_interval: false,
+-            ets_options: [:bag, read_concurrency: true]
++            ets_options: [:set, read_concurrency: true]
+           ],
+           warmers: [
+             refresh_all:
+diff --git a/test/plausible_web/plugs/tracker_plug_test.exs b/test/plausible_web/plugs/tracker_plug_test.exs
+index 488b5b2..2b21c6c 100644
+--- a/test/plausible_web/plugs/tracker_plug_test.exs
++++ b/test/plausible_web/plugs/tracker_plug_test.exs
+@@ -13,7 +13,7 @@ defmodule PlausibleWeb.TrackerPlugTest do
+   If you're making changes in the tracker template files (`src/plausible.js`, `compile.js`),
+   do regenerate the files before running tests, so they're up to date.
+   """
+-  use PlausibleWeb.ConnCase, async: true
++  use PlausibleWeb.ConnCase, async: false
+   import Plug.Test
+ 
+   alias PlausibleWeb.Tracker
+@@ -50,6 +50,39 @@ defmodule PlausibleWeb.TrackerPlugTest do
+       refute String.contains?(response, "fileDownloads:!0")
+     end
+ 
++    on_ce do
++      test "serves cached scripts after creating and updating their configuration", %{conn: conn} do
++        site = new_site()
++        config = Tracker.get_or_create_tracker_script_configuration!(site)
++        original_script = Tracker.build_script(config)
++
++        patch_env(Plausible.Cache, enabled: true)
++
++        on_exit(fn ->
++          Plausible.Cache.Adapter.delete(PlausibleWeb.TrackerScriptCache.name(), config.id)
++        end)
++
++        assert eventually(fn ->
++                 {PlausibleWeb.TrackerScriptCache.get(config.id) == original_script, :ok}
++               end)
++
++        assert get(conn, "/js/#{config.id}.js") |> response(200) == original_script
++
++        updated_config =
++          Tracker.update_script_configuration!(site, @example_config, :installation)
++
++        # Broadcasts run asynchronously. Wait for the cache to change before requesting the script.
++        assert eventually(fn ->
++                 {PlausibleWeb.TrackerScriptCache.get(config.id) != original_script, :ok}
++               end)
++
++        updated_script = get(conn, "/js/#{config.id}.js") |> response(200)
++        assert updated_script == Tracker.build_script(updated_config)
++        assert updated_script =~ "formSubmissions:!0"
++        refute updated_script == original_script
++      end
++    end
++
+     # window.plausible is a substring checked for by the wordpress plugin to avoid 'optimization' by other wordpress plugins
+     test "script contains window.plausible", %{conn: conn} do
+       site = new_site()

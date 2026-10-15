@@ -1,0 +1,82 @@
+diff --git a/lib/plausible_web/live/change_domain.ex b/lib/plausible_web/live/change_domain.ex
+index a840f62..cd46017 100644
+--- a/lib/plausible_web/live/change_domain.ex
++++ b/lib/plausible_web/live/change_domain.ex
+@@ -30,6 +30,7 @@ defmodule PlausibleWeb.Live.ChangeDomain do
+         roles: [
+           :owner,
+           :admin,
++          :editor,
+           :super_admin
+         ]
+       )
+diff --git a/test/plausible_web/live/change_domain_test.exs b/test/plausible_web/live/change_domain_test.exs
+index 9b7ac6b..9fc3669 100644
+--- a/test/plausible_web/live/change_domain_test.exs
++++ b/test/plausible_web/live/change_domain_test.exs
+@@ -39,6 +39,33 @@ defmodule PlausibleWeb.Live.ChangeDomainTest do
+       assert html =~ "Change your website domain"
+     end
+ 
++    for membership_type <- [:team, :guest] do
++      test "#{membership_type} editors can change a site's domain", %{conn: conn, user: user} do
++        site = new_site()
++
++        case unquote(membership_type) do
++          :team -> add_member(site.team, user: user, role: :editor)
++          :guest -> add_guest(site, user: user, role: :editor)
++        end
++
++        original_domain = site.domain
++        new_domain = "new.#{original_domain}"
++        {:ok, lv, html} = live(conn, "/#{original_domain}/change-domain")
++        assert html =~ "Change your website domain"
++
++        lv
++        |> element("form")
++        |> render_submit(%{site: %{domain: new_domain}})
++
++        assert_patch(lv, "/#{URI.encode_www_form(new_domain)}/change-domain/success")
++        assert render_async(lv, 500) =~ "Domain Changed Successfully"
++
++        site = Repo.reload!(site)
++        assert site.domain == new_domain
++        assert site.domain_changed_from == original_domain
++      end
++    end
++
+     test "form submission when no change is made", %{conn: conn, site: site} do
+       {:ok, lv, _html} = live(conn, "/#{site.domain}/change-domain")
+ 
+@@ -378,6 +405,31 @@ defmodule PlausibleWeb.Live.ChangeDomainTest do
+     end
+   end
+ 
++  describe "Authorization" do
++    setup [:create_user, :log_in]
++
++    for membership_type <- [:team, :guest, :none] do
++      test "rejects #{membership_type} viewers or users without site access", %{
++        conn: conn,
++        user: user
++      } do
++        site = new_site()
++
++        case unquote(membership_type) do
++          :team -> add_member(site.team, user: user, role: :viewer)
++          :guest -> add_guest(site, user: user, role: :viewer)
++          :none -> :ok
++        end
++
++        for path <- ["change-domain", "change-domain/success"] do
++          assert_raise Ecto.NoResultsError, fn ->
++            live(conn, "/#{site.domain}/#{path}")
++          end
++        end
++      end
++    end
++  end
++
+   defp stub_detection_result(js_data) do
+     Req.Test.stub(Plausible.InstallationSupport.Checks.Detection, fn conn ->
+       conn

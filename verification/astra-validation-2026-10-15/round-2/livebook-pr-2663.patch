@@ -1,0 +1,68 @@
+diff --git a/lib/livebook/live_markdown/markdown_helpers.ex b/lib/livebook/live_markdown/markdown_helpers.ex
+index 49a4bd3..09c1080 100644
+--- a/lib/livebook/live_markdown/markdown_helpers.ex
++++ b/lib/livebook/live_markdown/markdown_helpers.ex
+@@ -375,15 +375,15 @@ defmodule Livebook.LiveMarkdown.MarkdownHelpers do
+ 
+   defp render_unordered_list(content) do
+     marker_fun = fn _index -> "* " end
+-    render_list(content, marker_fun, "  ")
++    render_list(content, marker_fun)
+   end
+ 
+   defp render_ordered_list(content) do
+     marker_fun = fn index -> "#{index + 1}. " end
+-    render_list(content, marker_fun, "   ")
++    render_list(content, marker_fun)
+   end
+ 
+-  defp render_list(items, marker_fun, indent) do
++  defp render_list(items, marker_fun) do
+     spaced? = spaced_list_items?(items)
+     item_separator = if(spaced?, do: "\n\n", else: "\n")
+ 
+@@ -393,7 +393,9 @@ defmodule Livebook.LiveMarkdown.MarkdownHelpers do
+     |> Enum.map(fn {inner, index} ->
+       [first_line | lines] = String.split(inner, "\n")
+ 
+-      first_line = [marker_fun.(index), first_line]
++      marker = marker_fun.(index)
++      indent = String.duplicate(" ", String.length(marker))
++      first_line = [marker, first_line]
+ 
+       lines =
+         Enum.map(lines, fn
+diff --git a/test/livebook/live_markdown/markdown_helpers_test.exs b/test/livebook/live_markdown/markdown_helpers_test.exs
+index 77189bd..db4d4a2 100644
+--- a/test/livebook/live_markdown/markdown_helpers_test.exs
++++ b/test/livebook/live_markdown/markdown_helpers_test.exs
+@@ -328,6 +328,29 @@ defmodule Livebook.LiveMarkdown.MarkdownHelpersTest do
+       assert markdown == reformat(markdown)
+     end
+ 
++    test "long ordered list with nested bullets" do
++      markdown =
++        Enum.map_join(1..100, "\n", fn index ->
++          indent = String.duplicate(" ", String.length("#{index}") + 2)
++          "#{index}. Item\n#{indent}* Nested bullet\n#{indent}  * Deeper bullet"
++        end)
++
++      assert markdown == reformat(markdown)
++    end
++
++    test "long ordered list with code blocks" do
++      markdown =
++        Enum.map_join(1..100, "\n\n", fn index ->
++          indent = String.duplicate(" ", String.length("#{index}") + 2)
++
++          "#{index}. Code\n\n" <>
++            "#{indent}```elixir\n#{indent}if true do\n" <>
++            "#{indent}  :ok\n\n#{indent}  :done\n#{indent}end\n#{indent}```"
++        end)
++
++      assert markdown == reformat(markdown)
++    end
++
+     test "surprise ordered list" do
+       markdown = "1986\\. What a great season."
+ 
