@@ -8,7 +8,11 @@ defmodule Eab.Report do
     final_score =
       if is_number(score["score_percent"]),
         do: "#{score["score_percent"]}%",
-        else: "Unavailable: run incomplete or contains errors"
+        else:
+          if(run["selection"],
+            do: "Unavailable: partial retry run",
+            else: "Unavailable: run incomplete or contains errors"
+          )
 
     rows =
       Enum.map_join(run["cases"], "\n", fn id ->
@@ -43,6 +47,7 @@ defmodule Eab.Report do
     # Benchmark report
 
     - Run: #{run["id"]}
+    - Scope: #{if run["selection"], do: "Evaluation-error retry of " <> run["selection"]["source_run"], else: "Full inventory"}
     - Model: #{escape(model["model"] || "Unknown")}
     - Backend: #{model["backend"] || "Unknown"}
     - Release: #{run["release_id"] || "Historical protocol only"}

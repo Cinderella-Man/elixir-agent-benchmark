@@ -205,7 +205,10 @@ defmodule Eab.Runner do
       )
 
     total = length(attempts)
-    complete = total > 0 and passed + failed == total and run["status"] == "completed"
+
+    complete =
+      total > 0 and passed + failed == total and run["status"] == "completed" and
+        is_nil(run["selection"])
 
     %{
       "passed" => passed,

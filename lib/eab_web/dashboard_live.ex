@@ -803,6 +803,10 @@ defmodule EabWeb.DashboardLive do
               · Experiment <code>{String.slice(@run["experiment_id"], 0, 12)}</code>
               · {@run["resume_count"] || 0} resumptions
             </p>
+            <p :if={@run["selection"]} class="fine-print">
+              Partial retry of {@run["selection"]["source_run"]}. Original outcomes are preserved;
+              this run has no full benchmark score.
+            </p>
             <button
               :if={@run["release_id"] && @run["status"] in ["interrupted", "cancelled", "error"]}
               id="resume"

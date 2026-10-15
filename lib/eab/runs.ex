@@ -12,6 +12,9 @@ defmodule Eab.Runs do
   def resume(id, endpoint, key, settings),
     do: GenServer.call(__MODULE__, {:resume, id, endpoint, key, settings}, 30_000)
 
+  def retry_errors(id, key),
+    do: GenServer.call(__MODULE__, {:retry_errors, id, key}, 30_000)
+
   def stop, do: GenServer.call(__MODULE__, :stop)
   def retry_cleanup, do: GenServer.call(__MODULE__, :retry_cleanup)
 
@@ -67,28 +70,72 @@ defmodule Eab.Runs do
       do: {:reply, {:error, "Container cleanup needs attention: #{error}"}, state}
 
   def handle_call({:start, endpoint, key, settings}, _from, state) do
-    id = DateTime.utc_now() |> Calendar.strftime("%Y%m%d-%H%M%S-")
-    id = id <> Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)
-
     release = Release.freeze()
     settings = Model.settings(endpoint, settings)
+    launch(new_run(release, endpoint, settings), key, state)
+  rescue
+    error -> {:reply, {:error, Exception.message(error)}, state}
+  end
 
-    run = %{
-      "id" => id,
-      "created_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
-      "status" => "running",
-      "phase" => "starting",
-      "message" => "Checking the model endpoint",
-      "model" => endpoint,
-      "settings" => settings,
-      "cases" => release["protocol"]["inventory"]["cases"],
-      "protocol" => release["protocol"],
-      "release_id" => release["id"],
-      "experiment_id" => Release.experiment(release["id"], endpoint, settings),
-      "case_metadata" => Release.case_metadata(release),
-      "attempts" => %{},
-      "cleanup_pending" => true
+  def handle_call({:retry_errors, _, _}, _from, state)
+      when not is_nil(state.active) or not is_nil(state.cleanup) or
+             not is_nil(state.cleanup_error),
+      do: {:reply, {:error, "Wait for the active run and container cleanup to finish"}, state}
+
+  def handle_call({:retry_errors, id, key}, _from, state) do
+    source = Store.run(id) || raise "Run not found"
+
+    unless source["status"] in ~w(error interrupted cancelled) and
+             source["cleanup_pending"] == false,
+           do: raise("The source run must be stopped and cleaned up")
+
+    previous = Release.read!(source["release_id"])
+    Checkpoints.validate_cases!(source, previous)
+
+    unless source["protocol"] == previous["protocol"] and
+             source["experiment_id"] ==
+               Release.experiment(
+                 source["release_id"],
+                 source["model"],
+                 source["settings"],
+                 source["selection"]
+               ),
+           do: raise("Source run identity changed")
+
+    release = Release.freeze()
+
+    unless Map.drop(previous["protocol"], ["implementation"]) ==
+             Map.drop(release["protocol"], ["implementation"]),
+           do: raise("Case inputs or agent changed; start a new full run")
+
+    cases =
+      Enum.filter(source["cases"], fn case_id ->
+        record = Store.read("runs/#{id}/#{case_id}/attempt.json")
+        record && record["status"] == "error" && is_nil(Checkpoints.completed(source, case_id))
+      end)
+
+    if cases == [], do: raise("No evaluation errors to retry; completed outcomes are preserved")
+    endpoint = source["model"]
+    settings = source["settings"]
+    unless Model.settings(endpoint, settings) == settings, do: raise("Model settings changed")
+
+    selection = %{
+      "kind" => "error_retry",
+      "source_run" => id,
+      "source_release" => source["release_id"],
+      "source_run_hash" => Eab.Inventory.hash_file(Store.path("runs/#{id}/run.json")),
+      "cases" => cases
     }
+
+    run =
+      new_run(release, endpoint, settings)
+      |> Map.put("cases", cases)
+      |> Map.put("selection", selection)
+      |> Map.put("message", "Retrying evaluation errors in a fresh partial run")
+      |> Map.put(
+        "experiment_id",
+        Release.experiment(release["id"], endpoint, settings, selection)
+      )
 
     launch(run, key, state)
   rescue
@@ -253,6 +300,28 @@ defmodule Eab.Runs do
   end
 
   def handle_info(_, state), do: {:noreply, state}
+
+  defp new_run(release, endpoint, settings) do
+    id = DateTime.utc_now() |> Calendar.strftime("%Y%m%d-%H%M%S-")
+    id = id <> Base.encode16(:crypto.strong_rand_bytes(4), case: :lower)
+
+    %{
+      "id" => id,
+      "created_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+      "status" => "running",
+      "phase" => "starting",
+      "message" => "Checking the model endpoint",
+      "model" => endpoint,
+      "settings" => settings,
+      "cases" => release["protocol"]["inventory"]["cases"],
+      "protocol" => release["protocol"],
+      "release_id" => release["id"],
+      "experiment_id" => Release.experiment(release["id"], endpoint, settings),
+      "case_metadata" => Release.case_metadata(release),
+      "attempts" => %{},
+      "cleanup_pending" => true
+    }
+  end
 
   defp launch(run, key, state) do
     Eab.Retention.lease(run["id"])

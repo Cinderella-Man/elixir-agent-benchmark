@@ -96,14 +96,41 @@ defmodule Eab.Checkpoints do
 
     release = Release.read!(run["release_id"])
     Release.verify!(release)
+    validate_cases!(run, release)
 
     unless run["protocol"] == release["protocol"] and
-             run["cases"] == release["protocol"]["inventory"]["cases"] and
              run["experiment_id"] ==
-               Release.experiment(run["release_id"], run["model"], run["settings"]) and
-             run["experiment_id"] == Release.experiment(run["release_id"], endpoint, settings),
+               Release.experiment(
+                 run["release_id"],
+                 run["model"],
+                 run["settings"],
+                 run["selection"]
+               ) and
+             run["experiment_id"] ==
+               Release.experiment(run["release_id"], endpoint, settings, run["selection"]),
            do: raise("Release, model or settings differ; start a new run")
 
+    :ok
+  end
+
+  def validate_cases!(run, release) do
+    inventory = release["protocol"]["inventory"]["cases"]
+    cases = run["cases"]
+
+    valid =
+      case run["selection"] do
+        nil ->
+          cases == inventory
+
+        %{"kind" => "error_retry", "cases" => ^cases, "source_run" => source} ->
+          Store.valid_id?(source) and is_list(cases) and cases != [] and
+            Enum.filter(inventory, &(&1 in cases)) == cases
+
+        _ ->
+          false
+      end
+
+    unless valid, do: raise("Run cases differ from the frozen selection")
     :ok
   end
 

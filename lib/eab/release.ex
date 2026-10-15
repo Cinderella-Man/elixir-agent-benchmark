@@ -76,13 +76,15 @@ defmodule Eab.Release do
     :ok
   end
 
-  def experiment(release_id, endpoint, settings) do
-    Cache.key(%{
+  def experiment(release_id, endpoint, settings, selection \\ nil) do
+    identity = %{
       "release" => release_id,
       "model" => model_identity(endpoint),
       "settings" => settings,
       "network" => "offline-workspaces-model-gateway-only-v1"
-    })
+    }
+
+    Cache.key(if selection, do: Map.put(identity, "selection", selection), else: identity)
   end
 
   def model_identity(endpoint),
