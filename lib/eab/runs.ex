@@ -13,7 +13,10 @@ defmodule Eab.Runs do
     do: GenServer.call(__MODULE__, {:resume, id, endpoint, key, settings}, 30_000)
 
   def retry_errors(id, key),
-    do: GenServer.call(__MODULE__, {:retry_errors, id, key}, 30_000)
+    do: GenServer.call(__MODULE__, {:partial, id, :errors, key}, 30_000)
+
+  def repeat_cases(id, cases, key),
+    do: GenServer.call(__MODULE__, {:partial, id, {:selected, cases}, key}, 30_000)
 
   def stop, do: GenServer.call(__MODULE__, :stop)
   def retry_cleanup, do: GenServer.call(__MODULE__, :retry_cleanup)
@@ -77,15 +80,20 @@ defmodule Eab.Runs do
     error -> {:reply, {:error, Exception.message(error)}, state}
   end
 
-  def handle_call({:retry_errors, _, _}, _from, state)
+  def handle_call({:partial, _, _, _}, _from, state)
       when not is_nil(state.active) or not is_nil(state.cleanup) or
              not is_nil(state.cleanup_error),
       do: {:reply, {:error, "Wait for the active run and container cleanup to finish"}, state}
 
-  def handle_call({:retry_errors, id, key}, _from, state) do
+  def handle_call({:partial, id, mode, key}, _from, state) do
     source = Store.run(id) || raise "Run not found"
 
-    unless source["status"] in ~w(error interrupted cancelled) and
+    allowed =
+      if mode == :errors,
+        do: ~w(error interrupted cancelled),
+        else: ~w(completed error interrupted cancelled)
+
+    unless source["status"] in allowed and
              source["cleanup_pending"] == false,
            do: raise("The source run must be stopped and cleaned up")
 
@@ -108,19 +116,13 @@ defmodule Eab.Runs do
              Map.drop(release["protocol"], ["implementation"]),
            do: raise("Case inputs or agent changed; start a new full run")
 
-    cases =
-      Enum.filter(source["cases"], fn case_id ->
-        record = Store.read("runs/#{id}/#{case_id}/attempt.json")
-        record && record["status"] == "error" && is_nil(Checkpoints.completed(source, case_id))
-      end)
-
-    if cases == [], do: raise("No evaluation errors to retry; completed outcomes are preserved")
+    {kind, cases} = partial_cases(source, mode)
     endpoint = source["model"]
     settings = source["settings"]
     unless Model.settings(endpoint, settings) == settings, do: raise("Model settings changed")
 
     selection = %{
-      "kind" => "error_retry",
+      "kind" => kind,
       "source_run" => id,
       "source_release" => source["release_id"],
       "source_run_hash" => Eab.Inventory.hash_file(Store.path("runs/#{id}/run.json")),
@@ -131,7 +133,7 @@ defmodule Eab.Runs do
       new_run(release, endpoint, settings)
       |> Map.put("cases", cases)
       |> Map.put("selection", selection)
-      |> Map.put("message", "Retrying evaluation errors in a fresh partial run")
+      |> Map.put("message", "Starting selected cases in a fresh partial run")
       |> Map.put(
         "experiment_id",
         Release.experiment(release["id"], endpoint, settings, selection)
@@ -300,6 +302,25 @@ defmodule Eab.Runs do
   end
 
   def handle_info(_, state), do: {:noreply, state}
+
+  defp partial_cases(source, :errors) do
+    cases =
+      Enum.filter(source["cases"], fn case_id ->
+        record = Store.read("runs/#{source["id"]}/#{case_id}/attempt.json")
+        record && record["status"] == "error" && is_nil(Checkpoints.completed(source, case_id))
+      end)
+
+    if cases == [], do: raise("No evaluation errors to retry; completed outcomes are preserved")
+    {"error_retry", cases}
+  end
+
+  defp partial_cases(source, {:selected, cases}) do
+    unless is_list(cases) and cases != [] and cases == Enum.uniq(cases) and
+             Enum.all?(cases, &(&1 in source["cases"])),
+           do: raise("Choose distinct cases from the source run")
+
+    {"case_repeat", Enum.filter(source["cases"], &(&1 in cases))}
+  end
 
   defp new_run(release, endpoint, settings) do
     id = DateTime.utc_now() |> Calendar.strftime("%Y%m%d-%H%M%S-")

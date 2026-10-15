@@ -10,7 +10,7 @@ defmodule Eab.Report do
         do: "#{score["score_percent"]}%",
         else:
           if(run["selection"],
-            do: "Unavailable: partial retry run",
+            do: "Unavailable: partial run",
             else: "Unavailable: run incomplete or contains errors"
           )
 
@@ -47,7 +47,7 @@ defmodule Eab.Report do
     # Benchmark report
 
     - Run: #{run["id"]}
-    - Scope: #{if run["selection"], do: "Evaluation-error retry of " <> run["selection"]["source_run"], else: "Full inventory"}
+    - Scope: #{scope(run)}
     - Model: #{escape(model["model"] || "Unknown")}
     - Backend: #{model["backend"] || "Unknown"}
     - Release: #{run["release_id"] || "Historical protocol only"}
@@ -81,6 +81,14 @@ defmodule Eab.Report do
     #{evidence}
     """)
   end
+
+  defp scope(%{"selection" => %{"kind" => "error_retry", "source_run" => id}}),
+    do: "Evaluation-error retry of " <> id
+
+  defp scope(%{"selection" => %{"kind" => "case_repeat", "source_run" => id}}),
+    do: "Selected-case repeat of " <> id
+
+  defp scope(_), do: "Full inventory"
 
   defp escape(text), do: text |> String.replace("|", "\\|") |> String.replace(~r/[\r\n]+/, " ")
 end

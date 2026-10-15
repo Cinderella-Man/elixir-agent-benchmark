@@ -804,7 +804,7 @@ defmodule EabWeb.DashboardLive do
               · {@run["resume_count"] || 0} resumptions
             </p>
             <p :if={@run["selection"]} class="fine-print">
-              Partial retry of {@run["selection"]["source_run"]}. Original outcomes are preserved;
+              Partial run based on {@run["selection"]["source_run"]}. Original outcomes are preserved;
               this run has no full benchmark score.
             </p>
             <button

@@ -33,48 +33,8 @@ defmodule Eab.RunsTest do
   test "error retries are fresh, bounded to errors, preserve the source and have no full score" do
     parent = self()
     Runs.subscribe()
-    release = Eab.Release.freeze()
-    cases = release["protocol"]["inventory"]["cases"]
-    [passed, failed, error_a, error_b | _] = cases
-    settings = Eab.Model.settings(endpoint())
-
-    source = %{
-      "id" => "source",
-      "created_at" => "2026-01-01",
-      "status" => "error",
-      "cleanup_pending" => false,
-      "model" => endpoint(),
-      "settings" => settings,
-      "cases" => cases,
-      "protocol" => release["protocol"],
-      "release_id" => release["id"],
-      "experiment_id" => Eab.Release.experiment(release["id"], endpoint(), settings),
-      "attempts" => %{}
-    }
-
-    Store.write("runs/source/run.json", source)
-
-    for id <- [passed, failed] do
-      Store.write("runs/source/#{id}/runtime.json", %{"image" => "synthetic", "services" => %{}})
-      {record, _} = Eab.Checkpoints.submit("source", id, %{"case" => id}, "original patch", "")
-      grade = Eab.Evidence.save("source", id, %{"passed" => id == passed}, "")
-
-      Eab.Checkpoints.complete(
-        "source",
-        id,
-        Map.merge(record, %{"status" => "completed", "grade" => grade}),
-        ""
-      )
-    end
-
-    for id <- [error_a, error_b] do
-      Store.write("runs/source/#{id}/attempt.json", %{
-        "status" => "error",
-        "error" => "server_is_overloaded"
-      })
-
-      Store.write_text("runs/source/#{id}/model.patch", "original partial patch")
-    end
+    {source, [passed, _failed, error_a, error_b | _]} = partial_source()
+    settings = source["settings"]
 
     original = source_files()
 
@@ -120,7 +80,7 @@ defmodule Eab.RunsTest do
     assert Eab.Runner.score(complete)["passed"] == 2
     assert Eab.Runner.score(complete)["score_percent"] == nil
     Eab.Report.write(complete)
-    assert File.read!(Store.path("runs/#{id}/report.md")) =~ "Unavailable: partial retry run"
+    assert File.read!(Store.path("runs/#{id}/report.md")) =~ "Unavailable: partial run"
     Runs.stop()
     await_cleanup()
 
@@ -129,6 +89,103 @@ defmodule Eab.RunsTest do
 
     assert {:error, message} = Runs.retry_errors("source", "")
     assert message =~ "No evaluation errors"
+  end
+
+  test "explicit repeats run only selected completed cases from scratch and retain every prior outcome" do
+    parent = self()
+    Runs.subscribe()
+    {source, [passed, failed | _]} = partial_source()
+    source = Map.put(source, "status", "completed")
+    Store.write("runs/source/run.json", source)
+    Store.index_run(source)
+    original = source_files()
+
+    Application.put_env(:eab, :runner, fn run, _, _ ->
+      send(parent, {:repeat, run, Eab.Checkpoints.plan(run)})
+
+      receive do
+        :finish -> :ok
+      end
+    end)
+
+    for cases <- [[], [passed, passed], ["unknown"], nil] do
+      assert {:error, message} = Runs.repeat_cases("source", cases, "")
+      assert message =~ "Choose distinct cases"
+    end
+
+    assert {:ok, id} = Runs.repeat_cases("source", [failed, passed], "")
+    assert_receive {:repeat, run, plan}, 3000
+    assert run["cases"] == [passed, failed]
+    assert plan.restart == [passed, failed]
+    assert plan.retained == %{} and plan.submissions == %{}
+    assert run["selection"]["kind"] == "case_repeat"
+
+    assert run["selection"]["source_run_hash"] ==
+             Eab.Inventory.hash_file(Store.path("runs/source/run.json"))
+
+    assert run["model"] == source["model"] and run["settings"] == source["settings"]
+    assert :ok = Eab.Checkpoints.validate_run!(run, endpoint(), source["settings"])
+    assert {:error, _} = Runs.repeat_cases("source", [passed], "")
+    assert source_files() == original
+
+    Eab.Report.write(run)
+    assert File.read!(Store.path("runs/#{id}/report.md")) =~ "Selected-case repeat of source"
+    Runs.stop()
+    await_cleanup()
+    assert source_files() == original
+    assert {:ok, ^id} = Runs.resume(id, endpoint(), "", source["settings"])
+    assert_receive {:repeat, resumed, resumed_plan}, 3000
+    assert resumed["cases"] == [passed, failed]
+    assert resumed_plan.restart == [passed, failed]
+    assert source_files() == original
+  end
+
+  defp partial_source do
+    release = Eab.Release.freeze()
+    cases = release["protocol"]["inventory"]["cases"]
+    [passed, failed, error_a, error_b | _] = cases
+    settings = Eab.Model.settings(endpoint())
+
+    source = %{
+      "id" => "source",
+      "created_at" => "2026-01-01",
+      "status" => "error",
+      "cleanup_pending" => false,
+      "model" => endpoint(),
+      "settings" => settings,
+      "cases" => cases,
+      "protocol" => release["protocol"],
+      "release_id" => release["id"],
+      "experiment_id" => Eab.Release.experiment(release["id"], endpoint(), settings),
+      "attempts" => %{}
+    }
+
+    Store.write("runs/source/run.json", source)
+    Store.index_run(source)
+
+    for id <- [passed, failed] do
+      Store.write("runs/source/#{id}/runtime.json", %{"image" => "synthetic", "services" => %{}})
+      {record, _} = Eab.Checkpoints.submit("source", id, %{"case" => id}, "original patch", "")
+      grade = Eab.Evidence.save("source", id, %{"passed" => id == passed}, "")
+
+      Eab.Checkpoints.complete(
+        "source",
+        id,
+        Map.merge(record, %{"status" => "completed", "grade" => grade}),
+        ""
+      )
+    end
+
+    for id <- [error_a, error_b] do
+      Store.write("runs/source/#{id}/attempt.json", %{
+        "status" => "error",
+        "error" => "server_is_overloaded"
+      })
+
+      Store.write_text("runs/source/#{id}/model.patch", "original partial patch")
+    end
+
+    {source, cases}
   end
 
   defp source_files do
