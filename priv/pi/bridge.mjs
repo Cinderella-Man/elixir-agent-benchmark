@@ -68,7 +68,9 @@ server.listen(0, '127.0.0.1', () => {
   provider.baseUrl = `http://127.0.0.1:${server.address().port}${config.api_prefix}`;
   writeFileSync(join(agentDir, 'models.json'), JSON.stringify(config.models));
   writeFileSync(join(agentDir, 'settings.json'), JSON.stringify(config.settings));
-  const prompt = join(agentDir, 'ticket.md');
+  // One Pi process runs per isolated workspace. Keep this model-visible path
+  // stable across fresh attempts; only private Pi configuration needs a random directory.
+  const prompt = join(tmpdir(), 'eab-ticket.md');
   const instructions = join(agentDir, 'instructions.md');
   writeFileSync(prompt, config.prompt);
   writeFileSync(instructions, config.instructions);
