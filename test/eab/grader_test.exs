@@ -78,8 +78,9 @@ defmodule Eab.GraderTest do
   end
 
   test "all retained PR reference patches satisfy edit rules and have partial controls" do
-    assert length(Eab.Inventory.all()) == 11
+    assert length(Eab.Inventory.all()) == 10
     refute "plausible-pr-6300" in Eab.Inventory.all()
+    refute "plausible-pr-6763" in Eab.Inventory.all()
 
     for id <- Eab.Inventory.all() do
       spec = Eab.Inventory.spec(id)
