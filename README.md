@@ -1,6 +1,6 @@
 # Elixir Agent Benchmark
 
-A local Elixir website that evaluates one served coding model against **ten historical PR repairs**: four Plausible and six Livebook cases. Connect a llama.cpp or Strata server, or sign in with ChatGPT and select an available OpenAI model, then click **Run benchmark**.
+A local Elixir website that evaluates one served coding model against **nine historical PR repairs**: three Plausible and six Livebook cases. Connect a llama.cpp or Strata server, or sign in with ChatGPT and select an available OpenAI model, then click **Run benchmark**.
 
 The application prepares Docker images, checks the fixtures, runs the [Pi coding agent](https://github.com/earendil-works/pi) in isolated Docker workspaces, and grades its repairs with executable tests. There is no AI judge or speed score.
 
@@ -40,7 +40,7 @@ Pi and the project run on the benchmark's Docker host. The model server can run 
 
 ## Run settings and results
 
-Local-server defaults: all ten cases, seed 101, unlimited model and tool calls, up to 8,192 tokens per response and 65,536 generated tokens per case. Context is detected automatically and capped at 262,144 tokens. Advanced settings allow explicit overrides within the server's capacity. History is retained without compaction; exhausting either the generation budget or context window submits the current patch for grading.
+Local-server defaults: all nine cases, seed 101, unlimited model and tool calls, up to 8,192 tokens per response and 65,536 generated tokens per case. Context is detected automatically and capped at 262,144 tokens. Advanced settings allow explicit overrides within the server's capacity. History is retained without compaction; exhausting either the generation budget or context window submits the current patch for grading.
 
 ChatGPT subscription defaults are a **262,144 generated-token threshold per case** and **high reasoning effort**. Change them under Advanced run settings; available reasoning levels depend on the selected model. The threshold is checked between complete responses, so one response may exceed it. Reasoning tokens count once within output usage. OpenAI enforces context and response limits; no seed, exact prompt preflight or hard response cap is claimed. Full history, Pi tools, workspaces and grading use the same execution flow. Effective policies are saved in results and reports; strict local runs and subscription runs cannot join the same comparison.
 
@@ -58,6 +58,6 @@ Under **Retained preparation**, preview removal of one case's cached state or un
 
 [Task-quality research and the twelve-PR audit](docs/verification/task-quality-audit-2026-10-14.md) assess whether these fixtures measure their stated tasks. Protocol `elixir-agent-benchmark-v3` removes Plausible 6300 because its reference fails the timezone contract, promotes custom checks for all eleven remaining cases, and accepts equivalent readable Erlang diagnostic layouts. See the [promotion verification](docs/verification/task-quality-promotion-2026-10-14.md) for final-fixture qualification and challenge replays. Historical scores keep their original inventory and checks.
 
-[The original eleven-case freeze](docs/verification/case-freeze-2026-10-15.md) records three fresh qualification rounds, exact Pi inputs and environment identities. [Astra validation](verification/astra-confirmation-2026-10-15/README.md) established two reviewed successful repairs for nine cases. Protocol `elixir-agent-benchmark-v4` excludes Plausible 6763; its unchanged bundle and rejection reason are preserved under [cases_rejected](cases_rejected/README.md). Historical evidence retains the original inventory.
+[The original eleven-case freeze](docs/verification/case-freeze-2026-10-15.md) records three fresh qualification rounds, exact Pi inputs and environment identities. [Astra validation](verification/astra-confirmation-2026-10-15/README.md) established two reviewed successful repairs for nine cases. Protocol `elixir-agent-benchmark-v4` excludes Plausible 6763 and 6441; their unchanged bundles and rejection reasons are preserved under [cases_rejected](cases_rejected/README.md). Historical evidence retains the original inventory.
 
 New case drafts use [versioned admission contracts](docs/case-admission.md), with exact upstream reconstruction, recorded independent review and executable qualification before entering the inventory. The website also supports comparable-run matrices and reference-aware release cache removal. Storage snapshots distinguish per-image shared/unique bytes from Docker-wide totals.

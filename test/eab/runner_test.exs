@@ -26,7 +26,7 @@ defmodule Eab.RunnerTest do
   test "fixture images contain only broken source, with dependencies installed inside Docker" do
     recipe =
       Eab.Fixtures.dockerfile(
-        Eab.Inventory.spec("plausible-pr-6441"),
+        Eab.Inventory.spec("plausible-pr-5939"),
         "elixir@sha256:base",
         "node@sha256:node"
       )

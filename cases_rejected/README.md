@@ -7,6 +7,7 @@ and scores retain their original inputs and inventory.
 | Case | Rejected on | Reason |
 | --- | --- | --- |
 | [Plausible 6763](plausible-pr-6763/ticket.md) | 2026-10-15 | The short ticket leaves the CSV column policy ambiguous, while a hidden check requires retaining an unavailable column with blank values. Only one of three graded Astra attempts passed. Clarify the requirement and validate a new case version before reconsidering it. |
+| [Plausible 6441](plausible-pr-6441/ticket.md) | 2026-10-15 | Only one of three graded Astra attempts passed, so the case did not meet the two-reviewed-success admission rule. Failed repairs excluded legitimate imported goals too broadly. The recorded success demonstrates solvability; no fixture defect was established. |
 
 See the [eleven-case Astra review](../verification/astra-confirmation-2026-10-15/README.md)
 for the recorded attempts and diagnosis. Rejection does not establish that a
