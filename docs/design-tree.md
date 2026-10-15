@@ -219,3 +219,11 @@ The design frontier for this first step is settled. Provider/account conformance
 The glossary now distinguishes **solvability validation** and **prompt sufficiency review** from **fixture qualification**. A rejected repair is not automatically a model-quality failure: its evidence may instead identify a case ambiguity, grader defect, infrastructure problem, or an unresolved cause.
 
 Implementation verification: [ChatGPT subscription provider](verification/openai-subscription-2026-10-15.md). The default functional suite passes 146 tests (5 Docker-tagged tests excluded), the production image builds, and the updated dashboard is deployed. Real account-authorized inference and the two fresh case-validation runs remain unperformed.
+
+## Realistic PR scope and additional projects — 2026-10-15
+
+The user wants to expand beyond the current projects and prioritize the multi-file work common in their own tickets, typically spanning 2–5 files. The [static scope audit](verification/case-scope-audit-2026-10-15.md) finds that seven of eleven current reference solutions touch one implementation path, three touch 3–4, and one touches eight including a deleted/moved path. This is a scope description, not a measured difficulty ranking.
+
+The [selection guidelines](pr-selection-guidelines.md) use 2–5 substantive implementation files as the main discovery preference, counting tests and generated changes separately and requiring an explanation of the coordinated behavior. File count is never a submission requirement; simpler correct implementations remain valid. Keep minimal tickets, inspect injected schema-v2 requirement text as part of the prompt, and retain the existing fixture/review/two-pass solvability policy.
+
+The [upstream candidate research](research/multi-file-pr-candidates-2026-10-15.md) begins project and PR screening. Candidate findings do not change the eleven-case inventory or establish runnable new project environments. Start with a small pilot across a supported project and two additional projects, finish each case before bulk expansion, and continue using the ordinary Pi flow. The previous 250-cases-per-project target is superseded by the total 100–200-case direction.

@@ -1,0 +1,34 @@
+diff --git a/lib/plausible/application.ex b/lib/plausible/application.ex
+--- a/lib/plausible/application.ex
++++ b/lib/plausible/application.ex
+@@ -164,7 +164,7 @@
+           adapter_opts: [
+             n_lock_partitions: 1,
+             ttl_check_interval: false,
+-            ets_options: [:bag, read_concurrency: true]
++            ets_options: [read_concurrency: true]
+           ],
+           warmers: [
+             refresh_all:
+diff --git a/lib/plausible_web/tracker.ex b/lib/plausible_web/tracker.ex
+--- a/lib/plausible_web/tracker.ex
++++ b/lib/plausible_web/tracker.ex
+@@ -69,10 +69,14 @@
+   def build_script(nil), do: nil
+ 
+   defp broadcast_script_upsert(tracker_script_configuration) do
+-    PlausibleWeb.TrackerScriptCache.broadcast_put(
+-      tracker_script_configuration.id,
+-      PlausibleWeb.TrackerScriptCache.cache_content(tracker_script_configuration)
+-    )
++    content = PlausibleWeb.TrackerScriptCache.cache_content(tracker_script_configuration)
++
++    on_ee do
++      PlausibleWeb.TrackerScriptCache.broadcast_put(tracker_script_configuration.id, content)
++    else
++      Plausible.Cache.Adapter.put(:tracker_script_cache, tracker_script_configuration.id, content)
++      :ok
++    end
+   end
+ 
+   def update_script_configuration(site, config_update, changeset_type) do
