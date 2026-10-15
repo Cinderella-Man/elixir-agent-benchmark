@@ -58,4 +58,6 @@ Under **Retained preparation**, preview removal of one case's cached state or un
 
 [Task-quality research and the twelve-PR audit](docs/verification/task-quality-audit-2026-10-14.md) assess whether these fixtures measure their stated tasks. Protocol `elixir-agent-benchmark-v3` removes Plausible 6300 because its reference fails the timezone contract, promotes custom checks for all eleven remaining cases, and accepts equivalent readable Erlang diagnostic layouts. See the [promotion verification](docs/verification/task-quality-promotion-2026-10-14.md) for final-fixture qualification and challenge replays. Historical scores keep their original inventory and checks.
 
+[The 2026-10-15 freeze](docs/verification/case-freeze-2026-10-15.md) records three fresh qualification rounds, exact Pi inputs and environment identities. Subscription access to GPT-6-Astra is verified; two blind validation runs per case remain pending.
+
 New case drafts use [versioned admission contracts](docs/case-admission.md), with exact upstream reconstruction, recorded independent review and executable qualification before entering the inventory. The website also supports comparable-run matrices and reference-aware release cache removal. Storage snapshots distinguish per-image shared/unique bytes from Docker-wide totals.
