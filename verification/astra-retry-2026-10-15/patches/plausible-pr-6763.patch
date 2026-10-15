@@ -1,0 +1,67 @@
+diff --git a/lib/plausible/stats/query_optimizer.ex b/lib/plausible/stats/query_optimizer.ex
+index 34b7762..8792bf0 100644
+--- a/lib/plausible/stats/query_optimizer.ex
++++ b/lib/plausible/stats/query_optimizer.ex
+@@ -265,7 +265,7 @@ defmodule Plausible.Stats.QueryOptimizer do
+           time_on_page_data:
+             Map.merge(query.time_on_page_data, %{
+               include_new_metric: false,
+-              include_legacy_metric: true,
++              include_legacy_metric: Legacy.TimeOnPage.can_merge_legacy_time_on_page?(query),
+               cutoff: nil
+             })
+         )
+diff --git a/test/plausible_web/controllers/api/stats_controller/dashboard_csv_export_test.exs b/test/plausible_web/controllers/api/stats_controller/dashboard_csv_export_test.exs
+index 8b8fff1..df29c89 100644
+--- a/test/plausible_web/controllers/api/stats_controller/dashboard_csv_export_test.exs
++++ b/test/plausible_web/controllers/api/stats_controller/dashboard_csv_export_test.exs
+@@ -819,6 +819,49 @@ defmodule PlausibleWeb.Api.StatsController.DashboardCsvExportTest do
+       assert_zip(conn, "30d-filter-path")
+     end
+ 
++    test "exports page-filtered data for sites using legacy time on page", %{
++      conn: conn,
++      site: site
++    } do
++      site = Plausible.Sites.update_legacy_time_on_page_cutoff!(site, nil)
++
++      populate_stats(site, [
++        build(:pageview, user_id: 12, pathname: "/blog", timestamp: ~N[2020-01-05 00:00:00]),
++        build(:pageview, user_id: 12, pathname: "/another", timestamp: ~N[2020-01-05 00:01:00])
++      ])
++
++      archive =
++        conn
++        |> do_export(site, %{
++          @base_params
++          | date_range: ["2020-01-05", "2020-01-06"],
++            filters: [["is", "event:page", ["/blog"]]],
++            reports: @page_filtered_reports
++        })
++        |> response(200)
++
++      assert unzip_and_parse_csv(archive, ~c"visitors.csv") == [
++               [
++                 "date",
++                 "visitors",
++                 "pageviews",
++                 "visits",
++                 "bounce_rate",
++                 "time_on_page",
++                 "scroll_depth"
++               ],
++               ["2020-01-05", "1", "1", "1", "0", "", ""],
++               ["2020-01-06", "0", "0", "0", "0.0", "", ""],
++               [""]
++             ]
++
++      assert unzip_and_parse_csv(archive, ~c"pages.csv") == [
++               ["name", "visitors", "pageviews", "bounce_rate", "time_on_page", "scroll_depth"],
++               ["/blog", "1", "1", "0", "60", ""],
++               [""]
++             ]
++    end
++
+     test "exports scroll depth in visitors.csv", %{conn: conn, site: site} do
+       populate_stats(site, [
+         build(:pageview, user_id: 12, pathname: "/blog", timestamp: ~N[2020-01-05 00:00:00]),

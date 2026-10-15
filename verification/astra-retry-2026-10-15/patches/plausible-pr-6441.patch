@@ -1,0 +1,245 @@
+diff --git a/lib/plausible/stats/goals.ex b/lib/plausible/stats/goals.ex
+index 806635f..f9eb3b7 100644
+--- a/lib/plausible/stats/goals.ex
++++ b/lib/plausible/stats/goals.ex
+@@ -101,8 +101,8 @@ defmodule Plausible.Stats.Goals do
+         %{
+           indices: [idx | acc.indices],
+           types: [to_string(goal_type) | acc.types],
+-          # This will contain "" for non-event goals
+-          event_names_imports: [to_string(goal.event_name) | acc.event_names_imports],
++          # Imported events cannot be attributed to goals with property filters.
++          event_names_imports: [imported_event_name(goal) | acc.event_names_imports],
+           event_names_by_type: [event_name_by_type(goal_type, goal) | acc.event_names_by_type],
+           # Event goals are considered to match everything for the sake of efficient queries in query_builder.ex
+           # See also Plausible.Stats.SQL.Expression.event_goal_join/1
+@@ -117,6 +117,10 @@ defmodule Plausible.Stats.Goals do
+     |> Map.new()
+   end
+ 
++  defp imported_event_name(goal) do
++    if Plausible.Goal.has_custom_props?(goal), do: "", else: to_string(goal.event_name)
++  end
++
+   defp event_name_by_type(:event, goal), do: goal.event_name
+   defp event_name_by_type(:page, _goal), do: "pageview"
+   defp event_name_by_type(:scroll, _goal), do: "engagement"
+@@ -139,6 +143,20 @@ defmodule Plausible.Stats.Goals do
+     goal_filters? and any_scroll_goals_preloaded?
+   end
+ 
++  def custom_prop_goal_filters?(query) do
++    query.filters
++    |> Filters.all_leaf_filters()
++    |> Enum.any?(fn
++      [_, "event:goal" | _] = filter ->
++        query.preloaded_goals.all
++        |> goals_matching_any_clause(filter)
++        |> Enum.any?(&Plausible.Goal.has_custom_props?/1)
++
++      _ ->
++        false
++    end)
++  end
++
+   defp filter_preloaded(goals, filter, clause) do
+     Enum.filter(goals, fn goal -> matches?(goal, filter, clause) end)
+   end
+diff --git a/lib/plausible/stats/imported/base.ex b/lib/plausible/stats/imported/base.ex
+index a8b485a..81ccee9 100644
+--- a/lib/plausible/stats/imported/base.ex
++++ b/lib/plausible/stats/imported/base.ex
+@@ -82,6 +82,10 @@ defmodule Plausible.Stats.Imported.Base do
+       behavioral_filters != [] ->
+         []
+ 
++      # Imported aggregates do not contain the metadata needed by these goals.
++      Plausible.Stats.Goals.custom_prop_goal_filters?(query) ->
++        []
++
+       custom_prop_query?(query) ->
+         do_decide_custom_prop_table(query)
+ 
+diff --git a/lib/plausible/stats/imported/imported.ex b/lib/plausible/stats/imported/imported.ex
+index caf3e5a..7c097c4 100644
+--- a/lib/plausible/stats/imported/imported.ex
++++ b/lib/plausible/stats/imported/imported.ex
+@@ -268,12 +268,13 @@ defmodule Plausible.Stats.Imported do
+             """
+             notEmpty(
+               arrayFilter(
+-                goal_idx -> ?[goal_idx] = 'page' AND match(?, ?[goal_idx]),
++                goal_idx -> ?[goal_idx] = 'page' AND empty(?[goal_idx]) AND match(?, ?[goal_idx]),
+                 ?
+               ) as indices
+             )
+             """,
+             type(^goal_join_data.types, {:array, :string}),
++            type(^goal_join_data.custom_props_keys, {:array, {:array, :string}}),
+             i.page,
+             type(^goal_join_data.page_regexes, {:array, :string}),
+             type(^goal_join_data.indices, {:array, :integer})
+diff --git a/test/plausible_web/controllers/api/external_stats_controller/query_goal_custom_props_test.exs b/test/plausible_web/controllers/api/external_stats_controller/query_goal_custom_props_test.exs
+index 360e00a..2cdbe48 100644
+--- a/test/plausible_web/controllers/api/external_stats_controller/query_goal_custom_props_test.exs
++++ b/test/plausible_web/controllers/api/external_stats_controller/query_goal_custom_props_test.exs
+@@ -5,6 +5,159 @@ defmodule PlausibleWeb.Api.ExternalStatsController.QueryGoalCustomPropsTest do
+ 
+   alias Plausible.Goals
+ 
++  describe "goals with custom property filters and imports" do
++    setup :create_site_import
++
++    for {goal_type, goal_attrs, goal_name} <- [
++          {:event, %{"event_name" => "Purchase"}, "Purchase"},
++          {:page, %{"page_path" => "/checkout"}, "Visit /checkout"}
++        ] do
++      @goal_type goal_type
++      @goal_attrs goal_attrs
++      @goal_name goal_name
++
++      test "excludes imports when filtering by a #{@goal_type} goal with custom properties", %{
++        conn: conn,
++        site: site,
++        site_import: site_import
++      } do
++        {:ok, _goal} =
++          Goals.create(site, Map.put(@goal_attrs, "custom_props", %{"variant" => "A"}))
++
++        populate_stats(site, site_import.id, [
++          build(:event,
++            name: if(@goal_type == :event, do: "Purchase", else: "pageview"),
++            pathname: "/checkout",
++            "meta.key": ["variant"],
++            "meta.value": ["A"],
++            user_id: 1
++          ),
++          build(:event,
++            name: if(@goal_type == :event, do: "Purchase", else: "pageview"),
++            pathname: "/checkout",
++            "meta.key": ["variant"],
++            "meta.value": ["B"],
++            user_id: 2
++          ),
++          build(:imported_custom_events, name: "Purchase", visitors: 10, events: 20),
++          build(:imported_pages, page: "/checkout", visitors: 10, pageviews: 20),
++          build(:imported_visitors, visitors: 10)
++        ])
++
++        for dimensions <- [[], ["time:day"], ["event:goal"]],
++            filter <- [
++              ["is", "event:goal", [@goal_name]],
++              [
++                "contains",
++                "event:goal",
++                [String.upcase(@goal_name)],
++                %{"case_sensitive" => false}
++              ]
++            ] do
++          response =
++            conn
++            |> post("/api/v2/query", %{
++              "site_id" => site.domain,
++              "date_range" => "all",
++              "metrics" => ["visitors", "events", "conversion_rate"],
++              "dimensions" => dimensions,
++              "filters" => [filter],
++              "include" => %{"imports" => true}
++            })
++            |> json_response(200)
++
++          assert %{
++                   "imports_included" => false,
++                   "imports_skip_reason" => "unsupported_query"
++                 } = response["meta"]
++
++          assert [%{"metrics" => [1, 1, 50.0]}] = response["results"]
++        end
++      end
++    end
++
++    test "goal breakdown only adds imports to goals without property filters", %{
++      conn: conn,
++      site: site,
++      site_import: site_import
++    } do
++      for attrs <- [
++            %{"event_name" => "Purchase", "display_name" => "All purchases"},
++            %{
++              "event_name" => "Purchase",
++              "display_name" => "Purchase A",
++              "custom_props" => %{"variant" => "A"}
++            },
++            %{
++              "page_path" => "/checkout",
++              "display_name" => "Checkout A",
++              "custom_props" => %{"variant" => "A"}
++            },
++            %{"page_path" => "/checkout", "display_name" => "All checkouts"}
++          ] do
++        {:ok, _goal} = Goals.create(site, attrs)
++      end
++
++      populate_stats(site, site_import.id, [
++        build(:event, name: "Purchase", "meta.key": ["variant"], "meta.value": ["A"], user_id: 1),
++        build(:event, name: "Purchase", "meta.key": ["variant"], "meta.value": ["B"], user_id: 2),
++        build(:pageview,
++          pathname: "/checkout",
++          "meta.key": ["variant"],
++          "meta.value": ["A"],
++          user_id: 1
++        ),
++        build(:pageview,
++          pathname: "/checkout",
++          "meta.key": ["variant"],
++          "meta.value": ["B"],
++          user_id: 2
++        ),
++        build(:imported_custom_events, name: "Purchase", visitors: 10, events: 20),
++        build(:imported_pages, page: "/checkout", visitors: 10, pageviews: 20),
++        build(:imported_visitors, visitors: 10)
++      ])
++
++      response =
++        conn
++        |> post("/api/v2/query", %{
++          "site_id" => site.domain,
++          "date_range" => "all",
++          "metrics" => ["visitors", "events", "conversion_rate"],
++          "dimensions" => ["event:goal"],
++          "include" => %{"imports" => true}
++        })
++        |> json_response(200)
++
++      assert response["meta"]["imports_included"] == true
++
++      assert Enum.sort_by(response["results"], & &1["dimensions"]) == [
++               %{"dimensions" => ["All checkouts"], "metrics" => [12, 22, 100.0]},
++               %{"dimensions" => ["All purchases"], "metrics" => [12, 22, 100.0]},
++               %{"dimensions" => ["Checkout A"], "metrics" => [1, 1, 8.33]},
++               %{"dimensions" => ["Purchase A"], "metrics" => [1, 1, 8.33]}
++             ]
++
++      # Merely configuring property-filtered goals must not disable imports for
++      # queries that do not use them.
++      for filters <- [[], [["is", "event:goal", ["All purchases"]]]] do
++        response =
++          conn
++          |> post("/api/v2/query", %{
++            "site_id" => site.domain,
++            "date_range" => "all",
++            "metrics" => ["visitors"],
++            "filters" => filters,
++            "include" => %{"imports" => true}
++          })
++          |> json_response(200)
++
++        assert response["meta"]["imports_included"] == true
++        assert response["results"] == [%{"dimensions" => [], "metrics" => [12]}]
++      end
++    end
++  end
++
+   describe "goals with custom property filters" do
+     test "filters custom event goals by custom properties", %{conn: conn, site: site} do
+       {:ok, _goal} =

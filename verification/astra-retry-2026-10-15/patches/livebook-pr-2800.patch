@@ -1,0 +1,89 @@
+diff --git a/lib/livebook/runtime/evaluator.ex b/lib/livebook/runtime/evaluator.ex
+index 518e90c..76a6029 100644
+--- a/lib/livebook/runtime/evaluator.ex
++++ b/lib/livebook/runtime/evaluator.ex
+@@ -785,29 +785,14 @@ defmodule Livebook.Runtime.Evaluator do
+   end
+ 
+   defp make_snippet(code, location) do
+-    start_line = 1
+-    start_column = 1
+-    line = :erl_anno.line(location)
+-
+     case :erl_anno.column(location) do
+       :undefined ->
+         nil
+ 
+-      column ->
+-        lines = :string.split(code, "\n", :all)
+-        snippet = :lists.nth(line - start_line + 1, lines)
+-
+-        offset =
+-          if line == start_line do
+-            column - start_column
+-          else
+-            column - 1
+-          end
+-
+-        case :string.trim(code, :leading) do
+-          [] -> nil
+-          _ -> %{content: snippet, offset: offset}
+-        end
++      _column ->
++        code
++        |> String.split("\n")
++        |> Enum.at(:erl_anno.line(location) - 1)
+     end
+   end
+ 
+diff --git a/test/livebook/runtime/evaluator_test.exs b/test/livebook/runtime/evaluator_test.exs
+index e3541c7..0e2a22c 100644
+--- a/test/livebook/runtime/evaluator_test.exs
++++ b/test/livebook/runtime/evaluator_test.exs
+@@ -1369,21 +1369,46 @@ defmodule Livebook.Runtime.EvaluatorTest do
+       assert metadata.code_markers == []
+     end
+ 
++    test "syntax errors include the source snippet and location", %{evaluator: evaluator} do
++      code = "X = 1,\nY = ."
++      Evaluator.evaluate_code(evaluator, :erlang, code, :code_1, [], file: "file.erl")
++
++      assert_receive {:runtime_evaluation_response, :code_1, error(message),
++                      metadata() = metadata}
++
++      assert clean_message(message) == """
++             ** (SyntaxError) invalid syntax found on file.erl:2:5:
++                 error: syntax error before: .
++                 │
++               2 │ Y = .
++                 │     ^
++                 │
++                 └─ file.erl:2:5\
++             """
++
++      assert metadata.code_markers == [
++               %{line: 2, severity: :error, description: "erl_parse: syntax error before: ."}
++             ]
++    end
++
+     test "syntax and tokenizer errors are converted", %{evaluator: evaluator} do
+       # Incomplete input
+       Evaluator.evaluate_code(evaluator, :erlang, "X =", :code_1, [])
+       assert_receive {:runtime_evaluation_response, :code_1, error(message), metadata()}
+       assert "\e[31m** (TokenMissingError)" <> _ = message
++      assert message =~ "│ X ="
+ 
+       # Parser error
+       Evaluator.evaluate_code(evaluator, :erlang, "X ==/== a.", :code_2, [])
+       assert_receive {:runtime_evaluation_response, :code_2, error(message), metadata()}
+       assert "\e[31m** (SyntaxError)" <> _ = message
++      assert message =~ "│ X ==/== a."
+ 
+       # Tokenizer error
+       Evaluator.evaluate_code(evaluator, :erlang, "$a$", :code_3, [])
+       assert_receive {:runtime_evaluation_response, :code_3, error(message), metadata()}
+       assert "\e[31m** (SyntaxError)" <> _ = message
++      assert message =~ "│ $a$"
+ 
+       # Erlang exception
+       Evaluator.evaluate_code(evaluator, :erlang, "list_to_binary(1).", :code_4, [])

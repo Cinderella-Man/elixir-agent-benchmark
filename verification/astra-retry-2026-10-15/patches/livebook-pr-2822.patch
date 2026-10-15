@@ -1,0 +1,92 @@
+diff --git a/lib/livebook/runtime/evaluator.ex b/lib/livebook/runtime/evaluator.ex
+index 2343b84..3d013ce 100644
+--- a/lib/livebook/runtime/evaluator.ex
++++ b/lib/livebook/runtime/evaluator.ex
+@@ -468,8 +468,20 @@ defmodule Livebook.Runtime.Evaluator do
+           identifiers_used = :unknown
+           identifiers_defined = %{}
+           identifier_definitions = []
+-          # Empty context
++          # Keep an empty context, except for imports and process dictionary,
++          # which are stored in full rather than diffed against the parent context.
+           new_context = initial_context()
++
++          new_context = %{
++            new_context
++            | env: %{
++                new_context.env
++                | functions: context.env.functions,
++                  macros: context.env.macros
++              },
++              pdict: context.pdict
++          }
++
+           {new_context, result, identifiers_used, identifiers_defined, identifier_definitions}
+       end
+ 
+diff --git a/test/livebook/runtime/evaluator_test.exs b/test/livebook/runtime/evaluator_test.exs
+index 6d2fe89..53a30c4 100644
+--- a/test/livebook/runtime/evaluator_test.exs
++++ b/test/livebook/runtime/evaluator_test.exs
+@@ -362,6 +362,61 @@ defmodule Livebook.Runtime.EvaluatorTest do
+                       metadata()}
+     end
+ 
++    test "preserves inherited imports after an evaluation error", %{evaluator: evaluator} do
++      code1 = """
++      import Integer, only: [digits: 1, is_even: 1]
++      """
++
++      code2 = """
++      import Integer, only: []
++      raise ":<"
++      """
++
++      code3 = """
++      if is_even(2), do: Enum.sum(digits(123)), else: 0
++      """
++
++      Evaluator.evaluate_code(evaluator, :elixir, code1, :code_1, [])
++      assert_receive {:runtime_evaluation_response, :code_1, terminal_text(_), metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, code2, :code_2, [:code_1])
++      assert_receive {:runtime_evaluation_response, :code_2, error(_), metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, code3, :code_3, [:code_2, :code_1])
++
++      assert_receive {:runtime_evaluation_response, :code_3, terminal_text(ansi_number(6)),
++                      metadata()}
++    end
++
++    test "preserves inherited process dictionary after an evaluation error",
++         %{evaluator: evaluator} do
++      code1 = """
++      Process.put(:x, 1)
++      Process.put(:y, 2)
++      """
++
++      code2 = """
++      Process.put(:x, 10)
++      Process.delete(:y)
++      Process.put(:z, 3)
++      raise ":<"
++      """
++
++      code3 = """
++      {Process.get(:x), Process.get(:y), Process.get(:z)}
++      """
++
++      Evaluator.evaluate_code(evaluator, :elixir, code1, :code_1, [])
++      assert_receive {:runtime_evaluation_response, :code_1, terminal_text(_), metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, code2, :code_2, [:code_1])
++      assert_receive {:runtime_evaluation_response, :code_2, error(_), metadata()}
++
++      Evaluator.evaluate_code(evaluator, :elixir, code3, :code_3, [:code_2, :code_1])
++      assert_receive {:runtime_evaluation_response, :code_3, terminal_text(output), metadata()}
++      assert clean_message(output) == "{1, 2, nil}"
++    end
++
+     test "given file option sets it in evaluation environment", %{evaluator: evaluator} do
+       code = """
+       __DIR__

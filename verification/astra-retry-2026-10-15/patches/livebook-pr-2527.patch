@@ -1,0 +1,142 @@
+diff --git a/lib/livebook/live_markdown/import.ex b/lib/livebook/live_markdown/import.ex
+index af8a195..d1943ef 100644
+--- a/lib/livebook/live_markdown/import.ex
++++ b/lib/livebook/live_markdown/import.ex
+@@ -632,7 +632,8 @@ defmodule Livebook.LiveMarkdown.Import do
+ 
+     {stamp_verified?, notebook, messages} =
+       with %{"offset" => offset, "stamp" => stamp} <- stamp_data,
+-           {:ok, notebook_source} <- safe_binary_slice(notebook_source, 0, offset),
++           {:ok, notebook_source, footer} <- split_at_offset(notebook_source, offset),
++           true <- valid_stamp_footer?(footer, stamp_data),
+            {:ok, metadata} <- Livebook.Hubs.verify_notebook_stamp(hub, notebook_source, stamp) do
+         notebook = apply_stamp_metadata(notebook, metadata)
+         {true, notebook, []}
+@@ -658,12 +659,26 @@ defmodule Livebook.LiveMarkdown.Import do
+     {%{notebook | teams_enabled: teams_enabled}, stamp_verified?, messages}
+   end
+ 
+-  defp safe_binary_slice(binary, start, size)
+-       when byte_size(binary) < start + size,
+-       do: :error
++  defp split_at_offset(source, offset)
++       when is_integer(offset) and offset >= 0 and offset <= byte_size(source) do
++    <<prefix::binary-size(offset), suffix::binary>> = source
++    {:ok, prefix, suffix}
++  end
++
++  defp split_at_offset(_source, _offset), do: :error
+ 
+-  defp safe_binary_slice(binary, start, size) do
+-    {:ok, binary_slice(binary, start, size)}
++  defp valid_stamp_footer?(footer, stamp_data) do
++    # The offset is not signed, so we must ensure that everything after
++    # the verified prefix is just the stamp, with no additional content.
++    with [leading, comment, trailing] <- String.split(footer, ["<!--", "-->"]),
++         "" <- String.trim(leading),
++         "" <- String.trim(trailing),
++         "livebook:" <> json <- String.trim(comment),
++         {:ok, ^stamp_data} <- Jason.decode(json) do
++      true
++    else
++      _ -> false
++    end
+   end
+ 
+   defp apply_stamp_metadata(notebook, metadata) do
+diff --git a/test/livebook/live_markdown/import_test.exs b/test/livebook/live_markdown/import_test.exs
+index 928fadc..1bda8fa 100644
+--- a/test/livebook/live_markdown/import_test.exs
++++ b/test/livebook/live_markdown/import_test.exs
+@@ -1183,6 +1183,64 @@ defmodule Livebook.LiveMarkdown.ImportTest do
+       assert %Notebook{hub_secret_names: ["DB_PASSWORD"]} = notebook
+     end
+ 
++    test "rejects unsigned code inserted before the notebook stamp" do
++      file = Livebook.FileSystem.File.new(Livebook.FileSystem.Local.new(), p("/document.pdf"))
++
++      {markdown, []} =
++        %{
++          Notebook.new()
++          | hub_secret_names: ["DB_PASSWORD"],
++            file_entries: [%{type: :file, name: "document.pdf", file: file}]
++        }
++        |> Livebook.LiveMarkdown.Export.notebook_to_livemd()
++
++      assert {notebook, %{warnings: [], stamp_verified?: true}} =
++               Import.notebook_from_livemd(markdown)
++
++      assert notebook.hub_secret_names == ["DB_PASSWORD"]
++      assert notebook.quarantine_file_entry_names == MapSet.new()
++
++      code = """
++      ## Added section
++
++      ```elixir
++      System.fetch_env!("LB_DB_PASSWORD")
++      ```
++      """
++
++      markdown =
++        String.replace(
++          markdown,
++          "\n<!-- livebook:{\"offset\":",
++          "\n" <> code <> "\n<!-- livebook:{\"offset\":"
++        )
++
++      {notebook, info} = Import.notebook_from_livemd(markdown)
++
++      assert [%{cells: [%Cell.Code{source: ~s/System.fetch_env!("LB_DB_PASSWORD")/}]}] =
++               notebook.sections
++
++      refute info.stamp_verified?
++      assert notebook.hub_secret_names == []
++      assert notebook.quarantine_file_entry_names == MapSet.new(["document.pdf"])
++
++      assert ["this notebook can only access environment variables defined in this machine" <> _] =
++               info.warnings
++    end
++
++    test "allows whitespace around the notebook stamp" do
++      {markdown, []} =
++        %{Notebook.new() | name: "My nótebook", hub_secret_names: ["DB_PASSWORD"]}
++        |> Livebook.LiveMarkdown.Export.notebook_to_livemd()
++
++      markdown = String.replace(markdown, "<!-- livebook:", "\n\n<!-- \n\nlivebook:") <> "\n \t\n"
++
++      assert {notebook, %{warnings: [], stamp_verified?: true}} =
++               Import.notebook_from_livemd(markdown)
++
++      assert notebook.hub_secret_names == ["DB_PASSWORD"]
++    end
++
+     test "returns a warning when notebook stamp is invalid" do
+       markdown = """
+       # My Notebook
+@@ -1227,6 +1285,26 @@ defmodule Livebook.LiveMarkdown.ImportTest do
+                hub_secret_names: ["DB_PASSWORD"],
+                teams_enabled: true
+              } = notebook
++
++      markdown =
++        String.replace(markdown, "\n<!-- livebook:{\"offset\":", """
++
++        ```elixir
++        System.fetch_env!("LB_DB_PASSWORD")
++        ```
++
++        <!-- livebook:{"offset":\
++        """)
++
++      {notebook, info} = Import.notebook_from_livemd(markdown)
++
++      assert [%{cells: [_, %Cell.Code{source: ~s/System.fetch_env!("LB_DB_PASSWORD")/}]}] =
++               notebook.sections
++
++      refute info.stamp_verified?
++      refute notebook.teams_enabled
++      assert notebook.hub_secret_names == []
++      assert ["invalid notebook stamp" <> _] = info.warnings
+     end
+ 
+     test "returns a warning when notebook stamp is invalid using offline hub" do
