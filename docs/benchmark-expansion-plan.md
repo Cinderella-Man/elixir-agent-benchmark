@@ -1,6 +1,8 @@
-# Expand toward 250 qualified PRs per project
+# Grow toward 100–200 validated cases
 
-Status, 2026-10-14: release/recovery/retention/evidence controls are implemented. The [twelve-case task-quality audit](verification/task-quality-audit-2026-10-14.md) led to an eleven-case v3 inventory: Plausible 6300 is retired and the remaining cases have stronger checks. See [promotion verification](verification/task-quality-promotion-2026-10-14.md) for final-fixture evidence. Older counts in this planning history refer to earlier checkpoints. The expansion target remains approximately 250 Plausible and 250 Livebook cases, reused across 10–30 model runs.
+Current direction, 2026-10-15: curate roughly 100–200 cases in total. Each admitted candidate needs fixture qualification, review of the minimal task against its graded requirements, and two fresh strong-model passes with the same model and settings. Use the existing Pi run flow with ChatGPT subscription authentication for solvability evidence, then evaluate local models against frozen validated releases. The user explicitly does not want a separate validation runner or interface. See [the confirmed validation decision](adr/0009-validate-minimal-tasks-with-blind-model-attempts.md) and [current design discussion](design-tree.md#subscription-model-validation--design-interview-2026-10-15).
+
+Implementation status from 2026-10-14: release/recovery/retention/evidence controls are implemented. The [twelve-case task-quality audit](verification/task-quality-audit-2026-10-14.md) led to an eleven-case v3 inventory: Plausible 6300 is retired and the remaining cases have stronger checks. See [promotion verification](verification/task-quality-promotion-2026-10-14.md) for fixture evidence, which predates the minimal-ticket edits. The earlier planning target of approximately 250 Plausible and 250 Livebook cases is historical; the current target is the total above. Detailed candidate discovery and automated admission below remain future corpus work.
 
 ## Scope and decisions
 
@@ -18,7 +20,7 @@ Further confirmed choices:
 
 The proposal below allows a curator to author missing tests when the requested outcome is unambiguous and the tests pass the relevant qualification gates; upstream test additions prioritize discovery but are not a substitute for validation. Broader platform requirements remain deferred unless their supported execution contract is added explicitly. These are planning recommendations, not evidence that more qualified cases already exist.
 
-Increasing case count improves coverage of these projects, but two repositories still cover two codebases. Deduplicate equivalent tasks and report results by project, task kind and task family. Do not pad the inventory with trivial, duplicate or inadequately specified tasks to hit a number, or select cases based on which target models pass them. Count distinct admitted PRs; splitting one large PR into several tasks does not increase the distinct-PR target.
+Increasing case count improves coverage of these projects, but two repositories still cover two codebases. Deduplicate equivalent tasks and report results by project, task kind and task family. Do not pad the inventory with trivial, duplicate or inadequately specified tasks to hit a number, or select cases based on the cheaper models' results. The strong-model validation gate intentionally defines a corpus with demonstrated solvability under its recorded conditions; preserve that limitation when reporting results. Count distinct admitted PRs; splitting one large PR into several tasks does not increase the distinct-PR target.
 
 ## Acceptance contracts for the expanded task types
 

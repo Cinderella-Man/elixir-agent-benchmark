@@ -164,6 +164,21 @@ defmodule Eab.Activity do
     end)
   end
 
+  defp model_text(%{"type" => type, "delta" => delta})
+       when type in [
+              "response.output_text.delta",
+              "response.reasoning_summary_text.delta",
+              "response.function_call_arguments.delta"
+            ] and is_binary(delta) do
+    delta
+  end
+
+  defp model_text(%{
+         "type" => "response.output_item.added",
+         "item" => %{"type" => "function_call", "name" => name}
+       }),
+       do: "\n[Model requests #{name}]\n"
+
   defp model_text(_), do: ""
 
   # Hold a possible partial credential across chunk boundaries before writing.

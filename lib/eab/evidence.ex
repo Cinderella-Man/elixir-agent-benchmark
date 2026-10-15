@@ -104,6 +104,7 @@ defmodule Eab.Evidence do
           {"model.patch", "Submitted patch"},
           {"grade.json", "Full grading evidence"},
           {"error.txt", "Full evaluation error"},
+          {"provider-error.json", "Provider error details"},
           {"pi-events.jsonl", "Pi trajectory"},
           {"attempt.json", "Attempt and usage"},
           {"submission.json", "Saved submission receipt"},

@@ -57,6 +57,12 @@ defmodule Eab.Report do
 
     #{escape(run["message"] || "")}
 
+    Effective settings (subscription thresholds and local strict caps are distinct policies):
+
+    ```json
+    #{Jason.encode!(run["settings"] || %{}, pretty: true)}
+    ```
+
     | Case | Result | Model calls | Explanation |
     | --- | --- | ---: | --- |
     #{rows}

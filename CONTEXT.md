@@ -46,6 +46,10 @@
 
 **Fixture qualification**: Controls proving that the current environment and grader reject unchanged starting code, plausible incomplete solutions and integrity bypasses, while accepting the reference solution.
 
+**Prompt sufficiency review**: Review that each scored obligation follows from the task description and project information available to the solver. A private grading preference is not a task requirement.
+
+**Solvability validation**: Evidence that a model can complete a case using only solver-visible information under recorded conditions. This complements fixture qualification and prompt sufficiency review without certifying exhaustive correctness.
+
 **Case outcome**: A completed pass or fail from the grader. Infrastructure and accounting errors remain errors.
 
 **Score**: The percentage of selected cases passed, with equal case weight. A final score requires a valid outcome for every selected case; missing, errored, cancelled and interrupted attempts prevent a final score.

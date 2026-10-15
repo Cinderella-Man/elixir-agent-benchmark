@@ -89,7 +89,10 @@ defmodule Eab.Model do
     |> Eab.Store.scrub(key)
   end
 
-  def settings(endpoint, input \\ %{}) do
+  def settings(endpoint, input \\ %{})
+  def settings(%{"backend" => "openai_subscription"}, input), do: Eab.OpenAI.settings(input)
+
+  def settings(endpoint, input) do
     defaults = Eab.Inventory.read_json(Eab.Inventory.path("config/benchmark.json"))["defaults"]
 
     window =
@@ -196,6 +199,9 @@ defmodule Eab.Model do
 
     %{"input_tokens" => input, "output_tokens" => output}
   end
+
+  def unchanged!(%{"backend" => "openai_subscription"} = endpoint, _key),
+    do: Eab.OpenAI.unchanged!(endpoint)
 
   def unchanged!(endpoint, key) do
     current = discover(endpoint["url"], key)

@@ -20,6 +20,8 @@ defmodule Eab.Pi do
 
   def config(endpoint, settings, prompt, instructions) do
     strata = endpoint["backend"] == "strata"
+    subscription = endpoint["backend"] == "openai_subscription"
+    provider = if subscription, do: "openai", else: "benchmark"
 
     compat =
       if strata,
@@ -38,23 +40,39 @@ defmodule Eab.Pi do
 
     %{
       "model" => endpoint["model"],
+      "provider" => provider,
       "api_prefix" => if(strata, do: "", else: "/v1"),
       "prompt" => prompt,
       "instructions" => instructions,
       "models" => %{
         "providers" => %{
-          "benchmark" => %{
-            "api" => if(strata, do: "anthropic-messages", else: "openai-completions"),
+          provider => %{
+            "api" =>
+              cond do
+                subscription -> "openai-responses"
+                strata -> "anthropic-messages"
+                true -> "openai-completions"
+              end,
             "apiKey" => "local-transport",
-            "compat" => compat,
+            "compat" =>
+              if(subscription,
+                do: %{
+                  "supportsDeveloperRole" => true,
+                  "supportsMaxOutputTokens" => false,
+                  "supportsStrictMode" => false
+                },
+                else: compat
+              ),
             "models" => [
               %{
                 "id" => endpoint["model"],
                 "name" => endpoint["model"],
-                "reasoning" => strata or reasoning_supported?(endpoint),
+                "reasoning" => subscription or strata or reasoning_supported?(endpoint),
                 "input" => ["text"],
-                "contextWindow" => settings["window_tokens"],
-                "maxTokens" => settings["response_tokens"],
+                # Pi requires numeric bookkeeping values. Subscription requests remove its
+                # output cap; compaction is off and these are not provider capacity claims.
+                "contextWindow" => settings["window_tokens"] || 262_144,
+                "maxTokens" => settings["response_tokens"] || 8192,
                 "cost" => %{"input" => 0, "output" => 0, "cacheRead" => 0, "cacheWrite" => 0}
               }
             ]

@@ -6,9 +6,10 @@ defmodule EabWeb.DashboardLive do
     "window_tokens" => "",
     "response_tokens" => "",
     "max_tokens" => "65536",
-    "seed" => "101"
+    "seed" => "101",
+    "reasoning_effort" => "high"
   }
-  def mount(_, _, socket) do
+  def mount(params, _, socket) do
     if connected?(socket) do
       Runs.subscribe()
       Process.send_after(self(), :poll_log, 1_000)
@@ -17,41 +18,59 @@ defmodule EabWeb.DashboardLive do
     snapshot = Runs.snapshot()
     selected = (snapshot.active || List.first(snapshot.history) || %{})["id"]
 
-    {:ok,
-     assign(socket,
-       snapshot: snapshot,
-       endpoint: nil,
-       url: "",
-       key: "",
-       settings: @defaults,
-       error: nil,
-       detecting: false,
-       selected: selected,
-       selected_run: if(selected, do: Store.run(selected)),
-       history_offset: 0,
-       comparison: nil,
-       comparison_ids: [],
-       comparison_offset: 0,
-       history_page: Store.run_page(),
-       case_offset: 0,
-       cache_status: Retention.status(),
-       cache_preview: nil,
-       cache_busy: false,
-       cache_message: nil,
-       cache_failures: [],
-       storage: nil,
-       storage_busy: false,
-       selected_case: nil,
-       log_case: nil,
-       case_attempt: nil,
-       log_text: "",
-       log_available: false,
-       follow_output: true,
-       evidence_links: [],
-       report_available: false,
-       cases: Enum.map(Inventory.all(), &Inventory.spec/1)
-     )
-     |> load_log()}
+    socket =
+      assign(socket,
+        snapshot: snapshot,
+        endpoint: nil,
+        url: "",
+        chatgpt: false,
+        accounts: Eab.ChatGPTAuth.accounts(),
+        account: params["chatgpt"] || "",
+        models: [],
+        key: "",
+        settings: @defaults,
+        local_settings: @defaults,
+        subscription_settings: Map.put(@defaults, "max_tokens", "262144"),
+        error: Phoenix.Flash.get(socket.assigns.flash, :error),
+        detecting: false,
+        selected: selected,
+        selected_run: if(selected, do: Store.run(selected)),
+        history_offset: 0,
+        comparison: nil,
+        comparison_ids: [],
+        comparison_offset: 0,
+        history_page: Store.run_page(),
+        case_offset: 0,
+        cache_status: Retention.status(),
+        cache_preview: nil,
+        cache_busy: false,
+        cache_message: nil,
+        cache_failures: [],
+        storage: nil,
+        storage_busy: false,
+        selected_case: nil,
+        log_case: nil,
+        case_attempt: nil,
+        log_text: "",
+        log_available: false,
+        follow_output: true,
+        evidence_links: [],
+        report_available: false,
+        cases: Enum.map(Inventory.all(), &Inventory.spec/1)
+      )
+      |> load_log()
+
+    if params["chatgpt"],
+      do:
+        {:ok,
+         discover_chatgpt(
+           assign(socket,
+             url: "https://api.openai.com",
+             chatgpt: true,
+             settings: Map.put(@defaults, "max_tokens", "262144")
+           )
+         )},
+      else: {:ok, socket}
   end
 
   def handle_event("connect", %{"connection" => values}, socket) do
@@ -63,14 +82,59 @@ defmodule EabWeb.DashboardLive do
       |> cancel_async(:discovery)
       |> assign(url: url, key: key, endpoint: nil, error: nil, detecting: String.trim(url) != "")
 
+    if Eab.OpenAI.endpoint?(url) do
+      Eab.ChatGPTAuth.retry_requests(socket.assigns.account)
+
+      socket = provider_settings(socket, true)
+      {:noreply, discover_chatgpt(assign(socket, chatgpt: true, key: ""))}
+    else
+      {:noreply,
+       socket
+       |> provider_settings(false)
+       |> assign(chatgpt: false, models: [])
+       |> start_async(:discovery, fn ->
+         try do
+           {:ok, if(String.trim(url) == "", do: nil, else: Model.discover(url, key))}
+         rescue
+           e -> {:error, Exception.message(e)}
+         end
+       end)}
+    end
+  end
+
+  def handle_event("chatgpt_account", %{"account" => id}, socket) do
+    Eab.ChatGPTAuth.retry_requests(id)
+    {:noreply, discover_chatgpt(assign(socket, account: id, endpoint: nil))}
+  end
+
+  def handle_event("chatgpt_model", %{"model" => model}, socket) do
+    row = Enum.find(socket.assigns.models, &(&1["slug"] == model))
+    endpoint = if row, do: Eab.OpenAI.endpoint(socket.assigns.account, row)
+    {:noreply, assign(socket, endpoint: endpoint)}
+  end
+
+  def handle_event("chatgpt_sign_out", _, socket) do
+    active = socket.assigns.snapshot.active
+
+    if active && get_in(active, ["model", "account_id"]) == socket.assigns.account,
+      do: Runs.stop()
+
+    message =
+      case Eab.ChatGPTAuth.sign_out(socket.assigns.account) do
+        {:ok, _} -> nil
+        {:error, error} -> error
+      end
+
     {:noreply,
-     start_async(socket, :discovery, fn ->
-       try do
-         {:ok, if(String.trim(url) == "", do: nil, else: Model.discover(url, key))}
-       rescue
-         e -> {:error, Exception.message(e)}
-       end
-     end)}
+     socket
+     |> cancel_async(:discovery)
+     |> assign(
+       endpoint: nil,
+       models: [],
+       detecting: false,
+       accounts: Eab.ChatGPTAuth.accounts(),
+       error: message
+     )}
   end
 
   def handle_event("settings", %{"settings" => values}, socket),
@@ -218,6 +282,10 @@ defmodule EabWeb.DashboardLive do
   def handle_event("follow_output", _, socket),
     do: {:noreply, assign(socket, follow_output: not socket.assigns.follow_output)}
 
+  def handle_async(:discovery, {:ok, {:catalog, rows}}, socket) do
+    {:noreply, assign(socket, models: rows, detecting: false, error: nil)}
+  end
+
   def handle_async(:discovery, {:ok, {:ok, endpoint}}, socket),
     do: {:noreply, assign(socket, endpoint: endpoint, detecting: false, error: nil)}
 
@@ -268,6 +336,50 @@ defmodule EabWeb.DashboardLive do
   def handle_info(:poll_log, socket) do
     Process.send_after(self(), :poll_log, 1_000)
     {:noreply, load_log(socket)}
+  end
+
+  defp provider_settings(socket, subscription) do
+    cond do
+      socket.assigns.chatgpt == subscription ->
+        socket
+
+      subscription ->
+        assign(socket,
+          local_settings: socket.assigns.settings,
+          settings: socket.assigns.subscription_settings
+        )
+
+      true ->
+        assign(socket,
+          subscription_settings: socket.assigns.settings,
+          settings: socket.assigns.local_settings
+        )
+    end
+  end
+
+  defp discover_chatgpt(socket) do
+    accounts = Eab.ChatGPTAuth.accounts()
+    account = socket.assigns.account
+    selected = Enum.find(accounts, &(&1["id"] == account))
+
+    socket =
+      socket
+      |> cancel_async(:discovery)
+      |> assign(accounts: accounts, endpoint: nil, models: [], detecting: false, error: nil)
+
+    if selected && selected["signed_in"] do
+      socket
+      |> assign(detecting: true)
+      |> start_async(:discovery, fn ->
+        try do
+          {:catalog, Eab.OpenAI.catalog(account)}
+        rescue
+          e -> {:error, Exception.message(e)}
+        end
+      end)
+    else
+      socket
+    end
   end
 
   defp refresh(socket) do
@@ -445,7 +557,7 @@ defmodule EabWeb.DashboardLive do
             <span class="section-icon" aria-hidden="true">⌘</span><h2>Run configuration</h2>
           </div>
           <p class="muted">
-            A running llama.cpp or Strata server. We’ll read its model details automatically.
+            Connect a llama.cpp or Strata server, or use https://api.openai.com with your ChatGPT subscription.
           </p>
           <form id="connection" phx-change="connect" phx-submit="connect">
             <label for="endpoint">Server endpoint</label>
@@ -461,7 +573,7 @@ defmodule EabWeb.DashboardLive do
                 autocomplete="url"
               /><button type="submit" class="secondary" disabled={@detecting}>Connect</button>
             </div>
-            <details>
+            <details :if={not @chatgpt}>
               <summary>Server credentials</summary><label for="key">API key
               <span class="muted">— optional, kept in memory</span></label><input
                 id="key"
@@ -473,13 +585,57 @@ defmodule EabWeb.DashboardLive do
               />
             </details>
           </form>
+          <div :if={@chatgpt} class="model-card" id="chatgpt-connection">
+            <form id="chatgpt-account-form" phx-change="chatgpt_account">
+              <label for="chatgpt-account">ChatGPT account / workspace</label>
+              <select id="chatgpt-account" name="account">
+                <option value="" selected={@account == ""}>Add an account or workspace</option>
+                <option
+                  :for={account <- @accounts}
+                  value={account["id"]}
+                  selected={@account == account["id"]}
+                >
+                  {account["label"]}{if account["signed_in"], do: "", else: " (sign in required)"}
+                </option>
+              </select>
+            </form>
+            <a
+              class="secondary"
+              href={EabWeb.ChatGPTController.base_url() <> "/auth/chatgpt?" <> URI.encode_query(%{"account" => @account})}
+            >Continue with ChatGPT</a>
+            <button
+              :if={Enum.any?(@accounts, &(&1["id"] == @account and &1["signed_in"]))}
+              type="button"
+              class="secondary"
+              phx-click="chatgpt_sign_out"
+            >Sign out</button>
+            <p class="fine-print">
+              Uses your ChatGPT plan allowance.
+              <a href="https://chatgpt.com/settings/usage" target="_blank" rel="noreferrer">Manage usage and access</a>
+            </p>
+            <form :if={@models != []} id="chatgpt-model-form" phx-change="chatgpt_model">
+              <label for="chatgpt-model">Available model</label>
+              <select id="chatgpt-model" name="model">
+                <option value="" selected={is_nil(@endpoint)}>Choose a model</option>
+                <option
+                  :for={model <- @models}
+                  value={model["slug"]}
+                  selected={@endpoint && @endpoint["model"] == model["slug"]}
+                >
+                  {model["display_name"] || model["slug"]}
+                </option>
+              </select>
+            </form>
+          </div>
           <div :if={@detecting} class="model-card" role="status">Reading model details…</div>
           <div :if={@endpoint} class="model-card">
-            <span class="badge">CONNECTED · {if @endpoint["backend"] == "strata",
-              do: "STRATA",
-              else: "LLAMA.CPP"}</span>
+            <span class="badge">CONNECTED · {case @endpoint["backend"] do
+              "openai_subscription" -> "CHATGPT"
+              "strata" -> "STRATA"
+              _ -> "LLAMA.CPP"
+            end}</span>
             <h3>{@endpoint["model"]}</h3>
-            <dl>
+            <dl :if={not @chatgpt}>
               <div>
                 <dt>Context capacity</dt><dd>{@endpoint["context"]} tokens</dd>
               </div><div>
@@ -490,23 +646,45 @@ defmodule EabWeb.DashboardLive do
                 <dt>Server build</dt><dd>{@endpoint["profile"]["build_info"] || "Not reported"}</dd>
               </div>
             </dl>
-            <p class="fine-print">Server-reported metadata. Artifact identity is unverified.</p>
+            <p class="fine-print">
+              {@endpoint["identity_note"] ||
+                "Server-reported metadata. Artifact identity is unverified."}
+            </p>
           </div>
           <form id="settings" phx-change="settings">
             <details class="advanced">
               <summary>Advanced run settings</summary>
-              <p class="fine-print">
+              <p :if={not @chatgpt} class="fine-print">
                 Defaults use the detected context up to 262,144 tokens. Full history is retained.
                 Model and tool calls are unlimited.
               </p>
+              <p :if={@chatgpt} class="fine-print">
+                Full history is retained. The generated-token threshold is checked between completed responses and can be exceeded by one response. OpenAI controls context and response limits; seed and strict response caps are unavailable. Reasoning tokens count toward the threshold.
+              </p>
+              <label :if={@chatgpt}>
+                Reasoning effort
+                <select name="settings[reasoning_effort]">
+                  <option
+                    :for={effort <- ~w(default low medium high xhigh)}
+                    value={effort}
+                    selected={@settings["reasoning_effort"] == effort}
+                  >
+                    {effort}
+                  </option>
+                </select>
+              </label>
               <div class="settings-grid">
                 <label :for={
-                  {key, title} <- [
-                    {"window_tokens", "Context tokens (blank = automatic)"},
-                    {"response_tokens", "Tokens per response (blank = up to 8,192)"},
-                    {"max_tokens", "Generated tokens per case"},
-                    {"seed", "Seed"}
-                  ]
+                  {key, title} <-
+                    if(@chatgpt,
+                      do: [{"max_tokens", "Generated-token threshold per case"}],
+                      else: [
+                        {"window_tokens", "Context tokens (blank = automatic)"},
+                        {"response_tokens", "Tokens per response (blank = up to 8,192)"},
+                        {"max_tokens", "Generated tokens per case"},
+                        {"seed", "Seed"}
+                      ]
+                    )
                 }>{title}<input
                   type="number"
                   min={if key == "seed", do: "0", else: "1"}
@@ -681,7 +859,10 @@ defmodule EabWeb.DashboardLive do
                       Generated tokens: {@case_attempt["generated_tokens"]} / {@run["settings"][
                         "max_tokens"
                       ]}.
-                      Context limit: {@run["settings"]["window_tokens"]} tokens.
+                      <span :if={@run["settings"]["budget_policy"] == "response_boundary_soft_limit"}>Soft threshold, checked between responses. Context is provider-enforced.</span>
+                      <span :if={@run["settings"]["budget_policy"] != "response_boundary_soft_limit"}>Context limit: {@run[
+                        "settings"
+                      ]["window_tokens"]} tokens.</span>
                       Prompt tokens include conversation history and tool output; the generation budget counts model output.
                     </p>
                     <p

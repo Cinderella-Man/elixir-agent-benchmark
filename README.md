@@ -1,6 +1,6 @@
 # Elixir Agent Benchmark
 
-A local Elixir website that evaluates one served coding model against **eleven historical PR repairs**: five Plausible and six Livebook cases. Enter a llama.cpp or Strata endpoint, inspect the automatically discovered model, and click **Run benchmark**.
+A local Elixir website that evaluates one served coding model against **eleven historical PR repairs**: five Plausible and six Livebook cases. Connect a llama.cpp or Strata server, or sign in with ChatGPT and select an available OpenAI model, then click **Run benchmark**.
 
 The application prepares Docker images, checks the fixtures, runs the [Pi coding agent](https://github.com/earendil-works/pi) in isolated Docker workspaces, and grades its repairs with executable tests. There is no AI judge or speed score.
 
@@ -15,6 +15,8 @@ docker compose up --build -d
 ```
 
 Open [http://localhost:4000](http://localhost:4000). Enter the server root, for example `http://localhost:8080`, and an optional API key. Model details load automatically. Click **Run benchmark**; first preparation downloads project dependencies and fixture images. The website shows each stage, case results and downloadable evidence.
+
+To use your ChatGPT subscription, enter `https://api.openai.com` (or `https://api.openai.com/v1`). Choose **Continue with ChatGPT**, authorize this app in your browser, and select a model from your account's catalog. The callback uses `127.0.0.1` on the dashboard port. No Platform API key or Codex credential file is needed. Saved account/workspace registrations appear in the connection card; each keeps its own credentials. [Manage the app's ChatGPT allowance](https://chatgpt.com/settings/usage).
 
 Execution starts only when you click **Run benchmark**. Connecting to an endpoint reads model metadata without generating output.
 
@@ -38,7 +40,11 @@ Pi and the project run on the benchmark's Docker host. The model server can run 
 
 ## Run settings and results
 
-Defaults: all eleven cases, seed 101, unlimited model and tool calls, up to 8,192 tokens per response and 65,536 generated tokens per case. Context is detected automatically and capped at 262,144 tokens. Advanced settings allow explicit overrides within the server's capacity. History is retained without compaction; exhausting either the generation budget or context window submits the current patch for grading.
+Local-server defaults: all eleven cases, seed 101, unlimited model and tool calls, up to 8,192 tokens per response and 65,536 generated tokens per case. Context is detected automatically and capped at 262,144 tokens. Advanced settings allow explicit overrides within the server's capacity. History is retained without compaction; exhausting either the generation budget or context window submits the current patch for grading.
+
+ChatGPT subscription defaults are a **262,144 generated-token threshold per case** and **high reasoning effort**. Change them under Advanced run settings; available reasoning levels depend on the selected model. The threshold is checked between complete responses, so one response may exceed it. Reasoning tokens count once within output usage. OpenAI enforces context and response limits; no seed, exact prompt preflight or hard response cap is claimed. Full history, Pi tools, workspaces and grading use the same execution flow. Effective policies are saved in results and reports; strict local runs and subscription runs cannot join the same comparison.
+
+For solvability validation, start two **new** runs with the same frozen cases, model and settings. Inspect both outcomes along with fixture controls and prompt fairness before admitting a case. Resume is recovery, not a second independent validation attempt. This remains manual curation; the application does not automatically admit cases.
 
 One run is active at a time. Closing the browser does not stop it. **Stop run** cancels execution and cleans up this installation's containers. After interruption, reconnect the same model with the same settings and choose **Resume unfinished cases**. Completed passes, failures and evaluation errors stay fixed; saved submissions resume grading, and unfinished Pi work starts in a fresh workspace with its prior evidence preserved. Changed release, model or settings require a new run. Historical runs without checkpoint receipts cannot resume.
 

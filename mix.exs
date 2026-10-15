@@ -25,6 +25,7 @@ defmodule Eab.MixProject do
       {:bandit, "~> 1.8"},
       {:jason, "~> 1.4"},
       {:req, "~> 0.5"},
+      {:jose, "~> 1.11"},
       {:lazy_html, ">= 0.0.0", only: :test}
     ]
   end

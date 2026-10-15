@@ -5,6 +5,7 @@ defmodule EabWeb.Router do
   pipeline :browser do
     plug(:accepts, ["html"])
     plug(:fetch_session)
+    plug(:fetch_live_flash)
     plug(:protect_from_forgery)
 
     plug(:put_secure_browser_headers, %{
@@ -17,6 +18,8 @@ defmodule EabWeb.Router do
 
   scope "/", EabWeb do
     pipe_through(:browser)
+    get("/auth/chatgpt", ChatGPTController, :start)
+    get("/auth/chatgpt/callback", ChatGPTController, :callback)
     live("/", DashboardLive)
     get("/artifacts/:id/*path", ArtifactController, :show)
   end

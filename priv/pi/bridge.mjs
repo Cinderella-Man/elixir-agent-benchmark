@@ -63,7 +63,8 @@ const server = createServer(async (request, response) => {
 server.requestTimeout = 0;
 server.listen(0, '127.0.0.1', () => {
   const agentDir = mkdtempSync(join(tmpdir(), 'eab-pi-'));
-  const provider = config.models.providers.benchmark;
+  const providerName = config.provider || 'benchmark';
+  const provider = config.models.providers[providerName];
   provider.baseUrl = `http://127.0.0.1:${server.address().port}${config.api_prefix}`;
   writeFileSync(join(agentDir, 'models.json'), JSON.stringify(config.models));
   writeFileSync(join(agentDir, 'settings.json'), JSON.stringify(config.settings));
@@ -73,7 +74,7 @@ server.listen(0, '127.0.0.1', () => {
   writeFileSync(instructions, config.instructions);
   child = spawn(process.execPath, [
     join(root, 'node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js'),
-    '--mode', 'json', '--no-session', '--provider', 'benchmark', '--model', config.model,
+    '--mode', 'json', '--no-session', '--provider', providerName, '--model', config.model,
     '--tools', 'read,bash,edit,write',
     '--no-extensions', '--no-mcp', '--no-skills', '--no-prompt-templates',
     '--no-themes', '--no-approve', '--offline',

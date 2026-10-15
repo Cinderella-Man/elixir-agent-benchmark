@@ -4,7 +4,11 @@ defmodule Eab.PiGateway do
 
   def request(frame, state) do
     route =
-      if state.endpoint["backend"] == "strata", do: "/v1/messages", else: "/v1/chat/completions"
+      case state.endpoint["backend"] do
+        "openai_subscription" -> "/v1/responses"
+        "strata" -> "/v1/messages"
+        _ -> "/v1/chat/completions"
+      end
 
     unless frame["method"] == "POST" and frame["path"] == route and is_map(frame["body"]),
       do: raise("Pi requested an unsupported endpoint route")
@@ -24,6 +28,45 @@ defmodule Eab.PiGateway do
     end
   rescue
     error -> error_reply(frame, state, Store.redact(Exception.message(error), state.key))
+  end
+
+  defp exchange(frame, %{endpoint: %{"backend" => "openai_subscription"}} = state) do
+    payload = Eab.OpenAI.payload(frame["body"], state.endpoint, state.settings)
+    step = state.calls |> Integer.to_string() |> String.pad_leading(4, "0")
+    Store.write("#{state.prefix}/request-#{step}.json", payload)
+    state = %{state | calls: state.calls + 1}
+    persist(state)
+
+    try do
+      Activity.note(
+        "Model call #{state.calls}: ChatGPT subscription; provider-enforced context. Generated so far: #{state.generated_tokens}/#{state.settings["max_tokens"]} tokens (soft threshold). Waiting for model response…"
+      )
+
+      response = Eab.OpenAI.stream(state.endpoint, payload)
+      body = response.body
+      Store.write_text("#{state.prefix}/response-#{step}.sse", body)
+      usage = Eab.OpenAI.usage(response)
+      Store.write("#{state.prefix}/usage-#{step}.json", usage)
+      state = %{state | generated_tokens: state.generated_tokens + usage["output_tokens"]}
+      persist(state)
+      stream = make_ref()
+      Activity.model_chunk(stream, body)
+      Activity.model_end(stream)
+      state.emit.("Pi: call #{state.calls}, #{state.generated_tokens} generated tokens")
+      {reply(frame, 200, "text/event-stream", body), state}
+    rescue
+      error in Eab.OpenAI.Error ->
+        Eab.OpenAI.pause_for(state.endpoint["account_id"], error)
+
+        details = Eab.OpenAI.error_details(error)
+        Store.write("#{state.prefix}/provider-error-#{step}.json", details)
+        Store.write("#{state.prefix}/provider-error.json", details)
+
+        error_reply(frame, state, Exception.message(error))
+
+      error ->
+        error_reply(frame, state, Exception.message(error))
+    end
   end
 
   defp exchange(frame, state) do

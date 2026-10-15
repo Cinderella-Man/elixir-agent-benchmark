@@ -13,7 +13,19 @@ config :eab, EabWeb.Endpoint,
   server: config_env() != :test
 
 config :phoenix, :json_library, Jason
-config :phoenix, :filter_parameters, ["key", "password", "secret"]
+
+config :phoenix, :filter_parameters, [
+  "key",
+  "password",
+  "secret",
+  "code",
+  "state",
+  "id_token",
+  "access_token",
+  "refresh_token",
+  "code_verifier"
+]
+
 config :logger, :console, format: "$level $message\n"
 config :logger, level: :info
 

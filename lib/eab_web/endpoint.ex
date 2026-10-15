@@ -5,7 +5,7 @@ defmodule EabWeb.Endpoint do
     store: :cookie,
     key: "_eab",
     signing_salt: "local-benchmark",
-    same_site: "Strict",
+    same_site: "Lax",
     http_only: true
   ]
   socket("/live", Phoenix.LiveView.Socket,

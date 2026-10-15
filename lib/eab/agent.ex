@@ -24,8 +24,7 @@ defmodule Eab.Agent do
     #{if Eab.Browser.enabled?(spec), do: "Chromium and Playwright are preinstalled. Node tests can import process.env.EAB_BROWSER_MODULE. Bind any test web server to loopback and close browsers/servers after each suite.", else: ""}
     Allowed edit prefixes: #{Enum.join(spec["allowed_edit_prefixes"], ", ")}.
     When finished, give a short summary. Your current patch is then checked in a fresh workspace.
-    Model and tool calls are unlimited. Limits: #{settings["max_tokens"]} generated tokens total,
-    #{settings["window_tokens"]} context tokens including up to #{settings["response_tokens"]} response tokens.
+    #{budget_instructions(settings)}
     History is never compacted. If a budget is exhausted, the current patch is graded.
     Task details: #{Jason.encode!(spec["clarifications"] || %{})}
     """
@@ -86,5 +85,13 @@ defmodule Eab.Agent do
     Store.write("#{prefix}/attempt.json", record, key)
     Eab.Activity.note("ERROR: " <> record["error"])
     record
+  end
+
+  defp budget_instructions(%{"budget_policy" => "response_boundary_soft_limit"} = settings) do
+    "Model and tool calls are unlimited. Stop after #{settings["max_tokens"]} generated tokens total, checked between complete responses. A response can exceed the remaining threshold. Context and per-response limits are enforced by the provider."
+  end
+
+  defp budget_instructions(settings) do
+    "Model and tool calls are unlimited. Limits: #{settings["max_tokens"]} generated tokens total, #{settings["window_tokens"]} context tokens including up to #{settings["response_tokens"]} response tokens."
   end
 end

@@ -72,6 +72,22 @@ Completed baselines remain retained across model runs and controller restarts. *
 
 Deleting images outside the application is detected as missing cache state. Deleting `/data` loses receipts, releases and run evidence even if image layers survive. Back up both persistence domains if required.
 
+## ChatGPT subscription connection
+
+Enter `https://api.openai.com` in the existing endpoint field, choose a saved registration or add an account/workspace, and select **Continue with ChatGPT**. The browser returns to `http://127.0.0.1:<PORT>/auth/chatgpt/callback`; use the same computer as the controller. Choose an account-visible model and click the existing **Run benchmark** button. Connecting lists models without generating a response. Actual plan/model eligibility is established only by completed inference.
+
+The app follows OpenAI's [public-client registration flow](https://developers.openai.com/siwc/token-sharing-open-source/sign-in), with PKCE, state bound to the browser session, nonce and signed ID-token verification. Its own stable host ID, account/client mappings and rotating credentials live in `/data/credentials/chatgpt.json` (or `$EAB_DATA_DIR/credentials/chatgpt.json` outside Compose). The directory is owner-only and the file is written atomically with mode `0600`. Protect volume backups accordingly. These credentials are never copied into Pi workspaces or run artifacts. The browser session uses SameSite=Lax to permit the top-level OAuth return; CSRF protection remains enabled.
+
+A saved account without plan permission stays registered, but inference is disabled. **Continue with ChatGPT** requests the required consent again. Signing out stops an active run using that account, attempts session revocation and clears local tokens while keeping the registration and host ID. If remote revocation cannot be confirmed, the app says so and links to [ChatGPT Settings](https://chatgpt.com/settings/usage). It never imports personal Codex credentials.
+
+Subscription requests use only `POST https://api.openai.com/v1/responses`, with streaming, `store:false`, full input history and namespaced Pi functions. The native Pi OpenAI provider preserves tool-call identifiers and encrypted reasoning across calls. There is no automatic generation retry or fallback billing path. Successful output accounting requires `response.completed` with valid usage; incomplete, disconnected and quota-limited streams are evaluation errors. Request errors retain sanitized status, provider body, code, parameter and request ID in `provider-error-<step>.json` when supplied. The SSE itself retains streamed errors. These files live alongside the other exchange artifacts in the controller data directory; the latest provider error is also downloadable from the case evidence links.
+
+Quota and eligibility errors pause further inference requests for that account. Metadata checks remain available so existing submissions can finish grading. Resolve the allowance or policy issue, then explicitly **Connect** again to clear the pause and refresh models. A quota error does not imply a particular reset time or that the whole subscription is empty. Transient refresh failures retain credentials; terminal refresh errors require another sign-in with the saved registration. Refresh rotation is serialized. Sign-in success alone cannot establish whether an account, model, region or workspace supports this preview route.
+
+Subscription settings record `response_boundary_soft_limit` and `provider_enforced` context, with null seed, context capacity and hard response cap. Pi requires numeric bookkeeping defaults internally; its response cap is disabled and removed at the gateway, and compaction is off. Those bookkeeping values are not a claim about OpenAI's model capacity. Follow the [documented preview restrictions](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations) when changing the adapter. `high` is the initial reasoning effort; choose `default` for provider selection or another supported level if the model rejects that setting.
+
+Two ordinary fresh runs are the intended solvability check. Use matching model/settings and unchanged frozen fixtures, retain all outcomes, and investigate disagreement or unreasonable grader behavior. Do not use Resume as the second run or compare a generous subscription pass with a stricter local run as if their effective resource policies matched.
+
 ## Bounded correctness checks
 
 All developer dependencies also run in Docker:
