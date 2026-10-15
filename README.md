@@ -16,7 +16,7 @@ docker compose up --build -d
 
 Open [http://localhost:4000](http://localhost:4000). Enter the server root, for example `http://localhost:8080`, and an optional API key. Model details load automatically. Click **Run benchmark**; first preparation downloads project dependencies and fixture images. The website shows each stage, case results and downloadable evidence.
 
-To use your ChatGPT subscription, enter `https://api.openai.com` (or `https://api.openai.com/v1`). Choose **Continue with ChatGPT**, authorize this app in your browser, and select a model from your account's catalog. The callback uses `127.0.0.1` on the dashboard port. No Platform API key or Codex credential file is needed. Saved account/workspace registrations appear in the connection card; each keeps its own credentials. [Manage the app's ChatGPT allowance](https://chatgpt.com/settings/usage).
+To use your ChatGPT subscription, choose **ChatGPT** under **Model source**, then **Continue with ChatGPT**. Authorize this app in your browser using your usual sign-in method, including Google, and select a model from your account's catalog. The endpoint is configured automatically. The callback uses `127.0.0.1` on the dashboard port. No Platform API key or Codex credential file is needed. Saved account/workspace registrations appear in the connection panel; each keeps its own credentials. [Manage the app's ChatGPT allowance](https://chatgpt.com/settings/usage).
 
 Execution starts only when you click **Run benchmark**. Connecting to an endpoint reads model metadata without generating output.
 

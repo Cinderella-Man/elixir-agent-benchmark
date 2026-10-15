@@ -23,6 +23,8 @@ defmodule EabWeb.DashboardLive do
         snapshot: snapshot,
         endpoint: nil,
         url: "",
+        local_url: "",
+        local_key: "",
         chatgpt: false,
         accounts: Eab.ChatGPTAuth.accounts(),
         account: params["chatgpt"] || "",
@@ -73,6 +75,29 @@ defmodule EabWeb.DashboardLive do
       else: {:ok, socket}
   end
 
+  def handle_event("provider", %{"provider" => "chatgpt"}, socket) do
+    Eab.ChatGPTAuth.retry_requests(socket.assigns.account)
+
+    {:noreply,
+     socket
+     |> provider_settings(true)
+     |> assign(chatgpt: true, url: "https://api.openai.com", key: "")
+     |> discover_chatgpt()}
+  end
+
+  def handle_event("provider", %{"provider" => "local"}, socket) do
+    handle_event(
+      "connect",
+      %{
+        "connection" => %{
+          "url" => socket.assigns.local_url,
+          "key" => socket.assigns.local_key
+        }
+      },
+      socket
+    )
+  end
+
   def handle_event("connect", %{"connection" => values}, socket) do
     url = values["url"] || ""
     key = values["key"] || ""
@@ -91,7 +116,7 @@ defmodule EabWeb.DashboardLive do
       {:noreply,
        socket
        |> provider_settings(false)
-       |> assign(chatgpt: false, models: [])
+       |> assign(chatgpt: false, models: [], local_url: url, local_key: key)
        |> start_async(:discovery, fn ->
          try do
            {:ok, if(String.trim(url) == "", do: nil, else: Model.discover(url, key))}
@@ -326,6 +351,9 @@ defmodule EabWeb.DashboardLive do
   def handle_async(:discovery, {:ok, {:error, error}}, socket),
     do: {:noreply, assign(socket, detecting: false, error: error)}
 
+  def handle_async(:discovery, {:exit, {:shutdown, :cancel}}, socket),
+    do: {:noreply, socket}
+
   def handle_async(:discovery, {:exit, _}, socket),
     do:
       {:noreply,
@@ -378,7 +406,9 @@ defmodule EabWeb.DashboardLive do
         end
       end)
     else
-      socket
+      # Replace the async reference too, so an already queued result from the
+      # previous provider cannot reconnect it after the user switches away.
+      start_async(socket, :discovery, fn -> {:ok, nil} end)
     end
   end
 
@@ -556,10 +586,46 @@ defmodule EabWeb.DashboardLive do
           <div class="section-title">
             <span class="section-icon" aria-hidden="true">⌘</span><h2>Run configuration</h2>
           </div>
-          <p class="muted">
-            Connect a llama.cpp or Strata server, or use https://api.openai.com with your ChatGPT subscription.
-          </p>
-          <form id="connection" phx-change="connect" phx-submit="connect">
+          <form id="provider-choice" phx-change="provider">
+            <fieldset class="provider-options">
+              <legend>Model source</legend>
+              <label class={["provider-option", @chatgpt && "is-selected"]}>
+                <input type="radio" name="provider" value="chatgpt" checked={@chatgpt} />
+                <svg
+                  aria-hidden="true"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                >
+                  <path d="M20 11a8 8 0 0 1-8 8H5l-4 3V11a9 9 0 0 1 9-9h2a8 8 0 0 1 8 9Z" />
+                  <path d="M7 9h8M7 13h5" />
+                </svg>
+                <span><strong>ChatGPT</strong><small>Use your subscription</small></span>
+              </label>
+              <label class={["provider-option", not @chatgpt && "is-selected"]}>
+                <input type="radio" name="provider" value="local" checked={not @chatgpt} />
+                <svg
+                  aria-hidden="true"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                >
+                  <rect x="3" y="3" width="18" height="7" rx="2" /><rect
+                    x="3"
+                    y="14"
+                    width="18"
+                    height="7"
+                    rx="2"
+                  />
+                  <path d="M7 6.5h.01M7 17.5h.01M11 6.5h6M11 17.5h6" stroke-linecap="round" />
+                </svg>
+                <span><strong>Local server</strong><small>llama.cpp or Strata</small></span>
+              </label>
+            </fieldset>
+          </form>
+          <form :if={not @chatgpt} id="connection" phx-change="connect" phx-submit="connect">
             <label for="endpoint">Server endpoint</label>
             <div class="input-row">
               <input
@@ -573,7 +639,7 @@ defmodule EabWeb.DashboardLive do
                 autocomplete="url"
               /><button type="submit" class="secondary" disabled={@detecting}>Connect</button>
             </div>
-            <details :if={not @chatgpt}>
+            <details>
               <summary>Server credentials</summary><label for="key">API key
               <span class="muted">— optional, kept in memory</span></label><input
                 id="key"
@@ -585,8 +651,9 @@ defmodule EabWeb.DashboardLive do
               />
             </details>
           </form>
-          <div :if={@chatgpt} class="model-card" id="chatgpt-connection">
-            <form id="chatgpt-account-form" phx-change="chatgpt_account">
+          <div :if={@chatgpt} class="chatgpt-connection" id="chatgpt-connection">
+            <p class="muted">Sign in to choose a model available to your ChatGPT account.</p>
+            <form :if={@accounts != []} id="chatgpt-account-form" phx-change="chatgpt_account">
               <label for="chatgpt-account">ChatGPT account / workspace</label>
               <select id="chatgpt-account" name="account">
                 <option value="" selected={@account == ""}>Add an account or workspace</option>
@@ -600,9 +667,12 @@ defmodule EabWeb.DashboardLive do
               </select>
             </form>
             <a
-              class="secondary"
+              class="secondary chatgpt-sign-in"
               href={EabWeb.ChatGPTController.base_url() <> "/auth/chatgpt?" <> URI.encode_query(%{"account" => @account})}
             >Continue with ChatGPT</a>
+            <p class="fine-print">
+              Use your usual sign-in method, including Google, on the next page.
+            </p>
             <button
               :if={Enum.any?(@accounts, &(&1["id"] == @account and &1["signed_in"]))}
               type="button"

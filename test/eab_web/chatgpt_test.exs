@@ -6,6 +6,24 @@ defmodule EabWeb.ChatGPTTest do
   @endpoint EabWeb.Endpoint
   setup do: ChatGPTFixture.start!()
 
+  test "choosing ChatGPT exposes sign-in without requiring an endpoint or credentials" do
+    Application.put_env(:eab, :http_request, fn _ ->
+      flunk("Choosing an unsigned provider must not send a model request")
+    end)
+
+    {:ok, view, _} = live(build_conn(), "/")
+    assert has_element?(view, "#provider-choice input[value=local][checked]")
+    view |> form("#provider-choice", provider: "chatgpt") |> render_change()
+
+    assert has_element?(view, "#provider-choice input[value=chatgpt][checked]")
+    assert has_element?(view, "#chatgpt-connection a", "Continue with ChatGPT")
+    assert has_element?(view, "#run[disabled]")
+    refute has_element?(view, "#connection")
+    refute has_element?(view, "#chatgpt-account-form")
+    refute has_element?(view, "input[name='settings[response_tokens]']")
+    assert has_element?(view, "input[name='settings[max_tokens]'][value='262144']")
+  end
+
   test "OpenAI endpoint offers sign-in without probing local server routes" do
     Application.put_env(:eab, :http_request, fn _ ->
       flunk("Unsigned discovery sent a model request")
@@ -28,21 +46,50 @@ defmodule EabWeb.ChatGPTTest do
     {:ok, view, _} = live(build_conn(), "/")
     view |> form("#settings", settings: %{max_tokens: "12345"}) |> render_change()
 
-    view
-    |> form("#connection", connection: %{url: "https://api.openai.com", key: ""})
-    |> render_change()
+    view |> form("#provider-choice", provider: "chatgpt") |> render_change()
 
     assert has_element?(view, "input[name='settings[max_tokens]'][value='262144']")
     view |> form("#settings", settings: %{max_tokens: "300000"}) |> render_change()
-    view |> form("#connection", connection: %{url: ""}) |> render_change()
+    view |> form("#provider-choice", provider: "local") |> render_change()
     render_async(view)
     assert has_element?(view, "input[name='settings[max_tokens]'][value='12345']")
 
-    view
-    |> form("#connection", connection: %{url: "https://api.openai.com", key: ""})
-    |> render_change()
+    view |> form("#provider-choice", provider: "chatgpt") |> render_change()
 
     assert has_element?(view, "input[name='settings[max_tokens]'][value='300000']")
+  end
+
+  test "switching source cancels pending discovery and preserves the local connection" do
+    parent = self()
+
+    Application.put_env(:eab, :http_request, fn opts ->
+      send(parent, {:discovering, self(), opts[:url], opts[:headers]})
+
+      receive do
+        :release -> {:error, :unavailable}
+      end
+    end)
+
+    {:ok, view, _} = live(build_conn(), "/")
+
+    view
+    |> form("#connection", connection: %{url: "http://fixture", key: "local-secret"})
+    |> render_change()
+
+    assert_receive {:discovering, pid, "http://fixture/health", _}
+    ref = Process.monitor(pid)
+    view |> form("#provider-choice", provider: "chatgpt") |> render_change()
+    assert_receive {:DOWN, ^ref, :process, ^pid, _}
+    refute render_async(view) =~ "Model discovery stopped"
+    assert has_element?(view, "#run[disabled]")
+    refute render(view) =~ "local-secret"
+
+    view |> form("#provider-choice", provider: "local") |> render_change()
+    assert has_element?(view, "#endpoint[value='http://fixture']")
+    assert has_element?(view, "#key[value='local-secret']")
+    assert_receive {:discovering, _, "http://fixture/health", headers}
+    assert {"authorization", "Bearer local-secret"} in headers
+    view |> form("#provider-choice", provider: "chatgpt") |> render_change()
   end
 
   test "callback is bound to browser session then model selection enables the same Run button",
@@ -88,6 +135,8 @@ defmodule EabWeb.ChatGPTTest do
 
     {:ok, view, _} = live(recycle(signed_in), redirected_to(signed_in))
     render_async(view)
+    assert has_element?(view, "#provider-choice input[value=chatgpt][checked]")
+    refute has_element?(view, "#connection")
     assert has_element?(view, "#run[disabled]")
     view |> form("form[phx-change=chatgpt_model]", model: "available-model") |> render_change()
     assert has_element?(view, "#run:not([disabled])")
