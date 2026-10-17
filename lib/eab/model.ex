@@ -86,6 +86,7 @@ defmodule Eab.Model do
       "identity_note" =>
         "Server-reported identity; artifact checksum and provenance are unverified."
     }
+    |> Eab.ModelIdentity.attach()
     |> Eab.Store.scrub(key)
   end
 

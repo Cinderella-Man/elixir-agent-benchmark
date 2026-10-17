@@ -1,6 +1,6 @@
 defmodule Eab.Runs do
   use GenServer
-  alias Eab.{Checkpoints, Model, Pipeline, Release, Runner, Sandbox, Store}
+  alias Eab.{Checkpoints, MemoryMonitor, Model, Pipeline, Release, Runner, Sandbox, Store}
   @terminal ~w(completed error cancelled interrupted corrupt)
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   def subscribe, do: Phoenix.PubSub.subscribe(Eab.PubSub, "runs")
@@ -18,7 +18,7 @@ defmodule Eab.Runs do
   def repeat_cases(id, cases, key),
     do: GenServer.call(__MODULE__, {:partial, id, {:selected, cases}, key}, 30_000)
 
-  def stop, do: GenServer.call(__MODULE__, :stop)
+  def stop, do: GenServer.call(__MODULE__, :stop, 10_000)
   def retry_cleanup, do: GenServer.call(__MODULE__, :retry_cleanup)
 
   @impl true
@@ -35,6 +35,7 @@ defmodule Eab.Runs do
             Map.merge(run, %{
               "status" => "interrupted",
               "phase" => "interrupted",
+              "memory" => MemoryMonitor.recover(run["id"]),
               "message" =>
                 "Application restarted. Reconnect the same model to resume unfinished cases."
             })
@@ -48,7 +49,7 @@ defmodule Eab.Runs do
             Enum.each(pending_ids, &cleanup/1)
           end)
 
-    {:ok, %{active: nil, worker: nil, cleanup: task, cleanup_error: nil}}
+    {:ok, %{active: nil, worker: nil, memory_monitor: nil, cleanup: task, cleanup_error: nil}}
   end
 
   @impl true
@@ -211,10 +212,13 @@ defmodule Eab.Runs do
     owner = state.worker.pid
     Task.shutdown(state.worker, :brutal_kill)
 
+    memory = MemoryMonitor.finish(state.memory_monitor, state.active["id"], "cancelled")
+
     run =
       Map.merge(state.active, %{
         "status" => "cancelled",
         "phase" => "cancelled",
+        "memory" => memory,
         "message" => "Stopped. This run remains incomplete."
       })
 
@@ -227,10 +231,17 @@ defmodule Eab.Runs do
       end)
 
     broadcast()
-    {:reply, :ok, %{state | active: nil, worker: nil, cleanup: task}}
+    {:reply, :ok, %{state | active: nil, worker: nil, memory_monitor: nil, cleanup: task}}
   end
 
   @impl true
+  def handle_info({:memory_updated, id, memory}, %{active: %{"id" => id}} = state) do
+    run = Map.put(state.active, "memory", memory)
+    persist(run)
+    broadcast()
+    {:noreply, %{state | active: run}}
+  end
+
   def handle_info({:progress, id, event}, %{active: %{"id" => id}} = state) do
     log =
       case event do
@@ -345,6 +356,16 @@ defmodule Eab.Runs do
   end
 
   defp launch(run, key, state) do
+    case MemoryMonitor.start(run) do
+      {:ok, monitor, memory} ->
+        launch_monitored(Map.put(run, "memory", memory), key, state, monitor)
+
+      {:error, message} ->
+        {:reply, {:error, "Memory collection could not start: #{message}"}, state}
+    end
+  end
+
+  defp launch_monitored(run, key, state, monitor) do
     Eab.Retention.lease(run["id"])
     id = run["id"]
     parent = self()
@@ -368,16 +389,26 @@ defmodule Eab.Runs do
         end)
       rescue
         error ->
+          MemoryMonitor.finish(monitor, id, "Run could not start")
           Eab.Retention.release(id)
           reraise error, __STACKTRACE__
       end
 
     broadcast()
-    {:reply, {:ok, id}, %{state | active: run, worker: task}}
+    {:reply, {:ok, id}, %{state | active: run, worker: task, memory_monitor: monitor}}
   end
 
   defp finish(state, status, message) do
-    run = Map.merge(state.active, %{"status" => status, "phase" => status, "message" => message})
+    memory = MemoryMonitor.finish(state.memory_monitor, state.active["id"], status)
+
+    run =
+      Map.merge(state.active, %{
+        "status" => status,
+        "phase" => status,
+        "message" => message,
+        "memory" => memory
+      })
+
     persist(run)
     owner = state.worker.pid
 
@@ -388,7 +419,7 @@ defmodule Eab.Runs do
       end)
 
     broadcast()
-    {:noreply, %{state | active: nil, worker: nil, cleanup: task}}
+    {:noreply, %{state | active: nil, worker: nil, memory_monitor: nil, cleanup: task}}
   end
 
   defp persist(run) do

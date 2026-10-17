@@ -42,7 +42,12 @@ defmodule Eab.PiGateway do
         "Model call #{state.calls}: ChatGPT subscription; provider-enforced context. Generated so far: #{state.generated_tokens}/#{state.settings["max_tokens"]} tokens (soft threshold). Waiting for model response…"
       )
 
-      response = Eab.OpenAI.stream(state.endpoint, payload)
+      {response, measurement} =
+        Eab.Measurement.request(state.measurement, fn ->
+          Eab.OpenAI.stream(state.endpoint, payload)
+        end)
+
+      state = %{state | measurement: measurement}
       body = response.body
       Store.write_text("#{state.prefix}/response-#{step}.sse", body)
       usage = Eab.OpenAI.usage(response)
@@ -116,7 +121,12 @@ defmodule Eab.PiGateway do
             "Waiting for model response…"
         )
 
-        body = Model.stream(state.endpoint, state.key, payload)
+        {body, measurement} =
+          Eab.Measurement.request(state.measurement, fn ->
+            Model.stream(state.endpoint, state.key, payload)
+          end)
+
+        state = %{state | measurement: measurement}
         Store.write_text("#{state.prefix}/response-#{step}.sse", body, state.key)
         usage = Model.stream_usage(state.endpoint, body, count, allowance)
         Store.write("#{state.prefix}/usage-#{step}.json", usage, state.key)

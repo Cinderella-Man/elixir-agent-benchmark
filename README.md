@@ -1,5 +1,7 @@
 # Elixir Agent Benchmark
 
+The standalone **Elixir SWE Bench** [results page](results-page/README.md) displays published runs and includes a result exporter and GitHub Pages deployment workflow.
+
 A local Elixir website that evaluates one served coding model against **nine historical PR repairs**: three Plausible and six Livebook cases. Connect a llama.cpp or Strata server, or sign in with ChatGPT and select an available OpenAI model, then click **Run benchmark**.
 
 The application prepares Docker images, checks the fixtures, runs the [Pi coding agent](https://github.com/earendil-works/pi) in isolated Docker workspaces, and grades its repairs with executable tests. There is no AI judge or speed score.
@@ -21,6 +23,32 @@ To use your ChatGPT subscription, choose **ChatGPT** under **Model source**, the
 Execution starts only when you click **Run benchmark**. Connecting to an endpoint reads model metadata without generating output.
 
 The website is available only from the computer running it. The model endpoint can be on that computer or another reachable machine. If the server requires an API key, enter it under **Server credentials**.
+
+
+## Run memory on the model host
+
+The benchmark can sample the served model's VRAM and RAM throughout each run. This is independent of optional performance measurements. On this installation it is configured for **ratx570**, using its existing Tailscale SSH access; it does not start, stop or switch the model.
+
+The collector in `scripts/memory_stream.py` requires Linux cgroup v2, a dedicated model service, Python 3, `ss` and NVIDIA's `nvidia-smi`. Install it on the model host at `/srv/elixir-agent-benchmark/memory_stream.py`. Set these values in the benchmark's ignored `.env`, then rebuild/recreate the benchmark container:
+
+```dotenv
+EAB_MEMORY_SSH_TARGET=root@ratx570
+EAB_MEMORY_HOSTS=ratx570,100.70.151.84
+EAB_MEMORY_REMOTE_SCRIPT=/srv/elixir-agent-benchmark/memory_stream.py
+EAB_MEMORY_REMOTE_KEY_FILE=/srv/model-rig-lab/.local/secrets/api-key
+```
+
+Copy the model host's **already verified** SSH public host entry into `/data/memory/known_hosts` in the benchmark volume (mode 600). The SSH client uses strict host verification and no private key or agent; this configuration relies on Tailscale SSH authentication. The remote key-file path refers to the existing model API key **on that host**. Its contents never enter the benchmark or its evidence. `EAB_MEMORY_HOSTS` must list the exact hostnames/IPs used in the model endpoint URL; other hosts and hosted APIs are not sampled. Empty `EAB_MEMORY_SSH_TARGET` disables collection.
+
+Sampling starts before benchmark work and takes a final reading on completion, failure or cancellation. It resolves the local model listener, checks the artifact and configured context, and follows all GPU processes in its dedicated service cgroup. GPU allocations are mapped by physical UUID; unrelated services are excluded. RAM is cgroup `memory.current`, including charged page cache and kernel memory. Process RSS and whole-host RAM are retained separately in the raw observations. Collection never uses the service-lifetime `memory.peak` as a run peak.
+
+Each run saves:
+
+- `memory-samples.jsonl`: timestamped readings at a target one-second interval, with per-GPU allocation, service RAM, process RSS, RAM breakdown and simultaneous RAM + VRAM.
+- `memory.json`: session identities, per-GPU and aggregate sampled peaks, sample count and coverage. The combined peak is the maximum observed RAM + VRAM in one sample, not the sum of independent maxima.
+- `run.json` and `report.md`: the final summary. The dashboard provides summary and raw-sample downloads.
+
+Initial collector failure prevents a configured run from starting. Later disconnects, process/model changes or sampling gaps greater than 2.5 seconds preserve available readings and mark coverage partial; they do not alter repair scores. Resume appends a separate session, and application restart marks unfinished collection partial. Previously unmeasured parts of a resumed run remain partial. Samples can miss sub-second peaks; configured context capacity does not mean every task filled that context. These are observations of this deployment, not interchangeable VRAM/RAM or a guaranteed minimum hardware specification.
 
 ## How it runs
 

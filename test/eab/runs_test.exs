@@ -3,7 +3,7 @@ defmodule Eab.RunsTest do
   alias Eab.{Runs, Store}
 
   setup do
-    keys = [:data_dir, :runner, :cleanup]
+    keys = [:data_dir, :runner, :cleanup, :memory_monitor]
     old = Map.new(keys, &{&1, Application.get_env(:eab, &1)})
     Supervisor.terminate_child(Eab.Supervisor, Runs)
     root = Path.join(System.tmp_dir!(), "eab-run-test-#{System.unique_integer([:positive])}")
@@ -26,6 +26,67 @@ defmodule Eab.RunsTest do
     end)
 
     :ok
+  end
+
+  test "memory collection starts before work and finalizes on completion, error and cancellation" do
+    parent = self()
+    Runs.subscribe()
+
+    Application.put_env(:eab, :memory_monitor,
+      hosts: ["fixture"],
+      target: "fixture",
+      script: "fixture",
+      known_hosts: "fixture",
+      executable: "/opt/pi/node",
+      args: ["test/support/memory_collector.mjs", "normal"]
+    )
+
+    endpoint = %{
+      "url" => "http://fixture:8414",
+      "backend" => "strata",
+      "model" => "fixture",
+      "context" => 262_144,
+      "profile" => %{"model_path" => "/models/fixture-Q4_K_M.gguf"}
+    }
+
+    Application.put_env(:eab, :runner, fn run, _, _ ->
+      send(parent, {:started, self(), run})
+
+      receive do
+        {:finish, result} -> result
+      end
+    end)
+
+    for {status, result} <- [
+          {"completed", :ok},
+          {"error", {:error, "fixture error"}},
+          {"cancelled", :stop}
+        ] do
+      {:ok, id} = Runs.start(endpoint, "", %{})
+      assert_receive {:started, worker, run}, 3000
+      assert run["memory"]["sample_count"] == 1
+      if result == :stop, do: Runs.stop(), else: send(worker, {:finish, result})
+      await_terminal(id)
+      await_cleanup()
+      saved = Store.run(id)
+      assert saved["status"] == status
+      assert saved["memory"]["status"] == "complete"
+      assert saved["memory"]["sample_count"] == 2
+      assert File.read!(Store.path("runs/#{id}/report.md")) =~ "Sampled model-service memory"
+    end
+
+    config = Application.get_env(:eab, :memory_monitor)
+
+    Application.put_env(
+      :eab,
+      :memory_monitor,
+      Keyword.put(config, :args, ["test/support/memory_collector.mjs", "startup_error"])
+    )
+
+    assert {:error, message} = Runs.start(endpoint, "", %{})
+    assert message =~ "Memory collection could not start"
+    refute_receive {:started, _, _}
+    assert Runs.snapshot().active == nil
   end
 
   defp endpoint, do: %{"model" => "fixture", "context" => 32768}

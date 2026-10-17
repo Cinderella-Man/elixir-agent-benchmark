@@ -48,7 +48,8 @@ defmodule Eab.Report do
 
     - Run: #{run["id"]}
     - Scope: #{scope(run)}
-    - Model: #{escape(model["model"] || "Unknown")}
+    - Model: #{escape(Eab.ModelIdentity.label(model))}
+    - Model weights: #{Eab.ModelIdentity.size_label(model)}
     - Backend: #{model["backend"] || "Unknown"}
     - Release: #{run["release_id"] || "Historical protocol only"}
     - Experiment: #{run["experiment_id"] || "Not sealed"}
@@ -61,6 +62,8 @@ defmodule Eab.Report do
     - Final score: #{final_score}
 
     #{escape(run["message"] || "")}
+
+    #{memory(run)}
 
     Effective settings (subscription thresholds and local strict caps are distinct policies):
 
@@ -89,6 +92,13 @@ defmodule Eab.Report do
     do: "Selected-case repeat of " <> id
 
   defp scope(_), do: "Full inventory"
+
+  defp memory(%{"memory" => memory}) when is_map(memory) do
+    "Sampled model-service memory peaks: #{escape(Eab.MemoryMonitor.label(memory))}. " <>
+      "RAM includes the service's charged page cache. [Summary](memory.json) · [Samples](memory-samples.jsonl)."
+  end
+
+  defp memory(_), do: ""
 
   defp escape(text), do: text |> String.replace("|", "\\|") |> String.replace(~r/[\r\n]+/, " ")
 end

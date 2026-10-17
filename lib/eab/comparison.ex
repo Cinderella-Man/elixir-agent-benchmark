@@ -24,7 +24,7 @@ defmodule Eab.Comparison do
         Enum.map(runs, fn run ->
           %{
             "id" => run["id"],
-            "model" => get_in(run, ["model", "model"]) || "Unknown",
+            "model" => Eab.ModelIdentity.label(run["model"]),
             "backend" => get_in(run, ["model", "backend"]),
             "status" => run["status"],
             "score" => Runner.score(run)

@@ -141,6 +141,7 @@ defmodule Eab.Pi do
       emit: emit,
       calls: 0,
       generated_tokens: 0,
+      measurement: Eab.Measurement.start(),
       stop_reason: nil,
       error: nil,
       settled: false,
@@ -227,12 +228,18 @@ defmodule Eab.Pi do
     end
   end
 
-  defp summary(state, reason),
-    do: %{
+  defp summary(state, reason) do
+    summary = %{
       "calls" => state.calls,
       "generated_tokens" => state.generated_tokens,
       "stop_reason" => reason
     }
+
+    case Eab.Measurement.finish(state.measurement) do
+      nil -> summary
+      measurement -> Map.put(summary, "measurement", measurement)
+    end
+  end
 
   defp append(state, file, data) do
     path = Store.path("#{state.prefix}/#{file}")

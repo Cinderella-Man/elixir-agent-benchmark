@@ -704,12 +704,16 @@ defmodule EabWeb.DashboardLive do
               "strata" -> "STRATA"
               _ -> "LLAMA.CPP"
             end}</span>
-            <h3>{@endpoint["model"]}</h3>
+            <h3>{Eab.ModelIdentity.label(@endpoint)}</h3>
             <dl :if={not @chatgpt}>
               <div>
                 <dt>Context capacity</dt><dd>{@endpoint["context"]} tokens</dd>
               </div><div>
-                <dt>Quantization</dt><dd>{model_detail(@endpoint, "ftype")}</dd>
+                <dt>Quantization</dt><dd>
+                  {Eab.ModelIdentity.details(@endpoint)["quantization"] || "Not reported"}
+                </dd>
+              </div><div>
+                <dt>Model weights</dt><dd>{Eab.ModelIdentity.size_label(@endpoint)}</dd>
               </div><div>
                 <dt>Parameters</dt><dd>{model_detail(@endpoint, "n_params")}</dd>
               </div><div>
@@ -795,7 +799,10 @@ defmodule EabWeb.DashboardLive do
             <div class="run-heading">
               <span class="badge">{String.upcase(@run["status"])}</span><code>{@run["id"]}</code>
             </div>
-            <h3 class="run-model">{@run["model"]["model"]}</h3><p class="run-message" role="status">
+            <h3 class="run-model">{Eab.ModelIdentity.label(@run["model"])}</h3><p
+              class="run-message"
+              role="status"
+            >
               {@run["message"]}
             </p>
             <p :if={@run["release_id"]} class="fine-print">
@@ -835,6 +842,11 @@ defmodule EabWeb.DashboardLive do
                 <strong>{if @score["score_percent"], do: "#{@score["score_percent"]}%", else: "—"}</strong>
               </div>
             </div>
+            <p :if={@run["memory"]} class="fine-print" id="run-memory">
+              Sampled memory peaks: {Eab.MemoryMonitor.label(@run["memory"])}.
+              <a href={"/artifacts/#{@run["id"]}/memory.json"} download>Summary</a>
+              · <a href={"/artifacts/#{@run["id"]}/memory-samples.jsonl"} download>Samples</a>
+            </p>
             <div class="progress-heading">
               <span>Cases graded</span><strong>{@score["passed"] + @score["failed"]}/{@score[
                 "planned"
@@ -1074,7 +1086,7 @@ defmodule EabWeb.DashboardLive do
           class="history-row"
           phx-click="select"
           phx-value-id={run["id"]}
-        ><span><strong>{run["model"]["model"]}</strong><code>{run["id"]}</code></span><span>{run[
+        ><span><strong>{Eab.ModelIdentity.label(run["model"])}</strong><code>{run["id"]}</code></span><span>{run[
           "status"
         ]} →</span></button>
         <nav :if={@history_page.total > 20} aria-label="History pages">
@@ -1113,7 +1125,7 @@ defmodule EabWeb.DashboardLive do
               value={run["id"]}
               checked={run["id"] in @comparison_ids}
             />
-            {run["model"]["model"]} · {run["id"]} · {run["status"]}
+            {Eab.ModelIdentity.label(run["model"])} · {run["id"]} · {run["status"]}
           </label>
           <button class="secondary" type="submit">Compare selected runs</button>
         </form>

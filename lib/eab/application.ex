@@ -8,6 +8,7 @@ defmodule Eab.Application do
       {Phoenix.PubSub, name: Eab.PubSub},
       {Registry, keys: :duplicate, name: Eab.Commands},
       {Task.Supervisor, name: Eab.Tasks},
+      {DynamicSupervisor, strategy: :one_for_one, name: Eab.MemoryMonitors},
       Eab.ChatGPTAuth,
       Eab.Runs,
       EabWeb.Endpoint
