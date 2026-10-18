@@ -1,0 +1,189 @@
+diff --git a/assets/js/app.js b/assets/js/app.js
+index 476cdc1..f1b8d2c 100644
+--- a/assets/js/app.js
++++ b/assets/js/app.js
+@@ -95,6 +95,17 @@ Hooks.Menu = {
+ 
+ Hooks.AudioPlayer = {
+   mounted(){
++    this.song = null
++    this.ordinaryTitle = document.title
++    this.nowPlayingTitle = null
++    // The sticky player survives navigation; remember the latest ordinary page title.
++    this.titleObserver = new MutationObserver(() => {
++      if(document.title !== this.nowPlayingTitle){
++        this.ordinaryTitle = document.title
++        if(this.nowPlayingTitle){ document.title = this.nowPlayingTitle }
++      }
++    })
++    this.titleObserver.observe(document.querySelector("title"), {childList: true, subtree: true, characterData: true})
+     this.playbackBeganAt = null
+     this.player = this.el.querySelector("audio")
+     this.currentTime = this.el.querySelector("#player-time")
+@@ -109,6 +120,7 @@ Hooks.AudioPlayer = {
+         }
+       }
+     }
++    this.enableAudio = enableAudio
+     document.addEventListener("click", enableAudio)
+     this.el.addEventListener("js:listen_now", () => this.play({sync: true}))
+     this.el.addEventListener("js:play_pause", () => {
+@@ -116,7 +128,8 @@ Hooks.AudioPlayer = {
+         this.play()
+       }
+     })
+-    this.handleEvent("play", ({url, token, elapsed}) => {
++    this.handleEvent("play", ({url, token, elapsed, title, artist}) => {
++      this.song = {title, artist}
+       this.playbackBeganAt = nowSeconds() - elapsed
+       let currentSrc = this.player.src.split("?")[0]
+       if(currentSrc === url && this.player.paused){
+@@ -124,12 +137,36 @@ Hooks.AudioPlayer = {
+       } else if(currentSrc !== url) {
+         this.player.src = `${url}?token=${token}`
+         this.play({sync: true})
++      } else {
++        this.updateNowPlaying()
+       }
+     })
+     this.handleEvent("pause", () => this.pause())
+     this.handleEvent("stop", () => this.stop())
+   },
+ 
++  destroyed(){
++    this.titleObserver.disconnect()
++    this.stop()
++    this.clearNextTimer()
++    document.removeEventListener("click", this.enableAudio)
++  },
++
++  updateNowPlaying(){
++    if(!this.song){ return }
++    this.nowPlayingTitle = `${this.song.title} – ${this.song.artist}`
++    document.title = this.nowPlayingTitle
++    if("mediaSession" in navigator && typeof MediaMetadata !== "undefined"){
++      navigator.mediaSession.metadata = new MediaMetadata(this.song)
++    }
++  },
++
++  clearNowPlaying(){
++    this.nowPlayingTitle = null
++    document.title = this.ordinaryTitle
++    if("mediaSession" in navigator){ navigator.mediaSession.metadata = null }
++  },
++
+   clearNextTimer(){
+     clearTimeout(this.nextTimer)
+     this.nextTimer = null
+@@ -139,6 +176,8 @@ Hooks.AudioPlayer = {
+     let {sync} = opts
+     this.clearNextTimer()
+     this.player.play().then(() => {
++      if(this.player.paused){ return }
++      this.updateNowPlaying()
+       if(sync){ this.player.currentTime = nowSeconds() - this.playbackBeganAt }
+       this.progressTimer = setInterval(() => this.updateProgress(), 100)
+     }, error => {
+@@ -151,11 +190,12 @@ Hooks.AudioPlayer = {
+   pause(){
+     clearInterval(this.progressTimer)
+     this.player.pause()
++    this.clearNowPlaying()
+   },
+ 
+   stop(){
+-    clearInterval(this.progressTimer)
+-    this.player.pause()
++    this.pause()
++    this.song = null
+     this.player.currentTime = 0
+     this.updateProgress()
+     this.duration.innerText = ""
+diff --git a/lib/live_beats_web/live/player_live.ex b/lib/live_beats_web/live/player_live.ex
+index 26bc162..253a46c 100644
+--- a/lib/live_beats_web/live/player_live.ex
++++ b/lib/live_beats_web/live/player_live.ex
+@@ -313,6 +313,8 @@ defmodule LiveBeatsWeb.PlayerLive do
+       paused: Song.paused?(song),
+       elapsed: elapsed,
+       duration: song.duration,
++      title: song.title,
++      artist: song.artist,
+       token: token,
+       url: song.mp3_url
+     })
+diff --git a/test/benchmark/browser_helpers.mjs b/test/benchmark/browser_helpers.mjs
+index 7976403..799c9b2 100644
+--- a/test/benchmark/browser_helpers.mjs
++++ b/test/benchmark/browser_helpers.mjs
+@@ -35,7 +35,10 @@ export async function startFixture() {
+       const profile = data.profiles[profileIndex ?? next++];
+       assert.ok(profile, 'Fixture profile exists');
+       const context = await browser.newContext();
+-      if (!mediaSession) await context.addInitScript(() => {delete Navigator.prototype.mediaSession;});
++      if (!mediaSession) await context.addInitScript(() => {
++        delete Navigator.prototype.mediaSession;
++        delete window.MediaMetadata;
++      });
+       // External avatar/region imagery is unrelated to the local product workflow.
+       await context.route('**/*', route => {
+         const url = new URL(route.request().url());
+diff --git a/test/benchmark/preservation.mjs b/test/benchmark/preservation.mjs
+index 36debfc..b4806b8 100644
+--- a/test/benchmark/preservation.mjs
++++ b/test/benchmark/preservation.mjs
+@@ -18,6 +18,54 @@ test('ordinary audio can play pause resume and stop', async () => {
+   } finally {await context.close();}
+ });
+ 
++for (const mediaSession of [true, false]) {
++  test(`now-playing details follow playback (Media Session ${mediaSession ? 'available' : 'unavailable'})`, async () => {
++    const {page, context, profile, errors} = await fixture.page({mediaSession});
++    try {
++      const ordinaryTitle = await page.title();
++      assert.equal(await page.evaluate(() => 'mediaSession' in navigator), mediaSession);
++      const assertNowPlaying = async song => {
++        await page.waitForFunction(({title, artist}) =>
++          document.title.includes(title) && document.title.includes(artist), song);
++        const title = await page.title();
++        assert.ok(title.includes(song.title), `Tab title should include ${song.title}: ${title}`);
++        assert.ok(title.includes(song.artist), `Tab title should include ${song.artist}: ${title}`);
++        if (mediaSession) {
++          assert.deepEqual(await page.evaluate(() => {
++            const metadata = navigator.mediaSession.metadata;
++            return metadata && {title: metadata.title, artist: metadata.artist};
++          }), {title: song.title, artist: song.artist});
++        }
++      };
++
++      await playSong(page, profile.songs[0]);
++      await assertNowPlaying(profile.songs[0]);
++      await page.locator('#audio-player').getByRole('button', {name:'Pause',exact:true}).click();
++      await page.waitForFunction(() => document.querySelector('#audio-player audio').paused);
++      assert.equal(await page.title(), ordinaryTitle);
++      await page.locator('#audio-player').getByRole('button', {name:'Play',exact:true}).click();
++      await page.waitForFunction(() => !document.querySelector('#audio-player audio').paused);
++      await assertNowPlaying(profile.songs[0]);
++
++      await playSong(page, profile.songs[1]);
++      await assertNowPlaying(profile.songs[1]);
++      // LiveView updates the page title on navigation, but the sticky player keeps playing.
++      await page.locator('#upload-btn').click();
++      await page.getByRole('heading', {name:/^Add Music/}).waitFor();
++      await assertNowPlaying(profile.songs[1]);
++      await page.getByRole('button', {name:'Cancel',exact:true}).filter({visible:true}).click();
++      await page.waitForURL(`http://127.0.0.1:4002/${profile.username}`);
++      await assertNowPlaying(profile.songs[1]);
++      await stopListening(page);
++      assert.equal(await page.title(), ordinaryTitle);
++      if (mediaSession) {
++        assert.equal(await page.evaluate(() => navigator.mediaSession.metadata), null);
++      }
++      assert.deepEqual(errors, []);
++    } finally {await context.close();}
++  });
++}
++
+ test('profiles require a session and other listeners cannot control the owner songs', async () => {
+   const anonymous = await fixture.browser.newContext();
+   try {
