@@ -1,0 +1,338 @@
+diff --git a/lib/accent/versions/version_resolver.ex b/lib/accent/versions/version_resolver.ex
+new file mode 100644
+index 0000000..bd25f47
+--- /dev/null
++++ b/lib/accent/versions/version_resolver.ex
+@@ -0,0 +1,52 @@
++defmodule Accent.VersionResolver do
++  alias Accent.Repo
++  alias Accent.Scopes.Version, as: VersionScope
++
++  @doc """
++  Resolves a project's literal tag first, then its highest semantic version
++  matching the requirement. Stored tags may have a leading `v`; non-version
++  tags are ignored when matching requirements.
++  """
++  def resolve(project_id, tag) do
++    query = VersionScope.from_project(Accent.Version, project_id)
++
++    query
++    |> VersionScope.from_tag(tag)
++    |> Repo.one()
++    |> case do
++      nil -> compatible_version(query, tag)
++      version -> version
++    end
++  end
++
++  defp compatible_version(query, tag) when is_binary(tag) do
++    case Version.parse_requirement(tag) do
++      {:ok, requirement} ->
++        query
++        |> Repo.all()
++        |> Enum.reduce(nil, fn version, best ->
++          with {:ok, parsed} <- Version.parse(String.replace_prefix(version.tag, "v", "")),
++               true <- Version.match?(parsed, requirement) do
++            newest({parsed, version}, best)
++          else
++            _ -> best
++          end
++        end)
++        |> case do
++          nil -> nil
++          {_parsed, version} -> version
++        end
++
++      :error ->
++        nil
++    end
++  end
++
++  defp compatible_version(_query, _tag), do: nil
++
++  defp newest(candidate, nil), do: candidate
++
++  defp newest({parsed, _version} = candidate, {best_parsed, _best_version} = best) do
++    if Version.compare(parsed, best_parsed) == :gt, do: candidate, else: best
++  end
++end
+diff --git a/lib/web/controllers/export_controller.ex b/lib/web/controllers/export_controller.ex
+index 8ba2271..c2d792b 100644
+--- a/lib/web/controllers/export_controller.ex
++++ b/lib/web/controllers/export_controller.ex
+@@ -6,7 +6,6 @@ defmodule Accent.ExportController do
+   alias Accent.Scopes.Document, as: DocumentScope
+   alias Accent.Scopes.Revision, as: RevisionScope
+   alias Accent.Scopes.Translation, as: Scope
+-  alias Accent.Scopes.Version, as: VersionScope
+ 
+   alias Accent.{
+     Document,
+@@ -137,10 +136,8 @@ defmodule Accent.ExportController do
+   end
+ 
+   defp fetch_version(conn = %{params: %{"version" => version_param}, assigns: %{project: project}}, _) do
+-    Version
+-    |> VersionScope.from_project(project.id)
+-    |> VersionScope.from_tag(version_param)
+-    |> Repo.one()
++    project.id
++    |> Accent.VersionResolver.resolve(version_param)
+     |> case do
+       version = %Version{} ->
+         assign(conn, :version, version)
+diff --git a/lib/web/plugs/movement_context_parser.ex b/lib/web/plugs/movement_context_parser.ex
+index e5006ae..2a9b15e 100644
+--- a/lib/web/plugs/movement_context_parser.ex
++++ b/lib/web/plugs/movement_context_parser.ex
+@@ -1,9 +1,8 @@
+ defmodule Accent.Plugs.MovementContextParser do
+   use Plug.Builder
+ 
+-  alias Accent.{Document, Repo, Version}
++  alias Accent.{Document, Repo}
+   alias Accent.Scopes.Document, as: DocumentScope
+-  alias Accent.Scopes.Version, as: VersionScope
+   alias Movement.Context
+ 
+   plug(:validate_params)
+@@ -39,10 +38,8 @@ defmodule Accent.Plugs.MovementContextParser do
+   end
+ 
+   def assign_version(conn = %{assigns: %{project: project}, params: %{"version" => version}}, _) do
+-    Version
+-    |> VersionScope.from_tag(version)
+-    |> VersionScope.from_project(project.id)
+-    |> Repo.one()
++    project.id
++    |> Accent.VersionResolver.resolve(version)
+     |> case do
+       nil ->
+         conn
+diff --git a/test/support/version_selection.ex b/test/support/version_selection.ex
+new file mode 100644
+index 0000000..3374723
+--- /dev/null
++++ b/test/support/version_selection.ex
+@@ -0,0 +1,40 @@
++defmodule AccentTest.VersionSelection do
++  alias Accent.{Document, Project, Repo, Revision, Translation, Version}
++
++  def fixtures(%{project: project, revision: revision, user: user}) do
++    document = Repo.insert!(%Document{project_id: project.id, path: "versions", format: "json"})
++
++    translations =
++      for tag <- [nil, "v1.10.0", "1.9.0", "v1.9.0", "1.1.5", "2.0.0", "release", "~> 1.0"], into: %{} do
++        version = tag && Repo.insert!(%Version{project_id: project.id, user_id: user.id, name: tag, tag: tag})
++        {tag, translation(document, revision, version, tag || "unversioned")}
++      end
++
++    other_project = Repo.insert!(%Project{name: "Other project", main_color: "#000"})
++    other_revision = Repo.insert!(%Revision{project_id: other_project.id, language_id: revision.language_id, master: true})
++    other_document = Repo.insert!(%Document{project_id: other_project.id, path: document.path, format: "json"})
++
++    other_translations =
++      for tag <- ["1.99.0", "~> 1.1"] do
++        version = Repo.insert!(%Version{project_id: other_project.id, user_id: user.id, name: tag, tag: tag})
++        translation(other_document, other_revision, version, "other project")
++      end
++
++    %{document: document, translations: translations, other_translations: other_translations}
++  end
++
++  defp translation(document, revision, version, text) do
++    translation =
++      Repo.insert!(%Translation{
++        document_id: document.id,
++        revision_id: revision.id,
++        version_id: version && version.id,
++        key: "test",
++        corrected_text: text,
++        proposed_text: text,
++        conflicted: true
++      })
++
++    Repo.get!(Translation, translation.id)
++  end
++end
+diff --git a/test/web/controllers/export_controller_test.exs b/test/web/controllers/export_controller_test.exs
+index 3fba158..55c7ff2 100644
+--- a/test/web/controllers/export_controller_test.exs
++++ b/test/web/controllers/export_controller_test.exs
+@@ -113,6 +113,40 @@ defmodule AccentTest.ExportController do
+            """
+   end
+ 
++  for {requested, selected} <- [
++        {"~> 1.1", "v1.10.0"},
++        {">= 1.1.0 and < 1.9.0", "1.1.5"},
++        {"1.10.0", "v1.10.0"},
++        {"~> 1.0", "~> 1.0"},
++        {"1.9.0", "1.9.0"},
++        {"release", "release"},
++        {nil, nil}
++      ] do
++    test "export selects version #{inspect(requested)}", context do
++      %{conn: conn, project: project, language: language} = context
++      %{document: document, translations: translations} = AccentTest.VersionSelection.fixtures(context)
++
++      params = %{project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++      params = if unquote(requested), do: Map.put(params, :version, unquote(requested)), else: params
++      response = get(conn, export_path(conn, [], params))
++
++      assert response.status == 200
++      assert Jason.decode!(response.resp_body) == %{"test" => translations[unquote(selected)].corrected_text}
++    end
++  end
++
++  for requested <- ["~> 3.0", "~> invalid"] do
++    test "export rejects unmatched version #{requested}", context do
++      %{conn: conn, project: project, language: language} = context
++      %{document: document} = AccentTest.VersionSelection.fixtures(context)
++
++      params = %{version: unquote(requested), project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++      response = get(conn, export_path(conn, [], params))
++
++      assert response.status == 404
++    end
++  end
++
+   test "export without version", %{conn: conn, user: user, project: project, revision: revision, language: language} do
+     version = %Version{project_id: project.id, user_id: user.id, name: "Current", tag: "master"} |> Repo.insert!()
+     document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
+diff --git a/test/web/controllers/merge_controller_test.exs b/test/web/controllers/merge_controller_test.exs
+index 37962ec..dc00914 100644
+--- a/test/web/controllers/merge_controller_test.exs
++++ b/test/web/controllers/merge_controller_test.exs
+@@ -36,6 +36,55 @@ defmodule AccentTest.MergeController do
+     {:ok, [access_token: access_token, user: user, project: project, revision: revision, language: french_language]}
+   end
+ 
++  for {requested, selected} <- [
++        {"~> 1.1", "v1.10.0"},
++        {">= 1.1.0 and < 1.9.0", "1.1.5"},
++        {"~> 1.0", "~> 1.0"},
++        {"1.9.0", "1.9.0"},
++        {"release", "release"},
++        {nil, nil}
++      ] do
++    test "merge selects only version #{inspect(requested)}", context do
++      %{conn: conn, project: project, language: language, access_token: access_token} = context
++      %{document: document, translations: translations, other_translations: other_translations} = AccentTest.VersionSelection.fixtures(context)
++      selected = translations[unquote(selected)]
++      untouched = Enum.reject(Map.values(translations), &(&1.id == selected.id)) ++ other_translations
++
++      body = %{file: file(), project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++      body = if unquote(requested), do: Map.put(body, :version, unquote(requested)), else: body
++      expect(Accent.Hook.BroadcasterMock, :notify, fn %{event: "merge"} -> :ok end)
++
++      response =
++        conn
++        |> put_req_header("authorization", "Bearer #{access_token.token}")
++        |> post(merge_path(conn, []), body)
++
++      assert response.status == 200
++      assert Repo.get!(Translation, selected.id).proposed_text == "F"
++      for translation <- untouched, do: assert(Repo.get!(Translation, translation.id) == translation)
++      assert length(Repo.all(Translation)) == map_size(translations) + length(other_translations)
++    end
++  end
++
++  for requested <- ["missing", "~> 3.0", "~> invalid"] do
++    test "merge rejects unmatched version #{requested} without changing translations", context do
++      %{conn: conn, project: project, language: language, access_token: access_token} = context
++      %{document: document} = AccentTest.VersionSelection.fixtures(context)
++      before = Repo.all(from(t in Translation, order_by: t.id))
++      body = %{version: unquote(requested), file: file(), project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++      response =
++        conn
++        |> put_req_header("authorization", "Bearer #{access_token.token}")
++        |> post(merge_path(conn, []), body)
++
++      assert response.status == 422
++      assert response.resp_body == "unknown version"
++      assert Repo.all(from(t in Translation, order_by: t.id)) == before
++      assert Repo.all(Operation) == []
++    end
++  end
++
+   test "merge default", %{user: user, access_token: access_token, conn: conn, project: project, revision: revision, language: language} do
+     document = %Document{project_id: project.id, path: "test2", format: "json"} |> Repo.insert!()
+     %Translation{revision_id: revision.id, key: "test", conflicted: true, corrected_text: "initial", proposed_text: "initial", document_id: document.id} |> Repo.insert!()
+diff --git a/test/web/controllers/sync_controller_test.exs b/test/web/controllers/sync_controller_test.exs
+index 2830e48..deaa453 100644
+--- a/test/web/controllers/sync_controller_test.exs
++++ b/test/web/controllers/sync_controller_test.exs
+@@ -14,6 +14,7 @@ defmodule AccentTest.SyncController do
+     Project,
+     Repo,
+     Revision,
++    Translation,
+     User
+   }
+ 
+@@ -30,9 +31,61 @@ defmodule AccentTest.SyncController do
+     project = %Project{main_color: "#f00", name: "My project"} |> Repo.insert!()
+ 
+     %Collaborator{project_id: project.id, user_id: user.id, role: "admin"} |> Repo.insert!()
+-    %Revision{language_id: french_language.id, project_id: project.id, master: true} |> Repo.insert!()
++    revision = %Revision{language_id: french_language.id, project_id: project.id, master: true} |> Repo.insert!()
+ 
+-    {:ok, [access_token: access_token, user: user, project: project, language: french_language]}
++    {:ok, [access_token: access_token, user: user, project: project, revision: revision, language: french_language]}
++  end
++
++  for {requested, selected} <- [
++        {"~> 1.1", "v1.10.0"},
++        {">= 1.1.0 and < 1.9.0", "1.1.5"},
++        {"~> 1.0", "~> 1.0"},
++        {"1.9.0", "1.9.0"},
++        {"release", "release"},
++        {nil, nil}
++      ] do
++    test "sync selects only version #{inspect(requested)}", context do
++      %{conn: conn, project: project, language: language, access_token: access_token} = context
++      %{document: document, translations: translations, other_translations: other_translations} = AccentTest.VersionSelection.fixtures(context)
++      selected = translations[unquote(selected)]
++      untouched = Enum.reject(Map.values(translations), &(&1.id == selected.id)) ++ other_translations
++
++      body = %{file: file(), project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++      body = if unquote(requested), do: Map.put(body, :version, unquote(requested)), else: body
++      expect(Accent.Hook.BroadcasterMock, :notify, fn %{event: "sync"} -> :ok end)
++
++      response =
++        conn
++        |> put_req_header("authorization", "Bearer #{access_token.token}")
++        |> post(sync_path(conn, []), body)
++
++      assert response.status == 200
++      assert Repo.get!(Translation, selected.id).proposed_text == "F"
++      for translation <- untouched, do: assert(Repo.get!(Translation, translation.id) == translation)
++
++      created = Repo.all(from(t in Translation, where: t.key in ["test2", "test3"]))
++      assert length(created) == 2
++      assert Enum.all?(created, &(&1.version_id == selected.version_id and &1.revision_id == selected.revision_id))
++    end
++  end
++
++  for requested <- ["missing", "~> 3.0", "~> invalid"] do
++    test "sync rejects unmatched version #{requested} without changing translations", context do
++      %{conn: conn, project: project, language: language, access_token: access_token} = context
++      %{document: document} = AccentTest.VersionSelection.fixtures(context)
++      before = Repo.all(from(t in Translation, order_by: t.id))
++      body = %{version: unquote(requested), file: file(), project_id: project.id, language: language.slug, document_format: document.format, document_path: document.path}
++
++      response =
++        conn
++        |> put_req_header("authorization", "Bearer #{access_token.token}")
++        |> post(sync_path(conn, []), body)
++
++      assert response.status == 422
++      assert response.resp_body == "unknown version"
++      assert Repo.all(from(t in Translation, order_by: t.id)) == before
++      assert Repo.all(Operation) == []
++    end
+   end
+ 
+   test "sync with operations", %{user: user, access_token: access_token, conn: conn, project: project, language: language} do

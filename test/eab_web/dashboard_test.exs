@@ -65,6 +65,80 @@ defmodule EabWeb.DashboardTest do
     assert length(Eab.Inventory.all()) == 9
   end
 
+  test "completed runs can be added from the dashboard and viewed without exporting a file" do
+    run = publication_run()
+    page = publication_page(run)
+    {:ok, view, _} = live(build_conn(), "/")
+    assert has_element?(view, "#add-result:not([disabled])", "Add to results page")
+    view |> element("#add-result") |> render_click()
+    assert render_async(view) =~ "Added to the local results page"
+    assert has_element?(view, "#add-result[disabled]", "Added to results page")
+    assert has_element?(view, "#result-publication a[href='/results/']")
+    assert render(view) =~ "Push the result file to GitHub"
+
+    [public] = Eab.Results.load!(Path.join(page, "results"))
+    assert public == Eab.Results.export!(run, inventory: run["protocol"]["inventory"])
+    [built] = Eab.Results.read!(Path.join(page, "dist/results.json"))["results"]
+    assert built["passed"] == 9 and built["model"]["quantization"] == "Q4_K_M"
+    refute Jason.encode!(built) =~ "private-host"
+
+    # A repeated event and a reloaded tab cannot add another copy.
+    render_click(view, "add_result")
+    render_async(view)
+    assert length(Eab.Results.load!(Path.join(page, "results"))) == 1
+    {:ok, reloaded, _} = live(build_conn(), "/")
+    assert has_element?(reloaded, "#add-result[disabled]")
+
+    assert redirected_to(get(build_conn(), "/results")) == "/results/"
+    assert html_response(get(build_conn(), "/results/"), 200) =~ "Elixir SWE Bench"
+    response = get(build_conn(), "/results/results.json")
+    assert json_response(response, 200)["results"] == [built]
+
+    for script <- ~w(app.js results.js) do
+      conn = build_conn() |> Plug.Conn.put_private(:plug_skip_csrf_protection, false)
+      assert get(conn, "/results/#{script}").status == 200
+    end
+
+    assert get(build_conn(), "/results/README.md").status == 404
+    assert get(build_conn(), "/results/results/#{run["id"]}.json").status == 404
+  end
+
+  test "publication rejects unfinished or selected-case runs, including forged events" do
+    source = publication_run()
+    page = publication_page(source)
+
+    for run <- [
+          Map.put(source, "status", "running"),
+          Map.put(source, "selection", %{"kind" => "case_repeat"})
+        ] do
+      Eab.Store.write("runs/#{run["id"]}/run.json", run)
+      {:ok, view, _} = live(build_conn(), "/")
+      refute has_element?(view, "#add-result")
+      render_click(view, "add_result")
+      render_async(view)
+      assert has_element?(view, "#result-publication-error", "Could not add result")
+      assert Eab.Results.load!(Path.join(page, "results")) == []
+    end
+  end
+
+  test "publication failure is visible and the user can retry after fixing the page" do
+    run = publication_run()
+    page = publication_page(run)
+    source = File.read!(Path.join(page, "app.js"))
+    File.rm!(Path.join(page, "app.js"))
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> element("#add-result") |> render_click()
+    render_async(view)
+    assert has_element?(view, "#result-publication-error", "Could not add result")
+    assert has_element?(view, "#add-result:not([disabled])")
+    refute File.exists?(Path.join(page, "results/#{run["id"]}.json"))
+    File.write!(Path.join(page, "app.js"), source)
+    view |> element("#add-result") |> render_click()
+    render_async(view)
+    assert has_element?(view, "#result-publication")
+    refute has_element?(view, "#result-publication-error")
+  end
+
   test "run summary separates failed repairs from evaluation errors" do
     id = "score-summary-test"
     [a, b, c | _] = Eab.Inventory.all()
@@ -312,5 +386,57 @@ defmodule EabWeb.DashboardTest do
     |> render_click()
 
     assert has_element?(view, "input[value='comparison-ui-21'][checked]")
+  end
+
+  defp publication_run do
+    inventory = Eab.Results.read!("config/benchmark.json")
+
+    %{
+      "id" => "publish-button-test",
+      "experiment_id" => String.duplicate("b", 64),
+      "created_at" => "9999-01-01T00:00:00Z",
+      "status" => "completed",
+      "cases" => inventory["cases"],
+      "attempts" =>
+        Map.new(
+          inventory["cases"],
+          &{&1, %{"status" => "completed", "grade" => %{"passed" => true}}}
+        ),
+      "settings" => %{"max_tokens" => 65536},
+      "release_id" => String.duplicate("a", 64),
+      "protocol" => %{
+        "inventory" => inventory,
+        "fixtures" => Map.new(inventory["cases"], &{&1, Eab.Results.fixture_hashes(&1)})
+      },
+      "model" => %{
+        "model" => "alias",
+        "backend" => "llama_cpp",
+        "url" => "http://private-host",
+        "profile" => %{"model_path" => "/private/Fixture-Q4_K_M.gguf"}
+      }
+    }
+  end
+
+  defp publication_page(run) do
+    page = Path.join(System.tmp_dir!(), "eab-page-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(page)
+
+    for file <- ~w(index.html styles.css app.js),
+        do: File.cp!(Path.join(Eab.Results.root(), file), Path.join(page, file))
+
+    previous = Application.get_env(:eab, :results_page_root)
+    Application.put_env(:eab, :results_page_root, page)
+    Eab.Store.write("runs/#{run["id"]}/run.json", run)
+
+    on_exit(fn ->
+      if previous,
+        do: Application.put_env(:eab, :results_page_root, previous),
+        else: Application.delete_env(:eab, :results_page_root)
+
+      File.rm_rf!(page)
+      File.rm_rf!(Eab.Store.path("runs/#{run["id"]}"))
+    end)
+
+    page
   end
 end

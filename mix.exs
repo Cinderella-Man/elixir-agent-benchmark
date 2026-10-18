@@ -14,7 +14,7 @@ defmodule Eab.MixProject do
   end
 
   def application do
-    [mod: {Eab.Application, []}, extra_applications: [:logger, :crypto, :runtime_tools]]
+    [mod: {Eab.Application, []}, extra_applications: [:logger, :crypto, :runtime_tools, :inets]]
   end
 
   defp deps do

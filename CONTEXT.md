@@ -14,7 +14,17 @@
 
 **Model profile**: The served model, quantization, context capacity and serving configuration reported by an endpoint. Missing metadata remains unknown; aliases do not establish exact artifact identity.
 
+**Model identity**: The artifact name and quantization recovered from reported model metadata, kept separately from the API routing alias used to send requests.
+
+**Model weight size**: The recorded size of the model's weight files in bytes, displayed in decimal GB. It excludes context and runtime memory and is not a total VRAM requirement.
+
+**Deployment memory observation**: A dated sample of an identified inference process's GPU allocation, RAM and serving configuration. Process/service lifetime peaks do not establish the peak during a particular benchmark run or the minimum hardware required.
+
+**Attempt measurement**: Opt-in elapsed attempt time and model-request time from a named, explicitly authorized performance environment. Generated-token accounting remains available without timing. Model-request throughput includes prompt processing and response transfer.
+
 **Run**: An evaluation of one model profile across a frozen selection of cases, using fixed inputs, budgets and one declared seed.
+
+**Published result**: Outcomes for the current admitted cases from one completed run, with matching case fixture hashes, model identity and recorded evaluation conditions. Rejected cases are omitted. Each published result represents one run, not an aggregate of repeated runs; rows may have different effective settings.
 
 **Attempt**: One agent's investigation, edits, tool calls and submission for a case. A run records one scored attempt per case and retains interrupted work separately.
 

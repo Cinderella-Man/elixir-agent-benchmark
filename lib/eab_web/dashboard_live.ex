@@ -1,6 +1,18 @@
 defmodule EabWeb.DashboardLive do
   use Phoenix.LiveView
-  alias Eab.{Comparison, Evidence, Inventory, Model, Retention, Runner, Runs, Storage, Store}
+
+  alias Eab.{
+    Comparison,
+    Evidence,
+    Inventory,
+    Model,
+    Results,
+    Retention,
+    Runner,
+    Runs,
+    Storage,
+    Store
+  }
 
   @defaults %{
     "window_tokens" => "",
@@ -58,6 +70,9 @@ defmodule EabWeb.DashboardLive do
         follow_output: true,
         evidence_links: [],
         report_available: false,
+        publishing: nil,
+        publication_message: nil,
+        result_added: false,
         cases: Enum.map(Inventory.all(), &Inventory.spec/1)
       )
       |> load_log()
@@ -181,6 +196,30 @@ defmodule EabWeb.DashboardLive do
   def handle_event("stop", _, socket) do
     Runs.stop()
     {:noreply, refresh(socket)}
+  end
+
+  def handle_event("add_result", _, %{assigns: %{publishing: id}} = socket) when not is_nil(id),
+    do: {:noreply, socket}
+
+  def handle_event("add_result", _, socket) do
+    run = selected(socket.assigns)
+
+    if run do
+      id = run["id"]
+
+      {:noreply,
+       socket
+       |> assign(publishing: id, publication_message: nil)
+       |> start_async({:add_result, id}, fn ->
+         try do
+           {:ok, Results.publish!(Store.run(id))}
+         rescue
+           error -> {:error, Exception.message(error)}
+         end
+       end)}
+    else
+      {:noreply, assign(socket, error: "Select a completed run first")}
+    end
   end
 
   def handle_event("cache_preview", %{"cache" => %{"case" => id}}, socket) do
@@ -317,6 +356,21 @@ defmodule EabWeb.DashboardLive do
   def handle_async(:storage, {:ok, {:ok, storage}}, socket),
     do: {:noreply, assign(socket, storage: storage, storage_busy: false)}
 
+  def handle_async({:add_result, _id}, {:ok, {:ok, _status}}, socket),
+    do: {:noreply, socket |> assign(publishing: nil, publication_message: nil) |> load_log()}
+
+  def handle_async({:add_result, id}, {:ok, {:error, message}}, socket),
+    do:
+      {:noreply, assign(socket, publishing: nil, publication_message: %{id: id, error: message})}
+
+  def handle_async({:add_result, id}, {:exit, _}, socket),
+    do:
+      {:noreply,
+       assign(socket,
+         publishing: nil,
+         publication_message: %{id: id, error: "Adding the result stopped. Try again."}
+       )}
+
   def handle_async(:storage, {:ok, {:error, error}}, socket),
     do: {:noreply, assign(socket, storage_busy: false, error: error)}
 
@@ -444,7 +498,8 @@ defmodule EabWeb.DashboardLive do
     socket =
       assign(socket,
         evidence_links: if(run && id, do: Evidence.links(run["id"], id), else: []),
-        report_available: run && match?({:ok, _}, Store.artifact(run["id"], "report.md"))
+        report_available: run && match?({:ok, _}, Store.artifact(run["id"], "report.md")),
+        result_added: run && Results.added?(run["id"])
       )
 
     case run && id && Store.tail_artifact(run["id"], "#{id}/activity.log") do
@@ -704,12 +759,16 @@ defmodule EabWeb.DashboardLive do
               "strata" -> "STRATA"
               _ -> "LLAMA.CPP"
             end}</span>
-            <h3>{@endpoint["model"]}</h3>
+            <h3>{Eab.ModelIdentity.label(@endpoint)}</h3>
             <dl :if={not @chatgpt}>
               <div>
                 <dt>Context capacity</dt><dd>{@endpoint["context"]} tokens</dd>
               </div><div>
-                <dt>Quantization</dt><dd>{model_detail(@endpoint, "ftype")}</dd>
+                <dt>Quantization</dt><dd>
+                  {Eab.ModelIdentity.details(@endpoint)["quantization"] || "Not reported"}
+                </dd>
+              </div><div>
+                <dt>Model weights</dt><dd>{Eab.ModelIdentity.size_label(@endpoint)}</dd>
               </div><div>
                 <dt>Parameters</dt><dd>{model_detail(@endpoint, "n_params")}</dd>
               </div><div>
@@ -795,7 +854,10 @@ defmodule EabWeb.DashboardLive do
             <div class="run-heading">
               <span class="badge">{String.upcase(@run["status"])}</span><code>{@run["id"]}</code>
             </div>
-            <h3 class="run-model">{@run["model"]["model"]}</h3><p class="run-message" role="status">
+            <h3 class="run-model">{Eab.ModelIdentity.label(@run["model"])}</h3><p
+              class="run-message"
+              role="status"
+            >
               {@run["message"]}
             </p>
             <p :if={@run["release_id"]} class="fine-print">
@@ -835,6 +897,11 @@ defmodule EabWeb.DashboardLive do
                 <strong>{if @score["score_percent"], do: "#{@score["score_percent"]}%", else: "—"}</strong>
               </div>
             </div>
+            <p :if={@run["memory"]} class="fine-print" id="run-memory">
+              Sampled memory peaks: {Eab.MemoryMonitor.label(@run["memory"])}.
+              <a href={"/artifacts/#{@run["id"]}/memory.json"} download>Summary</a>
+              · <a href={"/artifacts/#{@run["id"]}/memory-samples.jsonl"} download>Samples</a>
+            </p>
             <div class="progress-heading">
               <span>Cases graded</span><strong>{@score["passed"] + @score["failed"]}/{@score[
                 "planned"
@@ -855,8 +922,51 @@ defmodule EabWeb.DashboardLive do
             </svg>
             <div class="score-note">
               <p class="fine-print">Errors and incomplete attempts prevent a final score.</p>
-              <a :if={@report_available} href={"/artifacts/#{@run["id"]}/report.md"} download>Download report ↓</a>
+              <div class="run-actions">
+                <a :if={@report_available} href={"/artifacts/#{@run["id"]}/report.md"} download>Download report ↓</a>
+                <button
+                  :if={
+                    @run["status"] == "completed" && is_nil(@run["selection"]) &&
+                      !is_nil(@score["score_percent"])
+                  }
+                  id="add-result"
+                  class="secondary"
+                  phx-click="add_result"
+                  disabled={
+                    @publishing != nil ||
+                      (@result_added &&
+                         !(@publication_message && @publication_message.id == @run["id"]))
+                  }
+                >
+                  {cond do
+                    @publishing == @run["id"] ->
+                      "Adding…"
+
+                    @publication_message && @publication_message.id == @run["id"] ->
+                      "Retry adding result"
+
+                    @result_added ->
+                      "Added to results page"
+
+                    true ->
+                      "Add to results page"
+                  end}
+                </button>
+              </div>
             </div>
+            <p :if={@result_added} id="result-publication" class="fine-print" role="status">
+              Added to the local results page.
+              <a href="/results/" target="_blank" rel="noopener">View results ↗</a>
+              · Push the result file to GitHub to update the public page.
+            </p>
+            <p
+              :if={@publication_message && @publication_message.id == @run["id"]}
+              id="result-publication-error"
+              class="notice error"
+              role="alert"
+            >
+              Could not add result: {@publication_message.error}
+            </p>
             <div class="cases-heading">
               <h3>Cases <span>{@score["planned"]}</span></h3>
               <span>Expand a case to inspect its evidence</span>
@@ -1074,7 +1184,7 @@ defmodule EabWeb.DashboardLive do
           class="history-row"
           phx-click="select"
           phx-value-id={run["id"]}
-        ><span><strong>{run["model"]["model"]}</strong><code>{run["id"]}</code></span><span>{run[
+        ><span><strong>{Eab.ModelIdentity.label(run["model"])}</strong><code>{run["id"]}</code></span><span>{run[
           "status"
         ]} →</span></button>
         <nav :if={@history_page.total > 20} aria-label="History pages">
@@ -1113,7 +1223,7 @@ defmodule EabWeb.DashboardLive do
               value={run["id"]}
               checked={run["id"] in @comparison_ids}
             />
-            {run["model"]["model"]} · {run["id"]} · {run["status"]}
+            {Eab.ModelIdentity.label(run["model"])} · {run["id"]} · {run["status"]}
           </label>
           <button class="secondary" type="submit">Compare selected runs</button>
         </form>

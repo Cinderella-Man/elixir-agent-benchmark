@@ -61,7 +61,7 @@ defmodule Eab.Release do
     protocol = release["protocol"]
 
     unless Cache.key(protocol) == release["id"] and
-             protocol["inventory"] == Inventory.read_json(Inventory.path("config/benchmark.json")) and
+             protocol["inventory"] == Inventory.definition() and
              protocol["implementation"] == Inventory.implementation_hash() and
              protocol["agent"] == Eab.Pi.identity(),
            do: raise("Benchmark implementation or release changed; start a new run")

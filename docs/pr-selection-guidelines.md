@@ -6,7 +6,7 @@ The target remains roughly **100–200 validated cases across several projects**
 
 ## Lessons from the first validation cycle
 
-The [active v4 inventory](../config/benchmark.json) contains **nine cases**, each with two reviewed successful Astra repairs. All eleven examined cases had at least one success; two did not meet admission. The [complete review](../verification/astra-confirmation-2026-10-15/README.md) preserves graded failures and provider interruptions separately.
+The original v4 pilot retained **nine cases**, each with two reviewed successful Astra repairs. During the [sequential curation loop](case-curation-loop.md), approved folders are temporarily parked outside `cases/`; the folders actually present in `cases/` determine the active set. All eleven examined cases had at least one success; two did not meet admission. The [complete review](../verification/astra-confirmation-2026-10-15/README.md) preserves graded failures and provider interruptions separately.
 
 | Finding | Curation rule |
 | --- | --- |
@@ -137,7 +137,7 @@ The [Astra validation record](../verification/astra-confirmation-2026-10-15/READ
 
 A resume is recovery, not a second fresh validation. An additional diagnostic attempt must have a recorded reason and bounded plan before it starts; it must not become an undisclosed retry-until-pass loop. Report all prior passes, failures and interruptions alongside any later qualifying pair. A selected retry or diagnostic subset is not a full-benchmark score. Do not pool outcomes across changed task versions or incompatible model settings.
 
-The current export API enforces recorded review and fixture qualification, not the three-round or model-solvability policies. Use a frozen provisional `config/benchmark.json` in a local curation checkout for model validation, without changing a checkout used by an active run. The dashboard runs that configured inventory; the controller also supports explicit error retries and selected fresh repeats through the same Pi pipeline. These remain ordinary recorded runs, with no separate agent engine or automatic admission gate.
+The current export API enforces recorded review and fixture qualification, not the three-round or model-solvability policies. For sequential validation, keep only the new candidate folder in `cases/` and park approved folders in `cases_approved/`; no configuration edit is needed. Freeze membership before launching a run and keep it unchanged until the run completes. The dashboard runs the discovered folder set; the controller also supports explicit error retries and selected fresh repeats through the same Pi pipeline. These remain ordinary recorded runs, with no separate agent engine or automatic admission gate.
 
 Publish only cases that meet the gate and have no unresolved contract/grader concern. Removing cases creates a new declared inventory; retain old scores with their original denominator. The v4 nine-case pilot draws on the preserved eleven-case evidence and retries; it is not a newly measured nine-case full-run score. Freeze selection before cheaper-model comparisons and investigate later quality reports without quietly removing that model's failures.
 

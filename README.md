@@ -1,6 +1,8 @@
 # Elixir Agent Benchmark
 
-A local Elixir website that evaluates one served coding model against **nine historical PR repairs**: three Plausible and six Livebook cases. Connect a llama.cpp or Strata server, or sign in with ChatGPT and select an available OpenAI model, then click **Run benchmark**.
+The standalone **Elixir SWE Bench** [results page](results-page/README.md) displays published runs. Click **Add to results page** on a completed full run to export it and rebuild the local page. Push the resulting public JSON file to GitHub to deploy through GitHub Pages.
+
+A local Elixir website that evaluates coding models against historical PR tasks. During the [sequential curation loop](docs/case-curation-loop.md), approved cases are temporarily parked in `cases_approved/`. Only case folders inside `cases/` are run. Moving folders back into `cases/` restores them automatically, with no inventory or configuration edits.
 
 The application prepares Docker images, checks the fixtures, runs the [Pi coding agent](https://github.com/earendil-works/pi) in isolated Docker workspaces, and grades its repairs with executable tests. There is no AI judge or speed score.
 
@@ -22,6 +24,32 @@ Execution starts only when you click **Run benchmark**. Connecting to an endpoin
 
 The website is available only from the computer running it. The model endpoint can be on that computer or another reachable machine. If the server requires an API key, enter it under **Server credentials**.
 
+
+## Run memory on the model host
+
+The benchmark can sample the served model's VRAM and RAM throughout each run. This is independent of optional performance measurements. On this installation it is configured for **ratx570**, using its existing Tailscale SSH access; it does not start, stop or switch the model.
+
+The [Elixir collector](tools/memory_collector/README.md) requires Linux cgroup v2, a dedicated model service, `ss` and NVIDIA's `nvidia-smi`. Its release includes Erlang/OTP, so the model host does not need Elixir installed. Build and install the release as described in its README, then set these values in the benchmark's ignored `.env` and rebuild/recreate the benchmark container:
+
+```dotenv
+EAB_MEMORY_SSH_TARGET=root@ratx570
+EAB_MEMORY_HOSTS=ratx570,100.70.151.84
+EAB_MEMORY_REMOTE_COLLECTOR=/srv/elixir-agent-benchmark/memory-collector/bin/eab_memory_collector
+EAB_MEMORY_REMOTE_KEY_FILE=/srv/model-rig-lab/.local/secrets/api-key
+```
+
+Copy the model host's **already verified** SSH public host entry into `/data/memory/known_hosts` in the benchmark volume (mode 600). The SSH client uses strict host verification and no private key or agent; this configuration relies on Tailscale SSH authentication. The remote key-file path refers to the existing model API key **on that host**. Its contents never enter the benchmark or its evidence. `EAB_MEMORY_HOSTS` must list the exact hostnames/IPs used in the model endpoint URL; other hosts and hosted APIs are not sampled. Empty `EAB_MEMORY_SSH_TARGET` disables collection.
+
+Sampling starts before benchmark work and takes a final reading on completion, failure or cancellation. It resolves the local model listener, checks the artifact and configured context, and follows all GPU processes in its dedicated service cgroup. GPU allocations are mapped by physical UUID; unrelated services are excluded. RAM is cgroup `memory.current`, including charged page cache and kernel memory. Process RSS and whole-host RAM are retained separately in the raw observations. Collection never uses the service-lifetime `memory.peak` as a run peak.
+
+Each run saves:
+
+- `memory-samples.jsonl`: timestamped readings at a target one-second interval, with per-GPU allocation, service RAM, process RSS, RAM breakdown and simultaneous RAM + VRAM.
+- `memory.json`: session identities, per-GPU and aggregate sampled peaks, sample count and coverage. The combined peak is the maximum observed RAM + VRAM in one sample, not the sum of independent maxima.
+- `run.json` and `report.md`: the final summary. The dashboard provides summary and raw-sample downloads.
+
+Initial collector failure prevents a configured run from starting. Later disconnects, process/model changes or sampling gaps greater than 2.5 seconds preserve available readings and mark coverage partial; they do not alter repair scores. Resume appends a separate session, and application restart marks unfinished collection partial. Previously unmeasured parts of a resumed run remain partial. Samples can miss sub-second peaks; configured context capacity does not mean every task filled that context. These are observations of this deployment, not interchangeable VRAM/RAM or a guaranteed minimum hardware specification.
+
 ## How it runs
 
 Pi attempts follow the inventory order, with preparation and grading running alongside them:
@@ -40,7 +68,7 @@ Pi and the project run on the benchmark's Docker host. The model server can run 
 
 ## Run settings and results
 
-Local-server defaults: all nine cases, seed 101, unlimited model and tool calls, up to 8,192 tokens per response and 65,536 generated tokens per case. Context is detected automatically and capped at 262,144 tokens. Advanced settings allow explicit overrides within the server's capacity. History is retained without compaction; exhausting either the generation budget or context window submits the current patch for grading.
+Local-server defaults: the active inventory only, seed 101, unlimited model and tool calls, up to 8,192 tokens per response and 65,536 generated tokens per case. Context is detected automatically and capped at 262,144 tokens. Advanced settings allow explicit overrides within the server's capacity. History is retained without compaction; exhausting either the generation budget or context window submits the current patch for grading.
 
 ChatGPT subscription defaults are a **262,144 generated-token threshold per case** and **high reasoning effort**. Change them under Advanced run settings; available reasoning levels depend on the selected model. The threshold is checked between complete responses, so one response may exceed it. Reasoning tokens count once within output usage. OpenAI enforces context and response limits; no seed, exact prompt preflight or hard response cap is claimed. Full history, Pi tools, workspaces and grading use the same execution flow. Effective policies are saved in results and reports; strict local runs and subscription runs cannot join the same comparison.
 

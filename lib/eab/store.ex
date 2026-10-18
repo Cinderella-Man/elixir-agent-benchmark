@@ -97,7 +97,11 @@ defmodule Eab.Store do
 
     # Discovery metadata and transcripts belong to the detailed record, not history.
     summary =
-      Map.update(summary, "model", %{}, &Map.take(&1 || %{}, ~w(model backend identity_note)))
+      Map.update(summary, "model", %{}, fn endpoint ->
+        endpoint
+        |> Eab.ModelIdentity.attach()
+        |> Map.take(~w(model backend identity_note identity))
+      end)
 
     write("runs/#{run["id"]}/summary.json", summary)
   end
@@ -113,7 +117,7 @@ defmodule Eab.Store do
 
         try do
           case read("runs/#{id}/summary.json") do
-            %{"id" => ^id, "model" => model} = summary when is_map(model) -> summary
+            %{"id" => ^id, "model" => %{"identity" => %{"version" => 1}}} = summary -> summary
             _ -> legacy_summary(id)
           end
         rescue

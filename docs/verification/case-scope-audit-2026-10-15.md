@@ -30,21 +30,15 @@ Plausible 5956's eight paths should not be read as eight independent implementat
 
 Run from the repository root. `git apply --numstat` reads patch statistics without applying the patch.
 
-```sh
-python3 - <<'PY'
-import json
-import subprocess
-from pathlib import Path
-
-for case in json.loads(Path("config/benchmark.json").read_text())["cases"]:
-    patch = Path("cases") / case / "reference.patch"
-    rows = subprocess.check_output(
-        ["git", "apply", "--numstat", str(patch)], text=True
-    ).splitlines()
-    counts = [row.split("\t", 2) for row in rows]
-    print(case, len(counts), sum(int(row[0]) for row in counts),
-          sum(int(row[1]) for row in counts))
-PY
+```elixir
+# Run with mix run --no-start from an .exs file.
+for case_id <- Jason.decode!(File.read!("config/benchmark.json"))["cases"] do
+  {output, 0} = System.cmd("git", ["apply", "--numstat", "cases/#{case_id}/reference.patch"])
+  rows = output |> String.split("\n", trim: true) |> Enum.map(&String.split(&1, "\t"))
+  added = Enum.sum(Enum.map(rows, fn [n, _, _] -> String.to_integer(n) end))
+  removed = Enum.sum(Enum.map(rows, fn [_, n, _] -> String.to_integer(n) end))
+  IO.puts("#{case_id} #{length(rows)} #{added} #{removed}")
+end
 ```
 
 The existing cases were not edited or regraded for this audit. Their prompt/fairness questions and unperformed strong-model validation remain separate; in particular, Plausible 6449's multi-file shape does not resolve its [documented policy ambiguity](../design-tree.md#subscription-model-validation--design-interview-2026-10-15).

@@ -227,3 +227,54 @@ The user wants to expand beyond the current projects and prioritize the multi-fi
 The [selection guidelines](pr-selection-guidelines.md) use 2–5 substantive implementation files as the main discovery preference, counting tests and generated changes separately and requiring an explanation of the coordinated behavior. File count is never a submission requirement; simpler correct implementations remain valid. Keep minimal tickets, inspect injected schema-v2 requirement text as part of the prompt, and retain the existing fixture/review/two-pass solvability policy.
 
 The [upstream candidate research](research/multi-file-pr-candidates-2026-10-15.md) begins project and PR screening. Candidate findings do not change the eleven-case inventory or establish runnable new project environments. Start with a small pilot across a supported project and two additional projects, finish each case before bulk expansion, and continue using the ordinary Pi flow. The previous 250-cases-per-project target is superseded by the total 100–200-case direction.
+
+## Results presentation — 2026-10-17, updated 2026-10-18
+
+Status: implemented in `results-page/`, named **Elixir SWE Bench** by the user. The page is separate from the local runner and prepared for GitHub Pages. No repository rename or public deployment has been performed.
+
+### Confirmed decisions
+
+| Decision | User direction | Implementation |
+| --- | --- | --- |
+| Audience | A shareable results page | Static HTML/CSS/JavaScript with an Elixir exporter |
+| Entry | One completed run per point | Separate rows for repeats, no averaging or pooled attempts |
+| Additions | New model/quantization results should be easy to add | `mix eab.results add` creates one public JSON record; the build discovers all records |
+| Presentation | Minimal content, no comparison selector or model search | Title, model-size slider and one continuous plot with labels left of the dots; cases and settings open below it |
+| Cases | Show the nine valid cases, excluding rejected cases from Astra's details too | Astra 9/9, Flash 8/9, Swift Qwen 27B 5/9 and Qwen 27B 2/9; axis spans 0–9 |
+| Model labels | Exact artifact name and quantization in the benchmark itself | Discovery, saved-run history, run headings, comparisons and new reports use normalized identity; transport keeps the routing alias |
+| Size | Keep model size and allow a maximum size | The slider uses weight-file size, so missing runtime measurements do not hide known-size models; observed VRAM/RAM remains separate deployment data |
+
+### Publication contract
+
+The exporter requires a completed full-inventory source run and final pass/fail outcomes. It selects the current admitted cases only after checking that their saved fixture hashes match the current files. Removed cases are absent from the public records and expandable details. Original run evidence remains intact. The public schema records source release identity and per-run settings; these rows do not imply identical evaluation policies. The local benchmark's strict comparison checks are unchanged.
+
+Public records exclude endpoint addresses, account identifiers, transcripts and raw provider metadata. The builder validates the current inventory, fixture hashes, distinct run IDs, settings and metadata. A future case change requires explicitly refreshing eligible records or obtaining new runs. Missing model metadata stays unknown; optional publisher overrides have explicit provenance.
+
+The two 27B models report 17,431,404,544 bytes each. The Flash model's two served GGUF files total 83,863,586,496 bytes. These values are weight sizes, not total VRAM requirements; context and runtime need additional memory. Astra is labelled API. The model-size slider includes both 27B models at 50 GB, with All restoring every row. A loaded Strata process at a configured 262144 context was observed with 69.8 GB GPU allocation and a 51.5 GB service-lifetime RAM peak; these are separately dated deployment observations, not saved-run memory peaks. The collector attributes GPU memory to the actual process and devices, avoiding Strata hardware telemetry that selected other physical GPUs. Other local model memory profiles remain uncaptured.
+
+The GitHub Actions workflow validates records and builds only `results-page/dist/` for Pages. One-time setup and normal additions are documented in [the page README](../results-page/README.md). Links follow `GITHUB_REPOSITORY` during Actions builds, accommodating a later repository rename. The page needs no server, database, npm dependencies or external assets at runtime.
+
+The glossary records **Published result**, **Model identity** and **Model weight size**. These presentation and static-hosting choices are readily reversible, so no new ADR is needed.
+
+The user requested time-to-solve, tokens and speed alongside memory. Public records now include generated tokens and model calls for every current case. Explicitly configured performance environments can retain attempt and model-request durations; ordinary functional runs keep measurement disabled. Throughput uses output tokens per complete model-request time, including prompt processing and transfer. Existing unqualified timings are not published as speed evidence. Speed qualification requires a separate suitable environment and explicit authorization. Memory collection is independently authorized on ratx570 and does not run inference or collect performance measurements.
+
+
+Run memory collection is implemented as a run-owned SSH stream from the model host. A first sample and matching model/context are required before work starts; completion, error and cancellation finalize the stream. Dedicated service cgroup counters and process-attributed NVIDIA allocations exclude unrelated workloads. Raw samples and session summaries persist with each run; gaps, disconnects and interrupted/resumed segments retain partial coverage. Public export automatically carries hardware and sampled peaks without private host/service/GPU identifiers. RAM plus VRAM is a simultaneous sampled total, while each resource retains its own peak and per-GPU breakdown.
+
+## Selecting future new cases — 2026-10-18
+
+Status: closed at the user's request. No case-selection or combined-result feature is being pursued from this discussion.
+
+The user decided to omit Astra from the published model comparison and plans to add an explanatory note. Astra supplies solvability validation: every admitted case must have the required successful Astra evidence, so its success on the admitted set is an admission condition rather than an independent comparison score. This supersedes the earlier decision to show an Astra result on the public page. It does not require rerunning every old case together with each addition.
+
+Successful model attempts support solvability; they do not prove that a case or grader is free of bugs. The existing fixture qualification, prompt review and two-fresh-success policy remain applicable. The user closed the discussion without requesting a website edit or a new execution feature.
+
+### Established facts
+
+The dashboard currently starts the entire configured inventory. The executor already operates on the case list saved in a run, but fresh-run creation always fills that list from the complete inventory. Internal selected-repeat support only accepts cases from an earlier run and requires unchanged case inputs and inventory; it cannot select future additions. Resume also requires the original release and cannot append cases.
+
+A fresh subset could use the existing scheduler, agent and grader. It would need an explicit selection recorded before execution, validation against the frozen inventory, and checkpoint support for a selection without a source run. Candidates outside the inventory are not selectable; the existing admission workflow permits a provisional curation inventory after fixture and review gates for blind model validation.
+
+Running a new subset and combining its outcomes with earlier Astra outcomes are separate decisions. The current glossary and publication contract define a published result as one completed full run. The exporter rejects selected repeats and the results-page builder requires coverage of every current case. Selection alone would therefore not produce an updated full-benchmark Astra row.
+
+The earlier questions about manual versus automatic selection and combining historical Astra outcomes are withdrawn. The investigation above records current behavior, not an implementation plan. No new glossary term or ADR is needed.

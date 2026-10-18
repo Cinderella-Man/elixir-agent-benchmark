@@ -86,6 +86,7 @@ defmodule Eab.Model do
       "identity_note" =>
         "Server-reported identity; artifact checksum and provenance are unverified."
     }
+    |> Eab.ModelIdentity.attach()
     |> Eab.Store.scrub(key)
   end
 
@@ -93,7 +94,7 @@ defmodule Eab.Model do
   def settings(%{"backend" => "openai_subscription"}, input), do: Eab.OpenAI.settings(input)
 
   def settings(endpoint, input) do
-    defaults = Eab.Inventory.read_json(Eab.Inventory.path("config/benchmark.json"))["defaults"]
+    defaults = Eab.Inventory.definition()["defaults"]
 
     window =
       integer(

@@ -2,7 +2,23 @@ defmodule Eab.Inventory do
   def root, do: Application.fetch_env!(:eab, :root)
   def path(relative), do: Path.join(root(), relative)
   def read_json(path), do: path |> File.read!() |> Jason.decode!()
-  def all, do: read_json(path("config/benchmark.json"))["cases"]
+
+  def definition do
+    config = read_json(path("config/benchmark.json"))
+
+    present =
+      path("cases/*/case.json")
+      |> Path.wildcard()
+      |> Enum.filter(&File.regular?/1)
+      |> Enum.map(&(Path.dirname(&1) |> Path.basename()))
+
+    # The configured list preserves historical ordering; folders determine
+    # membership, including new cases that have never appeared in that list.
+    ordered = Enum.filter(config["cases"] || [], &(&1 in present))
+    Map.put(config, "cases", ordered ++ Enum.sort(present -- ordered))
+  end
+
+  def all, do: definition()["cases"]
 
   def spec(id) do
     unless Process.get({__MODULE__, id}) || id in all(),
@@ -108,7 +124,7 @@ defmodule Eab.Inventory do
 
   def protocol do
     %{
-      "inventory" => read_json(path("config/benchmark.json")),
+      "inventory" => definition(),
       "agent" => Eab.Pi.identity(),
       "implementation" => implementation_hash(),
       "fixtures" => Map.new(all(), &{&1, fixture_hashes(&1)})
