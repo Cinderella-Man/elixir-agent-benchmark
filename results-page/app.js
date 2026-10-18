@@ -15,6 +15,13 @@
     return;
   }
   const records = data.results;
+  if (records.length === 0) {
+    document.querySelector(".size-control").remove();
+    document.querySelector("footer").remove();
+    $("chart").append(node("p", "empty", "No benchmark results yet."));
+    return;
+  }
+  $("snapshot-note").hidden = !records.some(r => r.resources?.kind === "loaded_snapshot");
   const number = new Intl.NumberFormat("en-US");
   const fmt = value => number.format(value);
   const gb = bytes => bytes == null ? "Not recorded" : `${(bytes / 1e9).toFixed(1)} GB`;
@@ -130,7 +137,7 @@
   function plot(shown) {
     const figure = node("div", "plot");
     const area = node("div", "plot-area");
-    area.style.height = `${Math.max(shown.length, 1) * 86 + 20}px`;
+    area.style.setProperty("--row-count", Math.max(shown.length, 1));
     for (const value of ticks(data.benchmark.case_count)) {
       const line = node("div", "plot-grid");
       line.style.left = `${value / data.benchmark.case_count * 100}%`;
@@ -138,10 +145,12 @@
       area.append(line);
     }
     for (const [i, r] of shown.entries()) {
-      const point = node("button", "plot-point" + (selected === r.run_id ? " selected" : ""));
+      const position = r.passed / r.total;
+      const point = node("button", "plot-point" + (selected === r.run_id ? " selected" : "") + (position < .2 ? " near-start" : ""));
       point.id = `point-${r.run_id}`;
-      point.style.left = `${r.passed / r.total * 100}%`;
-      point.style.top = `${i * 86 + 43}px`;
+      point.style.left = `${position * 100}%`;
+      point.style.setProperty("--score-position", position);
+      point.style.setProperty("--row-index", i);
       point.setAttribute("aria-label", `${r.model.name}${r.model.quantization ? ` ${r.model.quantization}` : ""}, ${r.passed} of ${r.total} cases passed. Show details`);
       point.setAttribute("aria-expanded", String(selected === r.run_id));
       if (selected === r.run_id) point.setAttribute("aria-controls", "run-detail");

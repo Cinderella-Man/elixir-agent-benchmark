@@ -1,0 +1,22 @@
+# Model-host memory collector
+
+This dependency-free Elixir/OTP release samples the inference service on its own host. It reads counters and model properties; it performs no inference. The benchmark starts it over SSH and saves its NDJSON output throughout each run.
+
+Build from the repository root using Docker:
+
+```sh
+docker build -f tools/memory_collector/Dockerfile \
+  --output type=local,dest=.local/memory-elixir .
+```
+
+The resulting `.local/memory-elixir/memory-collector/` includes Erlang/OTP and the native SCTP library. It targets Ubuntu 24.04 x86-64, matching ratx570. Copy the whole directory to `/srv/elixir-agent-benchmark/memory-collector` on the model host. Do not replace a release while a benchmark is collecting memory. No system Elixir installation or collector daemon is needed; the benchmark launches one process per collection session.
+
+Configure `EAB_MEMORY_REMOTE_COLLECTOR` with the full path to `bin/eab_memory_collector`, following the [runner setup](../../README.md#run-memory-on-the-model-host). The host also needs `ss`, `nvidia-smi`, procfs and a dedicated cgroup v2 model service. The API key stays in its existing file on that host.
+
+The command `bin/eab_memory_collector eval 'Eab.MemoryCollector.CLI.main()'` accepts one JSON request line on stdin. A streaming request specifies `port`, `key_file`, `artifact`, `context_tokens` and `backend`. It emits a ready identity, samples at a target one-second interval, and a final sample when stdin closes or receives another byte. A request with `"mode":"snapshot"`, `pid`, `port` and `key_file` emits a single observation; see the [snapshot example](../../results-page/README.md#capture-memory-and-future-timings).
+
+Implementation lives in `lib/eab/memory_collector/` so the runner's ExUnit suite tests the same source as this release:
+
+```sh
+mix test test/eab/memory_collector_test.exs test/eab/memory_monitor_test.exs --max-cases 2
+```

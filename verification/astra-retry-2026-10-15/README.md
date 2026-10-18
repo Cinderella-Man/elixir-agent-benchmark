@@ -49,6 +49,5 @@ All 633 artifacts from round 1 and 501 from round 2 remain byte-for-byte unchang
 - [release.json](release.json): retry execution release protocol.
 - `patches/*.patch`: the six successful model repairs, saved as evidence rather than applied to benchmark fixtures.
 - [checksums.json](checksums.json): SHA-256 checksums for the public package.
-- [export.py](export.py): offline verification/export; it makes no model or network calls. It requires the private original run copies under `.local/astra-validation-2026-10-15/`, the retry copy and review/receipt records under `.local/astra-retry-2026-10-15/`, and the unchanged frozen package. Run `python3 verification/astra-retry-2026-10-15/export.py` at the recorded implementation revision to reproduce the export.
 
-The public package excludes credentials, account identifiers, raw provider responses and model reasoning. Full original artifacts remain in the local controller's store. The original freeze verifier remains specific to its original implementation; this package records and verifies the controller delta explicitly instead of rewriting that historical freeze.
+The public package excludes credentials, account identifiers, raw provider responses and model reasoning. Saved benchmark runs and their private copies were cleared on 2026-10-18; the one-off exporter was retired. Public evidence remains unchanged. Historical checksums describe the original package, including retired tooling available in Git history. This package records the controller delta explicitly instead of rewriting the historical freeze.

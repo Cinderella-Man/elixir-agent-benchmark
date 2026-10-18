@@ -1,6 +1,6 @@
 # Elixir Agent Benchmark
 
-The standalone **Elixir SWE Bench** [results page](results-page/README.md) displays published runs and includes a result exporter and GitHub Pages deployment workflow.
+The standalone **Elixir SWE Bench** [results page](results-page/README.md) displays published runs. Click **Add to results page** on a completed full run to export it and rebuild the local page. Push the resulting public JSON file to GitHub to deploy through GitHub Pages.
 
 A local Elixir website that evaluates one served coding model against **nine historical PR repairs**: three Plausible and six Livebook cases. Connect a llama.cpp or Strata server, or sign in with ChatGPT and select an available OpenAI model, then click **Run benchmark**.
 
@@ -29,12 +29,12 @@ The website is available only from the computer running it. The model endpoint c
 
 The benchmark can sample the served model's VRAM and RAM throughout each run. This is independent of optional performance measurements. On this installation it is configured for **ratx570**, using its existing Tailscale SSH access; it does not start, stop or switch the model.
 
-The collector in `scripts/memory_stream.py` requires Linux cgroup v2, a dedicated model service, Python 3, `ss` and NVIDIA's `nvidia-smi`. Install it on the model host at `/srv/elixir-agent-benchmark/memory_stream.py`. Set these values in the benchmark's ignored `.env`, then rebuild/recreate the benchmark container:
+The [Elixir collector](tools/memory_collector/README.md) requires Linux cgroup v2, a dedicated model service, `ss` and NVIDIA's `nvidia-smi`. Its release includes Erlang/OTP, so the model host does not need Elixir installed. Build and install the release as described in its README, then set these values in the benchmark's ignored `.env` and rebuild/recreate the benchmark container:
 
 ```dotenv
 EAB_MEMORY_SSH_TARGET=root@ratx570
 EAB_MEMORY_HOSTS=ratx570,100.70.151.84
-EAB_MEMORY_REMOTE_SCRIPT=/srv/elixir-agent-benchmark/memory_stream.py
+EAB_MEMORY_REMOTE_COLLECTOR=/srv/elixir-agent-benchmark/memory-collector/bin/eab_memory_collector
 EAB_MEMORY_REMOTE_KEY_FILE=/srv/model-rig-lab/.local/secrets/api-key
 ```
 

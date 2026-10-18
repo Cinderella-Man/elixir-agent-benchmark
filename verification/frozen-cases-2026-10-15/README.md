@@ -49,7 +49,7 @@ docker run --rm --cpus=2 --memory=4g \
 
 After successful repeatability, `capture.exs` attaches the pinned Pi image and records the real initial request for each case, one at a time. It compiles the existing `Eab.Agent` source under a different module name, changing only the `Pi.run` call to the local capture function. Production prompt construction therefore runs unchanged. The capture stops before submission/checkpointing, executes no solver tools, and sends no request to a provider. It is an inspection harness, not an alternate solver.
 
-The dated `export.py` validates the original run's evidence, including `.local/case-freeze-2026-10-15/pre-prompt-fix.json`, then exports this package without raw logs. That snapshot records the implementation before the prompt-path repair. Do not fabricate it for later reproductions; publish a new dated record for a later audit.
+The one-off exporter was retired on 2026-10-18; its source remains in Git history. The exported evidence and historical checksums remain unchanged. The original export validated `.local/case-freeze-2026-10-15/pre-prompt-fix.json`, which records the implementation before the prompt-path repair. Do not fabricate it for later reproductions; publish a new dated record for a later audit.
 
 ## Before blind validation
 

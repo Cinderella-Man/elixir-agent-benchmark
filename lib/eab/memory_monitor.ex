@@ -122,7 +122,7 @@ defmodule Eab.MemoryMonitor do
       "-o",
       "UserKnownHostsFile=#{config[:known_hosts]}",
       config[:target],
-      "python3 #{quote_shell(config[:script])}"
+      "#{quote_shell(config[:collector])} eval 'Eab.MemoryCollector.CLI.main()'"
     ]
 
     executable =

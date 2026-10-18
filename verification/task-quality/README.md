@@ -40,13 +40,7 @@ mix run --no-start scripts/replay_audit_submissions.exs
 
 The archived `audit_cases.exs` run intentionally reports an unmet positive expectation for Plausible 6300 and exits nonzero: reproducing its DST defect is the evidence for retirement. The eleven-case promotion scripts must complete successfully. Use controller code matching the recorded grader identity when reproducing a historical experiment.
 
-After those runs, export the portable record with Python 3.9 or later:
-
-```sh
-python3 scripts/export_case_audit.py .local/task-audit docs/verification/task-quality-evidence-2026-10-14.json
-```
-
-The exporter rejects missing or changed inputs and missing full-grader replays. It requires a negative control to fail a behavioral check that passed on the custom reference, so the independent DST defect cannot count as mutant detection. Positive alternatives must also pass original preservation. The evidence records the runner's actual combined command; standalone `command` hints in some plans are not used by the runner.
+The one-off audit and promotion exporters were retired on 2026-10-18; their source remains in Git history. The checked-in evidence remains unchanged. The audit export required a negative control to fail a behavioral check that passed on the custom reference, so the independent DST defect did not count as mutant detection. Positive alternatives also had to pass original preservation. The evidence records the runner's actual combined command; standalone `command` hints in some plans are not used by the runner.
 
 The exact runner used for the recorded probes is retained in [executed-audit-runner.exs](executed-audit-runner.exs). The current copy in `scripts/` also selects the original fixture archive explicitly. The exact executed snapshot preserves the historical identity; subsequent script changes do not retroactively alter old execution records.
 
@@ -72,9 +66,8 @@ Use a separate `EAB_DATA_DIR`, for example `.local/task-promotion`, with the sam
 ```sh
 mix run --no-start scripts/qualify_promoted_cases.exs
 mix run --no-start scripts/replay_promoted_cases.exs
-python3 scripts/export_promoted_cases.py .local/task-promotion
 ```
 
 Finish qualification before starting replay. Qualification permits at most two preparation workers. Each replay process uses one workspace at a time; optional case IDs may partition the replay into at most two independent workers with disjoint case lists. The replay script accepts optional case IDs, reconstructs each named variant from the unchanged reference and reviewed replacement plan, and requires a current successful qualification. Bad repairs submit the original reference tests, so the hidden checks must independently detect one of that variant’s specific named behavioral failures from the original audit. Valid alternatives submit the revised reference tests and must pass the complete grader. Each final reference suite also runs in a fresh workspace at seed 101 and must match every seed-0 test identity/state.
 
-The exporter validates the frozen inventory and fixture checksums, original archive, current runner/plan/submission identities, full grades, required checks and reference repeat outcomes. Raw promotion records and submitted patches stay under `promotion-results/` and `promotion-patches/` in the data directory. No model scores or speed measurements are produced.
+The recorded export validated the frozen inventory and fixture checksums, original archive, runner/plan/submission identities, full grades, required checks and reference repeat outcomes. Raw promotion records and submitted patches stay under `promotion-results/` and `promotion-patches/` in the data directory. No model scores or speed measurements are produced.

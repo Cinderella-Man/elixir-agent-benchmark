@@ -236,9 +236,9 @@ Status: implemented in `results-page/`, named **Elixir SWE Bench** by the user. 
 
 | Decision | User direction | Implementation |
 | --- | --- | --- |
-| Audience | A shareable results page | Static HTML/CSS/JavaScript with a Python standard-library exporter |
+| Audience | A shareable results page | Static HTML/CSS/JavaScript with an Elixir exporter |
 | Entry | One completed run per point | Separate rows for repeats, no averaging or pooled attempts |
-| Additions | New model/quantization results should be easy to add | `publish.py add` creates one public JSON record; the build discovers all records |
+| Additions | New model/quantization results should be easy to add | `mix eab.results add` creates one public JSON record; the build discovers all records |
 | Presentation | Minimal content, no comparison selector or model search | Title, model-size slider and one continuous plot with labels left of the dots; cases and settings open below it |
 | Cases | Show the nine valid cases, excluding rejected cases from Astra's details too | Astra 9/9, Flash 8/9, Swift Qwen 27B 5/9 and Qwen 27B 2/9; axis spans 0–9 |
 | Model labels | Exact artifact name and quantization in the benchmark itself | Discovery, saved-run history, run headings, comparisons and new reports use normalized identity; transport keeps the routing alias |
@@ -260,3 +260,21 @@ The user requested time-to-solve, tokens and speed alongside memory. Public reco
 
 
 Run memory collection is implemented as a run-owned SSH stream from the model host. A first sample and matching model/context are required before work starts; completion, error and cancellation finalize the stream. Dedicated service cgroup counters and process-attributed NVIDIA allocations exclude unrelated workloads. Raw samples and session summaries persist with each run; gaps, disconnects and interrupted/resumed segments retain partial coverage. Public export automatically carries hardware and sampled peaks without private host/service/GPU identifiers. RAM plus VRAM is a simultaneous sampled total, while each resource retains its own peak and per-GPU breakdown.
+
+## Selecting future new cases — 2026-10-18
+
+Status: closed at the user's request. No case-selection or combined-result feature is being pursued from this discussion.
+
+The user decided to omit Astra from the published model comparison and plans to add an explanatory note. Astra supplies solvability validation: every admitted case must have the required successful Astra evidence, so its success on the admitted set is an admission condition rather than an independent comparison score. This supersedes the earlier decision to show an Astra result on the public page. It does not require rerunning every old case together with each addition.
+
+Successful model attempts support solvability; they do not prove that a case or grader is free of bugs. The existing fixture qualification, prompt review and two-fresh-success policy remain applicable. The user closed the discussion without requesting a website edit or a new execution feature.
+
+### Established facts
+
+The dashboard currently starts the entire configured inventory. The executor already operates on the case list saved in a run, but fresh-run creation always fills that list from the complete inventory. Internal selected-repeat support only accepts cases from an earlier run and requires unchanged case inputs and inventory; it cannot select future additions. Resume also requires the original release and cannot append cases.
+
+A fresh subset could use the existing scheduler, agent and grader. It would need an explicit selection recorded before execution, validation against the frozen inventory, and checkpoint support for a selection without a source run. Candidates outside the inventory are not selectable; the existing admission workflow permits a provisional curation inventory after fixture and review gates for blind model validation.
+
+Running a new subset and combining its outcomes with earlier Astra outcomes are separate decisions. The current glossary and publication contract define a published result as one completed full run. The exporter rejects selected repeats and the results-page builder requires coverage of every current case. Selection alone would therefore not produce an updated full-benchmark Astra row.
+
+The earlier questions about manual versus automatic selection and combining historical Astra outcomes are withdrawn. The investigation above records current behavior, not an implementation plan. No new glossary term or ADR is needed.

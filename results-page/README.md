@@ -4,29 +4,43 @@ A static, shareable page for Elixir SWE Bench results, produced by this reposito
 
 The page contains a title, maximum model-size slider and one shared chart, with labels immediately left of their dots. Case outcomes and recorded settings open below the chart. There is no comparison selector or model search.
 
-The initial records cover the same nine valid cases: **Astra 9/9**, **Qwen3.8-Flash-Next-GSQ-RCO-abliterated IQ3_S 8/9**, **Swift-1.5-Qwen3.8-27B Q4_K_M 5/9**, and **Qwen3.8-27B Q4_K_M 2/9**. Rejected cases are excluded from the public data and details. These are recorded outcomes, not new executions. Effective settings can differ between rows and remain visible in the details; the local runner's strict comparison rules are unchanged.
+The previous benchmark runs and published results were cleared on 2026-10-18 for fresh measurements. The nine benchmark cases remain configured. With no published records, the page shows “No benchmark results yet” and hides the slider and chart guidance.
 
-Model weight sizes remain visible, separately from observed GPU and RAM allocation. Flash has a loaded-process observation at 262,144 configured context: 69.8 decimal GB across three RTX 3090s, 7.8 GB sampled service RAM and a 51.5 GB service-lifetime RAM peak. The public record includes per-GPU allocations, CPU, KV cache type, runtime version, timestamp, RSS and cgroup observations. This snapshot does not establish peak memory during the saved run, a fully occupied context, or the minimum hardware needed with another offload/cache configuration. The other local models have no captured memory profile yet; Astra is an API model.
+Fresh runs on ratx570 collect model-service RAM and VRAM throughout the run. Their exported summaries include sampled peaks, the highest simultaneous RAM + VRAM total, per-GPU allocations, configured context, runtime and collection coverage. Model weight size remains a separate field.
 
-The slider filters model weight-file size in decimal GB. At 50 GB, both 17.4 GB Qwen models appear even though their runtime memory has not been measured. Observed VRAM/RAM remains separate deployment data and does not determine eligibility for this size filter. A numeric limit hides unknown-size/API models; All restores them. Each case shows its saved generated-token count. Durations and throughput remain unmeasured for the existing runs.
+The slider still filters model weight-file size in decimal GB when results exist. Changing it to “Max VRAM+RAM used” is deferred until fresh runs provide the required memory data. Observed VRAM/RAM does not yet determine eligibility for this filter. A numeric limit hides unknown-size/API models; All restores them.
 
 ## Preview
 
-From the repository root:
+From the repository root with Elixir 1.19+, OTP 28+ and dependencies installed (`mix deps.get`):
 
 ```sh
-python3 results-page/publish.py build
-python3 -m http.server 4173 --bind 127.0.0.1 --directory results-page/dist
+mix eab.results build
+mix eab.results serve
 ```
 
 Open [the local preview](http://127.0.0.1:4173). You can also open `results-page/dist/index.html` directly in a browser; data is loaded from a local script, so no fetch server is required. Generated `dist/` files are ignored by Git.
 
-## Adding a result
-
-Export the original `run.json` from a completed benchmark run:
+For a Docker-only installation, prepare the tooling image and dependencies using the [development setup](../docs/runbook.md#bounded-correctness-checks), then run:
 
 ```sh
-python3 results-page/publish.py add /path/to/run.json \
+docker run --rm --cpus=2 --network host --user "$(id -u):$(id -g)" \
+  -e HEX_HOME=/tmp/hex -v "$PWD:/app" -w /app eab-tooling:dev \
+  mix eab.results serve
+```
+
+Use the same container command with `mix eab.results add .local/publication/run.json`, `check` or `build` for publication work.
+
+## Adding a result
+
+In the benchmark dashboard, select a completed full run and click **Add to results page**, beside **Download report**. It exports the saved model identity, scores, token usage and available memory measurements, then rebuilds the page. **View results** opens the built-in preview at `/results/`; the standalone preview on port 4173 reads the same files. Repeated clicks keep the existing public record.
+
+Docker Compose mounts this checkout's `results-page/` into the benchmark container. The button writes one public JSON file into `results-page/results/`, and generated files into `results-page/dist/`. Outputs remain editable by the checkout owner. It does not commit or push: commit the new result file and push to `main` to update GitHub Pages.
+
+For optional label/size overrides or an exported run from another installation, the command line remains available:
+
+```sh
+mix eab.results add /path/to/run.json \
   --model-label 'My model 32B' \
   --quantization 'Q4_K_M' \
   --size-gb 20.5 \
@@ -34,35 +48,36 @@ python3 results-page/publish.py add /path/to/run.json \
   --evidence-url 'https://example.com/public-run-evidence'
 ```
 
-All flags are optional. Model name, quantization and size use saved artifact metadata when available, including legacy runs whose routing aliases differ from their artifact names. `--quantization` and `--size-gb` mark owner-supplied values; absent metadata stays unknown. `--note` adds context shown in the details. The command creates one small JSON file in `results-page/results/` and rebuilds the preview. It refuses to overwrite an existing run; edit its public JSON deliberately to correct a label or note.
+All flags are optional. Model name, quantization and size use saved artifact metadata when available, including legacy runs whose routing aliases differ from their artifact names. `--quantization` and `--size-gb` mark owner-supplied values; absent metadata stays unknown. `--note` adds context shown in the details. The command uses the same publisher as the dashboard button. Adding an existing run rebuilds the preview and preserves its public JSON, including manual edits; edit that JSON deliberately to correct a label or note.
 
-For the Docker installation, copy the original run file out to an ignored local directory first:
+To use the command line with a run stored in Docker, copy the original run file out to an ignored local directory first:
 
 ```sh
 mkdir -p .local/publication
 docker compose cp benchmark:/data/runs/RUN_ID/run.json .local/publication/run.json
-python3 results-page/publish.py add .local/publication/run.json
+mix eab.results add .local/publication/run.json
 ```
 
 The exporter requires a completed full-inventory source run and a pass/fail grade for every case. Errors, interruptions, partial repeats and unknown settings are rejected. Every current case must occur in the run with matching fixture hashes. It exports only those current cases, recomputes counts from their outcomes and leaves the original run unchanged. Endpoint URLs, account identifiers, transcripts and raw provider metadata are excluded. It uses the recorded grades, not a new audit of the underlying grading receipts. Review the model label, optional note and evidence link before publishing.
 
-Commit the new file in `results-page/results/` and push it to `main`. After the one-time Pages setup below, GitHub rebuilds and publishes automatically. No manifest or HTML edits are needed. Alternatively, add a JSON record in the same schema as the existing file; `check` and `build` validate all records.
+Commit the new file in `results-page/results/` and push it to `main`. After the one-time Pages setup below, GitHub rebuilds and publishes automatically. No manifest or HTML edits are needed. The exporter creates the public schema; `check` and `build` validate all records.
 
 ```sh
-python3 results-page/publish.py check
-python3 -m unittest discover -s results-page -p 'test_*.py'
+mix eab.results check
+mix test test/eab/results_test.exs --max-cases 2
 ```
 
 The builder checks every public record against `config/benchmark.json` and the current case fixture hashes. A changed inventory or fixture makes stale records fail validation: explicitly re-export eligible source runs or replace records with new runs before publishing. Do not splice attempts from different runs together. Unknown future settings fail validation; extend the public schema when that happens.
 
 ## Capture memory and future timings
 
-`scripts/model_resources.py` reads the selected inference process with `nvidia-smi` and Linux procfs/cgroup counters, plus authenticated model properties. It performs no inference and no speed measurement. Run it **on the model host**, with the engine PID (not the Python HTTP server PID):
+Fresh runs collect memory automatically. For a separate loaded-model snapshot, the [Elixir collector](../tools/memory_collector/README.md) reads the selected inference process with `nvidia-smi` and Linux procfs/cgroup counters, plus authenticated model properties. It performs no inference and no speed measurement. Run the installed release **on the model host**, replacing the example engine PID, model port and existing API key-file path:
 
 ```sh
-python3 scripts/model_resources.py --pid ENGINE_PID \
-  --endpoint http://127.0.0.1:PORT --key-file /path/to/existing-api-key \
-  --output /path/to/memory-observation.json
+/srv/elixir-agent-benchmark/memory-collector/bin/eab_memory_collector \
+  eval 'Eab.MemoryCollector.CLI.main()' > memory-observation.json <<'JSON'
+{"mode":"snapshot","pid":1234,"port":8414,"key_file":"/path/to/existing-api-key"}
+JSON
 ```
 
 The key, host address, PID, absolute artifact path and GPU UUIDs are not exported. GPU usage is attributed by process PID and physical GPU UUID before producing public values; whole-host GPU/RAM figures can include unrelated work. On the inspected Strata deployment, its own hardware panel selected the wrong physical GPUs, so it was not used for memory attribution. The exporter accepts a snapshot only when artifact, backend and context match the result. A matching artifact name is not a checksum/provenance guarantee.
@@ -83,7 +98,7 @@ GitHub Pages serves HTML, CSS and JavaScript at `<owner>.github.io/<repository>/
 
 One-time setup:
 
-1. Commit and push `results-page/` and `.github/workflows/results-page.yml` to `main`.
+1. Commit and push the page, Elixir publication tooling and workflow changes to `main`.
 2. Open the repository's [Settings → Pages](https://github.com/Cinderella-Man/elixir-agent-benchmark/settings/pages).
 3. Under **Build and deployment → Source**, select **GitHub Actions**.
 4. Open **Actions → Publish benchmark results → Run workflow**. Future pushes that change result files, page files or the inventory will publish automatically.
@@ -96,12 +111,13 @@ The workflow runs the publication checks, builds `results-page/dist/`, uploads o
 
 - `index.html`, `styles.css`, `app.js`: page and interactions.
 - `results/*.json`: one public record per run; these are the everyday additions.
-- `publish.py`: validates/export records and assembles the static site using Python 3.10+.
-- `test_publish.py`: functional checks for eligibility, current-case projection, model metadata, GPU attribution and public exports.
+- `lib/eab/results.ex` and `lib/eab/results/`: public export, validation and static site generation.
+- `mix eab.results`: add, check, build and preview commands using Elixir 1.19+ and OTP 28+.
+- `test/eab/results_test.exs`: ExUnit checks for eligibility, current-case projection, model metadata, GPU attribution and public exports.
 - `dist/`: generated HTML, assets and downloadable result data; deployed by GitHub Actions.
 
 ### Automatic memory from benchmark runs
 
-The benchmark now streams model-service memory from a configured model host during each ordinary run; see [runner setup](../README.md#run-memory-on-the-model-host). `publish.py add path/to/run.json` automatically includes its saved `memory` summary. No separate `--resources` option is needed for these runs.
+The benchmark now streams model-service memory from a configured model host during each ordinary run; see [runner setup](../README.md#run-memory-on-the-model-host). `mix eab.results add path/to/run.json` automatically includes its saved `memory` summary. No separate `--resources` option is needed for these runs.
 
 `resources.kind = "run_samples"` records sampled run peaks for VRAM, service RAM, RSS and simultaneous RAM + VRAM, plus per-GPU peaks, configured context, runtime, KV cache, interval, sample count and complete/partial coverage. The exporter strips private host/service identifiers and GPU UUIDs. It refuses to combine resumed sessions from different deployments or physical GPUs. The page distinguishes run samples from the earlier `loaded_snapshot`; the old results are not backfilled with new measurements. Model weight size remains a separate field and slider.

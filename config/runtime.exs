@@ -30,8 +30,11 @@ if config_env() != :test do
       hosts: hosts,
       known_hosts:
         System.get_env("EAB_MEMORY_KNOWN_HOSTS", Path.join(data, "memory/known_hosts")),
-      script:
-        System.get_env("EAB_MEMORY_REMOTE_SCRIPT", "/srv/elixir-agent-benchmark/memory_stream.py"),
+      collector:
+        System.get_env(
+          "EAB_MEMORY_REMOTE_COLLECTOR",
+          "/srv/elixir-agent-benchmark/memory-collector/bin/eab_memory_collector"
+        ),
       key_file: System.get_env("EAB_MEMORY_REMOTE_KEY_FILE")
   end
 

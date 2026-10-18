@@ -35,7 +35,7 @@ defmodule Eab.RunsTest do
     Application.put_env(:eab, :memory_monitor,
       hosts: ["fixture"],
       target: "fixture",
-      script: "fixture",
+      collector: "fixture",
       known_hosts: "fixture",
       executable: "/opt/pi/node",
       args: ["test/support/memory_collector.mjs", "normal"]
