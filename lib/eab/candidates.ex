@@ -139,8 +139,8 @@ defmodule Eab.Candidates do
     end)
   end
 
-  # Export a reviewable admission bundle. Publishing its ID in config/benchmark.json
-  # is deliberately a separate repository change, never a side effect of import.
+  # Export a reviewable admission bundle. Placing it under cases/ activates it;
+  # importing a candidate never changes the runnable folders.
   def export(ref, destination) do
     record = read!(ref)
 

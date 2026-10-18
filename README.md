@@ -2,7 +2,7 @@
 
 The standalone **Elixir SWE Bench** [results page](results-page/README.md) displays published runs. Click **Add to results page** on a completed full run to export it and rebuild the local page. Push the resulting public JSON file to GitHub to deploy through GitHub Pages.
 
-A local Elixir website that evaluates one served coding model against **nine historical PR repairs**: three Plausible and six Livebook cases. Connect a llama.cpp or Strata server, or sign in with ChatGPT and select an available OpenAI model, then click **Run benchmark**.
+A local Elixir website that evaluates coding models against historical PR tasks. During the [sequential curation loop](docs/case-curation-loop.md), the nine existing cases are temporarily parked in `cases_approved/`. Only case folders inside `cases/` are run. Moving folders back into `cases/` restores them automatically, with no inventory or configuration edits.
 
 The application prepares Docker images, checks the fixtures, runs the [Pi coding agent](https://github.com/earendil-works/pi) in isolated Docker workspaces, and grades its repairs with executable tests. There is no AI judge or speed score.
 
@@ -68,7 +68,7 @@ Pi and the project run on the benchmark's Docker host. The model server can run 
 
 ## Run settings and results
 
-Local-server defaults: all nine cases, seed 101, unlimited model and tool calls, up to 8,192 tokens per response and 65,536 generated tokens per case. Context is detected automatically and capped at 262,144 tokens. Advanced settings allow explicit overrides within the server's capacity. History is retained without compaction; exhausting either the generation budget or context window submits the current patch for grading.
+Local-server defaults: the active inventory only, seed 101, unlimited model and tool calls, up to 8,192 tokens per response and 65,536 generated tokens per case. Context is detected automatically and capped at 262,144 tokens. Advanced settings allow explicit overrides within the server's capacity. History is retained without compaction; exhausting either the generation budget or context window submits the current patch for grading.
 
 ChatGPT subscription defaults are a **262,144 generated-token threshold per case** and **high reasoning effort**. Change them under Advanced run settings; available reasoning levels depend on the selected model. The threshold is checked between complete responses, so one response may exceed it. Reasoning tokens count once within output usage. OpenAI enforces context and response limits; no seed, exact prompt preflight or hard response cap is claimed. Full history, Pi tools, workspaces and grading use the same execution flow. Effective policies are saved in results and reports; strict local runs and subscription runs cannot join the same comparison.
 

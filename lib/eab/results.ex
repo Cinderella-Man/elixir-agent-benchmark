@@ -152,7 +152,7 @@ defmodule Eab.Results do
 
     # Serialize dashboard requests so two tabs cannot rebuild over each other's results.
     :global.trans({{__MODULE__, Path.expand(page)}, self()}, fn ->
-      inventory = opts[:inventory] || read!(Path.join(project_root(), "config/benchmark.json"))
+      inventory = opts[:inventory] || Eab.Inventory.definition()
       opts = Keyword.merge(opts, page_root: page, inventory: inventory)
       record = export!(run, opts)
       records = load!(Path.join(page, "results"))
@@ -194,7 +194,7 @@ defmodule Eab.Results do
 
   def build!(records, destination \\ Path.join(root(), "dist"), opts \\ []) do
     page = opts[:page_root] || root()
-    inventory = opts[:inventory] || read!(Path.join(project_root(), "config/benchmark.json"))
+    inventory = opts[:inventory] || Eab.Inventory.definition()
     expected = Map.new(inventory["cases"], &{&1, fixture_hashes(&1, opts[:case_root])})
 
     for record <- records do
