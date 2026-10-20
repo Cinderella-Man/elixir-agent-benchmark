@@ -47,7 +47,7 @@ records = for {run_id, n} <- Enum.with_index(run_ids, 1) do
   unless Enum.map(initial["input"], & &1["role"]) == ["developer", "user"],
     do: raise("Initial request contains prior context")
   unless grade["regression_coverage"]["passed"], do: raise("No behavioral regression coverage")
-  File.cp!(Store.path("#{base}/model.patch"), Path.join(out, "astra-#{n}.patch"))
+  File.cp!(Store.path("#{base}/model.patch"), Path.join(out, "astra-success-#{n}.patch"))
   %{
     "run_id" => run_id, "status" => run["status"], "case" => id,
     "candidate" => ref, "release_id" => run["release_id"], "experiment_id" => run["experiment_id"],
@@ -91,7 +91,7 @@ record = %{
   "schema" => 1, "functional_validation_only" => true,
   "two_fresh_blind_runs" => true, "distinct_session_keys" => true,
   "matching_frozen_inputs" => true, "serving_revision_available" => false,
-  "prior_attempts" => [],
+  "prior_attempts" => [Inventory.read_json(Path.join(__DIR__, "astra-1.json"))],
   "runs" => records
 }
 File.write!(Path.join(out, "astra-results.json"), Jason.encode!(record, pretty: true) <> "\n")
