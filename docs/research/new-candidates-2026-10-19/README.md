@@ -1,6 +1,6 @@
 # New candidate cases — 2026-10-19
 
-Discovery-only research notes. One file per candidate. **No case bundles, imports, builds, tests, model runs or commits** were performed. Status values are research dispositions, not admissions.
+Discovery-only research notes from 2026-10-19. One file per candidate. **No case bundles, imports, builds, tests, model runs or commits** were performed during that discovery pass. Later curation dispositions are marked explicitly and link to execution evidence.
 
 Selection basis: [PR selection guidelines](../../pr-selection-guidelines.md), [case admission](../../case-admission.md), and the exclusion register already recorded in `docs/research/*` and `cases_rejected/`. Existing screened PRs (Ecto/Plug/Phoenix/Oban/Livebook/Plausible/Operately/LiveBeats/Accent/Guardian/Finch/ExDoc/Cachex/Swoosh/…) were **not rediscovered**.
 
@@ -16,7 +16,7 @@ Selection basis: [PR selection guidelines](../../pr-selection-guidelines.md), [c
 | [redix-351-least-busy-routing.md](redix-351-least-busy-routing.md) | Redix | [#351](https://github.com/whatyouhide/redix/pull/351) | feature | 3 | Cluster pool routing and manager lookup must stay consistent under mixed slot maps | discovered — draft next |
 | [redix-356-sentinel-socket-leak.md](redix-356-sentinel-socket-leak.md) | Redix | [#356](https://github.com/whatyouhide/redix/pull/356) | bug_fix | 1 | Sentinel path must close sockets on role/ROLE failure before trying the next sentinel | discovered — focused reserve |
 | [nimble-parsec-154-choice-fallback.md](nimble-parsec-154-choice-fallback.md) | NimbleParsec | [#154](https://github.com/dashbitco/nimble_parsec/pull/154) | bug_fix | 1 | Traversal errors must honor choice fallback like other unbound combinators | discovered — focused reserve |
-| [ash-3031-calculation-arguments.md](ash-3031-calculation-arguments.md) | Ash | [#3031](https://github.com/ash-project/ash/pull/3031) | bug_fix | 5 | Calculation argument validation must run once and keep literal/expression distinctions | discovered — larger coherent task |
+| [ash-3031-calculation-arguments.md](ash-3031-calculation-arguments.md) | Ash | [#3031](https://github.com/ash-project/ash/pull/3031) | bug_fix | 5 | Calculation argument validation must run once and keep literal/expression distinctions | [admitted; user-authorized single run, 2026-10-20](../../../verification/case-curation-2026-10-20/ash-pr-3031/README.md) |
 | [phoenix-html-474-json-escape.md](phoenix-html-474-json-escape.md) | Phoenix.HTML | [#474](https://github.com/phoenixframework/phoenix_html/pull/474) (+ #475) | feature | 1 | Public JSON-in-HTML escaping helper with a follow-up arity/API correction | discovered — focused reserve |
 | [phoenix-live-dashboard-487-app-process-tree.md](phoenix-live-dashboard-487-app-process-tree.md) | Phoenix.LiveDashboard | [#487](https://github.com/phoenixframework/phoenix_live_dashboard/pull/487) | feature | 1 (+ CSS) | Application process inspection UI: nested tree, expand/collapse, search | discovered — browser/UI reserve |
 
@@ -62,3 +62,5 @@ Same gate as always, and **none of it was done in this pass**:
 ## Later pass — more library candidates
 
 Additional library candidates mined the same day live in [`more-candidates/more-candidates-README.md`](more-candidates/more-candidates-README.md) (ecto_sql #758 / #741, absinthe `@oneOf` lineage #1386+#1438+#1439, broadway #369, bandit #705). That index owns the rows; this README does not duplicate them.
+
+**Curation policy, 2026-10-20:** before implementing a researched candidate, follow [prepared fork sources](../../prepared-fork-sources.md) and inspect existing fork branches. Runnable cases must pin prepared fork baselines; a research shortlist is not an admitted inventory. The [source audit](../../../verification/prepared-forks-2026-10-20/README.md) records branch reuse and migration evidence.

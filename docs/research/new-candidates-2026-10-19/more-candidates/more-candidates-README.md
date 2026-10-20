@@ -69,3 +69,5 @@ Mix: three coordinated 2–5 file bugs/features and one slightly larger coordina
 - Full parent graphs beyond the squash/merge parent shown on each commit page (2026-10-19).
 
 HTML/diff/commit retrieval date: **2026-10-19**.
+
+**Curation policy, 2026-10-20:** before implementing a researched candidate, follow [prepared fork sources](../../../prepared-fork-sources.md) and inspect existing fork branches. Runnable cases must pin prepared fork baselines; a research shortlist is not an admitted inventory. The [source audit](../../../../verification/prepared-forks-2026-10-20/README.md) records branch reuse and migration evidence.

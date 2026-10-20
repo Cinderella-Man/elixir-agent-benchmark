@@ -4,6 +4,8 @@ Use these rules before spending time preparing a candidate. The next expansion s
 
 The target remains roughly **100–200 validated cases across several projects**, using the existing Pi runner. This is the current curation guidance, updated after the 2026-10-15 Astra validation and rejection decisions. It is not a new scoring rule or an automated admission feature. See the [admission contract](case-admission.md) for bundle formats and the [validation decision](adr/0009-validate-minimal-tasks-with-blind-model-attempts.md) for the two fresh strong-model passes.
 
+When screening an existing dossier or designing checks, consult [curation diagnostics and lessons](curation-lessons.md) for source-pair verification, preservation matrices and failure triage from Ash 3031.
+
 ## Lessons from the first validation cycle
 
 The original v4 pilot retained **nine cases**, each with two reviewed successful Astra repairs. During the [sequential curation loop](case-curation-loop.md), approved folders are temporarily parked outside `cases/`; the folders actually present in `cases/` determine the active set. All eleven examined cases had at least one success; two did not meet admission. The [complete review](../verification/astra-confirmation-2026-10-15/README.md) preserves graded failures and provider interruptions separately.
@@ -77,6 +79,8 @@ Feature reconstruction and original requests are eligible for small pilots, not 
 
 Apply the same contract, preservation, repeatability and blind-solvability gates to every source. Record source type and related task families. The current importer expects source reconstruction evidence; verify that a new source type fits that contract before preparing a bundle. Runtime or provenance support that is missing remains separate implementation work.
 
+Every runnable case uses a prepared branch in the user's fork. Follow [prepared fork sources](prepared-fork-sources.md): inspect existing branches before creating refs, commit neutral preparation once, preserve the exact upstream repair/reference pair, and verify the built workspace matches the pinned baseline tree. A researched upstream PR is source evidence, not the execution repository.
+
 ## Reject or defer these PRs
 
 | Disposition | Examples and reason |
@@ -116,6 +120,8 @@ Grade the submitted patch in a fresh environment, restore protected checks, veri
 
 After qualification and independent contract review, schedule **two fresh blind attempts with the same strong model, effective settings and frozen task inputs**, through the ordinary Pi flow. Each starts with a clean context and workspace and receives no previous solution, failure feedback, reference or hidden checks. Both passing patches need review. The two successes are feasibility evidence, not proof that all later failures measure model quality alone or that the model always solves the task.
 
+Apply the workflow's [launch/review sequence and explicit user overrides](case-curation-loop.md#validation-scope-and-user-overrides). A case-specific exception records the actual count; it does not change the default above.
+
 Freeze or record the following together:
 
 - Case/source version, exact full prompt including appended instructions, visible files, protected checks and requirement-to-assertion mapping.
@@ -154,6 +160,8 @@ Use this small curator record in a research note or candidate review; these are 
 ```markdown
 Source type / project / source revisions / PR or original request:
 Status: discovered | screened | provisional | admitted | deferred | rejected
+Active / parked / rejected / prior-curation records checked:
+Prepared fork / existing branch reuse / baseline and reference pins:
 Case version / release inventory / public or withheld exposure:
 Task kind / family / maintenance report or clarified brief:
 Full solver-visible ticket and appended instructions:
@@ -164,9 +172,12 @@ Visible source for each scored obligation:
 Starting-state and reference-test evidence (inspected vs executed):
 Plausible partial solution and expected named failure:
 Preservation and alternative-solution risks:
+Entry-point / input-state matrix and downstream preservation probes:
 Runtime / offline services / license evidence and unknowns:
 Three-round named control outcomes and frozen-input evidence:
 Blind model/settings policy and all attempt IDs (including failures/retries):
+Authorized run count / explicit exception / stop condition:
+Official grade and separate review/acceptance disposition for each attempt:
 Independent contract review / passing-patch reviews / unresolved findings:
 Coverage added / related or duplicate tasks:
 Admission or exclusion reason / conditions for reconsideration:

@@ -4,6 +4,10 @@ The standalone **Elixir SWE Bench** [results page](results-page/README.md) displ
 
 A local Elixir website that evaluates coding models against historical PR tasks. During the [sequential curation loop](docs/case-curation-loop.md), approved cases are temporarily parked in `cases_approved/`. Only case folders inside `cases/` are run. Moving folders back into `cases/` restores them automatically, with no inventory or configuration edits.
 
+For future curation sessions, [diagnostics and lessons](docs/curation-lessons.md) cover candidate screening, preservation checks, qualification drift, model-result review and stopping without losing evidence.
+
+Every runnable case must pin a prepared baseline branch in the user’s fork. Inspect and reuse existing branches before creating any; commit durable preparation there so ordinary clones need no source patch. Follow [prepared fork sources](docs/prepared-fork-sources.md); the [case-by-case fork audit](verification/prepared-forks-2026-10-20/README.md) records existing branch matches and migration evidence.
+
 The application prepares Docker images, checks the fixtures, runs the [Pi coding agent](https://github.com/earendil-works/pi) in isolated Docker workspaces, and grades its repairs with executable tests. There is no AI judge or speed score.
 
 ## Start
@@ -76,9 +80,11 @@ ChatGPT subscription defaults are a **262,144 generated-token threshold per case
 
 For local models, **Model host thinking preset** records the host's selected setting: off, on without a level, or an exact effort such as low, medium, xhigh or max. Blank uses explicit server metadata when available; otherwise results say “Not reported.” New local requests leave thinking controls to the server. The saved record distinguishes server-reported and operator-declared values, and the preset appears in reports and result labels.
 
-**Case time is always recorded.** Each attempt saves elapsed milliseconds from Pi startup through completion, including model and tool calls. Preparation, grading and time waiting for grading are excluded. The duration is saved before grading and preserved when grading resumes. Case details, reports and the results page show it alongside the thinking preset.
+**The normal controller records case time automatically.** Each attempt saves elapsed milliseconds from Pi startup through completion, including model and tool calls. Preparation, grading and time waiting for grading are excluded. The duration is saved before grading and preserved when grading resumes. Case details, reports and the results page show it alongside the thinking preset. On this shared machine, functional solver validation must use the [disabled timing observer](docs/case-curation-loop.md#local-timing-observer); those records explicitly say timing was disabled and contain no `attempt_ms`.
 
 For solvability validation, follow the [case-selection and validation guidelines](docs/pr-selection-guidelines.md): review the shortest sufficient task contract, repeat fixture controls three times, then obtain two reviewed **fresh blind successes** with matching frozen inputs, model and settings. Preserve every failure and interruption; explicit infrastructure retries are new attempts, while resume is recovery. Two successes demonstrate feasibility without proving that every later failure is the model's fault. This remains manual curation; the application does not automatically admit cases.
+
+The workflow records [case-specific user overrides](docs/case-curation-loop.md#validation-scope-and-user-overrides) without changing that default. Ash 3031 was accepted after one successful run at the user's explicit instruction; its evidence reports one, not two.
 
 One run is active at a time. Closing the browser does not stop it. **Stop run** cancels execution and cleans up this installation's containers. After interruption, reconnect the same model with the same settings and choose **Resume unfinished cases**. Completed passes, failures and evaluation errors stay fixed; saved submissions resume grading, and unfinished Pi work starts in a fresh workspace with its prior evidence preserved. Changed release, model or settings require a new run. Historical runs without checkpoint receipts cannot resume.
 

@@ -60,3 +60,5 @@ The subscription policy is a 262,144-generated-token **soft threshold**, checked
 Qualification uses one preparation worker and lookahead 1. The deployed controller uses the existing defaults of two preparation workers and lookahead 4; solver attempts remain sequential. These are recorded separately in the evidence and validation plan.
 
 The host clock remains live. Image identities and observed locale/timezone are recorded, but three successful repetitions do not prove absence of flakiness or complete test coverage. These public historical cases may have appeared in model training.
+
+**Prepared-source policy, 2026-10-20:** runnable additions and source migrations must follow [prepared fork sources](../../docs/prepared-fork-sources.md). This record retains its original source versions and outcomes; [the later fork audit](../prepared-forks-2026-10-20/README.md) records branch reuse and any new migration evidence separately.

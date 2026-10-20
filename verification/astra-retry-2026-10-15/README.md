@@ -51,3 +51,5 @@ All 633 artifacts from round 1 and 501 from round 2 remain byte-for-byte unchang
 - [checksums.json](checksums.json): SHA-256 checksums for the public package.
 
 The public package excludes credentials, account identifiers, raw provider responses and model reasoning. Saved benchmark runs and their private copies were cleared on 2026-10-18; the one-off exporter was retired. Public evidence remains unchanged. Historical checksums describe the original package, including retired tooling available in Git history. This package records the controller delta explicitly instead of rewriting the historical freeze.
+
+**Prepared-source policy, 2026-10-20:** runnable additions and source migrations must follow [prepared fork sources](../../docs/prepared-fork-sources.md). This record retains its original source versions and outcomes; [the later fork audit](../prepared-forks-2026-10-20/README.md) records branch reuse and any new migration evidence separately.

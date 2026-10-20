@@ -54,3 +54,5 @@ Both submitted repairs use a shared endpoint resolver: establish project scope, 
 The accepted reference remains the original qualified upstream implementation; model output does not replace it. The earlier invalid fixture versions and infrastructure-interrupted attempt remain recorded. No further model attempt is needed.
 
 Promotion preserves all eleven bundle files byte-for-byte, including the admission receipt; [bundle hashes](bundle-sha256.json) bind the moved files. Relocated admission verification passed and the active inventory is empty. Restoring this case later requires only moving its folder back into `cases/`, with no registry or manifest edits. Keep the controller idle and rebuild/recreate its image to pick up host folder changes.
+
+**Prepared-source policy, 2026-10-20:** runnable additions and source migrations must follow [prepared fork sources](../../../docs/prepared-fork-sources.md). This record retains its original source versions and outcomes; [the later fork audit](../../prepared-forks-2026-10-20/README.md) records branch reuse and any new migration evidence separately.

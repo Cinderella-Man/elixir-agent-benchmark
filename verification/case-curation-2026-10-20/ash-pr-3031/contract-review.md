@@ -1,0 +1,212 @@
+# Independent contract review: ash-pr-3031
+
+The later preservation-check amendment is independently reviewed in [preservation-amendment-review.md](preservation-amendment-review.md). Earlier approvals and hashes below remain tied to their named immutable versions.
+
+- Reviewer: `/root/contract_review`
+- Package author: `/root`
+- Review date: 2026-10-20
+- Review axis: requirements/specification, using the `code-review` skill
+- Repository review base: `d9684ec85319e3c86be384f534ddd19af4b10562`
+- Branch supplied for review: `codex/curate-researched-multifile-case`
+- Solver source revision inspected: `abc634f5a725fadad850dacefc4284dd1d803fad`
+- Decision: **APPROVE the contract and curated assertion mapping.** Runtime qualification remains a separate, pending gate.
+
+## Requirements-first attestation
+
+I first read `solver-contract.md` and ordinary source, documentation, and existing tests from the pristine source checkout. I did not inspect the reference implementation, upstream added tests, acceptance checks, research dossier, or PR diff during that phase. I sent the author my independently derived requirements and ambiguities before receiving authorization to inspect the proposed package.
+
+Only after that report did I inspect `case.json`, `ticket.md`, `acceptance.patch`, `reference.patch`, `reference-tests.patch`, `incomplete.patch`, and `integrity.patch`. The solver contract and draft ticket are byte-identical. This review contains no solver execution or test-result claims. I ran read-only patch-application checks, source searches, and byte comparisons; I ran no tests, builds, speed measurements, or performance comparisons.
+
+## Independently derived requirements
+
+The ticket explicitly requires consistent valid scalar/array arguments and atom/string names across loads, filters, and sorts; preservation of cast and constrained literal values beside expressions; structured input errors for malformed containers, unknown names, and custom-type rejection; rejection of expressions through both `filter_input` forms; and preservation of ordinary calculations, coercion, and required/optional/default behavior, including normalized nil.
+
+The source adds the following discoverable meaning:
+
+1. Existing calculation arguments accept map/keyword forms, recognize atom/string names, and normalize indexed maps for arrays. See `lib/ash/query/query.ex:2556`, `lib/ash/type/helpers.ex:8`, and `documentation/topics/resources/calculations.md:131`.
+2. `allow_expr?` controls whether an argument accepts expressions. Expressions use coercion, which deliberately differs from literal casting. See `lib/ash/resource/calculation/argument.ex:45`, `lib/ash/query/function/type.ex:25`, and `lib/ash/type/type.ex:420`.
+3. Defaults apply to omitted arguments. Optional supplied nil remains nil; required supplied nil fails even when a default exists. Literal/function/MFA defaults are supported. The same rules must hold after normalization produces nil. See `lib/ash/resource/calculation/argument.ex:36` and `lib/ash/query/query.ex:2724`.
+4. Type constraints may transform values. Supported scalar/array type failures include `:error` and `{:error, reason}`. Existing string-error handling retains the callback's reason. See `lib/ash/type/type.ex:267`, `:416`, `:446`, `:532`, and `lib/ash/query/query.ex:2699`.
+5. Public invalid-input errors follow Ash's invalid error classification. The contract does not prescribe a particular leaf exception, error-list ordering, AST wrapper, helper name, file decomposition, or callback invocation count.
+
+No requirement establishes precedence when both atom and string spellings of one argument are supplied. Recovery from arbitrary callback exceptions or unsupported return shapes is not implied.
+
+## Curated hidden assertion mapping
+
+Line references below identify lines in the reviewed `acceptance.patch`, including its patch header. Each row covers every assertion and loop expansion in that grouped test. “Invalid” means the public `{:error, %Ash.Error.Invalid{}}` result; it does not require a particular internal error representation.
+
+| Group and patch lines | Assertions checked | Visible basis |
+| --- | --- | --- |
+| Literal arrays, 177–190 | Loading the nested calculation produces true for the matching ID and false for other records. Five developer filter paths return exactly the matching record: nested calculations with either array-expression permission, direct expression call, map input, and tuple input. | “mixing literal and expression arguments”; “valid scalar/array arguments”; “loads, filters and sorts.” Existing calculation/filter forms are visible in source. The two nonmatching records distinguish failed ID membership from failed date comparison. |
+| String argument names, 192–200 | Map `filter_input` and tuple developer filters return the matching record; descending sort places it first; loads return true only for that ID. Timestamp text must cast successfully. | “atom/string argument names work consistently” and preservation of cast values; existing datetime casting and public sort semantics. No order is asserted between tied false records. |
+| Array expressions, 202–207 | A tags expression filters to the record with nonnil tags and loads true for it. | Valid array arguments and supported expressions. Expression nodes must remain expressions rather than being treated as indexed literal maps. |
+| User-input boundary, 209–217 | Literal arguments succeed in both map and tuple input forms; otherwise equivalent expression arguments yield Invalid in both forms. | Explicit `filter_input` map/tuple expression-rejection requirement. Literal acceptance prevents implementing the boundary by rejecting all calculation input. |
+| Malformed filter containers, 220–224 | Both forms yield Invalid for nil, a string, a non-keyword list, and an integer. | “malformed argument containers … return structured input errors.” Nil is not required to fail specifically as a malformed container: treating it as no arguments still must fail because this fixture has required arguments. |
+| Malformed sort containers, 227–230 | String, non-keyword list, and integer argument containers yield Invalid through `sort_input`. | Same explicit malformed-container requirement across sorts. |
+| Unknown names, 233–236 | Integer, undeclared string, and undeclared atom names yield Invalid. | “unknown arguments … return structured input errors.” The check permits any appropriate invalid-input leaf error. |
+| Normalized literals, 239–256 | A trimmed scalar and a custom string-to-map cast both load true beside an expression; their direct filters and a nested scalar calculation return both matching-title records and no other title. | “cast and constrained values survive beside expressions.” The custom type exposes discarded normalization or inappropriate recasting through observable values; no cast count or wrapper is asserted. |
+| Nil/default semantics, 259–267 | With both literal and expression siblings, a blank string normalized to nil fails required arguments with and without a default; optional normalized nil succeeds; an omitted callback default succeeds; a valid trimmed literal succeeds. | Explicit “required/optional/default … including values normalized to nil,” plus source rules that defaults apply only to absent input. |
+| Ordinary coercion, 270–272 | Explicit `type(" match ", :string)` preserves surrounding spaces. | Explicit “Preserve … expression coercion.” `Ash.Type.String.coerce/2` visibly uses `allow_empty?: true, trim?: false`; calculation literal normalization must not change that behavior. |
+| Callback rejection matrix, 369–377 | Scalar constraint, array cast, array constraint, and nested-array cast rejections yield Invalid through each of load, filter, and sort (12 combinations). | Explicit custom-type rejection and scalar/array consistency requirements, including supported `:error` callbacks. Nested arrays are already supported by `Ash.Type`. |
+| Valid custom populations, 380–395 | For scalar, array, and nested-array normalized values: both records remain present on load with true/false results; filters return exactly the matching record; descending sorts preserve both and order true before false. | Valid cast/constrained values and ordinary calculation/filter/sort semantics. The checks rule out blanket rejection, lost records, and constant calculation results. |
+| Callback messages, 398–401 | The public result is Invalid and its message includes the reason supplied by the callback. | Structured custom-type errors plus preservation of existing string-error propagation in `query.ex`. The asserted text is fixture-provided diagnostic data, not a framework wording requirement. |
+
+All 13 required identifiers in `case.json` match the grouped acceptance tests. The three declared requirement entries collectively map to every acceptance group. The four declared starting-failure identifiers are included in that set; whether they actually fail at the base is left to runtime qualification.
+
+## Upstream supplemental tests and preservation
+
+Both curated fixture/setup blocks are byte-identical to those in `reference-tests.patch` after the two module renames. The supplemental upstream assertions cover the same requirements:
+
+- Literal-array nested/direct/map/tuple filters and loads correspond to the first curated group.
+- String-keyed literal loads/filters/sorts correspond to the second group.
+- Array-valued expressions correspond to the third group.
+- User-input acceptance/rejection, malformed filters/sorts, and unknown names correspond to groups four through seven.
+- Trimmed scalars, custom cast/constrained maps, literal siblings, normalized nil, default callbacks, ordinary coercion, and nested scalar filters correspond to groups eight through ten.
+- Twelve callback-rejection combinations, three valid custom-type populations, and callback message retention correspond to groups eleven through thirteen.
+
+The upstream file additionally requires a specific `NoSuchInput` leaf and the existing `"does not support expressions"`/`"is required"` substrings. Those are recognizable source conventions, but the curated solver acceptance appropriately does not make their exact spelling or leaf type a condition of success. The grading commands do not independently name `reference-tests.patch`; supplemental oracle tests must not silently become additional solver obligations.
+
+Existing `test/calculations` and `test/sort/sort_test.exs` provide relevant preservation coverage. Their configured seed and bounded concurrency are compatible with functional qualification. This review does not establish their execution result.
+
+## Coverage limits and fixture assessment
+
+No blocking missing obligation or unfair implementation assumption was found. Coverage samples the contract rather than enumerating every combination. Indexed-map arrays, explicit nil, MFA defaults, direct rejection when an argument itself disallows expressions, and every malformed-input/entry-point combination are not individually covered by these 13 groups. These remain source-supported preservation expectations, not new hidden requirements or a claim of exhaustive validation.
+
+`incomplete.patch` is byte-for-byte the reference implementation patch with only the `lib/ash/sort/sort.ex` section removed. It applies cleanly to the pinned source. Static inspection shows a plausible compilable partial fix: existing sort calls still use the unchanged `from_resource_calculation/3` API, and the removed sort helpers have no callers in retained changes. The partial therefore targets a real omission—sort container normalization/error classification—rather than an obvious unresolved symbol. **Actual compilation and behavioral rejection of that partial remain runtime gates.**
+
+`integrity.patch` introduces a compile-time `System.halt(0)` in a new library file. It is an adversarial harness-integrity fixture, not an implementation candidate or a solver-visible requirement. Whether the harness rejects an early successful process exit without test evidence remains a separate qualification check.
+
+The reference implementation's new option, type-wrapper metadata, and helper decomposition are implementation choices. Acceptance checks do not require them.
+
+## Reviewed package hashes
+
+SHA-256 values identify the exact draft reviewed:
+
+| File | SHA-256 |
+| --- | --- |
+| `case.json` | `b535a1d3befee071f44951272ee376d67e013a86b95fb6ad43e6d6d8ae9b4630` |
+| `ticket.md` | `892d6f1633f36b6a85ec158da2ce1b77401b8ac072b6bc054ba892e9e6192de8` |
+| `acceptance.patch` | `7553bb9c30e0359d7e8d0d3aefd7c69edbc9fa4e8cfcfd728d193d24a45a8328` |
+| `reference.patch` | `06e3d0584c23c9b69a8e473afb55b880339084d4e8a368102eaf40bf34f36430` |
+| `reference-tests.patch` | `ef3d7c8a3392ec08cdf888c0dcd0ec44e564a4bad67b90395bdfecbd48e18e69` |
+| `incomplete.patch` | `552acbfe4db0123df75888198526500028f77caa99694b1c54af491d750bbb1b` |
+| `integrity.patch` | `3b954ff88ed1cfc58d47171917e5c338e8f613c7f046671bad164c0499718f42` |
+
+## Final draft amendment review
+
+Reviewer `/root/contract_review` independently reviewed the amendment supplied by author `/root` on 2026-10-20. **APPROVE the amended package identified by the final hashes below for the contract-review gate.** This approval applies to an immutable candidate containing these exact files; the preceding hash table and patch line references describe the initial draft.
+
+The amendment does not change the requirements-first assessment or assertion mapping:
+
+- `ticket.md` remains byte-identical to the contract read before hidden material.
+- The saved pre-format acceptance body reconstructs the exact previously reviewed patch hash, `7553bb9c30e0359d7e8d0d3aefd7c69edbc9fa4e8cfcfd728d193d24a45a8328`. The formatted body is byte-identical to the body of the final acceptance patch. I independently parsed both bodies with `Code.string_to_quoted!/1` and compared them after recursively removing AST metadata; they are equal. No fixtures, assertions, or test semantics changed.
+- All 13 required test identifiers still match the final acceptance tests, and the requirement links still cover exactly those identifiers.
+- `starting_failures` now contains all ten names reported as failed by the pristine `empty_patch.hidden.test_results` in `exploratory-controls.json`. I compared these sets directly and confirmed that each reported failure phase is `test`. The earlier four-name placeholder was incomplete; retaining the initial invalid qualification evidence and creating a new immutable candidate is the appropriate correction.
+- The environment clarification adds the user's existing functional-only machine constraint, including the prohibition on speed/throughput/latency benchmarks, performance comparisons, and timing commands. It adds no behavioral obligation to the code repair.
+- The reference implementation, upstream supplemental tests, incomplete implementation, and integrity fixture retain their previously reviewed hashes. The provenance record identifies the same source pair.
+
+The final acceptance groups begin at patch lines 182, 204, 232, 244, 265, 277, 284, 293, 321, 352, 451, 464, and 483, respectively, in the same order as the assertion-mapping table above.
+
+### Exploratory evidence inspected
+
+I inspected the named outcomes in `exploratory-controls.json`, which identify the **initial** candidate `a25d3e7fabd6772a0d2ce2de5d5e512a1cd1651d352a5236359f82a86c17c13d`:
+
+| Control | Recorded named outcome |
+| --- | --- |
+| Pristine/empty patch | Hidden suite completed: ten failures and three passes; all ten failures are test-body failures. Preservation completed with 117 passes. |
+| Reference patch | Hidden suite completed with 13 passes; preservation with 117 passes; submitted suite with 170 passes. |
+| Partial repair | Hidden suite completed with only the malformed-sort group failing; preservation and submitted suites each completed with 117 passes. This supplies execution evidence that the partial compiled and reached the intended behavior check. |
+| Early exit | Rejected; no completed suites or named test results were credited. |
+
+These observations support the manifest correction and the intended positive/negative controls. They do **not** make the initial four-name qualification valid, and they do **not** substitute for the three fresh qualification rounds on the amended candidate. Those final rounds were still a separate pending gate at this addendum. I ran only source parsing and read-only comparisons during this amendment review, not tests, builds, or measurements.
+
+### Final reviewed hashes
+
+I recomputed each SHA-256 value and confirmed an exact match with `final-draft-hashes.json`.
+
+| File | SHA-256 |
+| --- | --- |
+| `case.json` | `a62afa198835702983c6e0a6c2646875583ba9445aab1cf164cd0c3aeee0d2d6` |
+| `ticket.md` | `892d6f1633f36b6a85ec158da2ce1b77401b8ac072b6bc054ba892e9e6192de8` |
+| `acceptance.patch` | `9537f29ab5b06ef1b5364efd6eaa1695b386d4fe540047c0f94a24228fb39281` |
+| `reference.patch` | `06e3d0584c23c9b69a8e473afb55b880339084d4e8a368102eaf40bf34f36430` |
+| `reference-tests.patch` | `ef3d7c8a3392ec08cdf888c0dcd0ec44e564a4bad67b90395bdfecbd48e18e69` |
+| `incomplete.patch` | `552acbfe4db0123df75888198526500028f77caa99694b1c54af491d750bbb1b` |
+| `integrity.patch` | `3b954ff88ed1cfc58d47171917e5c338e8f613c7f046671bad164c0499718f42` |
+| `provenance.json` | `58117a715899847d92340a05af5dc0e2f79b2a3bd1b500e429f83eb9d97c2257` |
+
+## Output-environment amendment review
+
+Reviewer `/root/contract_review` independently reviewed the further amendment supplied by author `/root` on 2026-10-20. **APPROVE the contract and environmental-neutrality review for candidate `bf2535232342395525e8e45651fbdf3a45f846d7a0b23eca537322e98d90a691`, bound to the hashes below.** This is not approval of its still-separate runtime qualification or model-run gates.
+
+I inspected the new `environment.patch`, its retained adapter source and diagnostic test sources, the amended manifest, both hash inventories, and `reporter-interleaving.json`. I recomputed all nine final file hashes. Only `case.json` changed and `environment.patch` was added relative to `unbuffered-draft-hashes.json`. Removing the two newly appended output/concurrency sentences from the manifest reproduces the exact previously reviewed manifest hash. The ticket, acceptance assertions, reference implementation, upstream tests, incomplete control, integrity control, and provenance are byte-identical to the preceding reviewed draft.
+
+### Reason for the amendment
+
+The two retained unbuffered receipts identify candidate `8a1b0882a61f1a172d54bedac4854c316ac1f37784eaf2776bf7e543aa922d38`. Their recorded raw lines differ by a CLI progress dot before one `EAB_FAILURE_PHASE` record. Independent comparison of the named outcomes finds that the second receipt loses the corresponding phase in the reference regression probes and changes the derived detected-test list. Their other control outcomes agree, but this is scoring-relevant evidence loss. The record marks the repeatability gate failed, preserves both receipts, and records no model attempts. These receipts do not qualify the corrected candidate.
+
+### Environmental neutrality and scope
+
+The environment patch installs a group-leader IO proxy before `ExUnit.start/1`, and sets the default `max_cases` to two. It does not alter Ash implementation files, the reporters, calculation fixtures, test selection, assertions, or grading expectations. Two-case concurrency is consistent with the user's bounded-concurrency instruction and the existing suite commands; the added default also covers probes without command-specific overrides.
+
+The adapter groups buffered characters by requesting process and emits each writer's complete lines. Its only content boundary is a newline. It contains no test-name, reporter-name, marker-prefix, pass/fail, exception-phase, or expected-outcome recognition. Non-write IO requests are delegated. Remaining partial output is flushed through the global exit callback, not when individual writers exit; it is not selectively discarded or rewritten into result records. A failed final flush raises rather than pretending the output completed. The retained `line-buffered-io.exs` is byte-identical to the module introduced by the patch, with SHA-256 `b633f083b402c4c79e44783eff3d5b2333d8f23895745c1bb3bf90f40482ca96`.
+
+This deliberately changes when partial output appears and the interleaving of different writers; the solver-visible environment clarification discloses that buffering. Per-writer order and character content are retained on successful writes. Independent writer fragments can remain pending until finalization, so this is not a general preservation claim about cross-writer chronology or every possible interactive IO session. Processes already using another group leader and writes to other devices remain outside this adapter's interception scope. None of those boundaries adds an unstated calculation requirement or favors the reference implementation.
+
+The five diagnostic test sources exercise departed partial writers, supported write forms and Unicode, delegated non-write requests, write/flush failures, and proxy death. The retained actual-reporter diagnostic requires 40 completed test records, 20 assertion failures, and all failure phases/types. These are appropriate functional checks for the amendment. I reviewed their source but did not independently rerun them or treat their author's reported success as completion of the corrected candidate's qualification.
+
+The original requirements-first findings and all 13 assertion mappings remain applicable without revision. No new unfair solver obligation or contract mismatch was found. Three fresh, fully compared qualification rounds for this exact candidate remain required; previous successful control outcomes cannot be carried over as those rounds. I ran no qualifications, models, tests, builds, speed measurements, or folder moves during this amendment review.
+
+### Reviewed output-environment package hashes
+
+These recomputed values match the updated `final-draft-hashes.json`:
+
+| File | SHA-256 |
+| --- | --- |
+| `case.json` | `cb76a4a93c40c7f9d29936d425e56a323fbcec1513a589410b4c7c07fddeba25` |
+| `environment.patch` | `35a2076b4206bb61ca094cedd2dc3a91243a36c659838940a0aedbcca3da4bd9` |
+| `ticket.md` | `892d6f1633f36b6a85ec158da2ce1b77401b8ac072b6bc054ba892e9e6192de8` |
+| `acceptance.patch` | `9537f29ab5b06ef1b5364efd6eaa1695b386d4fe540047c0f94a24228fb39281` |
+| `reference.patch` | `06e3d0584c23c9b69a8e473afb55b880339084d4e8a368102eaf40bf34f36430` |
+| `reference-tests.patch` | `ef3d7c8a3392ec08cdf888c0dcd0ec44e564a4bad67b90395bdfecbd48e18e69` |
+| `incomplete.patch` | `552acbfe4db0123df75888198526500028f77caa99694b1c54af491d750bbb1b` |
+| `integrity.patch` | `3b954ff88ed1cfc58d47171917e5c338e8f613c7f046671bad164c0499718f42` |
+| `provenance.json` | `58117a715899847d92340a05af5dc0e2f79b2a3bd1b500e429f83eb9d97c2257` |
+
+## User-requested fork source amendment review
+
+Reviewer `/root/contract_review` independently reviewed the fork-source amendment supplied by author `/root` on 2026-10-20. **APPROVE the contract and source-neutrality review for candidate `66b3546266deff378786cf94a92d5b2257978678ef948e38c8eb2952e8093a5b`, bound to the eight hashes below.** This follows the user's explicit preference to use `Cinderella-Man/ash` with a prepared branch and minimal benchmark adaptation.
+
+I inspected the pinned Git objects, their complete changed-path inventories, the baseline preparation diff, the reference diff, the manifest/provenance changes, and the final package hashes. The source pair is:
+
+| Role | Revision | Tree |
+| --- | --- | --- |
+| Fork baseline, `codex/ash-pr-3031-benchmark` | `91d0b01085167e31193e93541623ef48c9f762b8` | `9b0b0a5718f7fd79e433d5352d168d4bd418ea38` |
+| Fork reference, `codex/ash-pr-3031-reference` | `ef09550410abc5444c3efc41b4c4b0f7c5a7c12a` | `95448ccaa26708ff6906f9126be34628fd1e5c60` |
+
+The baseline's sole parent is the original solver revision `abc634f5a725fadad850dacefc4284dd1d803fad`. Its complete diff changes only `.tool-versions`, `test/test_helper.exs`, and the new `test/support/line_buffered_io.exs`. There are no calculation implementation changes or new calculation regression assertions in this baseline. The upstream added calculation test file is absent.
+
+The adapter body is byte-identical to the independently reviewed adapter; only an SPDX copyright/license header is added. The helper installs it before ExUnit starts and sets `max_cases: 2, seed: 0`. The tool-version declarations now match the existing pinned runtime: Elixir `1.20.2-otp-29` and Erlang `29.0.5`; the `pipx` declaration is unchanged. This moves already-reviewed preparation into visible source without repairing the calculation bug. The previous adapter neutrality assessment and its IO boundaries continue to apply.
+
+The reference commit's sole parent is the prepared baseline. Its entire diff contains the same five implementation files and one added upstream calculation-test file reviewed originally. I independently compared the generated implementation diff byte-for-byte with `reference.patch` and the generated test-file diff byte-for-byte with `reference-tests.patch`; both match. Its author identity, author date, and subject match the accepted upstream commit `190987ec134a6a01b72d3eb8d9dcb26577b15873`. Thus the runtime preparation is common to both sides of the fork comparison, and the repair remains unchanged.
+
+The manifest now pins `https://github.com/Cinderella-Man/ash.git` at the prepared baseline. Provenance names [fork PR #1](https://github.com/Cinderella-Man/ash/pull/1) and the fork reference revision, while retaining [upstream PR #3031](https://github.com/ash-project/ash/pull/3031) and its revisions as inspiration. These links identify the recorded provenance; this review's identity checks use the immutable local Git objects.
+
+The only grading-command changes remove the explicit seed/concurrency flags from the two focused `mix test` commands. The test paths are unchanged, and the visible baseline now supplies those same defaults. Required tests, starting-failure inventory, requirement mappings, protected paths, timeout, pinned runtime image, and environment restrictions remain unchanged. No `environment.patch` exists in the final draft.
+
+The ticket, acceptance patch, reference patch, upstream test patch, incomplete control, and integrity control retain their previously reviewed hashes. All eight recomputed hashes match `final-draft-hashes.json`. The original requirements-first assessment and all 13 hidden assertion mappings therefore remain valid. No new unfair obligation or repair-scope change was found.
+
+This approval does not transfer qualification from any prior source pair. The fork candidate requires its own source/runtime qualification, three-round evidence comparison, and subsequent model-run gates. Any old candidate round allowed to finish remains evidence for its own version. I ran no qualifications, models, tests, builds, measurements, or folder moves during this review.
+
+### Reviewed fork package hashes
+
+| File | SHA-256 |
+| --- | --- |
+| `case.json` | `940f2d3bdc5ee837fe4db4504ff44a46aa9ef2682afb795605dbb9e1ddaa9736` |
+| `ticket.md` | `892d6f1633f36b6a85ec158da2ce1b77401b8ac072b6bc054ba892e9e6192de8` |
+| `acceptance.patch` | `9537f29ab5b06ef1b5364efd6eaa1695b386d4fe540047c0f94a24228fb39281` |
+| `reference.patch` | `06e3d0584c23c9b69a8e473afb55b880339084d4e8a368102eaf40bf34f36430` |
+| `reference-tests.patch` | `ef3d7c8a3392ec08cdf888c0dcd0ec44e564a4bad67b90395bdfecbd48e18e69` |
+| `incomplete.patch` | `552acbfe4db0123df75888198526500028f77caa99694b1c54af491d750bbb1b` |
+| `integrity.patch` | `3b954ff88ed1cfc58d47171917e5c338e8f613c7f046671bad164c0499718f42` |
+| `provenance.json` | `a01bca47e239f862139ec78d4ae3488ba65ef6bb6656153092cb5a07925e5bb9` |

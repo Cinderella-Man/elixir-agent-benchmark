@@ -2,7 +2,7 @@
 
 ## Case curation
 
-When adding a benchmark case, resuming an unfinished candidate, or finishing a curation batch, follow [the case curation workflow](docs/case-curation-loop.md). It defines temporary folder moves, fixture qualification, two fresh benchmark runs with Astra as the LLM solver, evidence review, and restoration before merging. Carry out the requested scope without asking the user to explain this workflow again.
+When adding a benchmark case, resuming an unfinished candidate, changing an existing case's source or preparation, or finishing a curation batch, follow [the case curation workflow](docs/case-curation-loop.md). Every runnable case must use a prepared branch in the user's fork. The workflow defines isolation, qualification, solver validation, explicit user overrides and restoration. For screening and preservation-check design, or unexpected qualification/model results, consult [curation diagnostics and lessons](docs/curation-lessons.md).
 
 ## Shared machine constraint
 

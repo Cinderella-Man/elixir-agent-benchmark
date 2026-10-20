@@ -34,3 +34,5 @@ The [sanitized run evidence](astra-results.json) contains named results and inpu
 The three independent control exports are [round 1](qualification-round-1.json), [round 2](qualification-round-2.json) and [round 3](qualification-round-3.json). Private raw preparation, control and model records remain in the persistent controller data volume; credentials, account identifiers and raw model traces are not included here.
 
 Moving this folder back into `cases/` requires no case or configuration changes. Admission binds file contents, not the holding-folder path.
+
+**Prepared-source policy, 2026-10-20:** runnable additions and source migrations must follow [prepared fork sources](../../../docs/prepared-fork-sources.md). This record retains its original source versions and outcomes; [the later fork audit](../../prepared-forks-2026-10-20/README.md) records branch reuse and any new migration evidence separately.

@@ -3,6 +3,8 @@
 **Case-prep status:** deep-inspected 2026-10-19 (API + raw diff + commit history).  
 **Verdict:** strong coordinated-fix case (5 impl files). **New test file does NOT need PostgreSQL** (`Ash.DataLayer.Ets`). Watch three later commits to the same files within three days.
 
+**Curation update, 2026-10-20:** the dossier below preserves discovery-time evidence. The case uses the accepted squash commit's actual first parent `abc634f5a725fadad850dacefc4284dd1d803fad`, rather than the older PR branch base listed below. `LICENSES/MIT.txt` is verified. The three flagged later commits were reviewed and do not belong to this repair. Follow the [curation evidence](../../../verification/case-curation-2026-10-20/ash-pr-3031/README.md) for the authoritative source pair and execution status.
+
 ---
 
 ## 1. Identity
