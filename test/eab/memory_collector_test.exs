@@ -115,6 +115,71 @@ defmodule Eab.MemoryCollectorTest do
     end
   end
 
+  test "Maya's Strata build metadata identifies the runtime without a health service field",
+       ctx do
+    original = ctx.opts[:http]
+
+    http = fn endpoint, key, route ->
+      if route == "/health",
+        do: %{"status" => "ok", "version" => "maya-fixture"},
+        else: original.(endpoint, key, route)
+    end
+
+    state = Collector.open(ctx.request, Keyword.put(ctx.opts, :http, http))
+    assert Collector.identity(state)["backend"] == "strata"
+    assert elem(Collector.sample(state), 0)["vram_bytes"] == 300 * 1_048_576
+  end
+
+  test "llama.cpp uses the same service and GPU counters", ctx do
+    original = ctx.opts[:http]
+
+    http = fn endpoint, key, route ->
+      case route do
+        "/health" -> %{"status" => "ok"}
+        "/props" -> Map.put(original.(endpoint, key, route), "build_info", "llama.cpp fixture")
+      end
+    end
+
+    state =
+      Collector.open(
+        Map.put(ctx.request, "backend", "llama_cpp"),
+        Keyword.put(ctx.opts, :http, http)
+      )
+
+    assert Collector.identity(state)["backend"] == "llama_cpp"
+    sample = elem(Collector.sample(state), 0)
+    assert sample["vram_bytes"] == 300 * 1_048_576
+    assert sample["service_ram_bytes"] == 50000
+  end
+
+  test "records all GGUF shards once, leaving missing files unknown", ctx do
+    first = Path.join(ctx.proc, "model-IQ3_S-00001-of-00002.gguf")
+    second = Path.join(ctx.proc, "model-IQ3_S-00002-of-00002.gguf")
+    File.write!(first, "123")
+    File.write!(second, "45678")
+    File.write!(Path.join(ctx.proc, "unrelated.gguf"), "ignored")
+    original = ctx.opts[:http]
+
+    http = fn endpoint, key, route ->
+      props = original.(endpoint, key, route)
+      if route == "/props", do: Map.put(props, "model_path", first), else: props
+    end
+
+    state =
+      Collector.open(
+        Map.put(ctx.request, "artifact", Path.basename(first)),
+        Keyword.put(ctx.opts, :http, http)
+      )
+
+    weights = Collector.identity(state)["weight_files"]
+    assert weights["size_bytes"] == 8
+    assert Enum.map(weights["files"], & &1["name"]) == Enum.map([first, second], &Path.basename/1)
+    refute JSON.encode!(weights) =~ ctx.proc
+    File.rm!(second)
+    assert Collector.identity(state)["weight_files"] == nil
+    assert Collector.identity(Collector.open(ctx.request, ctx.opts))["weight_files"] == nil
+  end
+
   test "GPU allocations aggregate service processes by physical UUID and reject unavailable counters" do
     cards = [["b", "3090", "24576"], ["a", "3090", "24576"]]
     apps = [["b", "10", "100"], ["a", "10", "200"], ["a", "11", "30"], ["a", "99", "500"]]

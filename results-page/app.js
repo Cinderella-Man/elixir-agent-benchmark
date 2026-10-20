@@ -160,6 +160,7 @@
       if (r.resources) label.append(node("span", "point-memory", r.resources.kind === "run_samples" ?
         `${gb(vram(r))} VRAM · ${gb(r.resources.peak_ram_bytes)} RAM · ${r.resources.coverage === "complete" ? "run peaks" : "partial samples"}` :
         `${gb(vram(r))} VRAM · ${gb(r.resources.service_ram_lifetime_peak_bytes ?? r.resources.ram_lifetime_peak_bytes)} RAM peak¹`));
+      else if (!hosted(r)) label.append(node("span", "point-memory", "RAM / VRAM not recorded"));
       if (records.filter(other => other.model.name === r.model.name && other.model.quantization === r.model.quantization).length > 1) {
         label.append(node("span", "point-meta", `${r.created_at.slice(0, 10)} · ${r.run_id.split("-").at(-1)}`));
       }

@@ -7,6 +7,25 @@ defmodule Eab.Results.Resources do
   @sampled ~w(kind started_at finished_at gpus peak_vram_bytes peak_ram_bytes peak_rss_bytes peak_combined_bytes sample_count interval_ms session_count coverage gap_count) ++
              @identity
 
+  def weight_size(nil, _artifact, _backend), do: nil
+
+  def weight_size(memory, artifact, backend) do
+    sizes =
+      for session <- memory["sessions"] || [], session["sample_count"] > 0 do
+        identity = session["identity"] || %{}
+        size = get_in(identity, ["weight_files", "size_bytes"])
+
+        if identity["model_artifact"] == artifact and identity["backend"] == backend and
+             is_integer(size) and size > 0,
+           do: size
+      end
+
+    case Enum.uniq(sizes) do
+      [size] -> size
+      _ -> nil
+    end
+  end
+
   def from_run!(nil), do: nil
 
   def from_run!(memory) do

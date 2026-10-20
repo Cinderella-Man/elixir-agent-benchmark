@@ -186,6 +186,29 @@ defmodule Eab.ResultsTest do
     assert_raise ArgumentError, ~r/physical GPUs/, fn ->
       Results.export!(put_in(source, ["memory", "sessions"], [session, other]))
     end
+
+    # Servers may omit weight size even though the collector can stat the model files.
+    source = put_in(source, ["model", "metadata"], %{})
+    assert Results.export!(source)["model"]["size_bytes"] == nil
+
+    weights = %{
+      "size_bytes" => 1234,
+      "files" => [%{"name" => identity["model_artifact"], "size_bytes" => 1234}]
+    }
+
+    source =
+      put_in(source, ["memory", "sessions", Access.at(0), "identity", "weight_files"], weights)
+
+    result = Results.export!(source)
+    assert result["model"]["size_bytes"] == 1234
+    assert result["model"]["size_source"] == "artifact_files"
+    refute Map.has_key?(result["resources"], "weight_files")
+    assert Results.export!(source, size_bytes: 5678)["model"]["size_bytes"] == 5678
+    assert Results.export!(source, size_bytes: 5678)["model"]["size_source"] == "owner_supplied"
+
+    reported = put_in(source, ["model", "metadata"], %{"model" => %{"size" => 9876}})
+    assert Results.export!(reported)["model"]["size_bytes"] == 9876
+    assert Results.export!(reported)["model"]["size_source"] == "reported"
   end
 
   test "incomplete, partial, mismatched and duplicated runs cannot be published" do
