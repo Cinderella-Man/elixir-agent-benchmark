@@ -33,6 +33,12 @@ assert json.loads((active/'admission.json').read_text())['candidate']['version']
 rpc('s=Eab.Runs.snapshot(); unless is_nil(s.active) and not s.cleaning and is_nil(s.cleanup_error), do: raise("Controller busy")')
 with (work/'build-amended-singleton.log').open('w') as output:
     run(['docker','compose','up','--build','-d'],stdout=output,stderr=subprocess.STDOUT)
+for _ in range(20):
+    ready=subprocess.run(['docker','compose','exec','-T','benchmark','bin/eab','rpc',
+        'IO.puts("CONTROLLER_READY")'],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    if ready.returncode==0 and 'CONTROLLER_READY' in ready.stdout:break
+    time.sleep(3)
+else:raise RuntimeError('Controller did not become ready; no model was launched')
 run(['docker','cp',str(v),f'{container}:/tmp/ash-validation'])
 rpc('unless Eab.Inventory.all() == ["ash-pr-3031"], do: raise("Not singleton"); Code.eval_file("/tmp/ash-validation/install-validation-observer.exs")')
 print('Admitted singleton rebuilt; disabled observer installed; starting blind pair',flush=True)

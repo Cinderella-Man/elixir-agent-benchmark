@@ -1,0 +1,9 @@
+# Binding solver runs to qualification
+
+Independent Standards review by `/root/standards_review`, 2026-10-20, found that comparing qualification rounds only with each other and solver runs only with each other left a gap: a rebuilt runtime between those stages could receive one ordinary qualification and inherit credit for three earlier rounds.
+
+The corrected `evidence-binding.exs` ensures the current runtime before preflight, compares all three checksummed receipts against its qualification identity, source and runtime fields, and compares complete normalized named outcomes. An offline, read-only Git inspection of that exact image checks its prepared source tree against the pinned fork tree. The binding must remain unchanged between launches. Export requires each solver's saved qualification identity, outcomes and runtime to match that binding and records the three receipt hashes.
+
+The reviewer rechecked the correction against the actual Runner artifact formats, found the blocker resolved and reported no further concrete blocker. The review was read-only. Runtime fields intentionally exclude `fixture_hashes`, because exporting a schema-v2 admission adds `admission.json`; the active/frozen bundle is verified separately.
+
+The amended Ash preflight executed successfully before its first new model run. It reused the same prepared image and verified its exact fork tree. The earlier automatic continuation stopped at a controller-startup RPC readiness failure before installing the observer or launching a model. After confirming controller idleness, singleton inventory and the absence of a new attempt, the observer and strengthened preflight were installed and the ordinary pair driver was launched manually. The continuation utility now waits for a successful read-only readiness probe after recreation.

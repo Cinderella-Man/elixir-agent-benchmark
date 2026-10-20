@@ -12,7 +12,7 @@ The current immutable candidate is **`923f2acf250e8b9e79afbda9cd56fce6e383aed747
 
 ## Current execution checkpoint
 
-All 13 original bundles remain parked unchanged under `cases_approved/`, with complete hashes in [original-inventory.json](original-inventory.json). The superseded admitted Ash bundle is preserved at `.local/ash-curation/superseded-admitted-66b3546` and in commit `ae0aaabd`; it is not an approved addition. The checkout and rebuilt controller currently have **empty active inventories** while the amended draft is qualified. The controller currently uses its normal observer; the disabled observer must be reinstalled before either new model run.
+All 13 original bundles remain parked unchanged under `cases_approved/`, with complete hashes in [original-inventory.json](original-inventory.json). The superseded admitted Ash bundle is preserved at `.local/ash-curation/superseded-admitted-66b3546` and in commit `ae0aaabd`; it is not an approved addition. The checkout and rebuilt controller currently contain only the admitted amended Ash case. The disabled timing observer is installed in the validation controller.
 
 Fresh ordinary Astra run **`20261020-145143-810635d8`** completed under candidate `66b3546266deff378786cf94a92d5b2257978678ef948e38c8eb2952e8093a5b`, passed its original official grader, and used 40 calls / 13,823 generated tokens. Sealed completion/submission verification and all named outcomes are retained in [astra-1.json](astra-1.json), with the sealed [patch](astra-1.patch). This was the first model attempt; no model attempt occurred on earlier drafts.
 
@@ -20,9 +20,11 @@ Fresh ordinary Astra run **`20261020-145143-810635d8`** completed under candidat
 
 The superseded version's three valid, matching qualification rounds remain under [superseded-66b3546](superseded-66b3546/), with its exact original input hashes. Those rounds are not credited to the strengthened version.
 
-The amendment was imported and its genuine independent review recorded through `Candidates`. **Three fresh rounds are running sequentially** via `import-preservation-amendment.exs`, currently in round one. The private candidate/current-pointer records are under `/data/curation/ash-pr-3031/`; the candidate version is shown above. Host progress is `.local/ash-curation/qualification-amendment.log`; raw receipts and matching outcomes will be saved under the version-specific private prefix. No model is active at this checkpoint and no model has run on this amended version. A host continuation process (`continue-preservation-amendment.py`, log `.local/ash-curation/amendment-continuation.log`) is waiting for the three-round completion markers. It will validate/export admission, rebuild singleton inventory, reinstall the disabled observer, and launch the two fresh ordinary runs using `run-fresh-pair.exs`. It stops on a qualification, grading, cleanup, or identity error; final independent patch review remains manual. Inspect that process/log before starting duplicate work.
+The amendment passed **three fresh qualification rounds with identical named outcomes**, including completion and failure phases/types. Their sanitized receipts are `qualification-round-1.json` through `qualification-round-3.json`. Admission was exported and verified. The current image still matches the exact prepared fork tree.
 
-Next: finish the three full fresh rounds and compare all named outcomes, including both probes and failure phases/types. Export admission, activate only this case, rebuild, reinstall the disabled observer, run preflight, and collect two new ordinary blind Astra runs under matching frozen inputs. Retain the earlier rejected attempt in the final evidence. Review both new sealed patches/results, restore all 14 bundles and the normal controller, freeze the restored release, commit/push the Ash completion, then proceed with the fork audit below.
+The first fresh amended-version run is **`20261020-160506-224bb2fa`**, launched through the ordinary Pi runner. The sequential pair driver is active; host progress is `.local/ash-curation/fresh-pair-amended.log`. It will launch the second run only after the first has completed, passed official grading and fully cleaned up. Inspect the current private `astra-runs.json` before starting any work to avoid duplicates. The earlier continuation stopped on a controller-startup RPC readiness failure before any new model attempt; manual recovery confirmed idleness and installed the disabled observer. See [evidence-binding-review.md](evidence-binding-review.md).
+
+Next: finish both fresh ordinary runs, verify their saved qualifications/runtimes against the three reviewed rounds, and independently review both sealed patches. Retain the earlier rejected attempt. Restore all 14 bundles and the normal controller, freeze the restored release, commit/push the Ash completion, then proceed with the fork audit below.
 
 ## Authorized follow-on work
 
@@ -46,11 +48,12 @@ The reporting issue and neutral per-writer line-buffer correction are documented
 
 ## Verification utilities
 
-Copy the relevant `.exs` scripts together into the controller and run with `bin/eab rpc 'Code.eval_file("/tmp/<directory>/<script>.exs")'`. `repeat-qualification.exs`, `export-qualification.exs`, and `validation-preflight.exs` require the sibling `qualification-outcomes.exs`. Utilities use the retained current-candidate pointer and refuse invalid gate transitions.
+Copy the relevant `.exs` scripts together into the controller and run with `bin/eab rpc 'Code.eval_file("/tmp/<directory>/<script>.exs")'`. `repeat-qualification.exs`, `export-qualification.exs`, and `validation-preflight.exs` require the sibling `qualification-outcomes.exs`. Preflight and model export also require `evidence-binding.exs`. Utilities use the retained current-candidate pointer and refuse invalid gate transitions.
 
 - `qualification-outcomes.exs` compares all controls, completed named tests, failure phases/types and both model-test probes.
 - `repeat-qualification.exs` archives cache receipts before fresh rounds; `export-qualification.exs` exports their sanitized evidence.
 - `install-validation-observer.exs` installs the sibling `validation-measurement.ex` only in the idle singleton controller. `validation-preflight.exs` verifies admission, candidate identity, three receipts and disabled timing.
+- `evidence-binding.exs` binds all three fresh receipts, the verified image source tree, and each saved solver qualification/runtime to one stable preflight.
 - `run-fresh-pair.exs` starts exactly two new ordinary runs sequentially, waits for full grading/cleanup, preserves every run ID, and stops for review on any failure. It verifies frozen inputs before each launch and exports passing results for independent patch review.
 - `start-astra.exs` launches the actual ordinary Pi runner with `gpt-6-astra`, high reasoning, 262144 generated-token response-boundary soft threshold, no compaction and no automatic retries. It records each run ID immediately and permits only the requested two launches.
 - `export-astra.exs` verifies sealed completion/submission receipts, all grading dimensions, behavioral pristine probes, matching frozen inputs, distinct fresh contexts, usage ledgers, and disabled observer records; it exports both model patches.

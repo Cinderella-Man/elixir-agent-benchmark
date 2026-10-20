@@ -7,6 +7,9 @@ unless length(run_ids) == 2, do: raise("Expected two new model runs")
 out = "/tmp/ash-astra-evidence"
 File.mkdir_p!(out)
 
+Code.require_file("qualification-outcomes.exs", __DIR__)
+Code.require_file("evidence-binding.exs", __DIR__)
+preflight = Store.read("#{prefix}/preflight.json")
 records = for {run_id, n} <- Enum.with_index(run_ids, 1) do
   run = Store.run(run_id)
   unless run["status"] == "completed" and run["cleanup_pending"] == false,
@@ -22,6 +25,7 @@ records = for {run_id, n} <- Enum.with_index(run_ids, 1) do
   unless attempt["measurement"] == %{"disabled" => "functional_validation_machine_policy"},
     do: raise("Unexpected timing data")
   base = "runs/#{run_id}/#{id}"
+  binding = Curation.EvidenceBinding.verify_run!(base, preflight, &AshCuration.Outcomes.normalize/1)
   for file <- ~w(attempt.json agent-progress.json) do
     saved = Store.read("#{base}/#{file}")
     unless saved["measurement"] == %{"disabled" => "functional_validation_machine_policy"} and
@@ -54,6 +58,7 @@ records = for {run_id, n} <- Enum.with_index(run_ids, 1) do
     "scope" => run["cases"], "model" => run["model"]["model"], "settings" => run["settings"],
     "agent" => attempt["agent"], "agent_image" => attempt["agent_image"],
     "calls" => attempt["calls"], "generated_tokens" => output,
+    "qualification_binding" => binding,
     "completion_receipt_verified" => true, "usage_ledger_verified" => true,
     "measurement" => attempt["measurement"],
     "compaction_enabled" => false, "automatic_retries" => 0,
@@ -79,14 +84,13 @@ records = for {run_id, n} <- Enum.with_index(run_ids, 1) do
   }
 end
 [first, second] = records
-for key <- ~w(release_id experiment_id scope model settings agent agent_image frozen_hashes initial_request_without_session_hash) do
+for key <- ~w(release_id experiment_id scope model settings agent agent_image frozen_hashes qualification_binding initial_request_without_session_hash) do
   unless first[key] == second[key], do: raise("Frozen inputs differ: #{key}")
 end
 [a, b] = Enum.map(run_ids, &Store.read("runs/#{&1}/#{id}/request-0000.json"))
 unless is_binary(a["prompt_cache_key"]) and is_binary(b["prompt_cache_key"]) and
     a["prompt_cache_key"] != b["prompt_cache_key"],
   do: raise("Expected distinct fresh session keys")
-preflight = Store.read("#{prefix}/preflight.json")
 record = %{
   "schema" => 1, "functional_validation_only" => true,
   "two_fresh_blind_runs" => true, "distinct_session_keys" => true,
