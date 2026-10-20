@@ -63,6 +63,9 @@ records = for {run_id, n} <- Enum.with_index(run_ids, 1) do
       &{&1, Map.take(grade[&1], ~w(passed completed test_results failure_phases failure_types))}),
     "regression_coverage" => grade["regression_coverage"]
       |> Map.take(~w(passed policy reason detected_tests))
+      |> Map.put("test_probe",
+        Map.take(grade["regression_coverage"]["test_probe"],
+          ~w(passed completed test_results failure_phases failure_types)))
       |> Map.put("broken_test_probe",
         Map.take(grade["regression_coverage"]["broken_test_probe"],
           ~w(passed completed test_results failure_phases failure_types))),

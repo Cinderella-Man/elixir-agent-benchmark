@@ -1,13 +1,15 @@
 # Ash #3031 — Validate calculation arguments once and preserve input errors
 
-**Status:** discovered  
+**Status:** in curation as `ash-pr-3031` (2026-10-20)\
 **Source type:** historical PR  
 **Project:** [ash-project/ash](https://github.com/ash-project/ash)  
 **PR:** [#3031](https://github.com/ash-project/ash/pull/3031)  
-**Source revisions:** base `bc4f2bbd99ca4a2077908a49f036a65dc42b5828` → merge `190987ec134a6a01b72d3eb8d9dcb26577b15873`  
+**Source revisions:** actual squash parent `abc634f5a725fadad850dacefc4284dd1d803fad` → merge `190987ec134a6a01b72d3eb8d9dcb26577b15873`\
 **Author:** barnabasJ · **Merged:** 2026-10-15  
 **Task kind / family:** bug_fix / query calculation arguments  
 **Research date:** 2026-10-19
+
+Curation corrected the discovery note's older branch base `bc4f2bbd99ca4a2077908a49f036a65dc42b5828`, which includes unrelated changes. The selected parent-to-squash pair changes five implementation files and one test file. The MIT notice is present at `LICENSES/MIT.txt`. See the [curation evidence](../../../verification/case-curation-2026-10-20/ash-pr-3031/README.md) for current qualification and model-run status.
 
 ## Authentic work
 
