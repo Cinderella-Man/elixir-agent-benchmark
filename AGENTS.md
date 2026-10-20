@@ -2,7 +2,7 @@
 
 ## Case curation
 
-When adding a benchmark case, resuming an unfinished candidate, changing an existing case's source or preparation, or finishing a curation batch, follow [the case curation workflow](docs/case-curation-loop.md). Every runnable case must use a prepared branch in the user's fork; the workflow links the source-preparation procedure. It also defines isolation, qualification, two fresh Astra solver runs, evidence review and restoration before merging.
+When adding a benchmark case, resuming an unfinished candidate, changing an existing case's source or preparation, or finishing a curation batch, follow [the case curation workflow](docs/case-curation-loop.md). Every runnable case must use a prepared branch in the user's fork. The workflow defines isolation, qualification, solver validation, explicit user overrides and restoration. For screening and preservation-check design, or unexpected qualification/model results, consult [curation diagnostics and lessons](docs/curation-lessons.md).
 
 ## Shared machine constraint
 

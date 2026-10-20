@@ -2,6 +2,8 @@
 
 Status: **accepted after the user-authorized single successful run**. Branch `codex/curate-researched-multifile-case`, main base `d9684ec85319e3c86be384f534ddd19af4b10562`. Selected from the already researched Ash 3031 dossier; not previously admitted or rejected. The upstream repair changes five substantive implementation files and one test file.
 
+Reusable process lessons are distilled in [curation diagnostics and lessons](../../../docs/curation-lessons.md). This directory preserves the original evidence and version-specific decisions.
+
 ## Prepared fork
 
 The user requested [Cinderella-Man/ash](https://github.com/Cinderella-Man/ash). The pushed baseline branch is `codex/ash-pr-3031-benchmark` at `91d0b01085167e31193e93541623ef48c9f762b8`; the pushed reference branch is `codex/ash-pr-3031-reference` at `ef09550410abc5444c3efc41b4c4b0f7c5a7c12a`. [Draft fork PR #1](https://github.com/Cinderella-Man/ash/pull/1) records this source pair.
@@ -12,7 +14,7 @@ The current immutable candidate is **`09528c895206c98feddc652314bef1da31dd72ee7e
 
 ## Revised validation scope
 
-The user explicitly reduced this case to **one successful fresh end-to-end Astra run** because of remaining token allowance, and prohibited a second launch. This overrides the normal two-run gate for this case only. The current run is `20261020-165846-d6df94bb`. Its existing solver and frozen inputs are unchanged. The controller-only second-launch script now raises before launch; the private single-run policy records this instruction. If this run passes all validation and patch review, approve it; otherwise retain it for another day. The other migrations remain deferred.
+The user explicitly reduced this case to **one successful fresh end-to-end Astra run** because of remaining token allowance, and prohibited a second launch. This overrode the normal two-run gate for this case only. Run `20261020-165846-d6df94bb` finished with its solver and frozen inputs unchanged. A controller-only launch guard blocked the queued second attempt, and the private single-run policy recorded the instruction. The run passed all validation and patch review and was accepted. The other migrations remain deferred.
 
 ## Completion
 

@@ -36,6 +36,8 @@ Review the new immutable bundle against the visible contract. Existing source mi
 
 Complete three fresh control rounds and two fresh ordinary Astra runs under the [curation policy](case-curation-loop.md). Historical successes and diagnostic replays stay tied to their original releases. They are not fresh blind runs of a changed version.
 
+Any explicit change to the required run count follows the workflow's [user-override policy](case-curation-loop.md#validation-scope-and-user-overrides). Reusable branches, a migrated source manifest and completed validation are separate audit states; see [source-screening lessons](curation-lessons.md#screen-the-exact-source-before-preparing-it).
+
 Bind all three checksummed receipts to the currently ensured runtime and qualification identity. Compare complete named outcomes, completion, failure phases/types and both model-test probes. Before each model launch, verify that identity and the source-tree-verified image. Afterward, require each run's saved `qualification.json` and `runtime.json` to match those receipts; agreement between the two runs alone is insufficient if the runtime changed after qualification.
 
 Review both sealed submissions, retain every attempt, and restore all approved cases with the normal controller observer. Verify every active fork URL, remote baseline/reference identity, source reconstruction, applicable admission and full restored release before committing the completed migration.

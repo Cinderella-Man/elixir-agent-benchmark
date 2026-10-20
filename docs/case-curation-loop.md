@@ -4,6 +4,8 @@ Use this workflow when asked to add cases, finish a candidate, or change an exis
 
 **“Run against Astra” means run the actual benchmark with `gpt-6-astra` as the LLM solver through the ordinary Pi runner.** Fixture qualification without a model, a curator-written solution, and an Astra subagent are not those solver runs.
 
+Before selecting a researched candidate or freezing its checks, use [curation diagnostics and lessons](curation-lessons.md) to check source-pair drift and preservation risks. Return to that guide for reporter discrepancies, runtime/evidence mismatches or surprising solver results.
+
 ## Folder roles
 
 | Location | Purpose |
@@ -22,6 +24,8 @@ Read the worktree status, current case folders and any candidate's verification 
 For an unfinished case from an older branch, inspect its diff first. Import only that candidate's bundle, contract review and case-specific evidence onto the new branch. Main may have moved substantially: keep current harness/configuration code and existing cases. Verify imported admission and qualification evidence against current source, artifact hashes, grader and runtime identities.
 
 Record the original approved case IDs and file hashes before moving them. These establish that restoration preserves every original bundle except explicitly authorized migrations. For a migration, retain the old bundle and record the approved replacement's complete hashes separately.
+
+Record the current authorized candidate count, required solver-run count and stopping condition. Resolve source/preparation and cheap diagnostic uncertainties before scheduling repeated controls or model runs. Reuse applicable reviewed utilities after checking their pinned versions and destinations; a curation task does not require building a new orchestration system.
 
 **Ready:** the branch/base and candidate are identified, existing work is preserved, and any reused evidence has been checked rather than assumed valid.
 
@@ -45,6 +49,8 @@ Develop drafts outside `cases/`. For new cases and existing schema-v2 cases, imp
 
 Complete **three fresh qualification rounds with matching named outcomes**, including completion and failure phases/types, through the applicable path. Each round executes reference, unchanged, incomplete and integrity controls in fresh workspaces/service state. A cached qualification lookup is not another fresh round; preserve the previous receipt outside the cache lookup before repeating controls. Prepared images may be reused.
 
+Inspect the first round's complete named outcomes before scheduling the remaining rounds. Resolve incorrect starting-failure declarations, incomplete reporting or reference failures first; retain exploratory evidence under its actual version. See [qualification diagnostics](curation-lessons.md#diagnose-qualification-before-repeating-expensive-work).
+
 For an unchanged resumed candidate, existing three-round evidence can remain valid after verifying the exact artifacts, receipts, grader, runtime and qualification identity. Record that verification as evidence reuse, not three new executions. Changed inputs require the applicable renewed review and fresh qualification.
 
 Export schema-v2 bundles with `Eab.Candidates.export/2` to `cases/<case-id>/`, including `admission.json`. For a qualified legacy source migration, copy the exact reviewed bundle and retain its equivalent source/review/three-round evidence separately. Rebuild the controller and verify isolation. Both paths use the same manual solver, sealed-submission review and restoration gates. Preserve the qualified upstream reference throughout model validation.
@@ -53,17 +59,25 @@ Export schema-v2 bundles with `Eab.Candidates.export/2` to `cases/<case-id>/`, i
 
 ## 4. Run the benchmark with Astra twice
 
+### Validation scope and user overrides
+
+The default is two reviewed fresh successes. An explicit user instruction can reduce that count for a named case. Record the instruction, case/version, required count and stop condition in its evidence; retain every other gate unless the user explicitly changes it. Report the actual count and exception. Ash 3031's [single-run approval](../verification/case-curation-2026-10-20/ash-pr-3031/README.md#revised-validation-scope) does not change the default for later cases.
+
+When the user narrows scope during execution, block queued future launches before doing other work and verify the guard. If they authorize the current run to finish, leave that run and its frozen inputs unchanged. Adjust evidence export to the authorized count without fabricating a pair or skipping per-run checks. At the requested stopping point, preserve incomplete evidence outside the validated inventory, restore approved cases once idle, and commit the checkpoint; token pressure alone does not authorize extra runs or relaxed checks.
+
+### Launch and review
+
 Use the existing benchmark connection and ordinary **Run benchmark** flow. The established validation settings are `gpt-6-astra`, high reasoning effort, a 262,144 generated-token response-boundary soft threshold, compaction disabled, and no automatic retries. Reuse these unless the user requests another policy; record effective settings and verify the model is available through the benchmark's own connection.
 
 The same flow can be launched through the controller's existing APIs: select the signed-in, plan-enabled account from `Eab.ChatGPTAuth.accounts/0`, find `gpt-6-astra` in `Eab.OpenAI.catalog/1`, build its endpoint with `Eab.OpenAI.endpoint/2`, then call `Eab.Runs.start(endpoint, "", %{"max_tokens" => 262144, "reasoning_effort" => "high"})`. Use the intended saved account if more than one is available. Keep credentials and account identifiers out of committed evidence.
 
-Before each launch, verify the singleton active inventory, admission, controller idleness and disabled timing observer described below. Record the returned run ID immediately. Wait for grading and cleanup before the next launch. Start the second run through the ordinary fresh-run path with the same frozen inputs/settings; **Resume is not a second independent attempt**.
+Before each launch, verify the current authorized scope, singleton active inventory, admission, controller idleness and disabled timing observer described below. Record the returned run ID immediately. Wait for grading and cleanup, then review the sealed patch before the next launch. An official pass alone must not automatically start the next attempt while a preservation concern remains unchecked. Start the second run through the ordinary fresh-run path with the same frozen inputs/settings; **Resume is not a second independent attempt**.
 
 Each solver starts with a fresh context and workspace containing only its ordinary visible task/source. Give it no previous repair, reference solution, hidden check or failure feedback. Keep case files, prompts, settings and effective controller implementation fixed across the pair.
 
 Retain every attempt. Diagnose graded failures against the visible contract and exact assertion; distinguish them from established infrastructure interruptions. A justified retry starts fresh and preserves the failed/interrupted record. If a case or environment correction changes frozen inputs, qualify the corrected version and collect a new matching pair. Missing historical run artifacts mean an unknown outcome, not a pass or a discarded failure.
 
-**Ready for approval:** two fresh runs completed and passed every required grading dimension under matching frozen inputs/settings, with no unresolved case/grader concern.
+**Ready for approval:** the authorized number of fresh runs completed and passed every required grading dimension under the frozen inputs/settings, with reviewed patches and no unresolved case/grader concern. This means two runs by default; any exception is recorded explicitly.
 
 ### Local timing observer
 
@@ -77,9 +91,9 @@ For that implementation, install the disabled source and its compiled module onl
 
 For each pass, verify the sealed submission/completion receipts, final cleanup, patch hashes, usage ledger, completed named acceptance/preservation/submitted results and applicable model-test policy. For bug fixes/features, confirm submitted tests fail in test bodies on pristine source and pass on the repair.
 
-Compare the two releases/experiments, model/settings, agent and runtime identities, frozen prompts/instructions/configuration/qualification, and initial requests excluding distinct session keys. Bind each run's saved qualification identity and complete normalized outcomes to all three reviewed receipts, and its runtime to their image/services/baseline and verified source tree. Agreement between the two model runs alone does not establish that the earlier qualification still applies. Record unavailable provider revision/seed information honestly.
+For multiple required runs, compare releases/experiments, model/settings, agent and runtime identities, frozen prompts/instructions/configuration/qualification, and initial requests excluding distinct session keys. For every run, bind its saved qualification identity and complete normalized outcomes to all three reviewed receipts, and its runtime to their image/services/baseline and verified source tree. Agreement between model runs alone does not establish that the earlier qualification still applies. Record unavailable provider revision/seed information honestly.
 
-Read both submitted patches for correctness, weakened tests and grader shortcuts. A valid implementation may differ from the reference or touch fewer files. Preserve both patches, reviews and sanitized result summaries in the case's verification directory, including all earlier unsuccessful attempts and amendments.
+Read every submitted patch for correctness, weakened tests and grader shortcuts. A valid implementation may differ from the reference or touch fewer files. Preserve all patches, reviews and sanitized result summaries in the case's verification directory, including earlier unsuccessful attempts and amendments.
 
 Once those gates pass, move the **unchanged complete bundle** from `cases/<case-id>/` to `cases_approved/<case-id>/` while the controller is idle. For a migration, preserve the old held bundle outside both active/approved folders before parking its reviewed replacement; do not merge directories. Record bundle hashes and approved status. For a multi-case batch, commit/push the checkpoint on its curation branch, rebuild the controller before the next run, and continue with the next requested candidate. Stop at the requested scope; finishing one candidate does not authorize an open-ended queue.
 
@@ -89,7 +103,7 @@ At batch completion, move every approved case directory from `cases_approved/` b
 
 Verify the original case IDs and complete file hashes against the pre-move record, using each authorized migration's reviewed replacement hashes for that case. Recheck all prepared fork branches against their pinned commits and preserve the recorded excluded bundles/refs. Rebuild/recreate the idle controller from repository source, verify the restored `Eab.Inventory.all()`, check schema-v2 admissions and freeze the restored release without starting another model run.
 
-Review the diff against the branch's main base. A case-only batch should contain the requested bundles, relevant documentation and review/verification evidence; temporary moves, unrequested case deletions, observer changes and unrelated old-branch harness changes must be absent. Commit and push the completed curation branch. Report its name/commit, which cases passed twice, and that the full inventory has been restored. Single-case validations are not a full-inventory model score.
+Review the diff against the branch's main base. A case-only batch should contain the requested bundles, relevant documentation and review/verification evidence; temporary moves, unrequested case deletions, observer changes and unrelated old-branch harness changes must be absent. Commit and push the completed curation branch. Report its name/commit, each accepted case's actual success count and any explicit exception, and that the full inventory has been restored. Single-case validations are not a full-inventory model score.
 
 **Done:** the requested candidates and migrations are accounted for, accepted bundles are in `cases/`, other original bundles are unchanged, controller inventory matches the checkout, and the branch is ready to merge.
 
