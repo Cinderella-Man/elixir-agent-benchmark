@@ -1,0 +1,69 @@
+diff --git a/lib/operately_web/api/queries/get_project.ex b/lib/operately_web/api/queries/get_project.ex
+index 791b602..dc4e377 100644
+--- a/lib/operately_web/api/queries/get_project.ex
++++ b/lib/operately_web/api/queries/get_project.ex
+@@ -48,7 +48,7 @@ defmodule OperatelyWeb.Api.Queries.GetProject do
+     OperatelyWeb.Api.Helpers.Inputs.parse_includes(inputs, [
+       include_contributors: [contributors: [:person]],
+       include_key_resources: [key_resources: :project],
+-      include_milestones: [milestones: :project],
++      include_milestones: [milestones: from(m in Operately.Projects.Milestone, where: is_nil(m.deleted_at), preload: :project)],
+       include_goal: [:goal],
+       include_space: [:group],
+       include_champion: [:champion],
+diff --git a/test/operately_web/api/queries/get_project_test.exs b/test/operately_web/api/queries/get_project_test.exs
+index 81bc84a..b0b00f5 100644
+--- a/test/operately_web/api/queries/get_project_test.exs
++++ b/test/operately_web/api/queries/get_project_test.exs
+@@ -193,12 +193,51 @@ defmodule OperatelyWeb.Api.Queries.GetProjectTest do
+       assert res.project.reviewer == serialize(person, level: :essential)
+     end
+ 
++    test "include_milestones is optional", ctx do
++      project = create_project(ctx)
++
++      assert {200, res} = query(ctx.conn, :get_project, %{id: Paths.project_id(project), include_milestones: true})
++      assert res.project.milestones == []
++
++      milestone_fixture(ctx.person, project_id: project.id)
++
++      assert {200, res} = query(ctx.conn, :get_project, %{id: Paths.project_id(project)})
++      assert res.project.milestones == nil
++
++      assert {200, res} = query(ctx.conn, :get_project, %{id: Paths.project_id(project), include_milestones: false})
++      assert res.project.milestones == nil
++    end
++
++    test "include_milestones excludes archived milestones", ctx do
++      project = create_project(ctx)
++      active = milestone_fixture(ctx.person, project_id: project.id, title: "Active milestone")
++      archived = milestone_fixture(ctx.person, project_id: project.id, title: "Archived milestone")
++      {:ok, _} = Operately.Projects.delete_milestone(ctx.person, archived)
++      active = Repo.preload(active, :project)
++
++      assert {200, res} = query(ctx.conn, :get_project, %{id: Paths.project_id(project), include_milestones: true})
++      assert res.project.milestones == [serialize(active, level: :essential)]
++
++      {:ok, _} = Operately.Projects.delete_milestone(ctx.person, active)
++
++      assert {200, res} = query(ctx.conn, :get_project, %{id: Paths.project_id(project), include_milestones: true})
++      assert res.project.milestones == []
++    end
++
+     test "include_archived", ctx do
+       project = create_project(ctx)
++      active = milestone_fixture(ctx.person, project_id: project.id)
++      archived = milestone_fixture(ctx.person, project_id: project.id)
++      {:ok, _} = Operately.Projects.delete_milestone(ctx.person, archived)
+       {:ok, project} = Operately.Projects.archive_project(ctx.person, project)
+ 
+       assert {200, res} = query(ctx.conn, :get_project, %{id: Paths.project_id(project)})
+       assert res.project.is_archived == true
++      assert res.project.milestones == nil
++
++      assert {200, res} = query(ctx.conn, :get_project, %{id: Paths.project_id(project), include_milestones: true})
++      assert res.project.is_archived == true
++      assert res.project.milestones == [serialize(%{active | project: project}, level: :essential)]
+     end
+ 
+     test "include_permissions", ctx do
