@@ -3,6 +3,39 @@ defmodule EabWeb.DashboardTest do
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
   @endpoint EabWeb.Endpoint
+
+  test "saved presets and synthetic durations appear in case details and indexed history" do
+    id = "thinking-duration-ui"
+    case_id = "synthetic-case"
+    settings = Eab.Thinking.settings(%{}, %{"reasoning_effort" => "off"})
+
+    attempt = %{
+      "status" => "completed",
+      "grade" => %{"passed" => true},
+      "measurement" => %{"attempt_ms" => 1234}
+    }
+
+    run = %{
+      "id" => id,
+      "created_at" => "9999-01-01T00:00:00Z",
+      "status" => "completed",
+      "cases" => [case_id],
+      "attempts" => %{case_id => attempt},
+      "settings" => settings,
+      "model" => %{"model" => "fixture"}
+    }
+
+    Eab.Store.write("runs/#{id}/run.json", run)
+    Eab.Store.write("runs/#{id}/#{case_id}/attempt.json", attempt)
+    Eab.Store.index_run(run)
+    on_exit(fn -> File.rm_rf!(Eab.Store.path("runs/#{id}")) end)
+    {:ok, view, _} = live(build_conn(), "/")
+    assert has_element?(view, "#run-thinking", "Thinking: Off")
+    assert has_element?(view, ".history-row", "Thinking: Off")
+    view |> element("#case-#{case_id}") |> render_click()
+    assert has_element?(view, "#case-time", "Case time: 1.234 s")
+  end
+
   test "a retired case in a saved run still shows and follows its command output" do
     id = "live-log-test"
     case_id = "plausible-pr-6300"
@@ -57,6 +90,10 @@ defmodule EabWeb.DashboardTest do
     assert html =~ "Benchmark dashboard"
     assert html =~ "Model and tool calls are unlimited."
     refute has_element?(view, "input[name='settings[max_calls]']")
+    assert has_element?(view, "input[name='settings[reasoning_effort]'][value='']")
+    assert has_element?(view, "#thinking-presets option[value='on']")
+    assert has_element?(view, "#thinking-presets option[value='max']")
+    assert has_element?(view, "#case-timing-status", "Case timing is always recorded")
     assert has_element?(view, "#run[disabled]")
     assert html =~ "plausible-pr-5939"
     refute html =~ "plausible-pr-6300"

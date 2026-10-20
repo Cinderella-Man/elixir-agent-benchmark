@@ -16,7 +16,6 @@ if config_env() != :test do
     cache_reserve_bytes:
       String.to_integer(System.get_env("EAB_CACHE_MIN_FREE_GB", "5")) * 1024 * 1024 * 1024,
     docker_storage_path: System.get_env("EAB_DOCKER_STORAGE_PATH"),
-    performance_environment: System.get_env("EAB_PERFORMANCE_ENV"),
     root: System.get_env("EAB_ROOT", File.cwd!())
 
   if target = System.get_env("EAB_MEMORY_SSH_TARGET") |> then(&if(&1 not in [nil, ""], do: &1)) do

@@ -9,7 +9,7 @@
     if (text !== undefined) e.textContent = text;
     return e;
   };
-  if (!data || data.schema_version !== 3) {
+  if (!data || data.schema_version !== 4) {
     $("chart").append(node("p", "empty", "Results could not be loaded. Please reload."));
     $("size-limit").disabled = true;
     return;
@@ -26,11 +26,14 @@
   const fmt = value => number.format(value);
   const gb = bytes => bytes == null ? "Not recorded" : `${(bytes / 1e9).toFixed(1)} GB`;
   const hosted = r => r.model.backend === "openai_subscription";
+  const thinking = r => ({unknown: "Not reported", on: "On (no level)", off: "Off",
+    default: "Server/provider default", unsupported: "Not supported"})[r.settings.reasoning_effort] ||
+    r.settings.reasoning_effort || "Not recorded";
   const vram = r => r.resources ? (r.resources.peak_vram_bytes ?? r.resources.gpus.reduce((sum, gpu) => sum + gpu.used_bytes, 0)) : null;
   const context = r => r.settings.window_tokens ? `${fmt(r.settings.window_tokens)} context` : "API";
   const sum = (r, key) => r.cases.every(c => Number.isInteger(c[key])) ? r.cases.reduce((n, c) => n + c[key], 0) : null;
   const measured = r => r.cases.every(c => c.measurement);
-  const millis = (r, key) => r.cases.reduce((n, c) => n + c.measurement[key], 0);
+  const millis = r => r.cases.reduce((n, c) => n + c.measurement.attempt_ms, 0);
   const readable = value => value == null ? "Not recorded" : typeof value === "boolean" ? (value ? "Enabled" : "Disabled") :
     typeof value === "number" ? fmt(value) : value.replaceAll("_", " ");
   const largest = records.reduce((max, r) => Math.max(max, (r.model.size_bytes || 0) / 1e9), 0);
@@ -41,6 +44,7 @@
     max_tokens: "Generation budget / case", budget_policy: "Budget policy", context_policy: "Context policy",
     window_tokens: "Context limit", response_tokens: "Tokens / response", safety_tokens: "Safety tokens",
     seed: "Seed", compaction: "History compaction", reasoning_effort: "Reasoning effort",
+    reasoning_effort_source: "Thinking source", thinking_policy: "Thinking policy",
   };
   let selected = null;
 
@@ -65,7 +69,7 @@
     body.id = "run-detail";
     body.setAttribute("aria-label", `${r.model.name} details`);
     const heading = node("div", "detail-heading");
-    heading.append(node("h2", "", `${r.model.name}${r.model.quantization ? ` · ${r.model.quantization}` : ""}`));
+    heading.append(node("h2", "", `${r.model.name}${r.model.quantization ? ` · ${r.model.quantization}` : ""} · Thinking: ${thinking(r)}`));
     const close = node("button", "close-detail", "Close ×");
     close.addEventListener("click", () => {
       selected = null;
@@ -95,11 +99,9 @@
     outcomes.append(definitionList([
       ["Generated tokens · all cases", totalTokens == null ? "Not recorded" : fmt(totalTokens)],
       ["Model calls", sum(r, "model_calls") == null ? "Not recorded" : fmt(sum(r, "model_calls"))],
-      ["Attempt time · all cases", measured(r) ? `${(millis(r, "attempt_ms") / 60000).toFixed(1)} min` : "Not measured"],
-      ["Model throughput", measured(r) && totalTokens != null && millis(r, "inference_ms") > 0 ?
-        `${(totalTokens / (millis(r, "inference_ms") / 1000)).toFixed(1)} output tokens/s` : "Not measured"],
+      ["Attempt time · all cases", measured(r) ? `${(millis(r) / 60000).toFixed(1)} min` : "Not measured"],
     ]));
-    if (measured(r)) outcomes.append(node("p", "detail-note", "Attempt time includes model and tool calls; preparation and grading are excluded. Throughput includes prompt processing and response transfer."));
+    if (measured(r)) outcomes.append(node("p", "detail-note", "Attempt time includes model and tool calls; preparation and grading are excluded."));
     const conditions = node("div");
     conditions.append(node("h3", "", "Memory & deployment"));
     const memory = [["Model weights", gb(r.model.size_bytes)], ["Context limit", context(r)]];
@@ -127,7 +129,6 @@
     conditions.append(node("h3", "settings-heading", "Run settings"), definitionList(
       Object.entries(r.settings).map(([key, value]) => [settings[key] || readable(key), readable(value)])));
     conditions.append(node("p", "record-id", `Date: ${r.created_at}\nRun: ${r.run_id}`));
-    if (measured(r)) conditions.append(node("p", "detail-note", `Measurement environment: ${[...new Set(r.cases.map(c => c.measurement.environment))].join(", ")}`));
     if (r.evidence_url) {
       const link = node("a", "", "Recorded evidence ↗"); link.href = r.evidence_url; conditions.append(link);
     }
@@ -151,11 +152,11 @@
       point.style.left = `${position * 100}%`;
       point.style.setProperty("--score-position", position);
       point.style.setProperty("--row-index", i);
-      point.setAttribute("aria-label", `${r.model.name}${r.model.quantization ? ` ${r.model.quantization}` : ""}, ${r.passed} of ${r.total} cases passed. Show details`);
+      point.setAttribute("aria-label", `${r.model.name}${r.model.quantization ? ` ${r.model.quantization}` : ""}, thinking ${thinking(r)}, ${r.passed} of ${r.total} cases passed. Show details`);
       point.setAttribute("aria-expanded", String(selected === r.run_id));
       if (selected === r.run_id) point.setAttribute("aria-controls", "run-detail");
       const label = node("span", "point-label");
-      label.append(node("span", "model-name", r.model.name), node("span", "point-meta", [r.model.quantization,
+      label.append(node("span", "model-name", r.model.name), node("span", "point-meta", [r.model.quantization, `Thinking: ${thinking(r)}`,
         hosted(r) ? "API" : `${gb(r.model.size_bytes)} weights`, r.settings.window_tokens ? `${r.settings.window_tokens / 1024}K ctx` : null].filter(Boolean).join(" · ")));
       if (r.resources) label.append(node("span", "point-memory", r.resources.kind === "run_samples" ?
         `${gb(vram(r))} VRAM · ${gb(r.resources.peak_ram_bytes)} RAM · ${r.resources.coverage === "complete" ? "run peaks" : "partial samples"}` :

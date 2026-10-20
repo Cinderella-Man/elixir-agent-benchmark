@@ -94,6 +94,13 @@ defmodule Eab.Store do
   def index_run(run) do
     summary =
       Map.take(run, ~w(id created_at status phase message model score release_id experiment_id))
+      |> Map.put(
+        "settings",
+        Map.take(
+          run["settings"] || %{},
+          ~w(reasoning_effort reasoning_effort_source thinking_policy)
+        )
+      )
 
     # Discovery metadata and transcripts belong to the detailed record, not history.
     summary =
@@ -117,8 +124,13 @@ defmodule Eab.Store do
 
         try do
           case read("runs/#{id}/summary.json") do
-            %{"id" => ^id, "model" => %{"identity" => %{"version" => 1}}} = summary -> summary
-            _ -> legacy_summary(id)
+            %{"id" => ^id, "model" => %{"identity" => %{"version" => 1}}, "settings" => settings} =
+                summary
+            when is_map(settings) ->
+              summary
+
+            _ ->
+              legacy_summary(id)
           end
         rescue
           Jason.DecodeError -> legacy_summary(id)

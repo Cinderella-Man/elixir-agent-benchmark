@@ -30,6 +30,7 @@ defmodule Eab.ComparisonTest do
           Map.put(other, "release_id", nil),
           Map.put(other, "release_id", "another"),
           Map.put(other, "cases", ~w(b a)),
+          put_in(other, ["settings", "reasoning_effort"], "off"),
           put_in(other, ["settings", "seed"], 42)
         ],
         do: assert_raise(RuntimeError, fn -> Comparison.build([run, changed]) end)

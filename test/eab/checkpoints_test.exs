@@ -82,7 +82,14 @@ defmodule Eab.CheckpointsTest do
     run: run,
     id: id
   } do
-    {record, _} = Checkpoints.submit(run["id"], id, %{"case" => id, "calls" => 40}, "patch", "")
+    {record, _} =
+      Checkpoints.submit(
+        run["id"],
+        id,
+        %{"case" => id, "calls" => 40, "measurement" => %{"attempt_ms" => 1500}},
+        "patch",
+        ""
+      )
 
     grade =
       Evidence.save(run["id"], id, %{"passed" => false, "reason" => "incomplete repair"}, "")
@@ -90,6 +97,7 @@ defmodule Eab.CheckpointsTest do
     record = Map.merge(record, %{"status" => "completed", "grade" => grade})
     Checkpoints.complete(run["id"], id, record, "")
     assert Checkpoints.plan(run).retained[id] == record
+    assert Checkpoints.plan(run).retained[id]["measurement"] == %{"attempt_ms" => 1500}
     refute id in Checkpoints.plan(run).restart
     Store.write("runs/#{run["id"]}/#{id}/grade.json", %{"passed" => true})
     assert_raise RuntimeError, ~r/evidence is missing or changed/, fn -> Checkpoints.plan(run) end

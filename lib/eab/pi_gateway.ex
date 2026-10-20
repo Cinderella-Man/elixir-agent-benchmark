@@ -42,12 +42,7 @@ defmodule Eab.PiGateway do
         "Model call #{state.calls}: ChatGPT subscription; provider-enforced context. Generated so far: #{state.generated_tokens}/#{state.settings["max_tokens"]} tokens (soft threshold). Waiting for model response…"
       )
 
-      {response, measurement} =
-        Eab.Measurement.request(state.measurement, fn ->
-          Eab.OpenAI.stream(state.endpoint, payload)
-        end)
-
-      state = %{state | measurement: measurement}
+      response = Eab.OpenAI.stream(state.endpoint, payload)
       body = response.body
       Store.write_text("#{state.prefix}/response-#{step}.sse", body)
       usage = Eab.OpenAI.usage(response)
@@ -96,6 +91,7 @@ defmodule Eab.PiGateway do
         "max_tokens" => allowance,
         "seed" => state.settings["seed"]
       })
+      |> Eab.Thinking.payload(state.settings)
 
     payload =
       if state.endpoint["backend"] == "strata",
@@ -121,12 +117,7 @@ defmodule Eab.PiGateway do
             "Waiting for model response…"
         )
 
-        {body, measurement} =
-          Eab.Measurement.request(state.measurement, fn ->
-            Model.stream(state.endpoint, state.key, payload)
-          end)
-
-        state = %{state | measurement: measurement}
+        body = Model.stream(state.endpoint, state.key, payload)
         Store.write_text("#{state.prefix}/response-#{step}.sse", body, state.key)
         usage = Model.stream_usage(state.endpoint, body, count, allowance)
         Store.write("#{state.prefix}/usage-#{step}.json", usage, state.key)
@@ -171,14 +162,15 @@ defmodule Eab.PiGateway do
   defp reply(frame, status, type, body),
     do: %{"id" => frame["id"], "status" => status, "content_type" => type, "body" => body}
 
-  def persist(state) do
+  def persist(state, measurement \\ nil) do
     Store.write(
       "#{state.prefix}/agent-progress.json",
       %{
         "calls" => state.calls,
         "generated_tokens" => state.generated_tokens,
         "stop_reason" => state.stop_reason,
-        "error" => state.error
+        "error" => state.error,
+        "measurement" => measurement || Eab.Measurement.finish(state.measurement)
       },
       state.key
     )

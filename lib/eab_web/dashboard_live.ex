@@ -19,7 +19,7 @@ defmodule EabWeb.DashboardLive do
     "response_tokens" => "",
     "max_tokens" => "65536",
     "seed" => "101",
-    "reasoning_effort" => "high"
+    "reasoning_effort" => ""
   }
   def mount(params, _, socket) do
     if connected?(socket) do
@@ -44,7 +44,7 @@ defmodule EabWeb.DashboardLive do
         key: "",
         settings: @defaults,
         local_settings: @defaults,
-        subscription_settings: Map.put(@defaults, "max_tokens", "262144"),
+        subscription_settings: subscription_defaults(),
         error: Phoenix.Flash.get(socket.assigns.flash, :error),
         detecting: false,
         selected: selected,
@@ -84,11 +84,14 @@ defmodule EabWeb.DashboardLive do
            assign(socket,
              url: "https://api.openai.com",
              chatgpt: true,
-             settings: Map.put(@defaults, "max_tokens", "262144")
+             settings: subscription_defaults()
            )
          )},
       else: {:ok, socket}
   end
+
+  defp subscription_defaults,
+    do: Map.merge(@defaults, %{"max_tokens" => "262144", "reasoning_effort" => "high"})
 
   def handle_event("provider", %{"provider" => "chatgpt"}, socket) do
     Eab.ChatGPTAuth.retry_requests(socket.assigns.account)
@@ -782,8 +785,35 @@ defmodule EabWeb.DashboardLive do
             <p :if={not @chatgpt} id="memory-collection-status" class="fine-print">
               {Eab.MemoryMonitor.configuration_label(@endpoint)}
             </p>
+            <p :if={not @chatgpt} id="server-thinking" class="fine-print">
+              Server thinking preset: {Eab.Thinking.reported(@endpoint) || "Not reported"}
+            </p>
           </div>
           <form id="settings" phx-change="settings">
+            <label :if={not @chatgpt}>
+              Model host thinking preset
+              <input
+                name="settings[reasoning_effort]"
+                value={@settings["reasoning_effort"]}
+                list="thinking-presets"
+                maxlength="64"
+                placeholder="Automatic if reported; otherwise enter the host preset"
+              />
+              <datalist id="thinking-presets">
+                <option
+                  :for={effort <- ~w(off on minimal low medium high xhigh max default unsupported)}
+                  value={effort}
+                />
+              </datalist>
+            </label>
+            <p :if={not @chatgpt} class="fine-print">
+              Records the preset selected on your model host; does not change it.
+              Use “on” for thinking without a level, or enter the exact level name.
+              Blank uses server metadata when available; otherwise it is saved as not reported.
+            </p>
+            <p id="case-timing-status" class="fine-print">
+              Case timing is always recorded. Preparation and grading are excluded.
+            </p>
             <details class="advanced">
               <summary>Advanced run settings</summary>
               <p :if={not @chatgpt} class="fine-print">
@@ -862,6 +892,12 @@ defmodule EabWeb.DashboardLive do
               role="status"
             >
               {@run["message"]}
+            </p>
+            <p id="run-thinking" class="fine-print">
+              Thinking: {Eab.Thinking.label(@run["settings"])} · {get_in(@run, [
+                "settings",
+                "reasoning_effort_source"
+              ]) || "Source not recorded"}
             </p>
             <p :if={@run["release_id"]} class="fine-print">
               Release <code>{String.slice(@run["release_id"], 0, 12)}</code>
@@ -1030,6 +1066,9 @@ defmodule EabWeb.DashboardLive do
                     {get_in(@run, ["attempts", @log_case, "error"])}
                   </p>
                   <section id="case-verdict" aria-label="Case result explanation" tabindex="-1">
+                    <p id="case-time" class="fine-print">
+                      Case time: {Eab.Measurement.label((@case_attempt || %{})["measurement"])} · Pi startup through completion, excluding preparation and grading.
+                    </p>
                     <h4>
                       {if is_nil(@case_attempt) and case_tone(@run, id) == "active",
                         do: "Awaiting evaluation",
@@ -1187,7 +1226,9 @@ defmodule EabWeb.DashboardLive do
           class="history-row"
           phx-click="select"
           phx-value-id={run["id"]}
-        ><span><strong>{Eab.ModelIdentity.label(run["model"])}</strong><code>{run["id"]}</code></span><span>{run[
+        ><span><strong>{Eab.ModelIdentity.label(run["model"])}</strong><span class="fine-print">Thinking: {Eab.Thinking.label(
+          run["settings"]
+        )}</span><code>{run["id"]}</code></span><span>{run[
           "status"
         ]} →</span></button>
         <nav :if={@history_page.total > 20} aria-label="History pages">

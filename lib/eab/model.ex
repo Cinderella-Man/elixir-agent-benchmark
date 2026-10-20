@@ -63,16 +63,19 @@ defmodule Eab.Model do
       do: raise("Endpoint must report its active context capacity")
 
     profile =
-      Map.take(props, [
-        "model_alias",
-        "model_path",
-        "model_ftype",
-        "build_info",
-        "default_generation_settings",
-        "chat_template",
-        "chat_template_caps",
-        "total_slots"
-      ])
+      Map.take(
+        props,
+        [
+          "model_alias",
+          "model_path",
+          "model_ftype",
+          "build_info",
+          "default_generation_settings",
+          "chat_template",
+          "chat_template_caps",
+          "total_slots"
+        ] ++ Eab.Thinking.profile_fields()
+      )
 
     row = Enum.find(models["data"], &(&1["id"] == alias_name))
 
@@ -122,6 +125,7 @@ defmodule Eab.Model do
       "seed" => integer(input, "seed", defaults["seed"], 0, 2_147_483_647),
       "compaction" => false
     }
+    |> Map.merge(Eab.Thinking.settings(endpoint, input))
   end
 
   def count(endpoint, key, payload) do

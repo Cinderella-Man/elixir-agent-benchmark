@@ -4,11 +4,11 @@ defmodule Eab.Results.Schema do
   @model_fields ~w(name backend quantization quantization_source size_bytes size_source parameter_count)
   @nullable_int ~w(window_tokens response_tokens seed)
   @integer ~w(safety_tokens max_tokens)
-  @text ~w(budget_policy context_policy reasoning_effort)
+  @text ~w(budget_policy context_policy reasoning_effort reasoning_effort_source thinking_policy)
 
   def validate!(r) do
-    fields!(r, @fields, "Expected a public v3 result; export the original run.json with add")
-    require!(r["schema_version"] === 3, "Unsupported result schema")
+    fields!(r, @fields, "Expected a public v4 result; export the original run.json with add")
+    require!(r["schema_version"] === 4, "Unsupported result schema")
     require!(Regex.match?(~r/^[A-Za-z0-9_-]+$/, text!(r["run_id"], "run_id")), "Invalid run ID")
     date!(r["created_at"])
     text!(r["benchmark"], "benchmark")
@@ -65,6 +65,23 @@ defmodule Eab.Results.Schema do
       require!(valid, "Invalid or unknown setting: #{key}")
     end)
 
+    if Map.has_key?(settings, "thinking_policy") do
+      require!(settings["thinking_policy"] == "server_preset", "Invalid thinking policy")
+      text!(settings["reasoning_effort"], "reasoning_effort")
+
+      require!(
+        settings["reasoning_effort_source"] in ~w(server_reported operator_declared not_reported),
+        "Invalid thinking source"
+      )
+
+      if settings["reasoning_effort_source"] == "not_reported",
+        do:
+          require!(
+            settings["reasoning_effort"] == "unknown",
+            "Unreported thinking must be unknown"
+          )
+    end
+
     cases = r["cases"]
     require!(is_list(cases) and cases != [], "At least one case is required")
 
@@ -82,29 +99,10 @@ defmodule Eab.Results.Schema do
 
       if not is_nil(c["measurement"]) do
         m = c["measurement"]
-        fields!(m, ~w(environment attempt_ms inference_ms), "Unexpected measurement fields")
-        text!(m["environment"], "measurement.environment")
-
-        for key <- ~w(attempt_ms inference_ms),
-            do: require!(nonnegative?(m[key]), "Invalid measured duration")
-
-        require!(
-          m["inference_ms"] <= m["attempt_ms"],
-          "Inference duration exceeds attempt duration"
-        )
+        fields!(m, ~w(attempt_ms), "Unexpected measurement fields")
+        require!(nonnegative?(m["attempt_ms"]), "Invalid measured duration")
       end
     end
-
-    environments =
-      Enum.flat_map(cases, fn c ->
-        if c["measurement"], do: [c["measurement"]["environment"]], else: []
-      end)
-      |> Enum.uniq()
-
-    require!(
-      length(environments) <= 1,
-      "Do not aggregate timings from different measurement environments"
-    )
 
     ids = Enum.map(cases, & &1["id"])
     require!(Enum.uniq(ids) == ids, "Duplicate case IDs")
