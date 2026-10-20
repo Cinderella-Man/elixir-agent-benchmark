@@ -1,0 +1,1983 @@
+diff --git a/.iex.exs b/.iex.exs
+index 41cbd07b47..69a87890ce 100644
+--- a/.iex.exs
++++ b/.iex.exs
+@@ -1,4 +1,5 @@
+-alias Changelog.{Repo, Person, Episode, EpisodeHost, EpisodeGuest, Podcast, Topic, Sponsor, Post}
++alias Changelog.{Repo, Person, Episode, EpisodeHost, EpisodeGuest, Podcast,
++                 Topic, Sponsor, Post}
+ 
+ import Ecto
+ import Ecto.Changeset
+diff --git a/lib/changelog/regexp.ex b/lib/changelog/regexp.ex
+index 4d1715a833..11c5e3b84b 100644
+--- a/lib/changelog/regexp.ex
++++ b/lib/changelog/regexp.ex
+@@ -1,4 +1,16 @@
+ defmodule Changelog.Regexp do
++  def http do
++    ~r/^https?:\/\//
++  end
++
++  def http_message do
++    "must include http(s)://"
++  end
++
++  def p_tag do
++    ~r/<\/?p>/
++  end
++
+   def slug do
+     ~r/\A[a-z|0-9|_|-]+\z/
+   end
+@@ -7,11 +19,11 @@ defmodule Changelog.Regexp do
+     "valid chars: a-z, 0-9, -, _"
+   end
+ 
+-  def http do
+-    ~r/^https?:\/\//
++  def timestamp do
++    ~r/(\d\d:)?(\d\d?:)(\d\d)(\.\d\d?)?/
+   end
+ 
+-  def http_message do
+-    "must include http(s)://"
++  def transcript_slugs do
++    ~r/(?<podcast>.*)\/.*-(?<episode>\w+).md/
+   end
+ end
+diff --git a/lib/changelog/transcripts/parser.ex b/lib/changelog/transcripts/parser.ex
+new file mode 100644
+index 0000000000..e434cee1bd
+--- /dev/null
++++ b/lib/changelog/transcripts/parser.ex
+@@ -0,0 +1,30 @@
++defmodule Changelog.Transcripts.Parser do
++  @speaker_regex ~r{\*\*(.*?):\*\*}
++
++  def parse_text(string, participants \\ [])
++  def parse_text(string, participants) when is_nil(string), do: parse_text("", participants)
++  def parse_text(string, participants) do
++    @speaker_regex
++    |> Regex.split(string, include_captures: true, trim: true)
++    |> Enum.chunk(2)
++    |> Enum.map(fn(tuple) ->
++      [speaker_section, content_section] = tuple
++
++      speaker_name = case Regex.run(@speaker_regex, speaker_section) do
++        [_, name] -> name
++        nil -> "Unknown"
++      end
++
++      speaker_id = Enum.find_value(participants, fn(x) -> if x.name == speaker_name do x.id end end)
++
++      content_section
++      |> String.split("\n\n", trim: true)
++      |> Enum.map(fn(line) ->
++        %{title: speaker_name,
++          person_id: speaker_id,
++          body: String.trim(line)}
++      end)
++    end)
++    |> List.flatten
++  end
++end
+diff --git a/lib/changelog/transcripts/source.ex b/lib/changelog/transcripts/source.ex
+new file mode 100644
+index 0000000000..18b3e0bcf8
+--- /dev/null
++++ b/lib/changelog/transcripts/source.ex
+@@ -0,0 +1,24 @@
++defmodule Changelog.Transcripts.Source do
++  @html_host "https://github.com"
++  @raw_host "https://raw.githubusercontent.com"
++  @repo_name "thechangelog/transcripts"
++
++  def repo_name, do: @repo_name
++  def repo_url, do: "#{@html_host}/#{@repo_name}"
++
++  def html_url(episode) do
++    "#{@html_host}/#{@repo_name}/blob/master/#{path(episode)}"
++  end
++
++  def raw_url(episode) do
++    "#{@raw_host}/#{@repo_name}/master/#{path(episode)}"
++  end
++
++  defp path(episode) do
++    podcast_name = Changelog.PodcastView.dasherized_name(episode.podcast)
++    podcast_slug = episode.podcast.slug
++    episode_slug = episode.slug
++
++    "#{podcast_slug}/#{podcast_name}-#{episode_slug}.md"
++  end
++end
+diff --git a/lib/changelog/transcripts/updater.ex b/lib/changelog/transcripts/updater.ex
+new file mode 100644
+index 0000000000..113c80dd4a
+--- /dev/null
++++ b/lib/changelog/transcripts/updater.ex
+@@ -0,0 +1,39 @@
++defmodule Changelog.Transcripts.Updater do
++
++  require Logger
++
++  alias Changelog.{Episode, Regexp, Repo}
++  alias Changelog.Transcripts.Source
++
++  def update(items) when is_list(items) do
++    for item <- items do
++      item
++      |> get_episode
++      |> update_episode
++    end
++  end
++  def update(item), do: update([item])
++
++  defp get_episode(item) when is_map(item), do: item
++  defp get_episode(item) when is_binary(item) do
++    %{"podcast" => p_slug, "episode" => e_slug} = Regex.named_captures(Regexp.transcript_slugs, item)
++
++    Episode.published
++    |> Episode.with_podcast_slug(p_slug)
++    |> Episode.with_slug(e_slug)
++    |> Repo.one
++  end
++
++  defp update_episode(episode) when is_nil(episode), do: nil
++  defp update_episode(episode) do
++    transcript_url =
++      episode
++      |> Episode.preload_podcast
++      |> Source.raw_url
++
++    case HTTPoison.get!(transcript_url) do
++      %{status_code: 200, body: text} -> Episode.update_transcript(episode, text)
++      _else -> Logger.info("Transcripts: Failed to fetch #{transcript_url}")
++    end
++  end
++end
+diff --git a/priv/repo/migrations/20170726201108_add_transcript_to_episodes.exs b/priv/repo/migrations/20170726201108_add_transcript_to_episodes.exs
+new file mode 100644
+index 0000000000..a8a9842f6c
+--- /dev/null
++++ b/priv/repo/migrations/20170726201108_add_transcript_to_episodes.exs
+@@ -0,0 +1,9 @@
++defmodule Changelog.Repo.Migrations.AddTranscriptToEpisodes do
++  use Ecto.Migration
++
++  def change do
++    alter table(:episodes) do
++      add(:transcript, {:array, :map}, default: [])
++    end
++  end
++end
+diff --git a/test/controllers/admin/episode_controller_test.exs b/test/controllers/admin/episode_controller_test.exs
+index 7bdbc034d6..de56f25381 100644
+--- a/test/controllers/admin/episode_controller_test.exs
++++ b/test/controllers/admin/episode_controller_test.exs
+@@ -2,7 +2,9 @@ defmodule Changelog.Admin.EpisodeControllerTest do
+   use Changelog.ConnCase
+   use Bamboo.Test
+ 
+-  alias Changelog.Episode
++  import Mock
++
++  alias Changelog.{Episode, Transcripts}
+ 
+   @valid_attrs %{title: "The one where we win", slug: "181-win"}
+   @invalid_attrs %{title: ""}
+@@ -151,6 +153,19 @@ defmodule Changelog.Admin.EpisodeControllerTest do
+     assert count(Episode.published) == 0
+   end
+ 
++  @tag :as_admin
++  test "fetches and updates transcript", %{conn: conn} do
++    p = insert(:podcast, name: "Happy Cast", slug: "happy")
++    e = insert(:published_episode, podcast: p, slug: "12")
++
++    with_mock Transcripts.Updater, [update: fn(_) -> true end] do
++      conn = post(conn, admin_podcast_episode_path(conn, :transcript, p.slug, e.slug))
++
++      assert called Transcripts.Updater.update(:_)
++      assert redirected_to(conn) == admin_podcast_episode_path(conn, :index, p.slug)
++    end
++  end
++
+   test "requires user auth on all actions", %{conn: conn} do
+     Enum.each([
+       get(conn, admin_podcast_episode_path(conn, :index, "1")),
+@@ -161,7 +176,8 @@ defmodule Changelog.Admin.EpisodeControllerTest do
+       put(conn, admin_podcast_episode_path(conn, :update, "1", "123"), episode: @valid_attrs),
+       delete(conn, admin_podcast_episode_path(conn, :delete, "1", "123")),
+       post(conn, admin_podcast_episode_path(conn, :publish, "1", "123")),
+-      post(conn, admin_podcast_episode_path(conn, :unpublish, "1", "123"))
++      post(conn, admin_podcast_episode_path(conn, :unpublish, "1", "123")),
++      post(conn, admin_podcast_episode_path(conn, :transcript, "1", "123"))
+     ], fn conn ->
+       assert html_response(conn, 302)
+       assert conn.halted
+diff --git a/test/controllers/episode_controller_test.exs b/test/controllers/episode_controller_test.exs
+index 17b860f111..5a692abac7 100644
+--- a/test/controllers/episode_controller_test.exs
++++ b/test/controllers/episode_controller_test.exs
+@@ -15,6 +15,23 @@ defmodule Changelog.EpisodeControllerTest do
+     assert html_response(conn, 200) =~ e.title
+   end
+ 
++  test "getting a published podcast episode page that has a transcript", %{conn: conn} do
++    p = insert(:podcast)
++    e = insert(:published_episode, podcast: p)
++    insert(:episode_host, episode: e)
++    insert(:episode_guest, episode: e)
++
++    Changelog.Episode.update_transcript(e, "**Host:** Welcome!\n\n**Guest:** Thanks!\n\n**Break:** Thanks to our Sponsors")
++
++    conn = get(conn, episode_path(conn, :show, p.slug, e.slug))
++
++    assert conn.status == 200
++    assert conn.resp_body =~ e.title
++    assert conn.resp_body =~ "Welcome!"
++    assert conn.resp_body =~ "Thanks!"
++    assert conn.resp_body =~ "Break"
++  end
++
+   test "getting a scheduled episode's page", %{conn: conn} do
+     p = insert(:podcast)
+     e = insert(:scheduled_episode, podcast: p)
+diff --git a/test/controllers/github_controller_test.exs b/test/controllers/github_controller_test.exs
+new file mode 100644
+index 0000000000..a07c77f664
+--- /dev/null
++++ b/test/controllers/github_controller_test.exs
+@@ -0,0 +1,54 @@
++defmodule Changelog.GithubControllerTest do
++  use Changelog.ConnCase
++
++  import Mock
++
++  alias Changelog.Transcripts
++
++  describe "the event endpoint" do
++    setup do
++      conn = put_req_header(build_conn(), "accept", "application/json")
++      {:ok, conn: conn}
++    end
++
++    test "it responds to the push event, calling the updater when repo matches", %{conn: conn} do
++      with_mock Transcripts.Updater, [update: fn(_) -> true end] do
++        conn =
++          conn
++          |> put_req_header("x-github-event", "push")
++          |> post(github_path(conn, :event), %{
++              "repository" => %{"full_name" => "thechangelog/transcripts"},
++              "commits" => [
++                %{"id" => "1", "added" => ["jsparty/js-party-14.md"], "modified" => ["rfc/rfc-1.md"]},
++                %{"id" => "2", "modified" => ["rfc/rfc-3.md", "podcast/podcast-1.md"]},
++                %{"id" => "3", "added" => ["gotime/gotime-50.md"], "removed" => ["nope"]}
++              ]
++            })
++
++        assert called Transcripts.Updater.update(["jsparty/js-party-14.md", "rfc/rfc-1.md", "rfc/rfc-3.md", "podcast/podcast-1.md", "gotime/gotime-50.md"])
++        assert conn.status == 200
++      end
++    end
++
++    test "it responds with method not allowed for push event when repo doesn't match", %{conn: conn} do
++      conn =
++        conn
++        |> put_req_header("x-github-event", "push")
++        |> post(github_path(conn, :event), %{
++            "repository" => %{"full_name" => "thechangelog/changelog.com"},
++            "commits" => [%{"id" => "1"}, %{"id" => "2"}, %{"id" => "3"}]
++          })
++
++      assert conn.status == 405
++    end
++
++    test "it responds with method not allowed for unsupported events", %{conn: conn} do
++      conn =
++        conn
++        |> put_req_header("x-github-event", "milestone")
++        |> post(github_path(conn, :event), %{})
++
++      assert conn.status == 405
++    end
++  end
++end
+diff --git a/test/controllers/slack_controller_test.exs b/test/controllers/slack_controller_test.exs
+index a09df40788..4173200bdf 100644
+--- a/test/controllers/slack_controller_test.exs
++++ b/test/controllers/slack_controller_test.exs
+@@ -47,16 +47,16 @@ defmodule Changelog.SlackControllerTest do
+ 
+   describe "the event endpoint" do
+     setup do
+-      conn = Plug.Conn.put_req_header(build_conn(), "accept", "application/json")
++      conn = put_req_header(build_conn(), "accept", "application/json")
+       {:ok, conn: conn}
+     end
+ 
+     test "it responds to verification challenge", %{conn: conn} do
+-      conn = post(conn, slack_path(conn, :event, %{
++      conn = post(conn, slack_path(conn, :event), %{
+         "type" => "url_verification",
+         "token" => "Jhj5dZrVaK7ZwHHjRyZWjbDl",
+         "challenge" => "3eZbrw1aBm2rZgRNFdxV2595E9CY3gmdALWMmHkvFXO7tYXAYM8P"
+-      }))
++      })
+ 
+       assert json_response(conn, 200) == %{"challenge" => "3eZbrw1aBm2rZgRNFdxV2595E9CY3gmdALWMmHkvFXO7tYXAYM8P"}
+     end
+@@ -70,7 +70,7 @@ defmodule Changelog.SlackControllerTest do
+          [],
+          [import_member_id: fn(_, _) -> nil end]}
+       ]) do
+-        conn = post(conn, slack_path(conn, :event, %{
++        conn = post(conn, slack_path(conn, :event), %{
+             "type" => "event_callback",
+             "event" => %{
+               "type" => "team_join",
+@@ -82,7 +82,7 @@ defmodule Changelog.SlackControllerTest do
+                 }
+               }
+             }
+-          }))
++          })
+ 
+         assert called Client.im("U2XU53R", Messages.welcome())
+         assert called Tasks.import_member_id("U2XU53R", "grace@hopper.com")
+@@ -91,7 +91,7 @@ defmodule Changelog.SlackControllerTest do
+     end
+ 
+     test "it responds with method not allowed for unsupported events", %{conn: conn} do
+-      conn = post(conn, slack_path(conn, :event, %{"type" => "event_callback", "event" => %{"type" => "channel_join"}}))
++      conn = post(conn, slack_path(conn, :event), %{"type" => "event_callback", "event" => %{"type" => "channel_join"}})
+ 
+       assert conn.status == 405
+     end
+diff --git a/test/fixtures/transcripts/js-party-1.md b/test/fixtures/transcripts/js-party-1.md
+new file mode 100644
+index 0000000000..fe4e74a4ff
+--- /dev/null
++++ b/test/fixtures/transcripts/js-party-1.md
+@@ -0,0 +1,419 @@
++**Mikeal Rogers:** Hey, everybody! Welcome to JS Party, where it's a party every week with Javascript. Alright, let's just dive right into it.
++
++**Alex Sexton:** I still don't want that to be the slogan. \[laughter\] I want my voice to be heard that I think that's a dumb slogan. Move on...
++
++**Rachel White:** I think it's dumb, but I like making Mikeal say it. \[laughter\]
++
++**Alex Sexton:** That's fair... That's very fair.
++
++**Mikeal Rogers:** That's really fair. Alright, I'm Mikeal Rogers...
++
++**Alex Sexton:** I'm Alex Sexton...
++
++**Rachel White:** And I'm Rachel White.
++
++**Mikeal Rogers:** Alright, everybody! Let's get this party started, let's just dive right into the first topic. So Google broke the internet. I don't know why they keep pointing out flaws in the internet's security, but \[whispering\] they broke the internet again!
++
++**Alex Sexton:** I thought they helped to disclose it, but wasn't it like some German W, some acronym...? I think it was the Germans, it's all I'm saying.
++
++**Mikeal Rogers:** It was the Germans... Likely story. Anyway, so SHA1 hashing algorithm has been cracked. I guess in 2005 there was a paper written that said theoretically it could be cracked, but nobody had done it yet. Apparently, as of like 2010, the federal government said no government encryption can use any SHA1 algorithms, which is a pretty good indication that foreign governments have been able to crack this for a while.
++
++**Alex Sexton:** Yeah... The only person I've seen strongly support SHA1 for the last six or seven years is Linus Torvalds in Git.
++
++**Mikeal Rogers:** It's so annoying...
++
++**Alex Sexton:** And not just kind of... He really was like, "You guys are all super dumb for caring about this."
++
++**Mikeal Rogers:** I know, it's really crazy. He's still downplaying it, actually. So backing up a little bit - let's just get into what is SHA1 and what does it do. Does anybody else wanna take a crack at this, or do you want me to explain it?
++
++**Rachel White:** I only know it from Git related stuff, so that's all...
++
++**Mikeal Rogers:** Right, that's actually a really good way to explain it though. The way that Git uses SHA1 is kind of indicative of how everybody uses it, which is that you take a bunch of data and you say, "I want a unique identifier for this data", so you hash it. That's what Git does to every change that comes into the Git tree - it gets this hash of the data and it uses that as the identifier.
++
++If you go to GitHub and you go to a project and then you click on Commit To and then you click on one of those Commit links, in the \[unintelligible 00:02:52.25\] you'll see this randomly-generated identifier, and that is a unique identifier for that hash. The problem is that if you could forge these - that's a very small amount of data, representing a large amount of data; theoretically, if you could reverse-engineer the algorithm, you could come up with a different data that would also hash to that same thing. People have been theoretically \[unintelligible 00:03:16.17\] and now they really can...
++
++**Alex Sexton:** It still costs like a hundred thousand dollars. It will be cheaper, but right now, with the current algorithm... It's insane how much faster they can do it, but still, with AWS spot instances it costs around a hundred thousand dollars to break a random thing.
++
++**Mikeal Rogers:** But how much do I have to pay Russian hackers that have a botnet? Like one Bitcoin, which is roughly twenty thousand dollars?
++
++**Alex Sexton:** I wouldn't necessarily be worried about this... Sorry, I didn't hear that.
++
++**Mikeal Rogers:** I was saying I'd probably need to pay one Bitcoin, which is roughly twenty thousand dollars, to get Russian hackers to break it.
++
++**Alex Sexton:** \[\\00:04:04.14\\\] Oh yeah, for sure. The cost is still prohibitive to the point where no one's gonna troll you with this. Someone really needs to want -- there has to be a reason someone's doing this at this point. But that will only be true for like two months, or something. People will make this better instantly, and then exploit everybody across the board.
++
++**Mikeal Rogers:** Right, and it's pretty much a given now that governments can do this at will. What that means is that if your integrity checks involve you hashing with this algorithm, now if you're just using those checks, people can just inject malware whenever they want.
++
++**Rachel White:** I have a question. If this has been relatively not super secure for a while, what was the catalyst for people to be like, "Okay, it's finally time to stop using this thing"? Was it something that Google did that you said...?
++
++**Alex Sexton:** Oh yeah, yesterday.
++
++**Mikeal Rogers:** Yeah. Well, honestly, I think most people in the security community have felt since 2005 that you should stop using this. There are other algorithms that are just as good that don't have this problem. And in 2010, most reasonable companies said, "Hey, we should stop using this."
++
++**Alex Sexton:** Browsers already don't allow -- you'll get a very big red X instead of a green lock if SHA1 is used for web security stuff. It's been well known to be very crackable by someone with a ton of money for a long time.
++
++**Mikeal Rogers:** Yeah, but like Alex said, Linus Torvalds has just remained unimpressed by evidence, so it is still in heavy use in Git, in GitHub, and a bunch of other Linux-related stuff.
++
++**Rachel White:** That's fine, because I'm wholly unimpressed by him, so it's okay. \[laughter\]
++
++**Alex Sexton:** You're only gonna make him stronger.
++
++**Mikeal Rogers:** To answer your question though, the thing that happened yesterday was that some people from Google and 'zee Germans' came out and just said, "Hey, look, we cracked it. Here's exactly how we cracked it." So it went from theoretical to "Here is an open version of this."
++
++**Alex Sexton:** To be totally clear though, they have to try a ton of things... They were able to reduce the subset that you had to brute force to a small enough amount to be significant. But it still takes a hundred and ten years of computing time, or something like that. You had to put a lot of machines into it. But that number will slowly churn down to seconds, I'm sure.
++
++**Mikeal Rogers:** Yeah. So if you're future-proofing, don't use SHA1.
++
++**Alex Sexton:** Or past-proofing. If you're just proofing at all, don't use SHA1. There's SHA256, which is essentially exactly the same, with much higher entropy, so just use that instead.
++
++**Mikeal Rogers:** I've actually become a big fan of multihash. Have you ever heard about this?
++
++**Alex Sexton:** No.
++
++**Mikeal Rogers:** Okay, nobody has. Juan Benet has been pushing this really hard for quite a while. He's one of the people behind IPFS, so lots of kind of distributed, peer-to-peer crypto stuff. He has really wanted to future-proof everything that he's been working on, so he started this little open source project called multi-format. What these are is essentially every time that you've gotta sit down and use a codec, or you've gotta use a particular encryption algorithm or a hashing function like this, let's just create a format that allows you to define which format you're using, so that libraries can just optionally support a bunch of different formats. And if in the future you wanna change formats, you don't break all of your clients, essentially.
++
++**Alex Sexton:** \[\\00:08:07.13\\\] It's very similar to .mkv or .mov - all the container things for video codecs, I suppose.
++
++**Mikeal Rogers:** Right. Although containers, oddly, do implement a bunch of features.
++
++**Alex Sexton:** True.
++
++**Mikeal Rogers:** This gets really ugly, actually, in codecs and containers. For multihash, for instance, there's libraries in pretty much every language ever, including a very well maintained Javascript implementation that works in the browser and in Node. So that's what I've used in a couple of projects recently. But the funny thing is that Linus is actually still just not convinced. He's basically said that the way that Git uses it is still not prone to these attacks, because they have the length of the body, and that makes this harder. We'll see how that ends up.
++
++**Alex Sexton:** I mean, it does make it a lot harder, for what it's worth.
++
++**Mikeal Rogers:** It does. It does make the attack a lot harder, but I do feel that rather than future-proofing or moving to just a better algorithm... He's just kind of dangling out this, like "Oh, prove me wrong, computer scientists!" \[laughs\] Which didn't work out that well for his last round of this...
++
++**Alex Sexton:** Right... It seems silly to be like, "Well, you only half-broke it, so I'm gonna continue..." If you got through a half of my lock, I'm gonna go ahead and just change out the whole thing.
++
++**Mikeal Rogers:** Yeah, rather than just like, "No, I'm gonna continue to put these half-locks on things."
++
++**Alex Sexton:** Right.
++
++**Mikeal Rogers:** This kind of reminds me that the way we think about security on the web tends to be like, "Oh, I put CloudFlare in front of it, so I'm secure now." "I added SSL, or I added TLS, so I'm secure now." But really, security is this really multi-layered thing where when you break off one layer of the onion, you need the other layers around it to still be secure, right?
++
++**Alex Sexton:** Yeah. I think you almost can't even break off any of the layers of the onion. Security is really, really hard. It needs to be there at every layer, otherwise the other ones have no effect. I think an onion is a poor metaphor. A chain is much better - if you have a single weak link, then it doesn't matter; you can get through.
++
++**Mikeal Rogers:** Yeah. I mean, if you look at some of the stuff people have been doing with OAuth for a while... OAuth jumps through all these hoops to basically do an extra layer of encryption. Initially, they kind of did that so that you could do OAuth over HTTP without TLS. But even when you added TLS to it, it's really nice to keep all that encryption there, and one of the things that OAuth 2.0 did was it just kind of got rid of that. It was like, "Oh, whatever... We're using TLS." But you can break TLS; we know that certain authorities have been compromised for TLS so people can give out bad certs... That's not a very good way to secure everything.
++
++**Alex Sexton:** Sure. If you operate under the assumption that TLS is broken though, then the entire internet is broken already... The OAuth channel - if you had that extra encryption - would be broken, but then as soon as you got to that website and used it, you'd be screwed anyways if TLS is broken. So I don't think it'd be any more broken than it would already be, I guess. You're screwed, if that's the case, no matter what.
++
++Maybe someone doesn't get your authentication credentials, but hopefully you don't reuse those anywhere else, so...
++
++**Mikeal Rogers:** Alright. Do we have anything else to say about hashing algorithms? This is a pretty deep topic to start a Javascript show with...
++
++**Alex Sexton:** \[\\00:11:59.24\\\] Yeah, interesting choice.
++
++**Rachel White:** Somebody that doesn't know anything about this kind of stuff, a.k.a. me, or someone else that doesn't necessarily have to deal with the security side of the code that they write, what would be the best resource for somebody that wants to know how to actually authenticate stuff in a secure way that wouldn't anger Linus?
++
++**Alex Sexton:** I don't know if I'm answering your question directly, but if you're building a website and you wanna make sure your website is secure, Mozilla Observatory is a really good option. It will scan your website, it will check your TLS certs (some of this is involved there) and then it will check content security policy... A bunch of different things, and it will give you a prioritized list of things to do. I would absolutely recommend putting any website you build through Mozilla Observatory to get that checklist, and score, and things like that.
++
++**Rachel White:** Cool, that's awesome. I didn't even know about that site, so that is helpful.
++
++**Mikeal Rogers:** I think also maybe we can call out a couple good application layer authentication schemes, as well. One of the problems with updating and getting rid of this is that people take their best practices from their common tools, and not using a secure hashing is not sending a very good message. Alex, you work for a bank - what authentications are you using over there?
++
++**Alex Sexton:** This seems like a broad question. How do we auth our employees?
++
++**Mikeal Rogers:** How do you auth customers? Do you actually encrypt or hash different pieces of the Stripe thing -- I hope you do... I hope that my credit card number is not just sitting there... \[laughs\]
++
++**Alex Sexton:** Yeah, so PCI determines all of the algorithms for how you must store credit card numbers and things like that. I have a pretty good guess on what it is, but I'm not even credentialed enough to touch or look at any of that code as an early employee at Stripe. That's another one of the security precautions that PCI mandates. It is mandated by a body, but as far as all of this auth goes, I feel like maybe my security brain is coming out a little bit... The way that your password gets hacked is not hashing algorithm collisions currently.
++
++This one's bad - I don't think too many people are using SHA1. Even if you use HMAC or SHA1 it's fine. There's even ways to make SHA1 fine, but use bcrypt to do passwords... Actually, my number one recommendation is don't implement any security stuff yourself. Use libraries that are well known and well tested. The number one rule at Stripe is don't implement your own crypto; don't invent your own crypto, because you have not thought it through correctly. That's my advice.
++
++**Mikeal Rogers:** Agreed. I tend to rely on modules written by smarter people than me.
++
++**Alex Sexton:** Right. The wide use of something signals far more security than a smart person, too. Someone can be smart and have a glaring hole that they singularly forgot because there's only one set of eyes on it. You can be pretty sure that the Rails auth stuff works pretty well, because every Saturday night it would be down if it didn't.
++
++**Mikeal Rogers:** \[\\00:16:00.17\\\] Unless Linus Torvalds is maintaining that library, then...
++
++**Alex Sexton:** Sure, sure, sure. \[laughter\] But at least it's well known. No one's being quiet about it.
++
++**Mikeal Rogers:** Yeah. I've actually been using Sodium encryption an signing. I don't know who came up with the standard, but Mathias Buus in the Node community has gotten really into it. There's really good libraries that work both in the browser and in Node, and it's a really good, consistent, easy way to do signing encryption.
++
++**Rachel White:** The stuff that I've seen from previous jobs that I was at where we did a lot of Node stuff was more built into CI tests, so when it would check to make sure all the tests pass, it would also check for known vulnerabilities and maybe certain NPM packages, or the way that code was written. Would that be separate to other things that people would want to integrate into their regular behavior? Or is that just another good level of authentication?
++
++**Mikeal Rogers:** It's a good practice to -- Snyk has a service that you can plug your open source module into (I believe for free), on your GitHub PRs and stuff like that. It will check if you have any vulnerabilities, and there's obviously a proprietary version as well. That looks through your NPM tree and sees if there's any known vulnerabilities, and in fact even offers you ways to patch them and stuff like that, so it's a pretty nice tool.
++
++But that's really just for known vulnerabilities, things we've already seen out in the wild. It doesn't really protect you against bad practices. Also, you run into this problem... Like Alex was saying, if nobody is using the module, then nobody is probably going to take the time to find these vulnerabilities early on. Using well known, well-trafficked modules will really help, as well.
++
++I think we're pretty good there. I think that we're actually coming into the time for a break now.
++
++**Break:** \[\\00:18:04.02\\\] to \[\\00:18:51.08\]
++
++**Mikeal Rogers:** Alright, let's dive into this a little bit. A relatively routine new version of Node came out - 7.6. We do these releases all the time, but this one is a big deal, and people are making a big deal out of it because V8 got updated in the background. They've been doing a lot of work so that we can actually take new versions of V8 in point releases and not break the API for everybody, so that's been great. But in this release, async/await came out from under a flag, so now in a current release of Node you can do async/await.
++
++I'm curious what you all think of this and what your views are on it? Before I get into my views...
++
++**Alex Sexton:** I don't have a ton of opinions... I understand the two sides of this, and I feel like... I mean, I think the primary -- at least \[unintelligible 00:19:51.12\] people are calling their primary concern is performance of this, versus callbacks or Promises or whatever. I think that's silly, because a) it will get faster the next version, and b) it's such a small performance hit that who cares?
++
++\[\\00:20:08.23\\\] It's primarily sugar; I guess there are the people who dislike sugar and there are people who like sugar. Just use whatever you want, I don't know... I dislike that this is an issue.
++
++**Mikeal Rogers:** You're just trying to make yourself above the controversy.
++
++**Alex Sexton:** Yeah, exactly.
++
++**Rachel White:** Why don't you explain the controversy for us, Mikeal?
++
++**Mikeal Rogers:** Look, there's a long, long argument against Promises. There's just a lot of people that don't like Promises. I actually don't care about Promises, I'm fully in the "do whatever you want, I don't care" camp...
++
++**Rachel White:** I'm telling your wife.
++
++**Mikeal Rogers:** ...but it does get annoying that people act like this is revolutionary. A lot of the articles that were written about this feature coming into Node are like, "Node finally tackles asynchronous programming." Node 0.0.2 tackled asynchronous programming. Asynchronous programming has been part of Node since day one; it's been the hardest thing for people to get over.
++
++And callbacks... The standard callback interfaces \[unintelligible 00:21:23.14\] into something usable and really fast. I think Promises landed a while ago in V8; people have been using Promises though since early Promise standards. Bluebird is based on the Promise standard, which is the really fast one, that people really tend to like.
++
++**Alex Sexton:** I feel like people used Promises far before it was even standard in V8, or whatever.
++
++**Mikeal Rogers:** Right. And before it was a standard, there were all these competing standard for Promises. If you go back far enough, you just could not get two people to agree on the same Promise.
++
++**Alex Sexton:** Well, you couldn't get jQuery to agree with the rest... \[unintelligible 00:22:03.23\] that was pretty early on, I feel like... Maybe not.
++
++**Mikeal Rogers:** So what Alex is hinting too is this fight in CommonJS over which standard would be the Promise standard. He said A/A+ because there was also Promises/B, C and I believe D, and I don't know how many letters we got up to.
++
++**Alex Sexton:** No one used those, though. They were just proposals.
++
++**Mikeal Rogers:** Right. But anyway, I think \[unintelligible 00:22:32.06\] ton of work just to get Promise people to agree on the same spec, or at least get everybody to stop listening to the people who were detracting. It got like a real standard in the language, which a lot of people that don't like Promises don't like. I personally prefer not to wrap this kind of state in an object myself... But one thing that you can say about it is that the browser - if you look at all browser standards - there's just no standard way to do I/O handlers. If you look at every DOM API that has to do this, they do something slightly different, and all of them are awful. And even if you don't like Promises, most of what people do in the DOM - they do the same thing, it's just worse than Promises.
++
++So it's nice to have a standard that going forward - if you look at the Fetch API and some of these new browser APIs - you have something unified, which is so good.
++
++**Alex Sexton:** To be clear, Promises made it into the DOM specification, not ECMA, right?
++
++**Mikeal Rogers:** Well, it's sort of in both. Async/await is a feature in the JS language, and it effectively yields a Promise, and it relies on that standard. You're getting into this annoying territory where we have two standards bodies working on the web platform.
++
++**Alex Sexton:** Yeah, but the Promise object doesn't have to exist in Node (the native Promise), and it just kind of does because V8 does.
++
++**Mikeal Rogers:** \[\\00:24:05.00\\\] Right, but there's some really low-level hooks. Now we're gonna get into some NodeJS details. There's a lot of tracing and debugging that you can do in NodeJS, especially in production systems to really get at the underlying state that's going on. There's all kinds of different methods to get at this; Node is one of the more inspectable platforms out there; there's different types of tracing that people do, and there's also this thing called AsyncWrap, which is like an async hook into the low-level event system. In order to do that, in Node there is this thing called Make callback in C++ land that wraps the callback that happens; it's just a little function.
++
++But Promises don't have that kind of hook yet - native Promises don't have the hook yet in V8, so there's work that needs to be done to get an equivalent thing happening at the native level, which at that point actually will make it much more valuable to use native Promises, rather than something like Bluebird. But anyway... What it all comes down to is that I think people don't actually like composing Promises into a bunch of things; they get kind of annoying and messy, and then end goal has been this async/await feature, which allows you to yield out a Promise. It's a syntactic sugar on top of what people are doing now. It is one of those more important pieces of syntactic sugar that makes this far more usable than it used to be, right?
++
++**Alex Sexton:** Yeah. It doesn't tackle a lot of the core problems people have with Promises, namely error eating, right?
++
++**Mikeal Rogers:** Yeah.
++
++**Alex Sexton:** But I think if you're already using Promises, async/await can be a nice update to your code style. I think for the most part it's fine - you don't have to use it, no one's forcing anyone to use it. You can almost always write a little wrapper around some dependent library that uses it to switch it back to whatever you like to use... Fibers, or whatever.
++
++**Mikeal Rogers:** Nobody uses fibers...
++
++**Alex Sexton:** I know, I intentionally said something that no one uses. \[laughter\] But I think it's a silly argument, just because it's sugar -- most of the time, performance on it is not going to matter materially at all, and you can choose to not use it, so... Deal with it.
++
++**Mikeal Rogers:** Yeah, that's a really good recap. \[laughs\] I wanted more controversy. Rachel, come in and tell me how much you love Promises real quick... I'm just kidding!
++
++**Rachel White:** That's the thing - now that I don't write a ton of production code, I can do whatever I want. Nothing makes me angry, because if it does I'll just do it a different way, so I'm pretty much indifferent about arguments in regards to code preferences. As long as it works, I'm happy with it.
++
++**Mikeal Rogers:** We're not gonna have very good arguments on this podcast if everybody's above arguing. \[laughter\]
++
++**Rachel White:** I mean, I'll argue, but not about this... \[laughter\]
++
++**Alex Sexton:** The question on our chat in Slack - you can join the Changelog Slack and the JS Party channel... Seth asked "Is there any argument against async/await other than performance and "syntax sugar is bad"? Well, against async/await maybe not, because it's just sugar, but there are plenty more arguments against Promises than just performance, namely error handling - I think that's the number one complaint. Whenever you're inside of Promises, often times you're many levels deep inside \[unintelligible 00:27:46.06\] and stuff, and errors can get swallowed in a way that's very, very hard to track them down, and very hard to even get stack traces back out of them when you do catch them.
++
++\[\\00:27:59.22\\\] You have to be very explicit about every error step along the path, and if you're not, then things just get swallowed and you don't realize that bad things are happening in your code. It may not be the number one design flaw with them, but it's certainly the number one thing people run into whenever they set up a giant Promise-based system.
++
++**Mikeal Rogers:** Yeah, and I think also the way that it handles errors kind of conflicts with the way that not just Node handles errors, because that wouldn't be accurate - Node doesn't have a way to handle errors, but a lot of the debugging facilities and tracing facilities in Node rely on errors and exceptions kind of bubbling up to the top... So because it's swallowing them, you lose a lot of the state and you can't figure out where you're going.
++
++So a lot of production Node systems have issues with that particular mode. That's being worked on, right? This is all really, really early days. I think that a lot of this is going to get better over time, but people that already have a big production system kind of don't like this.
++
++There's also a style argument or a way that people like to write code argument, and this argument is as old as time. It's just an OOP versus functional programming argument. Essentially, Promises wrap up a bunch of state in this object abstraction that you can then stack and compose, and some people think that that is a bad style of writing code, compared to more functional programming style. So there's that argument out there as well.
++
++People have different brains, and different people's brains like these different ways of writing code.
++
++**Alex Sexton:** Sure. Seth also asked, "Is there a suggestion for avoinding the error stuff and some of these other gotchas?" I don't think there's a great one... There are good, baseline rules for how to not write Promises in a way that accidentally swallow errors, but in practice, with some of the most brilliant people, it still happens almost every time, once or twice, somewhere.
++
++So there are other mechanisms for asynchronous coding - the baseline won't be callbacks, but then you get to what people hate about callbacks, which is 'callback hell', or whatever. I'm sure Mikeal has some things to say about 'callback hell'. I don't think he can deny that callback hell exists for some people...
++
++But then there are other async mechanisms... Async functions are coming in the future, which is a pretty fundamentally different model. And then generators, if you know that model, or another way to yield control in certain sections, and then pop back to those -- not necessarily used in the same exact ways, but generators and async functions are kind of cool because they don't swallow errors in the same way, and they make programming asynchronously look somewhat synchronous, which is pretty cool. They also because of that can be very confusing. It's very hard to stretch your brain to say, "Oh, this one character here, this one keyword caused all this stuff to happen behind the scenes", so they can be somewhat difficult to reason about sometimes. Maybe Michael has more opinions on generators and async functions, though. Or Rachel.
++
++**Mikeal Rogers:** Yeah, before we go too deep into this though, I just wanna point out that in the browser there's actually some new features around Promises, and for error tracking and handling, specific to Promises, that I believe actually rely on the native Promises.
++
++**Alex Sexton:** They're for debugging the Promises, though. Your code would still swallow it, but you might be able to see it in your tooling. Does that make sense?
++
++**Mikeal Rogers:** \[\\00:31:55.22\\\] Right, exactly. But honestly, the solution to callback hell is to write code that doesn't have callback hell, the same way that the way to not swallow errors in Promises is to write code in a way that doesn't swallow the errors, right?
++
++**Alex Sexton:** Yeah. Not necessarily a good solution, but viable.
++
++**Mikeal Rogers:** Yeah. I'll also say about coroutines - there's a library called Co, that's the main thing that people use on the Node side to really do a lot of the asynchronous programming using generators. It's not in super wide use generally, but it has this huge following in China. Really big. It's actually really interesting... There's this dude DeadHorse on GitHub, but he took over maintaining some of TJ Holowaychuck's modules when TJ left...
++
++**Alex Sexton:** As we all did...
++
++**Mikeal Rogers:** He quit for Go, as you do... He took over a lot of the Co stuff, and DeadHorse is actually a really well-known programmer in China. He helps with some of the cNODE and cnpm local stuff. He's actually a great dude, I met him when I went out to China. But because he's such a presence there, I think that he has sort of like by himself propped up the coroutine stuff, and a lot of programmers in China are actually using that. There's not as big of a Promise following there, it's much more around the Co stuff. It's really interesting... It's one of the few divergences in preferences that I know that are actually geographical.
++
++**Alex Sexton:** I actually only use the async module.
++
++**Mikeal Rogers:** That's kind of not maintained anymore either.
++
++**Alex Sexton:** That was not true... But back in the day, that was somewhat revolutionary. I think some of people's love for Promises came out of the bridge between Promises and callbacks that async was. It was like this weird middle ground where you didn't have to count the number of different things that had finished, or introduce multiple layers of callbacks in a row. You could kind of use the async module to flatten some of those things. But it definitely wasn't, by any means, a standard, or even internally consistent in how it worked. It was nice from a community growth standpoint, it was a stepping stone.
++
++**Mikeal Rogers:** I think in the server space and in the frontend space, if you get popular enough somebody will make a Promise version of your thing and there will be like a following around that... Like, there's definitely that pull request. I'm actually curious, Rachel, if you see this in the hardware space at all, if there's as much of a Promise following in NodeBots and what not.
++
++**Rachel White:** I honestly couldn't tell you, because I live in such a siloed thing. A lot of the NodeBot stuff is a very single-usage thing, so you'll have like one sensor being controlled by some other input. There's not a lot of need for a ton of Promises or stuff that you would need to have something special. You just don't run into the same kind of problems that you run into when you're writing things for the web, which is probably why I like hardware so much.
++
++**Alex Sexton:** What about sequential actions? Like, you want some servo to do this, then this, then this, then this.
++
++**Rachel White:** Oh, okay... Well, the thing that you run into the most then is when you're trying to run stuff on serial port; when you're getting data from multiple places at once and sometimes this stuff that you're waiting to happen from your sensor over Wi-Fi isn't going to happen as quickly or in sync as the stuff coming over your serial port cord, so... It is sort of an issue, but not that much. I, at least, haven't run into it that often. Plus, whenever I have to deal with a bunch of really intense -- it usually happens whenever you have to rewrite more custom C to handle new kinds of chips, and then have the C work with your Johnny-Five stuff on an Arduino or a Tessel.
++
++**Mikeal Rogers:** \[\\00:36:21.27\\\] It's all like really low-level callback stuff, right? You don't get a lot of high-level proposition at that layer...
++
++**Rachel White:** Yeah... I'm trying to think of anything that I've done recently that has been what I would refer to as callback hell, and it probably would be some Node application that I utilized graphics magic with. I'm actually interested in going in and trying out the new Node version with that kind of stuff. I think it might be really helpful for people that do a lot of procedural art-based stuff on the web, actually.
++
++**Mikeal Rogers:** Also, there's these performance arguments right now, and honestly, even though I'm not a huge Promise advocate, I think most of the performance arguments are really dumb. But in hardware, it actually makes sense. The reason why I think that the performance arguments are stupid is that you're talking about 0.02 milliseconds I think is like the largest difference between Bluebird and Promises and native Promises. And if you're talking to the network or the file system, that's really not a thing. Your websocket delay to local host is roughly like a 3 millisecond roundtrip time, so it's just not ever gonna be noticeable.
++
++But with a serial port, you're talking to the hardware there. It is asynchronous, but it is really, really fast, so you could actually see some of the performance stuff stack up there, and you might actually start to care.
++
++**Rachel White:** I don't care about much, but we'll see. \[laughter\]
++
++**Mikeal Rogers:** How fast can I AI this cat photo to blink this LED to...
++
++**Rachel White:** Okay, listen, don't... Don't...
++
++**Alex Sexton:** Don't pigeonhole me...
++
++**Rachel White:** Yes, exactly. I like other animals. \[laughter\]
++
++**Mikeal Rogers:** I thought you were gonna say, "I do more than just cat images."
++
++**Rachel White:** I wish I did.
++
++**Mikeal Rogers:** \[laughs\] Oh, that's awesome.
++
++**Rachel White:** You know, I enjoy pigeons and raccoons and other various other animals that love garbage... \[laughter\]
++
++**Alex Sexton:** We should have Isaac on, so you guys could discuss...
++
++**Rachel White:** Oh, I've already discussed raccoons with Isaac...
++
++**Alex Sexton:** I know, I just want that to be like a live voice thing.
++
++**Rachel White:** I don't know if I ever want to have that conversation again.
++
++**Alex Sexton:** Yeah, I made a mistake then.
++
++**Rachel White:** For anyone that's wondering, Isaac from NPM - if you ever see them, talk to them about how much they love raccoons. \[laughter\]
++
++**Alex Sexton:** They don't.
++
++**Mikeal Rogers:** \[laughs\] And on that note, we're about ready for another break. When we come back, we'll talk a little bit about the featured project of the week.
++
++**Break:** \[\\00:39:05.24\\\] to \[\\00:39:54.22\]
++
++**Mikeal Rogers:** And we are back. We're gonna get into the featured project of the week, AR.js. Rachel's particularly stoked about this one, so I'm gonna let you take this over.
++
++**Alex Sexton:** It's about assault rifles?
++
++**Rachel White:** No, no...
++
++**Mikeal Rogers:** That's version 15.
++
++**Alex Sexton:** AR.js v15...
++
++**Rachel White:** Okay, so AR.js is this really awesome library that you can use now that is augmented reality for the web using AR toolkit. It's built of a couple other different technologies. It's using three.js, it's using Mozzila's A-Frame, which is -- if you haven't messed around with A-Frame, what it does is it allows you to do web WebGL, WebVR in the browser, so you can either view things in the browser with a 3D appearance, or if you have a Google Cardboard or any other kind of virtual reality headset that phones go into - it allows you to actually see the 3D object that you have developed in virtual reality, with your phone.
++
++What AR.js does is it blends all of these things together and allows you to use digital markers. They're using hero markers, which are these squares that have...
++
++**Alex Sexton:** Little Greek burritos...
++
++**Rachel White:** No! \[laughs\] They're like QR code. Basically, any kind of digital marker is just using image processing with nearest neighbor type of math-y things... I'm great at explaining things technically. Basically, what AR.js does is -- unfortunately, if you have an iOS phone it doesn't work, so I can't even test it, which bums me out... But if you have an Android phone, you can set it up so that you have your 3D environment that you've crafted with A-Frame, and A-Frame is built on top of three.js, because it allows for the 3D objects in the browser.
++
++Then it uses the AR toolkit, which was originally elaborated in C, and they've made it work with Javascript. It does that nearest neighbor processing of the hero marker, and it assigns your 3D object so that when you use your phone in a WebGL supported browser and you point it at the marker, either on a computer screen or a piece of paper that's printed out, whatever 3D object you've assigned to that marker in your code will appear on the phone or the device that you're viewing it through as a hologram type thing.
++
++It's really cool. A-Frame is really accessible for people that are just starting out in Javascript. Their documentation is amazing, and pretty much what this AR.js library does is it allows you to take -- they basically took all of the difficult steps out of the equation. Everything is built together for you, the documentation on it is pretty good; it says that it runs at 60 FPS on a Nexus 6, which is pretty impressive, and there's a lot of examples of three.js things that you can do with it, so I'm excited to see what people make with it, because I'm very interested in any kind of augmented reality, virtual reality, mixed reality situation that we can do with Javascript. It's super exciting.
++
++**Alex Sexton:** This is only a slight side check... So it runs at 60 FPS, and if you look at the pictures of it, it's like this blob that sits on a piece of paper, and you can look around and the blob stays on the piece of paper, which is pretty nifty. You can move it and animate it and things like that; you can spin it on the piece of paper while you look around. That runs at 60 FPS, and that's pretty verifiable on the phone. But I can't get a div to animate from 200-pixels-high to 500-pixels-high at 60 FPS. I can't get my web page to scroll at 60 FPS by default half the time.
++
++**Mikeal Rogers:** \[\\00:44:18.15\\\] It's because you're not using WebGL! \[laughs\]
++
++**Alex Sexton:** I know... I'm just always so amazed that the difference -- everybody is almost hitting 60 FPS, but the place where we're starting out is always so different... It always blows my mind when these things work quickly, that's all I wanted to say.
++
++**Rachel White:** I mean, obviously that just means that the future of web is that it's all gonna be holograms...
++
++**Alex Sexton:** I'll buy it. \[laughter\]
++
++**Rachel White:** Yeah... I'm into it. I actually would be really interested in finding out -- I know that there's a device called the Leap Motion. It's a USB device that lets you essentially use your hand -- I think it's like two cameras, so it's essentially scanning the space above the Leap Motion, and when you put your hand in front of it, you get a 3D model. It's used a lot with Unity and gaming type stuff like that, but I know that there is a way to use it with WebGL, so now I'm curious if I'm able to use a Leap Motion with this augmented reality application to not only be able view holographic things through a device, but if I could couple it with another thing and try and move things around.
++
++I'm just thinking of all the really weird and awesome stuff that people can build with this. This is the stuff that I get excited about.
++
++**Alex Sexton:** Yes, and thanks in advance to Leap Motion for sponsoring the JS Party podcast, and also thanks in advance to the next company I'll give free advertising to, the Myo armband I backed on Kickstarter a long time ago. It's not quite positional, so it might not know exactly where your hand is (I feel like you could do that with a marker), but then it essentially can give you data about your exact hand position. It's an armband that goes kind of like next to your elbow, pretty far back, and it just reads the tensions in your different tendons, to know that your hand is doing a motion like a pull or a push or a squeeze or any of those different things...
++
++**Rachel White:** Yeah, I remember seeing that.
++
++**Alex Sexton:** I've actually given a few talks where you hook up the next slide and previous slide, and it's just like swipes in the air or behind your back, and then you can start animations or different things like that with squeezes... There's a whole set of default things for Keynote and stuff. It's pretty nifty, though I find that sometimes you have false positives and it'd just slide whenever you're gesturing wildly.
++
++You could just put a marker on your hand to know a position; you can get an RFID tattoo -- or not an RFID, a QR code. Rachel, you have the RFID baked into your hand, right?
++
++**Rachel White:** Yeah, I have an RFID chip in my hand.
++
++**Alex Sexton:** Yeah, that's in solidarity with your pets.
++
++**Rachel White:** Yeah, that's how much I love cats. I'm really dedicated.
++
++**Alex Sexton:** But I think you could do some really cool stuff with not just the position of your hand, but the motion of your fingers and stuff like that, like picking it up versus pushing it, versus all that stuff. Maybe a Leap Motion plus a Myo... You just mix them all together and get a drone in there somehow...
++
++**Rachel White:** Yeah, every single kind of crowdfunded device - put them all together and see what you can get.
++
++**Mikeal Rogers:** This is a really cool project. This reminds me... When they first used M scripting to compile down Doom and these 3D games, when they were first doing 3D standards in the browser, and those demos that nobody really ever used were what ended up pushing the web's implementation of WebGL forward.
++
++**Alex Sexton:** \[\\00:48:06.04\\\] Yeah, I mean... Brendan tore the conference circuit for like three years on those demos.
++
++**Mikeal Rogers:** And he's so bad at playing it, too... It was so funny.
++
++**Alex Sexton:** He eventually - after dying so quickly, so fast, so many times in front of 500 people - hacked the parameters to the game to where he can't die; he plays in god mode now when he does the demo.
++
++**Rachel White:** Are you talking about the Sentry Chicken talk?
++
++**Alex Sexton:** Yeah... The same version of that talk has different games.
++
++**Rachel White:** Okay.
++
++**Alex Sexton:** Actually, one thing mashup I'd love to see with this - just spitballing here - is some sort of like... If you use a piece of paper, and then you're able to kind of draw shapes, and then press some button on your keyboard and then it AR-ifies it to where you can pick up the shape... Does that make sense? It's essentially like the style in the super futuristic movies - I feel like we're almost there, where you can draw something and then manipulate it in 3D space.
++
++**Rachel White:** Well, there is something that exists like that. Not in the Javascript world, but there is an application called Vuforia, that allows you to create those augmented experiences where you can interact with this. So maybe somebody should do that.
++
++**Alex Sexton:** Yeah, I look forward to one of our listeners from this week presenting that on the show next week. It just takes one week, right?
++
++**Mikeal Rogers:** Yeah, yeah. \[laughs\] So have you all done any WebGL programming at all, or played around with any of the raw stuff?
++
++**Rachel White:** Yeah, I have. I have a bit. I'm learning A-Frame, I'm messing around with a bunch of other various three.js stuff, and I've done some WebGL video game things. This is something that I'm super interested in. Plus, it's happening so fast... People are making cool stuff with this, and I find that the people that are actively developing interactive things for WebGL-based art are not software engineers for their day jobs, they're just multi-faceted technologists and artists that were like, "Oh, this is cool. I wanna make cool stuff for this." That's really awesome.
++
++**Alex Sexton:** I haven't done a ton of WebGL stuff. A little bit for some of the Stripe \[unintelligible 00:50:40.17\], but I have met Mr. Dube, which I feel like it's pretty much the same thing.
++
++**Mikeal Rogers:** Okay, there you go. I've tried to use three.js and I really couldn't get my head into it. It's one of those libraries that's just so massive. I could take a demo and kind of hack it up, but I couldn't really get my head around it.
++
++**Rachel White:** So wait... Let me get this straight. You'll build an oven to bake your own bread, but you didn't wanna do a deep dive into three.js?
++
++**Mikeal Rogers:** Well no, it's because to get at the low-level constructs that I actually wanna figure our in order to understand how everything is built, there was too much code in the way. What I eventually ended up finding though is Mikola Lysenko and Substack live on the big island in Hawaii now next to a volcano, and they hack on this thing called Regl.
++
++**Rachel White:** Wait, wait...
++
++**Alex Sexton:** You've gotta skip over that kind of thing...
++
++**Rachel White:** Wait, Substack lives on an island in Hawaii now?
++
++**Mikeal Rogers:** Yeah, Substack and Mikola and Marino all moved to the big island in Hawaii, because it's cheap and because coconuts have 1,200 calories in them.
++
++**Rachel White:** Okay...
++
++**Mikeal Rogers:** \[laughs\] Yeah, it's amazing.
++
++**Alex Sexton:** You have to eat the skin in order to get all 1,200.
++
++**Mikeal Rogers:** \[\\00:51:59.16\\\] \[laughs\] No, but they are building this thing called Regl. Essentially, it's various substacks modules philosophy, and Mikola is just this amazing math dude, doing all these kinds of crazy algorithms. It essentially gives you WebGL, but then adds a bunch of features and kind of modules, and you can plug in different algorithms and stuff really easily into it. But the most amazing thing about it is when you get an error in your WebGL code, you actually get line numbers out of the debugger that gives you your line number in your crazy abstract thing from Regl.
++
++It's really well put together, and they've done a really amazing job with the tooling and the debugging side of it. I was actually able to build much cooler, quicker things with Regl than I could with three.js. Even though there's far less big demos and stuff written with it yet, I did find it easier to just kind of pick up and learn.
++
++Anyway, I think we're nearly good. We're gonna do picks now... It's time for picks. I hope you all picked something that you like that you can link to, or you can just pull one of the many things that you've already mentioned in the podcast so far.
++
++I'll go back and I'll just pick Regl, because it's an awesome library; I think they did a great job, and I love those guys. I hope they don't die in a volcano eruption. Oh, and I'll plug bits.coop. Mikola and Substack do consulting for any 3D programming stuff that you need - or really just any programming that you need. They're pretty amazing, and they're available through bits.coop. They're trying to do a cooperative anarco-socialist style thing for a consulting business. Check that out.
++
++**Alex Sexton:** My pick will be Observatory from Mozilla, which is the security checker that I mentioned before. If you have a website and you're interested in finding the security properties of that website and what you might wanna do to increase them, such as get rid of your SHA1 certs, then check out Observatory.mozilla.org.
++
++**Rachel White:** My pick is actually a talk, and it's Mariko Kosaka's talk on How Computers Read Pixels. It's really interesting and has great diagrams if you're ever wondering how image processing works, which is a foundation for a ton of augmented and mixed reality stuff with WebGL. It kind of helps you understand on a more fundamental level what is happening when you're looking at these AR markers.
++
++**Mikeal Rogers:** Mariko's talks are always so good. She really dives into these concepts that everybody takes for granted, and really learns them and explains them in a really amazing way.
++
++**Rachel White:** I know. I've told her that I really appreciate how she doesn't just explain how something's working so that it's accessible to everyone, but she also tells the journey of what lead her to want to even do that in the first place, and the struggles that she had while making it, and then the successes. Those are my favorite kinds of talks. I'm gonna try for the picks maybe every other week, between maybe a library or a project that's cool, and then other talks that I think are really great.
++
++**Mikeal Rogers:** Of course, you can find links to all this stuff in the show notes. That's it for this week... We'll of course be back next week. Rate us on iTunes, because that's the thing that people say at the end of podcasts, so you should probably do that...
++
++**Alex Sexton:** Subscribe and rate!
++
++**Rachel White:** And be nice!
++
++**Mikeal Rogers:** Subscribe, be nice... And yeah, check us out at JsParty.fm.
+diff --git a/test/fixtures/transcripts/the-changelog-200.md b/test/fixtures/transcripts/the-changelog-200.md
+new file mode 100644
+index 0000000000..54c46773a9
+--- /dev/null
++++ b/test/fixtures/transcripts/the-changelog-200.md
+@@ -0,0 +1,431 @@
++**Adam Stacoviak:** Welcome back everyone, this is The Changelog and I am your host, Adam Stacoviak. This is episode 200 - that's right, the big 2 0 0. I'm excited about that, because we actually had Raquel Vélez on this show. If you don't know Raquel Vélez, she's Rockbot pretty much everywhere out there. We talked to her about where she came from, how she got into programming with Javascript, her passion for robots and mechanical engineering, and also the culture of Npm.
++
++We have three sponsors for this show - Toptal, Linode and Full Stack Fest.
++
++Our first sponsor for the show today is our friends at Toptal. If you're new to the show, let me tell you, we love Toptal. If you've been listening for a while now, you know that we love Toptal.
++
++Toptal is an exclusive network of top freelance software developers and designers. Top companies every single day rely on Toptal freelancers for their most mission-critical projects. One of the things we love about Toptal is that it's this worldwide community of engineers and designers that just love to enrich the community. As a Toptal engineer or designer you'll have the flexibility to travel the world, be able to blog on their blog, be able to apply for open source grants and contribute back to things you really care about. Head to Toptal.com to learn more, or for a more personal introduction e-mail me, adam@changelog.com I'd love to help you take your first step with Toptal. And now, onto the show.
++
++Alright everyone, we've got a fun show lined up today. Raquel Vélez is here, and it's an interesting story to this show because we had a schedule a couple of days ago that didn't work. Long story short, if you haven't been following along, we shared it in our e-mail, we shared it on Twitter, I shared it on my personal Instagram and elsewhere on the internet, but my wife and I, we had a kid, so it's been a kind of craziness for us. It's always fun to have a kid, but it's crazy times the first couple months.
++
++Jerod, we've got Raquel here, aka Rockbot. What do you think, man?
++
++**Jerod Santo:** I'm excited, and I think you probably haven't heard it yet, but I congratulated you on the start of our last show. I just wanna reiterate that, for you and Heather. Exciting times at the Stacoviak house!
++
++**Adam Stacoviak:** Yes, a new changelogger in the system - love it!
++
++**Jerod Santo:** But, we have Raquel here. Raquel, welcome to the show!
++
++**Raquel Vélez:** Thank you! Hello, and congratulations! Oh my god!
++
++**Adam Stacoviak:** Thank you.
++
++**Raquel Vélez:** ... a little human.
++
++**Adam Stacoviak:** Yeah, it's the craziest thing. They come out and they become humans, isn't that crazy? Well, they're human all along, of course.
++
++**Raquel Vélez:** Well, I don't know, they start out kind of nugget-shaped, and slightly lizardy, and then eventually over time they become more human.
++
++**Jerod Santo:** What we could do is we could argue about exactly when that moment is.
++
++**Raquel Vélez:** Or, we could talk about pretty much anything else.
++
++**Jerod Santo:** Yes, pretty much anything else. So let's talk about this - I'm not sure if you saw this or watched it, but you were a feature prominently on our Beyond Code interview series, which is actually how I found out about you, Raquel. It's a video series we do, where we interview people at conference after-parties, and we ask everybody the exact same five or six deep questions, and watch them squirm and watch them have fun answering those. In season two - we'll link it up in the show notes - we had Amanda Shih, and we asked her who her programming hero is, and she had this response, which is actually probably my favorite moment in Beyond Code so far... \[\\00:04:01.14\\\]
++
++**Adam Stacoviak:** Yes, I agree. We have a clip, so let's go ahead and play the clip, and we'll let you all hear that.
++
++"That's a hard one. I have to say I have kind of a developer crush on Raquel. I'm pretty sure she doesn't know that I have a crush on her, but I think she's pretty awesome, she does robot stuff. Yeah, that would be one... There's a lot. I like looking up to people, and I think it's good to be inspired by people, but she's one that I can think off of the top of my head."
++
++**Jerod Santo:** I was interviewing her at that time, and I just had to kind of act like I knew who Raquel was, \[laughter\] because she didn't specify, and I'm like "Cool, good answer." Then I'm like, \[whispering\] "Adam, who's Raquel?"
++
++**Adam Stacoviak:** \[whispering\] Wait, that's Rockbot, from npm.
++
++**Jerod Santo:** \[cross-talk 00:04:46.00\] Rockbot, I'm like, "Oh, okay." So that was a fun way of introducing you to us. Just curious how you feel being someone who Amanda Shih thinks is pretty awesome, and even so much to have a developer crush on you.
++
++**Raquel Vélez:** Yeah, I saw a tweet along those lines, and I think I saw the video. I sat there staring at my monitor, being like, "Oh my god, this is adorable!" I'm honored, honestly. I think it's so heart lifting and just warm-fuzzy-feeling-y that... How can you possibly say anything negative about that? That is just so cool. I was on a speaker panel the other day, and they asked me what got you into speaking. A lot of people are like, "Well, the reason I started speaking is because I wanted to prove that I understood something" or "I wanted to get over my fear of public speaking" or whatever, and for me one of the biggest reasons - there's this really amazing quote that I've heard from lots of different sources, so I don't know who to attribute it to, but "You can't be it if you can't see it." So I was sick and tired of seeing the same type of person on stage at tech conferences, and I was like, "You know what? Forget it... I need more people who look like me on stage, so I'm gonna go and just be on stage. Let's just do this." So hearing other people kind of recognize that "I'm out there, I'm doing stuff", that's just super cool, and I love that. It feels really warm, fuzzy. Yay!
++
++**Adam Stacoviak:** Plus she was totally into robots, too. I think everybody there mentioned Johnny-Five.
++
++**Raquel Vélez:** Yeah, which is...
++
++**Jerod Santo:** It was a Javascript conference, so there was a lot of -- it was down in Houston, right? - so there was a lot of Node and NodeBots people in the house.
++
++**Adam Stacoviak:** Yes, quite following you have.
++
++**Jerod Santo:** And just to give you a brief introduction for you, just for our listeners, Raquel, you work at npm and you've been very active in the NodeJS and NodeBots community. When you're asked to introduce yourself, I noticed on your website, you have like four or five versions of your bio, which I thought was kind of funny... How do you introduce yourself?
++
++**Raquel Vélez:** I basically say "Hi, I'm Raquel Vélez, I'm @Rockbot on Twitter" - which always feels weird, because people are like "Why does anybody care about your Twitter handle?" except that so many people know me as Rockbot. They won't know my name, but they'll know my Twitter handle. So I'm like, "Hey, I'm rocbot, I work at npm, I work on the web team. One of my claims to fame is that I was employee number one at npm, so I've been there the whole time with the company." And then from then, things can go haywire; I can say so many things. \[laughter\] I was a huge, huge part of the NodeBots movement; I was one of the original, core members of NodeBots, and I still cheerlead on the sidelines. \[\\00:08:06.14\\\] I've taken a little bit of a hiatus... I've been doing it for three years and there are so many incredible people who have taken up the torch, that I want them to get the recognition, because I'm not doing it as much anymore.
++
++Other things... What other things do I wanna tell people? I generally tell people that I just love to geek out and nerd out on stuff, but I don't know...
++
++**Adam Stacoviak:** What about your podcast?
++
++**Raquel Vélez:** Oh yeah, I have a podcast - Reactive.audio. It's a weekly podcast where we basically - three people - hang out and chat about what happened over the last week in tech. It tends to have a bit of a Javascript angle, but we'll talk about pretty much anything. In my offtime I tend to -- I actually have started stepping away from the technology as much as I can, just because my work at npm is so intense that it's nice to take a complete break. Fun fact - I have a degree in Mechanical Engineering, and so the software stuff is really fun, but I miss working with my hands. So in the last year or so I've started taking up things like sewing and knitting, which to me is just mechanical engineering with fabric or yarn, and it's super cool to me, doing all this engineering in three-dimensional space, as opposed to...
++
++**Adam Stacoviak:** What kind of stuff do you make?
++
++**Raquel Vélez:** Clothes, actually... Because clothes are hard...
++
++**Adam Stacoviak:** Baby clothes?
++
++**Raquel Vélez:** No...
++
++**Adam Stacoviak:** I was trying to get some baby clothes, I'm sorry...
++
++**Jerod Santo:** You're trying to get some freebies, or what?
++
++**Adam Stacoviak:** Yeah.
++
++**Raquel Vélez:** Yeah, I mean... The thing about baby clothes that's so weird is that babies grow so fast...
++
++**Jerod Santo:** Yeah...
++
++**Adam Stacoviak:** It's a waste of time. You wear it for a month and you're done.
++
++**Raquel Vélez:** Yeah, exactly.
++
++**Jerod Santo:** I think that a Netflix for babies is a really good idea... I mean Netflix clothes, because you're constantly trading up, and I'm sure that \[unintelligible 00:10:07.14\]
++
++**Raquel Vélez:** That makes sense.
++
++**Jerod Santo:** So you're making clothes... You mentioned you have this different background and actually just looking at one of your bios - you've lived in four different countries, you speak five different languages, so you're polyglot in the traditional sense of polyglot...
++
++**Raquel Vélez:** Yeah.
++
++**Jerod Santo:** We like to learn how people came to where they are, and especially you being now such a prominent member of the open source and Javascript community, I was surprised to find that you're kind of relatively new to it in terms of your overall history. Can you take us back to this degree in mechanical engineering and how you got from there to a software developer at npm, Inc.?
++
++**Raquel Vélez:** Absolutely. First of all, we have to do the Wayne's world intro...
++
++**Jerod Santo:** Yes! Very good, I like that.
++
++**Raquel Vélez:** So let's see, how do we start? So I got a degree in Mechanical Engineering from Caltech, which is a pokey little tech school in Southern California. I was really into robots. My whole undergraduate career was all about robots. In robotics you can do either Mechanical Engineering, Electrical Engineering or Computer Science. Electrons and I don't get along, so that was out, and Computer Science just seemed really, really... Like, I didn't get to play with my hands, it was all extremely mathy and... I don't know, the Computer Science nerds - no offense to Computer Science nerds, but I didn't get along with them in the same way that I got along with Mechanical Engineering nerds, so I was like "Alright, Mechanical Engineering, it's like arts and crafts with big machines, let's do this." So I did that, but hilariously, over the course of doing all the mechanical engineering and doing robotics, there was always a need for more people to program stuff, and I got really interested in the artificial intelligence side of robotics, so I did a lot of programming just because I wanted to make the robots think. \[\\00:12:12.25\\\] But I never thought of it as Computer Science. Computer Science was for the really theoretical, pushing computers and computational mathematics into a whole new realm. I was just programming.
++
++So that was cool, that was fun; I did that for a really long time. Then eventually I got a little bit burnt out on robotics, because they don't really talk back, and if they do, something's very wrong. So I just was like, "Okay, I'm gonna take a little bit of a break from this", and I was the CTO of a little startup that ran out of money eventually - thank goodness... Because I had no business being a CTO.
++
++But I thought, you know, "I have a degree in Mechanical Engineering from Caltech, I've built robots. I could totally be a CTO of a web company?" No, no, I could not. That was terrible.
++
++So that ended, and I was like "Okay, you know what? CTO is a little bit too big for me, but let me try something a little bit easier." I had this vision of what I wanted the internet to be like. I had this vision of walking into a room and having this wall-sized screen where I could just kind of say, "Hey, take me to Target. I wanna buy a few things", without any sort of keyboard, mouse, or anything like that. Something like that movie where Tom Cruise has the gloves, and he can...
++
++**Adam Stacoviak:** Minority report...
++
++**Jerod Santo:** Minority report?
++
++**Raquel Vélez:** Minority report, yeah. So I was kind of thinking something along the lines of Minority Report, where I could scan through different things, and it was like this whole three-dimensional experience. And I was like, "That sounds really cool, I wanna build that." And I was getting into websites, because I kept coming with new ideas for companies, because... I don't know, I just thought I should just make a new company all the time - that was also a bad idea. But eventually I was like, "Okay, let me get into this website thing. Surely that can't be that hard." CTO-ing was a little bit out of my elements, but I have a degree in Mechanical Engineering from Caltech, I should totally be able to handle this whole internet thing. Yeah, I was an idiot. \[laughter\] Anyway...
++
++**Adam Stacoviak:** That's like your internal thought process: "Because I have this, I should be able to do that."
++
++**Raquel Vélez:** Obviously, right? Like how hard can it...
++
++**Adam Stacoviak:** And also your humble, retrospective perspective of it, too...
++
++**Raquel Vélez:** Of course... So what I did was I asked a bunch of my friends - I was living in Charlotte, North Carolina at the time, and there were a bunch of people who were into Ruby on Rails and Javascript and whatever, and I was like, "So what do I do? How do I get into this?" They were like, "Well, you know, just ask around." I was like, "You know what? Okay." I identified what I considered to be the 'coolest company in town' and what I did was - totally fearless - I just called up the CEO of the company and I was like, "Hey, can we sit down for coffee? Let's chat." Then I was like, "Hey, how do I get a job at your company?"
++
++At the time, Node was just kicking up. This was the end of 2011, early 2012. So he was like, "So, Node. If you can program in Node, I will hire you." I was like, "Alright, I have no idea what Node is, but let's do this." So I sat down and - I kid you not - over the course of three weeks just started everything I could about Node and HTML and CSS and everything. It was overwhelming, but I still did the - they had a little code challenge for engineers... \[\\00:16:03.09\\\] I did the best I could, and they rejected me. I was like, "This is stupid. I learned everything I needed to learn and they still rejected me." But then somebody at the company saw my application, and was like "Oh, this is interesting." I should also note that I had sent in along with the code challenge some previous code I had written. I had attempted Javascript two years prior, and I wrote something... I created a hand, an actual human hand, all in canvas, HTML and JS and CSS and stuff. I made it so that you could move all the joints in the hand, and have it be a perfect hand model. It was the crappiest Javascript you've ever seen in your life, because I didn't know Javascript; I knew C++. So I wrote Javascript like it was C++ and it was a nasty mess. Looking back on that code, you're like "Oh my god, what is this...?" But it was still really cool, and there was somebody at the company who was like, "Wow, she has potential."
++
++So he calls me up and he's like, "Hey, do you wanna do an internship? We've never done an internship before, but you could be a good intern." So I went in and put everything in like a little humble bag, and I was like "Alright. I have worked at companies like NASA and MIT, and now I'm gonna be an intern for $500/week, and learn this Javascript, Node, HTML internet thing..." It was supposed to be a six-week internship; after five weeks they hired me on full-time. I was a junior developer, and then I just learned everything I could.
++
++It was a consulting company, so they had me doing some PHP, some Javascript, and all sorts of things. And I was like, "You know what, I really like Node." Oh, I went to a NodeConf summer camp in 2012, which was kind of the jumping off point for my career, because I met a whole bunch of people in the Node community. This was NodeConf summer camp 2012 - there was a hundred people there. 90% of the people who were huge figures in Node were there, at that event. I met them and I got to know them. That was where I met Isaac for the first time, it's where I met all sorts of people. I mentioned Isaac because he's important too later in the story.
++
++And I was like, "These people are amazing, but they're all living on the West Coast, in the Bay Area." So my husband and I got married and three weeks later I was like, "You know what? Let's move to San Francisco" and he was like, "Okay!" And I was like, "Yes, let's do this!" So I got a job at a startup in San Francisco - it was all in Node. So I just slowly moved my way up. After six months there I moved to another company, and then about six months into that second position... So all the while I'm giving talks and I'm going to more Node events, and I'm just really getting to know everybody in the community. At this point I've already started -- I should backtrack a little bit... At NodeConf summer camp 2012 I also met Chris Williams, who is the curator of JSConf US. I met him and somehow he learned through grapevine that I used to build robots, and he was like "Hold up! We need to talk about this." Because he created Node Serialport, which is the interface by which you can use Node to talk to serial devices, which is a huge component to NodeBots. \[\\00:20:03.01\\8\] And he had hung out with Rick Waldron, who is the creator of Johnny-Five, and he was like, "We need to talk about this, because you actually know robotics. The rest of us know Javascript, and we wanna get into robotics, and you know robots and wanna get into Javascript. So let's see if we can make something happen."
++
++**Adam Stacoviak:** A merging of the minds, basically.
++
++**Raquel Vélez:** Yeah, exactly. And he was like, "I want you to speak at JSConf. Put in a proposal, let's talk about robots." Then my proposal got accepted, and he was like, "Also I want to do a NodeBots workshop." So my very first major conference, I not only gave a talk but also ran a workshop. That was when NodeBots was really born, and we can talk all about that. But meanwhile, I'm doing this NodeBots thing, I'm working in San Francisco, and then I get an e-mail from Isaac Schlueter, creator of npm and at the time the Benevolent Dictator For Life of Node (BDFL) and he was like, "Hey, I'm spinning npm into a company, and I'd love for you to join." And I was like, "How do you know who I am?" I mean, obviously he knew who I was because he'd seen me at all of these different events and we had a lot of friends in common; we were semi-friends as well, and it was just kind of like this amazing opportunity, and I was like, "Alright, let's do this!"
++
++**Adam Stacoviak:** So you were employee number one.
++
++**Raquel Vélez:** I was employee number one. I've been there for over two years now, and it's been a constant series of learning. Just learning more, and more, and more, and more. It is really shocking that I've only been in this industry for four years. I started in 2012 and it's now 2016. Most of the people that I work with have been in this industry for 10-20-25 years, and I'm like, "Hi, I've been doing this for not very long at all." But I think it helps that I did so much robotics before, so I understand the concepts of programming.
++
++One thing I'm super proud of is I knew Git before everybody else knew Git, because we were using Git in robotics, before the web world was using Git. So when I walked in and people were like, "Do you understand source control?", I was like, "You mean Git, or Subversion? What do you want, I got'em all." And they were just like, "Oh no, we use Git. There's a thing called GitHub", and I was like, "What? Are you serious? There's a thing called GitHub? There's a platform, an online place where you can do the Git stuff in the cloud? What -- this is so much better."
++
++**Adam Stacoviak:** The Git stuff!
++
++**Jerod Santo:** Nice.
++
++**Raquel Vélez:** Because we used to just have our own internal servers, and we had to get to the different servers... And I was like, "Oh my god, I'm actually old-school in something." \[laughs\]
++
++**Jerod Santo:** That's awesome.
++
++**Raquel Vélez:** So that was cool.
++
++**Jerod Santo:** I'm sitting here listening to this story, and I'm trying to characterize you in light of it, and you keep saying this statement, "I have a Mechanical Engineering degree from Caltech, so I can do this." I seem to think of you as - the word that keeps coming to mind is 'intrepid'. You have this fearless, adventurous side or characteristic about you which seems to have lead you down this path, and I just want to tee this up for you and we'll talk about it on the other side of the break, which is where did that come from? Did you come out of the womb in this way, or did somebody instill into you this idea that you can succeed, despite the odds or despite the circumstances? You seem to be outside of your comfort zone, but yet you just plow forward. So don't answer now; we'll take a break, so why don't you think about it a little bit, and on the other side tell us, where did this intrepid attitude come from? We'll be right back.
++
++**Break:** \[\\00:24:03.04\\\]
++
++**Jerod Santo:** Alright, we are back with Rockbot, as she is lovingly known on the internet. Raquel, before the break you kind of gave us your history of how you moved from this degree in Mechanical Engineering to employee number one at Npm. First of all, do you think that's a fair interpretation of a characteristic of you, which is that you have this fearless, adventurous, intrepid outlook on life where it seemed you kind of just barreled into opportunities, despite perhaps the odds being against you, or being in over your head? So the first part would be do you think that's fair, or you think I've mischaracterized you? And secondly, if it is fair, where does it come from?
++
++**Raquel Vélez:** Yeah, so I have to say... I think it's a fair characterization externally. Internally, I'm terrified. Constantly, totally, utterly terrified every single step of the way. But I have this analogy -- I'm really big on analogies, so no apologies... If you're standing at a beach and you know that there's something out in the water, there are people who are gonna be like, "Oh my god, it's too scary, I don't wanna swim", and they'll just kind of hang out on the beach. Then there are people who are like genuinely fearless, who just go straight forward. I'm the type of person who sits there on the beach and is like, "Oh my god, this is terrifying, but what I want is over there, in the ocean", so I take a really deep breath and be like, "This scares the living everything out of me, but I'm going for it anyway", and then I just go for it. There are some people who just get lifted up and dropped into the middle of the ocean and are forced to swim - that happens to me sometimes, but I like to be in control, so I tend to be the type of person who's like "This is terrifying, but if I don't go for it, then who will? And no one else is gonna give this to me."
++
++As from where that came from, I think a lot of that really does come from my family, from my mother... My family is from Porto Rico, and both of my parents grew up really poor, but they managed to get degrees in Chemical Engineering, and they eventually worked their way up and are now thriving and living happily with their degrees and doing lots of great things, and they own their own business etc. \[\\00:28:21.22\\\] So it was never an option for me to just kind of sit still and let things happen. It's very much been a "Well, what do you want?" For me, I think, trying to figure out what I want... In pre-school - I'm part of the generation of children who, for reasons completely unknown to me, teachers have decided to add graduations at every ridiculously silly, menial opportunity. So I had a pre-school graduation - I don't know why, but I did - and I was always the type of person who wanted to be at the center of attention. We had to do a class song, and I was like, "Well, they can't hear me." My mother loves telling this story of how I felt like no one could hear me, so I just walked up to the microphone and grabbed it for myself, and just started singing so that everybody could hear me, because otherwise I'd be lost in the crowd. That's silly, I don't wanna be lost in the crowd; I want people to know who I am.
++
++**Adam Stacoviak:** That's a good metaphor. It's the truth, but it's also a good metaphor for life.
++
++**Raquel Vélez:** Yeah, exactly. So when I was first thinking about like, "Should I get into this Node thing or not?" I genuinely was like, "Well, this thing is new enough. I could probably work my way up to the top. It's such a small community right now, I could probably get there and be known. Like, people would recognize who I am", and as we have found, that has worked out in my favor. I went out of my way... When it comes to meeting people, I'm extremely purposeful about who I'm meeting, when I'm meeting them... I try really hard not to be disingenuous. I like to think I'm really genuine about... When I'm meeting someone, I genuinely want to meet them and get to know them, and become friends if that's in the cards; or if we're not gonna be friends, then we're just not gonna be friends, that's fine. But I don't go out of my way to be friends just for the sake of networking and working my way up, but I do know who's gonna be in the room before I walk into it. I try to figure out, "Okay, who's here, who can I get to know, can I become friends with them?" but with the added side-bonus of "Hey, if things work out, I could move up."
++
++So that was very much my motivation, in a lot of ways not only for myself to be the person who is heard, but again, like I mentioned before, there aren't a lot of people out there that look like me on these stages, in these communities, leading these communities, and if I'm not the person to do it, then who will? And there's so many people who look like me who aren't at these leadership positions because they've never seen anybody who looks like them in those leadership positions. So again, if I don't do it, who will? It terrifies me, I cannot tell you how scared I am all the time, but at the same time, you can't grow unless you step out of your comfort zone. So I'm taking every single bit of it for myself, but with the added benefit of helping other people as well.
++
++**Jerod Santo:** It's funny you mentioned that you had this moment where you kind of take a deep breath and jump into the water so to speak, and I've noticed that you do write pretty prolifically on your blog - you have 24 pages of archives, which is pretty good by any measurement - over the years... \[\\00:32:08.13\\\] I went back to your very first post, because I always think those are the interesting ones to read, and you mentioned that you kind of got in the industry in 2012 - well, your first post was 2011; it may have been near the end of the year, but it was titled Smart Latinas Get The Party Started. I read it, and it's almost that moment where you're taking a deep breath because the content of the post is very much motivational speaking almost to yourself about writing this, and putting this out on the web. Do you remember writing that post? Was that your deep-breath moment?
++
++**Raquel Vélez:** Oh, absolutely. That was a moment where I was like, I need to just own this, because it's so easy to sit in the back seat and just be like, "I'm just going for the ride, let's just see what happens to me." I was tired of it, I was in a position where I was like, "I don't feel like people are taking me seriously, and I'm sick of it. So now what do we need to do? We need to step up and make this thing happen."
++
++If it was late 2011 - and I believe it was - I think it was that moment when I was like, "Alright, I'm at a crossroads. I've gotta decide what I'm gonna do next. Let's just do this, let's go for it." That was definitely... That was one of those moments when I was like, "Alright, I need to learn about this internet thing. I gotta get into this. Let's see what happens."
++
++**Jerod Santo:** Let's get the party started.
++
++**Raquel Vélez:** Yeah.
++
++**Adam Stacoviak:** How were you not being taken seriously?
++
++**Raquel Vélez:** Oh goodness, so many ways... Okay, so everything from the fun stories from college, right? I was one of the very few women in my major - there aren't a lot of women mechanical engineers, I think. I think the ratio was like 10:1 in my class, just in Mechanical Engineering. There were a bunch of biologists who were women, and that's cool too, but in my classes specifically, I would be one of the three women in the room. And there are just these little things... When I first started college I was like, "Okay, the civil rights movement worked, feminism happened, we're good. Everybody's on equal playing field." And then there are these little things where you start to realize... Like, you know the answer to the homework question, but nobody's asking you. You're like, "Hey, I know the answer", and they're like "Yeah, yeah..." and then they start asking somebody else. Or the people in charge of the shop - because in Mechanical Engineering you have to take shop classes - they tell all the guys, "Hey, go to it, good luck", and then they'll come over to you and say, "So here's how to use a drill press", and you're like, "Bitch, please. I've been using power tools since I was like seven. Don't do this to me."
++
++**Adam Stacoviak:** \[laughs\] That's awesome.
++
++**Raquel Vélez:** And then like there are moments where you're just like, "I don't get it... How is it possible that people just don't understand? I am just as smart as everybody else here." And it didn't help. There was only that one person who's like, "You do realize you only got here because you're Hispanic and female, right?" And you're like, "No! No, I got here just the same as you did. I worked my ass off! No. No, no, no!" So little things like that, and it continues, and it continues to this day, and you're like, "Man, I'm so tired of this." People just ask you different questions... When you come down after giving a talk, sometimes people will be like, "Oh, so actually this is what I've learned... You're wrong. \[\\00:36:09.04\\\] It's great that you got up on stage and said all these things, but actually..." and you're like, "Oh, shut up!" Like, you didn't get up on stage, I did, so why don't you let me be the expert, and you just shut up and sit down?
++
++So lots of little things... In particular, I was at that particular time when I wrote that post, Smart Latinas Get The Party Started. I was a CTO, and I would walk around in a business suit in downtown Charlotte, and people would be like, "Oh, you're adorable. You think you can be a CTO... That's so cute." And to be fair, I had no business being a CTO.
++
++**Jerod Santo:** Yeah, by your own admission.
++
++**Raquel Vélez:** By my own admission. But at the same time, I know lots of dudes who have no right to be a CTO, and they never got any crap like that. Just walking into the room, people would just kind of look at you funny, like "What are you doing here?" and I haven't even opened my mouth at all.
++
++**Jerod Santo:** So do you feel like you've made it over that hump, or are you still treated that way in many contexts?
++
++**Raquel Vélez:** In some ways, it really depends on the context. I'm at the point now where giving talks - I've made enough of a name for myself that people get really excited that Rockbot is speaking at a conference; they get really stoked, because they're excited to learn something mind-blowing, or whatever. I should also note though that I've spent a lot of time doing extremely technical talks to prove myself. I don't know that that's necessarily something that other people do. I very, very actively try not to give talks on diversity and things like that, just because I wanna make sure that I'm pigeonholing myself into, "Here's a super technical person, regardless of anything else." That said, of course I still care about diversity and inclusion, and I talk a lot about that one on one. I just don't do it necessarily in a public forum.
++
++I've also been told that once I open my mouth, people cannot doubt that I know what I'm talking about... \[laughs\]
++
++**Jerod Santo:** Just the way you deliver, or what do you mean?
++
++**Raquel Vélez:** Yeah, people would be like, "Oh, so do you work with computers?" and I'm like, "Yeah, actually I work at Npm..." and then I just start spewing lots of technical jargon, and people are like, "Oh... Yeah, okay, you're not an idiot." No, I'm not an idiot. \[laughs\]
++
++**Adam Stacoviak:** I cannot stand people who make assumptions about people, that just kind of come at them with this negative attitude about what they know. My wife deals with the same thing all the time as a designer. She's a really good designer, and she's always telling me very similar stories; similar perspective, but obviously different talents. This perspective that because of your gender, because of your background, because of where you came from, you can't possibly lead this team, you can't possibly do this very well. And they treat you like some sort of delicate thing - she is delicate, because she's a woman, but she's also very strong and very passionate, and very capable. And I cannot stand how it's like that. It drives me crazy.
++
++**Raquel Vélez:** No, it's one of those things... It's not limited to just gender, it's not limited to just race, there's so many things... I can't tell you the number... One of the beautiful things about working at Npm is I would say our average age as a company is probably in the high thirties, which is really rare for startups. \[\\00:40:04.03\\\] The stereotypical startup is like a bunch of 22-year-old guys eating ramen while sleeping in bunk beds. But we're not, we're over 30. Everybody I work with is just phenomenally brilliant, but it's interesting to see how some of them will walk into groups, and they're like "Oh, you're older..." and they're like, "Oh my god..." This person knows so much more than you do, has been doing this for the entirety of your life, so shut up and listen, you might learn something. \[laughs\]
++
++**Adam Stacoviak:** Let's tell this into some motivation, I guess. We've got four minutes until the break, so let's give a snapshot... We heard about your background obviously, and obviously some of the negativity towards reaching your goals, and you being self-assured to the point where you actually reach your goals, which is awesome... But you got a degree in Mechanical Engineering, you're not doing that directly - now I guess you kind of are with the robots piece, and we'll talk a bit about that probably just after the break, but could you tie in what was your motivation to go towards Javascript? I know you mentioned the...
++
++**Jerod Santo:** Robots can't talk...
++
++**Adam Stacoviak:** Yeah, robots can't talk... \[laughter\] You mentioned talking to the CEO and what not, but I didn't hear what motivated you to do that. Was it just the fact that it was a goal to reach for you? Help us with the motivation piece, and just after that we'll have a break and we'll come back and we'll talk about robots, and deeper about what you're doing at Npm.
++
++**Raquel Vélez:** Yeah, so the Javascript was really just more of a means to an end. It was an opportunity. The CEO said, "Learn Node" and I was like, "Okay", and Javascript has made sense. I think a lot of people struggle with the asynchronicity of Javascript, and for some reason my brain clicked almost instantly - it's a little bit rare amongst people who are just learning Javascript - and it was so much fun for me. I loved the instant gratification of working on the web and seeing my changes in real time, as opposed to having to wait and compile, and hope that you didn't have a bug so that you don't have to compile again - sort of the iterative approach.
++
++**Adam Stacoviak:** So it was about the speed.
++
++**Raquel Vélez:** It was. It was about the speed, it was about just the ease of use, the fact that I could play with it immediately in the browser; I didn't have to add any news stuff to my computer. And at that company that I finally did start working at I was exposed to other languages, like PHP and a little bit of Ruby and stuff like that, and I don't know, Javascript is just \[unintelligible 00:43:07.04\] in a really fun way, and I was like, "I'm just gonna keep getting good at this." I'm really good at not getting good at things. I tend to think of life as a big buffet, I just try a little bit of everything; I'm no expert in anything, but I'm really good in a lot of things, and I was like, "You know what, let's try being an expert in something. Let's try being an expert in Javascript, because it's actually really fun and I really enjoy it." So I just kind of latched on and just decided to keep going with it.
++
++**Jerod Santo:** I think there's something about the web that excites people - myself included - especially when you come from a minority or in a position where you feel like people expect you to ask for permission, or are asking why you're here, or why you deserve to belong here. You don't have to ask anybody's permission, and when you start doing websites, you just put it out there; you start writing and you just publish. \[\\00:44:04.06\\\] And sure, then you take the backlash from the publishing, or you have the problems that come alongside with that, but there's not gatekeepers, so you can deploy fast, you have the quick feedback loops, and you just have the open platform. I think that's just a beautiful thing.
++
++**Raquel Vélez:** Yeah.
++
++**Adam Stacoviak:** And also the fact that Javascript is in every browser. The accessibility - aside from mobile, iPhone or something like that, you can't program Javascript on an iPhone, but you can do it on iPad a bit easier with maybe some sort of cloud servers or something like that... But the accessibility to Javascript and programming with Javascript, the barrier to that entry is so low, as compared to what you said before. PHP - a little easier, or even Ruby, in theory you gotta get it right; you gotta get the right Ruby version on, and then you've gotta get all these different things in place; it usually requires Homebrew to make it a little easier, to make it the way that you would wanna develop long-term on it. So you've got all these different bumps and hurdles that you gotta get over with. Javascript, all you do is open your browser, enable a certain mode and hit command-option-9 and boom, you've got the console, the access to the source control, the source code and what not, and you're on your way.
++
++**Raquel Vélez:** Yes, exactly. It was too easy not to get into it. \[laughter\] It was just so fun.
++
++**Adam Stacoviak:** Yeah. On that note let's take a break. We'll come back, and we've got 20 more minutes to this show, so we'll talk deeply about robots, the book you mentioned, and any bit you could share about your experience at Npm and where you're going or what's happening there, especially around obviously what Npm is, but just how Javascript is moving forward. So we'll take that break and we'll talk about that when we come back.
++
++**Break:** \[\\00:45:59.00\\\]
++
++**Adam Stacoviak:** Alright, we're back from the break. This is interesting. Raquel, we've got a quote from you that says you essentially use robots as an excuse to get people excited about code and math. Is that where the motivation came for you to kind of get into that piece, get into the robots portion, combining Javascript and your Mechanical Engineering background?
++
++**Raquel Vélez:** Yeah, definitely. Getting people excited about code and math - that's been something that I've been doing for a long time. I have this really kind of backwards way of doing education. I hate the way that traditional education currently is set up, which is like, "Let's learn addition, and then let's learn multiplication after that. Then let's start talking about algebra and then calculus" and so on. I remember sitting in high-school, looking at my calculus teacher, and he looked at me and he was like, "What's wrong, Raquel?" I just looked at him straight up and I was like, "Dude, why are we learning this? This makes no sense. \[\\00:48:04.17\\\] What is the point of all of this?" He was like, "It will all make sense soon." And it took me another five years before it all made sense. It wasn't until college that I sat down and I was like, "Oh my god, all of this makes sense now!" And I was like, "This is backwards. This is completely and totally backwards."
++
++The way I want to teach people and what I've been doing ever since I had that epiphany is start with the cool thing first. Start with the cool thing that gets people excited. Robots are just so cool. People love robots. People love the movies, they love this idea of these little mechanical pets, or mechanical assistants or whatever, that they can boss around the way that their older siblings boss them around. There's just something really cool about robots. So when you introduce robots to people - whether they're children or adults or whatever - they're like, "Oh my god, how do I build that?" The first thing that everybody does is "I can't do that." So then I start, "Okay, what if I showed you how to do this? What if I showed you how to build one of these things?" People are like, "Oh my god, it's really that easy?" I was like, "Yeah, it really is that easy."
++
++I like to use a carrot instead of a stick to get people excited about robots. Then what's the next thing that people ask? They're like, "If all it requires is me to start putting these things together, now what do I do?" I'm like, "What do you want it to do?" Now the control is on their part. "I want it to follow something around." "Okay, cool. So how do we get this robot to follow another person or another robot or a dot on the wall around?" Well, now we have to talk about image processing. Or we have to talk about movement, or we have to talk about basically physics and math, and now you're excited about it. Now I can say, "Okay, now here's this thing called calculus. Here's this thing called algebra. Let's get into it." Now it's no longer a chore, but a yuck that needs to be shaved. I'm very careful with that, because I think a lot of people look at chores as like, "Oh, I just don't wanna do it because there's no point, except that I understand that later I'll be happy about it." But when you're shaving a yuck, you're like "I know what the end goal is. Now I have to go backwards and get to the point where I know enough that I can move forward again." Now you're in control, it's not the teacher in control. The teacher is not in control of your learning, saying "Hey, here's how you do this or that" or whatever. Now it's you in control, saying "I'm ready to learn this thing." And I've found that to be extremely powerful, because people all over... The NodeBots movement has completely -- it's unbelievable. It is just massive right now.
++
++It started out with just four people being like, "Alright, let's see if we can get people excited about this, because we're so excited about it", and there are NodeBots meetups all over the world. There is an international NodeBots day every July. All the NodeBots meetups have a hack day; it's like the third Saturday in July, or something like that, and all around the world everybody's hacking on NodeBots at the exact same time. And to your point, Jerod, the beauty of... A lot of people are like, "Why the hell would you use Javascript to build robots, of all the languages out there? When you build robots you use C++, or maybe you use Python..." \[\\00:51:58.20\\\]
++
++I have been an advocate for Javascript as soon as I figured out that Javascript will be used for robots; I was like, "Forget it. Everything else - put it to the side. Let's focus on Javascript", for exactly the same reason that you said. The barrier entry to Javascript is so low, that if I can get people excited about playing with robots because Javascript is so easy to use, then I can get them excited about other things, and get them excited about engineering, and computer science, and all sorts of who knows what else. It's an absolute game changer that you're not gonna necessarily see in the next couple of weeks or the next couple of months, or even the next couple of years, but in the next couple of decades I really think people are just gonna be like, "Well, I've built a robot, so how hard can this internet thing be?"
++
++**Jerod Santo:** Yes. I have an almost eight-year-old daughter, and we homeschool so I'm very involved in her education and what not. What's the quickest and easiest way for me to go from zero to NodeBots with her? Or zero to excited, with regard to NodeBots with her. What would be my steps to have something where she is like, "Let's do this."
++
++**Raquel Vélez:** Alright. So I would argue, do the "Hello, world". The "Hello, world" in NodeBots is not\[unintelligible 00:53:23.08\] it's getting an LED to blink. You start out with an Arduino and you've got a little LED, and you can use Johnny-Five. Johnny-Five is a module that Rick Waldron created. Rick is on the board of jQuery. What's cool about Johnny-Five is that it feels a lot like jQuery. If you're fairly proficient with jQuery, you can easily -- even if you're not fairly proficient with jQuery; if you just understand the basic concepts of jQuery, Johnny-Five is super easy. It's like Servo.to some angle. LED.on. LED.off. It's so, so easy. So what I would recommend that you do is you start off with getting the LED to turn on, and then add a button. Add a button so that when you press the button the LED turns on, and when you let go of the button the LED turns off. And then just start playing.
++
++The documentation and the API for Johnny-Five is so good, and it's pretty thorough, and it has so many different components that you can get and use, and all that stuff. So that's a really fun thing to do if you wanna use Johnny-Five. I'm gonna do something that's a little bit uncouth, but because your daughter is eight - I don't know if you've ever heard of Squishy Circuits...
++
++**Jerod Santo:** No...?
++
++**Raquel Vélez:** Okay, so there's this thing called Squishy Circuits, which is basically electronics with playdough. So you make playdough at home, and there's two different types of playdough that you create: one is with salt, and one is with sugar. What that means is one is conductive and the other one is not. And what you can do is you can actually create circuits with this playdough as like the wires between your components, and you can learn about electronics using playdough. And this is great for adults and kids, but especially if it's parents and kids working together, especially in a homeschool situation I think it's just super fun. Not only do you get to play in the kitchen and make playdough, but then you also get to play with electronics and start learning about basic E&M and all of those things. Again, it's about getting your hands dirty and playing around, and then the next thing you're gonna be doing is trying to understand "Okay, so what is the polarity of all these things? How does a capacitor work?" and those questions are things that you're gonna be excited to learn, as opposed to somebody sitting you down and being like, "Okay, so let's talk about Maxwell's equations." \[\\00:56:07.23\\\] It's just like, "Oh god, why? Why are we doing this?" \[laughs\]
++
++**Jerod Santo:** Right. Very cool. I will definitely check out Squishy Circuits.
++
++**Raquel Vélez:** Yes, and Johnny-Five, absolutely. Do all of it. Once you understand how electronics work, then doing the Johnny-Five stuff is even easier, and you can totally do the Johnny-Five stuff without understanding electronics. I certainly did. So yeah, it's pretty straightforward.
++
++**Adam Stacoviak:** This approach though, to start with the exciting thing to get to this motivated state - because there's times when you learn and you're like, "I realize I have to go through the trenches for a little bit to get to the other side, and I get that", and that's good if you're starting with motivation. But if you're beginning with no motivation and someone's sort of dragging you along, which is often the case as someone beginning to learn. You're motivated by some sort of long-term goal, but the short-term is really hard, and \[unintelligible 00:57:14.21\] this goal of like, "Here's something real that you can actually see tangibly, this 'Hello, world' that isn't just a \[unintelligible 00:57:21.00\] kind of thing, it's actually blinking light, or in this case with the Squishy Circuits, that's... I'm surprised that Squishy Circuits isn't bigger. I google it and there's a bunch of stuff out there, but it seems kind of like dated, to a degree. It has information around it, but it seems like it could be organized a bit more...
++
++**Raquel Vélez:** Yeah... Squishy Circuits came out of a university.
++
++**Adam Stacoviak:** St. Thomas, is that it?
++
++**Raquel Vélez:** Yeah, University of St. Thomas. The person who created it was actually one of my TAs in college, and I worship at her feat, she's just so amazing.
++
++**Adam Stacoviak:** I mean, I watch - and Jerod does, too - Shark Tank every week, and this should be on there. This should be a business, because it's... I think kids learning, and this kind of kids' learning stuff is just... It's so hands-on and so pliable to their minds. They see, "Okay, this is green, and that conducts, and this is a no-color, and that doesn't conduct, and I get that one. I put these two together and I put this in there, the light goes on." To me that's the best learning you could do.
++
++**Raquel Vélez:** Absolutely. So that's the interesting thing - there's so many different parts of our society that haven't figured out how to work together yet. Academia and the whole tech movement - there's so many opportunities for both to really take off, but I don't know why there's this whole, "Oh, academia, they don't know anything", and the academics are like, "Oh, they're just a bunch of 20-year-olds eating ramen while sleeping on bunk beds." There's so many opportunities for everything to coalesce, and we're just messing it up by not taking advantage of that.
++
++So I don't know. I don't know why Squishy Circuits isn't bigger and marketed everywhere. The other thing is how do you make money off of that? You can make the recipes at home...
++
++**Adam Stacoviak:** Well, this is not Shark Tank and I'm not Mr. Wonderful, but there's lots of areas where people don't want to make this stuff; maybe that's the interesting part, too. But just giving them the information - information is sellable; it doesn't have to be a hardened product. The book, for example, or a course, or access to ten videos that goes from zero to \[unintelligible 00:59:57.17\] lights, or something. \[\\01:00:01.09\\\] I think there's something interesting there that could be education-based. Because kids' education and education in general not so much should be a capitalistic, for-profit business, but there's certainly a lot of opportunity, because parents will pay to have their kids be educated in all sorts of unique ways. I'm sure Jerod buys books or get donated books or something for his curriculum at home, and there's some sort of monetary component that goes with it that he would totally add on to his daughter's education cycle that he would pay for. And there's Jerods all over the world.
++
++**Jerod Santo:** Yeah, I mean there's no better investment, in my opinion. Let's ask this one last thing about robots, and then we'll talk about Npm; Raquel, we wanna respect your time and we're getting near the end here. You've been in the NodeBots community for a long time... In fact, you're kind of slowly -- not backing out of it, but you're interested in other things in 2016... But throughout your time, give us a couple of the coolest things that you've seen done with regard to NodeBots and robotics over the years.
++
++**Raquel Vélez:** Oh my goodness... I'm not gonna answer the robotics general question, because that's just too big. But NodeBots - it's so amazing to me how far people can go with just six hours of time, starting from nothing, and building something really awesome. I've seen little robots that will know how to use a keyboard, they can type stuff out for you. Somebody built a little Wi-Fi-enabled cat laser thing. They'll be in their office in another part of town, and they will log into their home and just on their iPhone move the laser around to distract their cat in the middle of the day.
++
++There are lots of wearables - so many fun wearable-type things. A friend of mine \[unintelligible 01:02:11.07\] makes a sash called NodeSash where if you tweet at the NodeSash, if you give it a hex color, it will queue up on the sash. So everytime that you tweet these colors, there's just like a rainbow of colors on the sash.
++
++There are lots of robots that can do object avoidance... My whole goal as a member of the NodeBots community was to just keep pushing the edge, because a lot of people don't know where the end is, and they'll just kind of be like, "Well, this is as far as I can go, so I'm just not gonna go any further." I've built robots that had a little bit more AI in them. I had a robot that could draw. It drew an abstract piece of art. I had a robot that could scan an area and know what's in view, and all sorts of things. But probably the most impressive thing that I've seen to date is a hexapod, which is a six-legged robot that walks beautifully. It has a perfect gate, a walking pace that looks like a bug, and it's massive. I wanna say it's about two feet by two feet, a two-foot square. And it can open up, and it sounds so creepy. It is the creepiest sound because of all the servos and everything. It sounds like something out of the movies. And it's beautiful, the way that it moves around. \[\\01:04:02.22\\\] The person who built it - he's in Houston. His name has totally blanked, right just this second - of course it does; right at the moment when you need to give a shoutout. But he used Javascript animations to help program the servos, so that it would have a really fluid walk; and it is the creepiest thing... Oh, Donovan Buck - shoutout to Donovan Buck, @dtex on Twitter, for making this ridiculously creepy, but so freaking awesome robot. And he gives talks, and stuff, so I recommend seeing some of his talks to see this robot in action. It is absolutely beautiful. It was his second robot ever. The first one was the 'Hello, world'. He was like, "Alright, this Hello world is cool. Now I wanna build a hexapod", and I'm like, "Okay, you have the power, go for it!" It's really impressive.
++
++**Adam Stacoviak:** Aside from Johnny-Five which you've mentioned already, any interesting repos out there on GitHub or elsewhere that is essential to getting started?
++
++**Raquel Vélez:** Johnny-Five is a really good one to start with, and there are add-ons to Johnny-Five, and you can find those. I built a module called 'vektor' that does all of your matrix math. So you don't necessarily need to know how to do with linear algebra as long as you understand the basics of "This is what a vector is, and I need to rotate the vector" or whatever. I wanted to abstract out linear algebra enough so that people could just start using linear algebra and vector transformations and matrices. That was like my first Node module. I was like, "Okay, I can get into this. I have this niche that I can get into." I'm sure at this point there are better matrix modules out there, but I made it specifically for robotics. That was kind of one of my little claims to fame in the Node community. Like, "Hey, I was the first person to write a matrix module for Npm. Yay!"
++
++**Jerod Santo:** \[unintelligible 01:06:19.17\] Matrix movies, yours will still be the best.
++
++**Raquel Vélez:** Yes, indeed.
++
++**Jerod Santo:** Matrix II and III really didn't help.
++
++**Adam Stacoviak:** No, they were missing something special, and it just sort of went down from there. That's a whole different topic.
++
++**Raquel Vélez:** I'm sorry, there's only one Matrix movie.
++
++**Adam Stacoviak:** Oh, there is?
++
++**Jerod Santo:** Yes, that's right.
++
++**Adam Stacoviak:** The first...
++
++**Raquel Vélez:** There's only one. I don't know what you're talking about. \[laughter\]
++
++**Adam Stacoviak:** What trilogy? However, on the subject of open source and Npm, we've talked a little bit about your work there, but not deeply. We talked about you being employee number one, and Isaac reaching out to you and you thought you were an unknown, at least to him, from that perspective. But obviously this show's roots is in open source, we're called The Changelog - What's Fresh And New In Open Source. That's what our tagline has been forever, although I think our platform and this podcast and the content has kind of shifted and changed a little bit over that time, and we're probably a bit more about deeper stories than we are about what's fresh and new. But nonetheless, at Npm, give us an understanding of what your role is there and how you enjoy being able to work at a company where so much is built around open source - it was built around open source. Help us out with that.
++
++**Raquel Vélez:** Yeah, so Npm as an acronym, which actually doesn't stand for anything - this is the one thing that will blow everybody's minds; Npm does not officially stand for Node Package Manager, it's just Npm. Yeah... I know.
++
++**Jerod Santo:** Why? Why not?
++
++**Raquel Vélez:** Because why should it?
++
++**Adam Stacoviak:** Well, it did at first, but now it doesn't.
++
++**Raquel Vélez:** No, it doesn't. If you ask, it never did. \[\\01:08:02.08\\\] If you ask Isaac, he'll be like, "No, no. It's just Npm." \[laughter\] But Npm is a package manager for Javascript. It started out as just for Node, but now people are using it for everything, from backend Node, to frontend, to robots. So it's for absolutely everything Javascript-related although, let's be real, there's CSS in Npm, there's C in Npm, there's even some Ruby and Perl in Npm at this point. So it's really just an awesome package manager. My team is the web team, and our purview is when you go to npmjs.com, we take care of everything from the design, all the way down to making sure those boxes stay up. So we are full-stack, and we care a lot about this website and making sure that it is up and useful. We have so many things on our plate... I feel so bad, because we're a really small team. Npm as a company is about 25 people, which I think surprises a lot of people. The web team itself is four - actually five people, because we include the designer. So five people trying to tackle everything there is to tackle about a website. There is always somebody upset with the state of the website, and I'm so sorry. I'm so sorry, we just cannot handle everything.
++
++So that's our job, that's my team's job. We also have other teams at Npm. The CLI team, that's the one that everybody knows and loves, because when they do Npm install, that's their code. And of course, we have our registry team, our sales and marketing, and our support team, which is phenomenal. And our registry team, who makes sure that everything actually does stay up.
++
++Once upon a time the Npm registry would go down pretty much at a sneeze, and now it's got like 999999% up. It's ridiculous. Our teams are so fantastic.
++
++We love open source. So much of our code is open source. Unfortunately, as we grow, some things have to be a little bit more closed source, just because we need to make money somehow. But the benefit of that is that other people get to make closed source things with Npm as well. We introduced private packages and orgs, and we have our npm on-site, which is our enterprise solution. What that basically means is you can feel comfortable using npm for everything - not just your open source stuff, but also the things that you wanna keep just within your team or within your company, or just on your private projects that you're not ready to say 'Publish' on, because of all the possibilities that could happen when you publish code onto the internet. And I love that.
++
++I love that the community is number one in what we do, constantly. I think a lot of people got really angry when we became a company, because they're like, "Wait, no. You can't be a company, you can't be a for-profit company. Open source is so important." And it's like, look, we could stay open source and non-profit etc, but the thing about open source is that you take advantage of the community, who wants to put in their own personal time into making your product great, and that's fantastic. But the fact of the matter is that there are some things that nobody wants to do. There's a reason why sanitation workers are paid so well, because nobody wants to do the crap work. \[\\01:12:03.08\\\] So we're getting paid to do the work that other people wouldn't necessarily step up to do with their free time, and you shouldn't have to step up with your free time to make sure that servers are up. So being able to pay people to sustainably work - that's one of the great things about npm, we really care about sustainability in terms of just our culture. At 6 PM, in our office, the lights go out. This is like a building thing, but we never stopped it from happening. The lights turn off at 6 PM, so it's time to go home. Everybody leaves the office at 6 PM, because there's no point in overworking yourself.
++
++Our VP of engineering likes to tell everybody, she's like, "Okay, look, I want Npm to exit. I want Npm to exit big. In order for that to happen, I need everybody to be putting in their absolute best work. The only way for you to put in your absolute best work is if you sleep well every night, and eat well, and enjoy your time outside of work, so that when you're at work, you're actually doing your best work. So for the love of everything, just go home! Stop working at 6 PM! Don't get back online, we'll see you in the morning. There's nothing so horribly, awfully wrong that can't wait until the morning, unless it's like an ops thing."
++
++**Jerod Santo:** No, the registry's up all the time.
++
++**Raquel Vélez:** Yeah, \[unintelligible 01:13:27.27\] registry is up all the time. We have a really sensible ops rotation, I'm on it...
++
++**Adam Stacoviak:** And that makes sense, to have a rotation for those kinds of jobs, you know?
++
++**Raquel Vélez:** Exactly. We have a team that takes care of things when we're sleeping, so we don't get woken up in the middle of the night. I have never gotten woken up in the middle of the night. When something goes wrong, it's normally just a little box that Amazon forgot to notify us that it was shutting down, so it's like, "Alright, let's fix it." But we have such a redundant architecture that 90% of the time it's really not a big deal. So we really care about making sure that not only our employees are happy and thriving and successful, but that everybody else who's using our product is happy, and thriving, and successful. And yes, search still sucks. We know this, and we're working on it. \[laughs\] But you know, there's so many things, and there's only so much time for us to get all the things done.
++
++**Jerod Santo:** Do you have anything npm-related that's coming down the pipeline that you can share with us? Whether it be on the open source side or even on the \[unintelligible 01:14:36.14\] side.
++
++**Raquel Vélez:** Let's see... The website's getting a redesign, that's kind of fun. There's an npm camp coming up. It will be like a really chill conference, it's not actually camping. It will be in Oakland. You can find a tree every once in a while. Actually, I love working in Oakland. Oakland is just a fantastic place to be. I love it better than working in San Francisco by heaps and bounds, so shout out to Oakland.
++
++And let's see, what else is coming up. You know, right now we're focusing on our products and making sure that they are the best they can be. I know the CLI is working really hard; they have such a massive, massive to-do list. There's not gonna be an npm 4 coming out any time soon - npm 3 is still the hot thing, but they do weekly releases, so make sure you're constantly upgrading your npm, just so that you have the latest and greatest. That's pretty much what I can think of.
++
++**Adam Stacoviak:** Well, there is one topic that we have not talked about, which I'm sure if you're listening to this you've been wanting this; we have been wanting this for a very long time. \[\\01:16:06.08\\\] You rock the handle Rockbot, right?
++
++**Raquel Vélez:** Yeah.
++
++**Adam Stacoviak:** So I'm kind of curious... Knowing your history, knowing your path, as you've shared here on this show today - where did that name come from? Is it self-professed, has someone given you that name? Where did that come from?
++
++**Raquel Vélez:** Yeah, so back to 2009, there was this thing called Twitter, and I wanted to be part of it, but online identity is scary, so I didn't wanna put my name on my Twitter handle. At the time - I go by Raquel all the time now, but my nickname growing up was Rocky, like the boxer or the squirrel, whichever you prefer. And the reason my nickname was Rocky was that no one could pronounce Raquel. Don't ask me how - everyone kept calling me Rachel or Rochelle, or Roquelle, and I was like "I can't handle this anymore!" I was in third grade, and Rocky was my nickname all the way through college. So I was like okay, Rocky... But Rocky si such a common name... But I also do robots. So Rocky, robots - let's just squish the two together, and I'll try being Rockbot, and that is basically forever and ever the thing.
++
++**Adam Stacoviak:** Is it a hard handle to maintain, meaning as new networks come up, you're able to get it?
++
++**Raquel Vélez:** I'm pretty able to get it. The only downsides are... So in freenode there's a bot named Rockbot, so I can't get it there; I have to add underscores, or something. Then there is a company called Rockbot, it's like a crowdsourced jukebox sort of thing; so when you go to a bar you can get the Rockbot app and choose a song and pay money to listen to the song in the bar. That is really hilarious, because a) they're also located in Oakland, and b) their Twitter handle is @getRockbot, because they couldn't get the @Rockbot handle because I had it first.
++
++**Jerod Santo:** They need to hire you as their CTO. \[laughter\]
++
++**Raquel Vélez:** Well, it's a fun story... They know somebody that I know... So my first startup living in San Francisco, they knew my boss, and they asked via my boss if I would give up my Twitter handle for them, and I was like, "No?" At that point I had like 2,000 followers and they had like 200, and I was like, "No, no, no... That's not gonna work." At this point I think very much differently, but it's super funny getting tweets every once in a while, being like, "Oh my god, Rockbot is so awesome", and they show a picture of a bar. And I'm like, "Yeah..."
++
++**Jerod Santo:** \[unintelligible 01:19:07.13\] picture out.
++
++**Adam Stacoviak:** Alright, last question for you Raquel, and we'll let you get back to hacking and slinging. Programming hero. We love to hear who's influenced you, and obviously your path is a zig-zag like anybody's, not a straight arrow. But who would you consider a hero for yourself? Who's been an inspiration to you in programming, in open source, that you wanna give a shout out to. It doesn't have to be one, a couple is fine, but who's your hero?
++
++**Raquel Vélez:** Ceej, @ceejbot. C. J. Silverio is our VP of engineering at Npm. She started at Npm a week after I did, and so she and I have been on this fun journey for two years now. 90% of the things that I've learned in the last two years have come from her. \[\\01:20:04.15\\\] She is just above and beyond, holy cow amazing. I also need to give a shout out to Stubbornella, Nicole Sullivan. She's more in the CSS type of things, but she has taught me a ton about the non-coding side of things. Full disclosure, she's also my manager at the moment, but just has taught me so, so, so much about understanding a product, and understanding how to finagle your way to understanding what are the priorities, because it's so easy when you're first starting a company to be like, "Alright, I have all these billion and seven ideas. Let's execute on all of them!" And no, that's a terrible idea, don't do that. But knowing how to figure out which one of the one billion and seven... How do you pick just one to focus on, and she's kind of helping me understand that in the context of npm. So definitely massive shout outs to the two of them. I just bow at their feet. Yes, teach me everything you know. We have this joke at Npm that CeeJ and I started. Have you ever seen Heroes, the TV show?
++
++**Adam Stacoviak:** Yeah.
++
++**Raquel Vélez:** Do you know how Sylar would do something weird to people's brains, and everyone just assumed that he ate their brains to understand everything that they knew? So we just walk around, and I'd be like, "CeeJ, I need to pair with you, because I need to eat your brain." It's gruesome, but at the same time...
++
++**Adam Stacoviak:** Well, it's much than pick.
++
++**Raquel Vélez:** No, I don't wanna pick your brain, I just wanna eat it. Just give me all the knowledge that's in your brain so I can put it in my brain, so I can become all the more powerful. Yes.
++
++**Adam Stacoviak:** So I guess not really the last question, but this is really the last question... Since you're such a wealth of knowledge, we wanna eat your brain...
++
++**Jerod Santo:** In a nice way...
++
++**Adam Stacoviak:** Yeah, in a nice way, of course.
++
++**Raquel Vélez:** Oh, totally. My brain is for eating.
++
++**Jerod Santo:** In a non-creepy way.
++
++**Adam Stacoviak:** In a non-creepy way. What's on your radar? There's lots of open-source out there, you deeply invest with a lot of fun stuff - it's 6 PM when you take you breaks, what would you hack on that's new, fresh in open source? What's out there on your radar that if you had some time to play with it...?
++
++**Raquel Vélez:** Yeah. Oh, man... I've done such a good job of avoiding everything for a little while. That said, I keep hearing amazing things about React. I'm just like, "Okay, I need to just build something with that", but I haven't yet. I don't know... I've just been kind of like... I think a lot of the robot stuff continues to be really fascinating to me, seeing how people are building cooler and cooler things, which aren't on the super-mathy kind of stuff.
++
++There is somebody named Hackintosh (@hackintosh), he does some really, really, REALLY neat stuff with regards to streaming data and hacking Chromecasts to stream data that you might have gotten from BitTorrent, and just some fun things like that. That's the sort of thing that when I have time, I try to play around with that a bit more, because it's something I don't know at all. I know nothing about data streaming. I know very little about -- like, I use streams, but I don't use them the way that they use them, and that's some really, really cool stuff. \[\\01:24:00.00\\\] There's only so many things that are available via Chromecast, and I'm just like "I wanna watch this other thing!" So I think that's really fun and really cool, mad science that people do... I love seeing people do things with internet technology that no one ever thought that you should be able to do with internet technology, if that makes sense.
++
++**Adam Stacoviak:** Yeah. Well, certainly fun things in React; we've talked a bit about that. We had Dan Abramov on not long ago. Jerod, if you've got the internet up, pull up the number for me, because I forget. But we had Dan on, and we talked about Redux...
++
++**Jerod Santo:** 187?
++
++**Adam Stacoviak:** 197?
++
++**Jerod Santo:** 187.
++
++**Adam Stacoviak:** 187 - so go to changelog.com/187 if you're listening. It will also be in the show notes for you.
++
++**Jerod Santo:** 149 if you wanna go back to the initial React.js episode with the Facebook team.
++
++**Adam Stacoviak:** Yeah, that was a good one. We need to get them back on, because lots has happened since then, and we could use a catch up of some sort. But React is certainly cool... What was the other one you mentioned? Hackintosh?
++
++**Raquel Vélez:** Yeah, Hackintosh's stuff, just everything he does. He blows my mind every single time. Him and Feross, the two of them just build the coolest stuff. Like, "Whaaat? What are you doing? How... What?? Where did you come up with this idea?" \[laughter\] I love watching their talks at different conferences, because every single time it's guaranteed to just make me go, "Where do you find the time to come up with this ridiculous idea and then execute on it and then blow my mind? I don't understand!"
++
++**Jerod Santo:** Somebody else was singing Feross' praises recently. Adam, who was it? I think it was Henrik Joreteg. I was super excited about what Feross is up to, we might have to get him on the show.
++
++**Adam Stacoviak:** Well, I had a conversation for our ad spots with @opbeat, Thomas Watson, who runs Opbeat Node, and the Node piece to Opbeat for their application performance stuff, and he was talking about Feross and several others... But I think he was saying that Feross is sort of like independently employed, or something like that. Like somehow they're not really employed, but they're employed, this group of people.
++
++**Jerod Santo:** It's just one guy, isn't it?
++
++**Adam Stacoviak:** Yeah, but I'm referencing the other people Thomas mentioned, not just Feross. But this group of people are doing all the awesome stuff that Raquel's mentioned. I don't know, Raquel, is he employed somewhere? I think he just works in open source, and it's funded somehow, I don't know.
++
++**Raquel Vélez:** He might be one of those secret Googlers, or something. There's so many of them, that...
++
++**Adam Stacoviak:** Oh, the secret Googlers...
++
++**Raquel Vélez:** Could be, I don't know.
++
++**Jerod Santo:** I think we can start a conspiracy theory/rumor about Feross right now.
++
++**Raquel Vélez:** I love starting conspiracy theories.
++
++**Adam Stacoviak:** Well, Feross, if you happen to be listening, or someone who know Feross is listening and they know the truth, e-mail us - editors@changelog.com. We'd love to hear more. We'd like to learn the back story, and even have him on the show to dive a little deeper into what he's up to and all the neat things that he's building. Raquel, it's such a pleasure to learn more about where you came from, especially this intrepid attitude that Jerod has coined for you. I think it's such an interesting way to describe this fearless way of approaching the highest mountain sometimes, and I think you're an inspiration to people, and we look forward to hearing more about the awesome stuff you have been doing and you will do. And we mentioned off air, but you're family now, so... You're part of the Changelog family, and we'll be here to support you however we can. That is it for the show. Is there anything else you wanna mention before we go ahead and close? \[\\01:28:00.19\\\]
++
++**Raquel Vélez:** Find a reason to smile every day. That's all. \[laughs\]
++
++**Jerod Santo:** Nice.
++
++**Adam Stacoviak:** That's the way to do it right there - smiles every day. Don't frown, it's bad for your face. \[laughter\] Right?
++
++**Raquel Vélez:** Yeah, indeed. Anyway, thank you so much, this was super fun.
++
++**Adam Stacoviak:** Yeah, thanks everyone for listening to this show. I think this is episode 200 - if it's not, I'm sad about that. Changelog.com/200. You'll find show notes there, and all the details that Raquel has mentioned on this show today. That's it, so let's say goodbye.
++
++**Raquel Vélez:** Bye!
++
++**Jerod Santo:** Goodbye!
+diff --git a/test/helpers/public_helpers_test.exs b/test/helpers/public_helpers_test.exs
+index feaec66173..f33a23f8d8 100644
+--- a/test/helpers/public_helpers_test.exs
++++ b/test/helpers/public_helpers_test.exs
+@@ -34,4 +34,23 @@ defmodule Changelog.PublicHelpersTest do
+       assert plural_form([1], "person", "people") == "person"
+     end
+   end
++
++  describe "with_timestamp_links" do
++    test "normal use inside brackets" do
++      assert with_timestamp_links("[00:11:24.05]") == ~s{[<a class="timestamp" href="#t=00:11:24.05">00:11:24.05</a>]}
++    end
++
++    test "normal use outside brackets" do
++      assert with_timestamp_links("yup 00:01:00.5") == ~s{yup <a class="timestamp" href="#t=00:01:00.5">00:01:00.5</a>}
++    end
++
++    test "short-hand use" do
++      assert with_timestamp_links("[1:24] something") == ~s{[<a class="timestamp" href="#t=1:24">1:24</a>] something}
++    end
++
++    test "muliple occurrences" do
++      plain = "but [unintelligible 00:15:18.13] has helped with [00:14:19.03] stuff"
++      assert with_timestamp_links(plain) == ~s{but [unintelligible <a class="timestamp" href="#t=00:15:18.13">00:15:18.13</a>] has helped with [<a class="timestamp" href="#t=00:14:19.03">00:14:19.03</a>] stuff}
++    end
++  end
+ end
+diff --git a/test/lib/transcripts/parser_test.exs b/test/lib/transcripts/parser_test.exs
+new file mode 100644
+index 0000000000..b7e4633bca
+--- /dev/null
++++ b/test/lib/transcripts/parser_test.exs
+@@ -0,0 +1,71 @@
++defmodule Changelog.Transcripts.ParserTest do
++  use ExUnit.Case
++  import Changelog.TestCase
++
++  alias Changelog.Person
++  alias Changelog.Transcripts.Parser
++
++  test "parsing an empty string" do
++    parsed = Parser.parse_text("")
++    assert length(parsed) == 0
++  end
++
++  test "parsing nil" do
++    parsed = Parser.parse_text(nil)
++    assert length(parsed) == 0
++  end
++
++  test "parsing The Changelog 200" do
++    adam = %Person{id: 1, name: "Adam Stacoviak"}
++    jerod = %Person{id: 2, name: "Jerod Santo"}
++    raquel = %Person{id: 3, name: "Raquel Vélez"}
++
++    text = File.read!("#{fixtures_path()}/transcripts/the-changelog-200.md")
++
++    parsed = Parser.parse_text(text, [adam, jerod, raquel])
++
++    assert length(parsed) == 216
++
++    people_ids =
++      parsed
++      |> Enum.map(&(&1.person_id))
++      |> Enum.uniq
++      |> Enum.reject(&is_nil/1)
++
++    assert people_ids == [adam.id, jerod.id, raquel.id]
++
++    titles =
++      parsed
++      |> Enum.map(&(&1.title))
++      |> Enum.uniq
++
++    assert titles == ["Adam Stacoviak", "Jerod Santo", "Raquel Vélez", "Break"]
++  end
++
++  test "JS Party 1" do
++    alex   = %Person{id: 1, name: "Alex Sexton"}
++    mikeal = %Person{id: 2, name: "Mikeal Rogers"}
++    rachel = %Person{id: 3, name: "Rachel White"}
++
++    text = File.read!("#{fixtures_path()}/transcripts/js-party-1.md")
++
++    parsed = Parser.parse_text(text, [alex, mikeal, rachel])
++
++    assert length(parsed) == 210
++
++    people_ids =
++      parsed
++      |> Enum.map(&(&1.person_id))
++      |> Enum.uniq
++      |> Enum.reject(&is_nil/1)
++
++    assert people_ids == [mikeal.id, alex.id, rachel.id]
++
++    titles =
++      parsed
++      |> Enum.map(&(&1.title))
++      |> Enum.uniq
++
++    assert titles == ["Mikeal Rogers", "Alex Sexton", "Rachel White", "Break"]
++  end
++end
+diff --git a/test/lib/transcripts/source_test.exs b/test/lib/transcripts/source_test.exs
+new file mode 100644
+index 0000000000..8a67410d34
+--- /dev/null
++++ b/test/lib/transcripts/source_test.exs
+@@ -0,0 +1,26 @@
++defmodule Changelog.Transcripts.SourceTest do
++  use ExUnit.Case
++
++  alias Changelog.Transcripts.Source
++
++  test "repo_name" do
++    assert Source.repo_name == "thechangelog/transcripts"
++  end
++
++  test "repo_url" do
++    assert Source.repo_url == "https://github.com/thechangelog/transcripts"
++  end
++
++  test "html_url and raw_url for a Go Time episode" do
++    episode = %{slug: "51", podcast: %{name: "Go Time", slug: "gotime"}}
++
++    assert Source.html_url(episode) == "https://github.com/thechangelog/transcripts/blob/master/gotime/go-time-51.md"
++    assert Source.raw_url(episode) == "https://raw.githubusercontent.com/thechangelog/transcripts/master/gotime/go-time-51.md"
++  end
++
++  test "html_url and raw_url for an RFC episode" do
++    episode = %{slug: "bonus", podcast: %{name: "Request For Commits", slug: "rfc"}}
++    assert Source.html_url(episode) == "https://github.com/thechangelog/transcripts/blob/master/rfc/request-for-commits-bonus.md"
++    assert Source.raw_url(episode) == "https://raw.githubusercontent.com/thechangelog/transcripts/master/rfc/request-for-commits-bonus.md"
++  end
++end
+diff --git a/test/lib/transcripts/updater_test.exs b/test/lib/transcripts/updater_test.exs
+new file mode 100644
+index 0000000000..2d3753ab42
+--- /dev/null
++++ b/test/lib/transcripts/updater_test.exs
+@@ -0,0 +1,53 @@
++defmodule Changelog.Transcripts.UpdaterTest do
++  use Changelog.ModelCase
++
++  import Mock
++
++  alias Changelog.Transcripts.{Source, Updater}
++
++  describe "update" do
++    test "fetches transcript for valid episode" do
++      p = insert(:podcast, slug: "jsparty")
++      e = insert(:published_episode, slug: "12", podcast: p)
++
++      with_mock HTTPoison, [get!: fn(_) -> "markdown" end] do
++        Updater.update(e)
++        assert called HTTPoison.get!(Source.raw_url(e))
++      end
++    end
++
++    test "fetches multiple transcript for valid episodes" do
++      p = insert(:podcast, slug: "podcast")
++      e1 = insert(:published_episode, slug: "292", podcast: p)
++      e2 = insert(:published_episode, slug: "300", podcast: p)
++
++      with_mock HTTPoison, [get!: fn(_) -> "markdown" end] do
++        Updater.update([e1, e2])
++        assert called HTTPoison.get!(Source.raw_url(e1))
++        assert called HTTPoison.get!(Source.raw_url(e2))
++      end
++    end
++
++    test "fetches transcript for valid path" do
++      p = insert(:podcast, slug: "rfc")
++      e = insert(:published_episode, slug: "test", podcast: p)
++
++      with_mock HTTPoison, [get!: fn(_) -> "markdown" end] do
++        Updater.update("rfc/request-for-commits-test.md")
++        assert called HTTPoison.get!(Source.raw_url(e))
++      end
++    end
++
++    test "fetches multiple transcript for valid paths" do
++      p = insert(:podcast, slug: "podcast")
++      e1 = insert(:published_episode, slug: "292", podcast: p)
++      e2 = insert(:published_episode, slug: "300", podcast: p)
++
++      with_mock HTTPoison, [get!: fn(_) -> "markdown" end] do
++        Updater.update(["podcast/the-changelog-292.md", "podcast/the-changelog-300.md"])
++        assert called HTTPoison.get!(Source.raw_url(e1))
++        assert called HTTPoison.get!(Source.raw_url(e2))
++      end
++    end
++  end
++end
+diff --git a/test/support/conn_case.ex b/test/support/conn_case.ex
+index 2317d69c9f..f74641dc4c 100644
+--- a/test/support/conn_case.ex
++++ b/test/support/conn_case.ex
+@@ -23,11 +23,12 @@ defmodule Changelog.ConnCase do
+       alias Changelog.Repo
+       import Ecto
+       import Ecto.Query, only: [from: 2]
+-      import Plug.Conn, only: [assign: 3]
++      import Plug.Conn, only: [assign: 3, put_req_header: 3]
+ 
+       defp count(query), do: Repo.count(query)
+ 
+       import Changelog.Router.Helpers
++      import Changelog.TestCase
+       import Changelog.Factory
+       import Changelog.Plug.Conn
+       import Changelog.TimeView, only: [hours_from_now: 1, hours_ago: 1]
+diff --git a/test/support/model_case.ex b/test/support/model_case.ex
+index 98848fa940..4ca712fe8d 100644
+--- a/test/support/model_case.ex
++++ b/test/support/model_case.ex
+@@ -19,6 +19,7 @@ defmodule Changelog.ModelCase do
+       alias Changelog.Repo
+       import Ecto
+       import Ecto.Query, only: [from: 2]
++      import Changelog.TestCase
+       import Changelog.ModelCase
+       import Changelog.Factory
+     end
+@@ -61,8 +62,4 @@ defmodule Changelog.ModelCase do
+     |> Ecto.Changeset.traverse_errors(&Changelog.ErrorHelpers.translate_error/1)
+     |> Enum.flat_map(fn {key, errors} -> for msg <- errors, do: {key, msg} end)
+   end
+-
+-  def fixtures_path() do
+-    Path.dirname(__ENV__.file) <> "/../fixtures"
+-  end
+ end
+diff --git a/test/support/test_case.ex b/test/support/test_case.ex
+new file mode 100644
+index 0000000000..8329885ac4
+--- /dev/null
++++ b/test/support/test_case.ex
+@@ -0,0 +1,8 @@
++defmodule Changelog.TestCase do
++  @moduledoc """
++  Functions in this module are imported in all test modules
++  """
++  def fixtures_path() do
++    Path.dirname(__ENV__.file) <> "/../fixtures"
++  end
++end
+diff --git a/web/controllers/admin/episode_controller.ex b/web/controllers/admin/episode_controller.ex
+index 577bf1ab49..fe1b0878b6 100644
+--- a/web/controllers/admin/episode_controller.ex
++++ b/web/controllers/admin/episode_controller.ex
+@@ -1,7 +1,8 @@
+ defmodule Changelog.Admin.EpisodeController do
+   use Changelog.Web, :controller
+ 
+-  alias Changelog.{Email, Episode, EpisodeChannel, EpisodeHost, EpisodeStat, Mailer, Podcast}
++  alias Changelog.{Email, Episode, EpisodeChannel, EpisodeHost, EpisodeStat,
++                   Mailer, Podcast, Transcripts}
+ 
+   plug :assign_podcast
+   plug :scrub_params, "episode" when action in [:create, :update]
+@@ -170,6 +171,18 @@ defmodule Changelog.Admin.EpisodeController do
+     end
+   end
+ 
++  def transcript(conn, _params = %{"id" => slug}, podcast) do
++    episode =
++      assoc(podcast, :episodes)
++      |> Repo.get_by!(slug: slug)
++
++    Transcripts.Updater.update(episode)
++
++    conn
++    |> put_flash(:result, "success")
++    |> redirect(to: admin_podcast_episode_path(conn, :index, podcast.slug))
++  end
++
+   defp assign_podcast(conn, _) do
+     podcast = Repo.get_by!(Podcast, slug: conn.params["podcast_id"])
+     assign conn, :podcast, podcast
+diff --git a/web/controllers/github_controller.ex b/web/controllers/github_controller.ex
+new file mode 100644
+index 0000000000..26a4a0b205
+--- /dev/null
++++ b/web/controllers/github_controller.ex
+@@ -0,0 +1,38 @@
++defmodule Changelog.GithubController do
++  use Changelog.Web, :controller
++
++  alias Changelog.Transcripts.{Source, Updater}
++
++  require Logger
++
++  def event(conn, params) do
++    case get_req_header(conn, "x-github-event") do
++      ["push"] -> push_event(conn, params)
++      [event] -> unsupported_event(conn, params, event)
++    end
++  end
++
++  defp push_event(conn, params = %{"repository" => %{"full_name" => repo}, "commits" => commits}) do
++    if repo == Source.repo_name() do
++      commits
++      |> Enum.map(&(Map.take(&1, ["added", "modified"])))
++      |> Enum.map(&Map.values/1)
++      |> List.flatten
++      |> Updater.update
++
++      json(conn, %{})
++    else
++      unsupported_event(conn, params, "push #{repo}")
++    end
++  end
++
++  defp push_event(conn, params) do
++    unsupported_event(conn, params, "push fail")
++  end
++
++  defp unsupported_event(conn, params, event) do
++    Logger.info("GitHub: Unhandled event '#{event}' params: #{inspect(params)}")
++
++    send_resp(conn, :method_not_allowed, "")
++  end
++end
+diff --git a/web/helpers/public_helpers.ex b/web/helpers/public_helpers.ex
+index bce3a139ad..e777fc8d0e 100644
+--- a/web/helpers/public_helpers.ex
++++ b/web/helpers/public_helpers.ex
+@@ -1,6 +1,8 @@
+ defmodule Changelog.Helpers.PublicHelpers do
+   use Phoenix.HTML
+ 
++  alias Changelog.Regexp
++
+   def error_class(form, field) do
+     if form.errors[field], do: "error", else: ""
+   end
+@@ -44,7 +46,7 @@ defmodule Changelog.Helpers.PublicHelpers do
+   def plural_form(1, singular, _plural), do: singular
+   def plural_form(_count, _singular, plural), do: plural
+ 
+-  def sans_p_tags(html), do: String.replace(html, ~r/<\/?p>/, "")
++  def sans_p_tags(html), do: String.replace(html, Regexp.p_tag, "")
+ 
+   def tweet_url(text, url, via \\ "changelog")
+   def tweet_url(text, url, nil), do: tweet_url(text, url)
+@@ -73,4 +75,8 @@ defmodule Changelog.Helpers.PublicHelpers do
+     |> String.replace_leading("\"", "“")
+     |> String.replace_trailing("\"", "”")
+   end
++
++  def with_timestamp_links(string) do
++    String.replace(string, Regexp.timestamp, ~S{<a class="timestamp" href="#t=\0">\0</a>})
++  end
+ end
+diff --git a/web/models/episode.ex b/web/models/episode.ex
+index 709e4869e1..ebfa136c75 100644
+--- a/web/models/episode.ex
++++ b/web/models/episode.ex
+@@ -2,7 +2,8 @@ defmodule Changelog.Episode do
+   use Changelog.Web, :model
+   use Arc.Ecto.Schema
+ 
+-  alias Changelog.{EpisodeHost, EpisodeGuest, EpisodeChannel, EpisodeStat,  EpisodeSponsor, Podcast, Regexp}
++  alias Changelog.{EpisodeHost, EpisodeGuest, EpisodeChannel, EpisodeStat,
++                   EpisodeSponsor, Podcast, Regexp, Transcripts}
+ 
+   schema "episodes" do
+     field :slug, :string
+@@ -32,6 +33,8 @@ defmodule Changelog.Episode do
+     field :import_count, :float
+     field :reach_count, :integer
+ 
++    field :transcript, {:array, :map}
++
+     belongs_to :podcast, Podcast
+     has_many :episode_hosts, EpisodeHost, on_delete: :delete_all
+     has_many :hosts, through: [:episode_hosts, :person]
+@@ -76,6 +79,10 @@ defmodule Changelog.Episode do
+     from e in query, where: fragment("slug ~ E'^\\\\d+$'")
+   end
+ 
++  def with_slug(query, slug) do
++    from e in query, where: e.slug == ^slug
++  end
++
+   def with_podcast_slug(query, slug) do
+     from e in query, join: p in Podcast, where: e.podcast_id == p.id, where: p.slug == ^slug
+   end
+@@ -154,6 +161,14 @@ defmodule Changelog.Episode do
+     |> derive_bytes_and_duration
+   end
+ 
++  def participants(episode) do
++    episode = episode
++    |> preload_guests
++    |> preload_hosts
++
++    episode.guests ++ episode.hosts
++  end
++
+   def preload_all(episode) do
+     episode
+     |> preload_podcast
+@@ -213,6 +228,14 @@ defmodule Changelog.Episode do
+     |> Repo.update!
+   end
+ 
++  def update_transcript(episode, text) do
++    parsed = Transcripts.Parser.parse_text(text, participants(episode))
++
++    episode
++    |> change(transcript: parsed)
++    |> Repo.update!
++  end
++
+   defp derive_bytes_and_duration(changeset) do
+     if new_audio_file = get_change(changeset, :audio_file) do
+       tagged_file = Changelog.EpisodeView.audio_local_path(%{changeset.data | audio_file: new_audio_file})
+diff --git a/web/router.ex b/web/router.ex
+index bea807ea56..c0e85d4104 100644
+--- a/web/router.ex
++++ b/web/router.ex
+@@ -53,6 +53,7 @@ defmodule Changelog.Router do
+       resources "/episodes", EpisodeController
+       post "/episodes/:id/publish", EpisodeController, :publish, as: :episode
+       post "/episodes/:id/unpublish", EpisodeController, :unpublish, as: :episode
++      post "/episodes/:id/transcript", EpisodeController, :transcript, as: :episode
+     end
+     resources "/posts", PostController, except: [:show]
+     resources "/sponsors", SponsorController
+@@ -64,6 +65,12 @@ defmodule Changelog.Router do
+     get "/oembed", ApiController, :oembed
+   end
+ 
++  scope "/github", Changelog do
++    pipe_through [:api]
++
++    post "/event", GithubController, :event
++  end
++
+   scope "/slack", Changelog do
+     pipe_through [:api]
+ 
+@@ -114,7 +121,6 @@ defmodule Changelog.Router do
+     get "/films/gophercon-2016", PageController, :films_gophercon_2016
+     get "/guest/:slug", PageController, :guest
+     get "/guest", PageController, :guest
+-    get "/benefits", PageController, :benefits
+     get "/styleguide", PageController, :styleguide
+     get "/subscribe", PageController, :subscribe
+     get "/partnership", PageController, :partnership
+diff --git a/web/static/app/modules/_modules.sass b/web/static/app/modules/_modules.sass
+index 6ae1e8d414..aa47e377e3 100644
+--- a/web/static/app/modules/_modules.sass
++++ b/web/static/app/modules/_modules.sass
+@@ -44,5 +44,6 @@
+ @import subnav
+ @import toolbar
+ @import tooltip
++@import transcript
+ @import tweetable
+ @import search-box
+diff --git a/web/static/app/modules/_transcript.scss b/web/static/app/modules/_transcript.scss
+new file mode 100644
+index 0000000000..813add554b
+--- /dev/null
++++ b/web/static/app/modules/_transcript.scss
+@@ -0,0 +1,105 @@
++.transcript {
++  font-size: 16px;
++  margin: 20px 0;
++
++  &-item {
++    padding: 0.5em 0;
++    position: relative;
++
++    //
++    //
++    // Green Line
++    &:before {
++      content: "";
++      border-left: 1px solid $green;
++      bottom: 0;
++      position: absolute;
++      width: 1px;
++      top: 0;
++      left: 18px;
++    }
++
++    // Break styles
++    &--break {
++      padding: 1.25em 0 1em;
++
++      &:before {
++        border-left: 1px dashed $green;
++      }
++    }
++    // set z-index for other elements
++    &-speaker,
++    &-text {
++      position: relative;
++      z-index: 1;
++    }
++
++    //
++    //
++    // Speaker
++    &-speaker {
++      align-items: center;
++      display: flex;
++      flex-wrap: wrap;
++
++      &-image {
++        $size: 36px;
++        background: $black;
++        border: 3px solid $white;
++        border-radius: $size;
++        display: block;
++        height: $size;
++        margin-right: 10px;
++        width: $size;
++      }
++
++      &-name {
++        font-family: $display;
++        font-size: 14px;
++        font-weight: bold;
++        margin: 0;
++        text-transform: uppercase;
++
++        a {
++          color: $black;
++        }
++      }
++    }
++
++    //
++    //
++    // Text
++    &-text {
++      padding-left: 48px;
++    }
++  }
++
++  // Simple styling for break text
++  &-break {
++    font-family: $display;
++    font-size: 14px;
++    font-weight: bold;
++    text-transform: uppercase;
++  }
++  &-edit {
++    margin: 0;
++    font-size: 0.875em;
++  }
++}
++
++//
++//
++// Timestamps
++a.timestamp {
++  background: $light-grey url("/images/icon-timestamp.svg") 6px center no-repeat;
++  border-radius: 1em;
++  color: $medium-grey;
++  font-family: $display;
++  font-size: 12px;
++  padding: 0.5em 0.75em 0.35em 23px;
++  transition: background 0.1s ease-in-out;
++
++  &:hover {
++    background-color: darken($light-grey, 5%);
++  }
++}
+diff --git a/web/static/assets/images/icon-timestamp.svg b/web/static/assets/images/icon-timestamp.svg
+new file mode 100644
+index 0000000000..28c6ec3939
+--- /dev/null
++++ b/web/static/assets/images/icon-timestamp.svg
+@@ -0,0 +1,28 @@
++<svg width="13" height="13" viewBox="0 0 13 13" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
++<title>timestamp-icon</title>
++<desc>Created using Figma</desc>
++<g id="Canvas" transform="translate(-266 234)">
++<g id="timestamp-icon">
++<g id="Ellipse 2">
++<mask id="mask0_outline_ins">
++<use xlink:href="#path0_fill" fill="white" transform="translate(266 -234)"/>
++</mask>
++<g mask="url(#mask0_outline_ins)">
++<use xlink:href="#path1_stroke_2x" transform="translate(266 -234)" fill="#808080"/>
++</g>
++</g>
++<g id="Line 3">
++<use xlink:href="#path2_stroke" transform="matrix(6.12323e-17 -1 1 6.12323e-17 273 -227)" fill="#808080"/>
++</g>
++<g id="Line 3">
++<use xlink:href="#path3_stroke" transform="translate(273 -227)" fill="#808080"/>
++</g>
++</g>
++</g>
++<defs>
++<path id="path0_fill" d="M 13 6.5C 13 10.0899 10.0899 13 6.5 13C 2.91015 13 0 10.0899 0 6.5C 0 2.91015 2.91015 0 6.5 0C 10.0899 0 13 2.91015 13 6.5Z"/>
++<path id="path1_stroke_2x" d="M 12 6.5C 12 9.53757 9.53757 12 6.5 12L 6.5 14C 10.6421 14 14 10.6421 14 6.5L 12 6.5ZM 6.5 12C 3.46243 12 1 9.53757 1 6.5L -1 6.5C -1 10.6421 2.35786 14 6.5 14L 6.5 12ZM 1 6.5C 1 3.46243 3.46243 1 6.5 1L 6.5 -1C 2.35786 -1 -1 2.35786 -1 6.5L 1 6.5ZM 6.5 1C 9.53757 1 12 3.46243 12 6.5L 14 6.5C 14 2.35786 10.6421 -1 6.5 -1L 6.5 1Z"/>
++<path id="path2_stroke" d="M 0 0L 4 0L 4 -1L 0 -1L 0 0Z"/>
++<path id="path3_stroke" d="M 0 0L 3 0L 3 -1L 0 -1L 0 0Z"/>
++</defs>
++</svg>
+diff --git a/web/templates/admin/episode/_table.html.eex b/web/templates/admin/episode/_table.html.eex
+index a3e686bc33..c09b909b02 100644
+--- a/web/templates/admin/episode/_table.html.eex
++++ b/web/templates/admin/episode/_table.html.eex
+@@ -34,6 +34,10 @@
+           <%= link to: admin_podcast_episode_path(@conn, :show, @podcast.slug, episode.slug), class: "ui icon button" do %>
+             <i class="line chart icon"></i>
+           <% end %>
++
++          <%= link to: admin_podcast_episode_path(@conn, :transcript, @podcast.slug, episode.slug), method: :post, class: "ui icon button", title: "Refresh Transcript" do %>
++            <i class="refresh icon"></i>
++          <% end %>
+         <% end %>
+ 
+           <%= link to: episode_path(@conn, show_or_preview(episode), @podcast.slug, episode.slug), class: "ui icon button" do %>
+diff --git a/web/templates/episode/show.html.eex b/web/templates/episode/show.html.eex
+index fbe60059bd..336aa7dce8 100644
+--- a/web/templates/episode/show.html.eex
++++ b/web/templates/episode/show.html.eex
+@@ -54,7 +54,7 @@
+     </cite>
+ 
+     <footer class="episode_footer episode_footer--<%= @podcast.slug %>">
+-      <% participants = @episode.guests ++ @episode.hosts %>
++      <% participants = participants(@episode) %>
+       <%= if Enum.any?(participants) do %>
+       <section class="episode-footer-section">
+         <div class="episode-footer-section_icon"><img src="<%= static_url(@conn, "/images/guest-gray.svg") %>" alt="Show notes"></div>
+@@ -100,17 +100,43 @@
+       </section>
+       <% end %>
+ 
++      <%= if Enum.any?(@episode.transcript) do %>
++      <section class="episode-footer-section">
++        <div class="episode-footer-section_icon"><img src="<%= static_url(@conn, "/images/notes.svg") %>" alt="Show transcript"></div>
++        <div class="episode-footer-section_content">
++          <h3 id="transcript">Transcript</h3>
++          <div class="transcript">
++            <%= for {part, index} <- Enum.with_index(@episode.transcript) do %>
++              <% speaker = Enum.find(participants, fn(x) -> x.id == part["person_id"] end) %>
++              <div id="transcript-<%= index %>" class="transcript-item <%= unless speaker do %>transcript-item--break<% end %>">
++                <%= if speaker do %>
++                  <div class="transcript-item-speaker">
++                    <%= link to: PersonView.external_url(speaker), title: speaker.name, rel: "external" do %>
++                      <img class="transcript-item-speaker-image" src="<%= PersonView.avatar_url(speaker) %>" width=75 height=75 alt=""/>
++                    <% end %>
++                    <p class="transcript-item-speaker-name"><%= link part["title"], to: "#transcript-#{index}" %></p>
++                  </div>
++                <% end %>
++                <div class="transcript-item-text">
++                  <%= unless speaker do %><strong class="transcript-break"><%= part["title"] %></strong><% end %>
++                  <%= part["body"] |> md_to_html |> sans_p_tags |> with_timestamp_links |> raw %>
++                </div>
++              </div>
++            <% end %>
++            <div  class="transcript-item transcript-item--break">
++              <div class="transcript-item-text">
++                <strong class="transcript-break">The End</strong>
++                <p class="transcript-edit"><%= link "Edit or Improve this Transcription on Github", to: "#", title: "", rel: "external" %></p>
++              </div>
++            </div>
++          </div>
++        </div>
++      </section>
++      <% end %>
++
+       <%= link "View all episodes", to: podcast_path(@conn, :archive, @podcast.slug), class: "btn btn--block" %>
+     </footer>
+   </article>
+ </div>
+ 
+ <%= render SharedView, "_news_cta_1.html", assigns %>
+-
+-<div class="wrapper wrapper--half-gray">
+-  <%= render SharedView, "_community_cta_2.html", assigns %>
+-</div>
+-
+-<div class="wrapper wrapper--gray">
+-  <%= render SharedView, "_films_cta_1.html", assigns %>
+-</div>
+diff --git a/web/templates/feed/_episode_description.xml.eex b/web/templates/feed/_episode_description.xml.eex
+index 482d46a71a..f7eb6a413d 100644
+--- a/web/templates/feed/_episode_description.xml.eex
++++ b/web/templates/feed/_episode_description.xml.eex
+@@ -10,7 +10,7 @@
+   <% end %>
+   </ul>
+ <% end %>
+-<% participants = @episode.guests ++ @episode.hosts %>
++<% participants = EpisodeView.participants(@episode) %>
+ <%= if Enum.any?(participants) do %>
+   <p>Featuring</p>
+   <ul>
+diff --git a/web/templates/live/live.html.eex b/web/templates/live/live.html.eex
+index aeeddbea27..b3a11c7fab 100644
+--- a/web/templates/live/live.html.eex
++++ b/web/templates/live/live.html.eex
+@@ -17,7 +17,7 @@
+       <div class="live-info-more">
+         <p class="live-info-description"><%= @podcast.description %></p>
+ 
+-        <% participants = @episode.guests ++ @episode.hosts %>
++        <% participants = EpisodeView.participants(@episode) %>
+         <div class="live-info-guests live-info-guests--<%= length(participants) %>">
+         <%= for person <- participants do %>
+           <article class="live-info-guests-item">
+diff --git a/web/templates/page/benefits.html.eex b/web/templates/page/benefits.html.eex
+deleted file mode 100644
+index 07bf2d8c30..0000000000
+--- a/web/templates/page/benefits.html.eex
++++ /dev/null
+@@ -1,16 +0,0 @@
+-<article class="section content">
+-  <div class="container container--has-padding container--skinny">
+-    <header class="content_header">
+-      <h2>Changelog Community Benefits</h2>
+-    </header>
+-    <div class="content_body">
+-      <p>Stay tuned! We're in the middle of relaunching this part of the site.</p>
+-
+-      <P>If you're a community member, we ask kindly for your patience.</P>
+-
+-      <hr>
+-
+-      <p><a href="/contact">Get in touch</a> if you have any questions.</p>
+-    </div>
+-  </div>
+-</article>
+diff --git a/web/views/episode_view.ex b/web/views/episode_view.ex
+index 22657944be..24b97297fe 100644
+--- a/web/views/episode_view.ex
++++ b/web/views/episode_view.ex
+@@ -1,7 +1,8 @@
+ defmodule Changelog.EpisodeView do
+   use Changelog.Web, :public_view
+ 
+-  alias Changelog.{AudioFile, Endpoint, LayoutView, PersonView, SharedView, PodcastView, SponsorView, TimeView}
++  alias Changelog.{AudioFile, Endpoint, LayoutView, PersonView, SharedView,
++                   PodcastView, SponsorView, TimeView}
+ 
+   import Changelog.Meta.{Title, Description}
+ 
+@@ -78,6 +79,10 @@ defmodule Changelog.EpisodeView do
+     end
+   end
+ 
++  def participants(episode) do
++    Changelog.Episode.participants(episode)
++  end
++
+   def sponsorships_with_light_logo(episode) do
+     Enum.reject(episode.episode_sponsors, fn(s) -> is_nil(s.sponsor.light_logo) end)
+   end

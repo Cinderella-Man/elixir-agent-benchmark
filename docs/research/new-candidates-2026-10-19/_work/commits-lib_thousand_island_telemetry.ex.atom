@@ -1,0 +1,599 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/" xml:lang="en-US">
+  <id>tag:github.com,2008:/mtrudel/thousand_island/commits/main/lib/thousand_island/telemetry.ex</id>
+  <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commits/main/lib/thousand_island/telemetry.ex"/>
+  <link type="application/atom+xml" rel="self" href="https://github.com/mtrudel/thousand_island/commits/main/lib/thousand_island/telemetry.ex.atom"/>
+  <title>Recent Commits to thousand_island:main</title>
+  <updated>2026-08-31T20:27:52Z</updated>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/3f262b1030bc4354e0a48de83e05d1480523b71a</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/3f262b1030bc4354e0a48de83e05d1480523b71a"/>
+    <title>
+        Fix: Add system time to telemetry span start measurements (#223)
+    </title>
+    <updated>2026-08-31T20:27:52Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/94031664?s=30&amp;v=4"/>
+    <author>
+      <name>mpettibone</name>
+      <uri>https://github.com/mpettibone</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Fix: Add system time to telemetry span start measurements (#223)
+
+Note: I asked Claude to specifically look for spec non-conformance. It found below. Claude helped write the desc, test case and identification of the PR.
+
+## Summary
+
+- Add `system_time` to listener, acceptor, and connection span start measurements.
+- Preserve caller-supplied `system_time` and `monotonic_time` values through `Map.put_new_lazy/3`.
+- Document the measurement and update start-event regression tests.
+- Add a focused test for explicit timestamp preservation.
+
+## Non-conformance
+
+**The rule.** The span convention Thousand Island&amp;#39;s telemetry documents itself against specifies two measurements on every span start event: &amp;quot;`system_time =&amp;gt; integer(), monotonic_time =&amp;gt; integer()`&amp;quot; ([`telemetry.span/3`](https://hexdocs.pm/telemetry/telemetry.html#span/3)).
+
+**What Thousand Island does today.** `ThousandIsland.Telemetry.start_span/3` (`lib/thousand_island/telemetry.ex`) fills in only `monotonic_time`. No listener, acceptor, or connection start event carries `system_time`, although the module documentation presents these pairs as spans.
+
+**What goes wrong.** Monotonic time is meaningful only relative to one runtime instance. Without the conventional wall-clock anchor, consumers cannot place a span start on a calendar timeline, cannot correlate spans across nodes, and cannot line spans up with log timestamps, which is precisely the gap `system_time` exists to close. Generic span-consuming tooling that reads the conventional key finds it missing.
+
+**What this PR makes it do.** `start_span/3` adds `system_time` through `Map.put_new_lazy/3`, so all three span starts carry both conventional measurements, a caller-supplied value for either timestamp is preserved unchanged, and no clock call is made when one is supplied. The event documentation is updated to list the new measurement.
+
+## Test plan
+
+Verified on Elixir 1.18.4 / Erlang OTP 27.3.4 against current `main`:
+
+- `mix test test/thousand_island/telemetry_test.exs test/thousand_island/handler_test.exs test/thousand_island/listener_test.exs test/thousand_island/server_test.exs` passes.
+- `mix format --check-formatted`, `mix credo --strict`, and `mix dialyzer` pass.
+- The updated start-event assertions fail on unpatched `main` and pass with this change.
+
+Regression coverage verifies:
+
+- listener, acceptor, and connection start events include integer `system_time` and `monotonic_time` measurements;
+- explicitly supplied values for both timestamps are retained unchanged.
+
+## Compatibility / risks
+
+- This is an additive measurement key and does not remove or rename existing event data.
+- Telemetry consumers that require an exact measurement map may need to accept the additional key.
+- Lazy insertion avoids a system clock call when an internal caller already supplied `system_time`.&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/7caea621e0afeeb2e92874796a7b8d3caf0e2a7b</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/7caea621e0afeeb2e92874796a7b8d3caf0e2a7b"/>
+    <title>
+        Fix: Emit telemetry exception events for handler callback exceptions …
+    </title>
+    <updated>2026-08-31T20:24:08Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/94031664?s=30&amp;v=4"/>
+    <author>
+      <name>mpettibone</name>
+      <uri>https://github.com/mpettibone</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Fix: Emit telemetry exception events for handler callback exceptions (#222)
+
+Note: I asked Claude to specifically look for spec non-conformance. It found below. Claude helped write the desc, test case and identification of the PR.
+
+## Summary
+
+- End connection spans with `[:thousand_island, :connection, :exception]` when `handle_connection/2` or `handle_data/3` raises, throws, or exits.
+- Include the conventional `duration` and `monotonic_time` measurements plus `kind`, `reason`, and `stacktrace` metadata.
+- Re-raise with the original exception class, reason, and stacktrace so handler process behavior is unchanged.
+- Preserve `[:thousand_island, :connection, :stop]` for ordinary `{:error, reason, state}` returns and all normal close paths.
+
+## Non-conformance
+
+**The rule.** The telemetry library&amp;#39;s span convention, which Thousand Island&amp;#39;s event documentation explicitly adopts for its listener, acceptor, and connection event pairs, is defined in [`telemetry.span/3`](https://hexdocs.pm/telemetry/telemetry.html#span/3): &amp;quot;Those events will be one of the following pairs: `EventPrefix ++ [start]` and `EventPrefix ++ [stop]` or `EventPrefix ++ [start]` and `EventPrefix ++ [exception]`&amp;quot;, where the exception event carries `kind =&amp;gt; throw | error | exit`, `reason =&amp;gt; term()`, and `stacktrace =&amp;gt; list()` in its metadata.
+
+**What Thousand Island does today.** No exception event exists anywhere in `lib/thousand_island/telemetry.ex`. When `handle_connection/2` or `handle_data/3` raises, throws, or exits, the crash propagates into the generated `terminate/2` in `lib/thousand_island/handler.ex`, whose catch-all clause reports it through `ThousandIsland.Telemetry.stop_span/3`: a `stop` event with the GenServer-normalized exit reason tucked into `error` metadata.
+
+**What goes wrong.** A crashed callback and an ordinary `{:error, reason, state}` return produce the same terminal event, so telemetry consumers cannot tell failures-by-contract from failures-by-crash. The exception class and stacktrace, which the convention places on the exception event, are lost by the time GenServer has normalized the termination reason. Error-tracking integrations built around the standard `exception` event see nothing at all.
+
+**What this PR makes it do.** Callback dispatch is wrapped: a raise, throw, or exit emits exactly one `[:thousand_island, :connection, :exception]` event with the conventional `duration`/`monotonic_time` measurements and `kind`/`reason`/`stacktrace` metadata, then re-raises through `:erlang.raise/3` so process and supervisor behavior are byte-for-byte unchanged. A process-local marker prevents the later `terminate/2` cleanup from also emitting `stop` for the same span. Ordinary error returns keep emitting `stop`, and never `exception`.
+
+## Test plan
+
+Verified on Elixir 1.18.4 / Erlang OTP 27.3.4 against current `main`:
+
+- `mix test test/thousand_island/handler_test.exs` passes.
+- `mix format --check-formatted`, `mix credo --strict`, and `mix dialyzer` pass.
+- The new assertions fail on unpatched `main` and pass with this change.
+
+Regression coverage verifies:
+
+- `:error`, `:throw`, and `:exit` classes produce one `connection.exception` event with conventional fields;
+- exceptions from both `handle_connection/2` and `handle_data/3` are covered;
+- ordinary `{:error, reason, state}` returns still produce `connection.stop` and never `connection.exception`.
+
+## Compatibility / risks
+
+- This adds a new telemetry event. Consumers interested in callback crashes should subscribe to `[:thousand_island, :connection, :exception]` in addition to `:stop`.
+- Consumers that previously counted callback exceptions through `connection.stop` will see them move to `connection.exception`. This is the intended convention correction.
+- Exception propagation and process exit behavior are preserved by re-raising with `:erlang.raise/3`.
+- The terminal-event marker is process-local and keyed by span context. This relies on the existing invariant that connection callbacks and connection cleanup run in the same handler process.&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/0453daf2ec954abe1c5ac59ea4b73eec6af26826</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/0453daf2ec954abe1c5ac59ea4b73eec6af26826"/>
+    <title>
+        Retry the transient network errors accept(2) documents instead of cra…
+    </title>
+    <updated>2026-08-21T00:54:35Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/94031664?s=30&amp;v=4"/>
+    <author>
+      <name>mpettibone</name>
+      <uri>https://github.com/mpettibone</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Retry the transient network errors accept(2) documents instead of crashing the acceptor (#208)
+
+* Treat transient network errors from accept as retryable
+
+## The problem
+
+The accept loop retries only `:econnaborted` and `:einval`, and treats every other accept error as fatal:
+
+```elixir
+{:error, reason} when reason in [:econnaborted, :einval] -&amp;gt;
+  ThousandIsland.Telemetry.span_event(span, reason)
+  accept(...)
+
+{:error, :closed} -&amp;gt;
+  ThousandIsland.Telemetry.stop_span(span, %{connections: count})
+
+{:error, reason} -&amp;gt;
+  ThousandIsland.Telemetry.stop_span(span, %{connections: count}, %{error: reason})
+  raise &amp;quot;Unexpected error in accept: #{inspect(reason)}&amp;quot;
+```
+
+On Linux, `accept` can return a network error that was already pending on the incoming connection: `:enetdown`, `:enetunreach`, `:ehostdown`, `:ehostunreach`, `:enonet`, `:eproto`, `:enoprotoopt`, `:eopnotsupp`, and on some kernels `:etimedout`. Every one of these hits the catch all `raise`. A transient condition on a single inbound connection crashes the acceptor, and a short burst of them escalates: 4 crashes within 5 seconds kill the `AcceptorSupervisor` (dropping that acceptor&amp;#39;s in-flight connections, since the connection supervisor lives under it), and sustained bursts walk up the tree toward the whole server, exactly as with descriptor exhaustion.
+
+## Why it matters
+
+These errors are not exotic. They are what the kernel hands back when a connection arrives carrying a pending ICMP error, when a route flaps, or when a probe touches the port in a way the OS surfaces oddly. The existing `:einval` handling was added in 1.3.12 (#162) for exactly this class of thing: HAProxy TCP health checks on FreeBSD, via Bandit issue 460. Today every other error in the set crashes the acceptor instead of being shrugged off.
+
+## Prior art
+
+The Linux `accept(2)` man page is explicit in its error handling note: &amp;quot;Linux accept() (and accept4()) passes already-pending network errors on the new socket as an error code from accept()&amp;quot;, and applications should &amp;quot;treat them like EAGAIN by retrying&amp;quot;; for TCP/IP it names &amp;quot;ENETDOWN, EPROTO, ENOPROTOOPT, EHOSTDOWN, ENONET, EHOSTUNREACH, EOPNOTSUPP, and ENETUNREACH&amp;quot;. That list is the basis for this change. `:etimedout` is included from the man page&amp;#39;s adjacent note that &amp;quot;Various Linux kernels can return other errors such as ENOSR, ESOCKTNOSUPPORT, EPROTONOSUPPORT, ETIMEDOUT&amp;quot;; of those four, only `ETIMEDOUT` is a plausible transient condition of one incoming TCP connection, so the other three deliberately stay on the fail-loud path.
+
+Ranch goes further and retries every accept error that is not `emfile`, `enfile`, or `closed` (a bare `{error, _} -&amp;gt; ok` clause in `ranch_acceptor.erl`). This PR takes the more conservative path of enumerating the documented set, which keeps Thousand Island&amp;#39;s fail-loud behavior for anything genuinely unexpected, such as a corrupt listener socket.
+
+## Design
+
+- The transient set is a module attribute, so the list sits in one place and is easy to review against the man page.
+- The existing `:econnaborted` / `:einval` clause is untouched, and both keep emitting their existing events. Nothing about current behavior changes; this PR only widens what is survivable.
+- The new errnos emit a single `[:thousand_island, :acceptor, :accept_error]` event carrying the specific error in its `error` measurement, following the pattern of `recv_error` and friends. One event to attach to, with the errno available for anyone who wants to discriminate. It is documented and wired into `ThousandIsland.Logger` at the `:error` level.
+- The retry has no sleep, unlike the descriptor exhaustion backoff proposed in a companion PR. There is nothing to wait out here; the next accept may well succeed immediately.
+- The catch all `raise` stays for anything not in the set.
+
+## Regression tests
+
+Two tests in `test/thousand_island/acceptor_transient_error_test.exs`, using an error-injecting transport. The first opens an echo connection, then injects all ten errnos (the nine new ones plus `:einval`, which also regression-covers the existing path) back to back. Ten consecutive crashes would blow the acceptor&amp;#39;s restart budget several times over, so on unmodified main the established connection is killed by the supervisor collapse and the test fails deterministically. With the fix, the established connection keeps echoing through the error burst, the `AcceptorSupervisor` pid is unchanged, and new connections are served afterward. The second test asserts the `:accept_error` event fires carrying the specific errno (`:ehostunreach`) in its measurements.
+
+## Verification
+
+- Both tests fail on unmodified main across seeds and pass on the branch.
+- Full suite on the branch: no new failures beyond the sandbox&amp;#39;s usual reuseport and IPv6 environment set.
+- `mix format --check-formatted`, `mix credo --strict`, and `mix dialyzer` are all clean on the branch.
+
+## Performance and compatibility
+
+No hot path impact: the new clause runs only when `accept` returns one of the listed errors. Fully backward compatible: the existing `:econnaborted` and `:einval` events are untouched, and the only addition to the public surface is the new documented `:accept_error` event.
+
+## Note
+
+This is the smallest of the acceptor hardening changes in spirit: it widens an existing retry list to match what `accept(2)` spells out. It composes with the descriptor exhaustion and handler start failure PRs; all three live in the same `else` block and can be reviewed separately or as one &amp;quot;harden the acceptor&amp;quot; change if that reads better.
+
+* Update and rename acceptor_transient_error_test.exs to acceptor_test.exs
+
+---------
+
+Co-authored-by: Mat Trudel &amp;lt;mat@geeky.net&amp;gt;&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/8c3199730cbf85faff75bf69996873d50fd1e68b</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/8c3199730cbf85faff75bf69996873d50fd1e68b"/>
+    <title>
+        Survive handler start failure: close the socket and keep accepting (#…
+    </title>
+    <updated>2026-08-21T00:26:05Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/94031664?s=30&amp;v=4"/>
+    <author>
+      <name>mpettibone</name>
+      <uri>https://github.com/mpettibone</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Survive handler start failure: close the socket and keep accepting (#209)
+
+* Survive handler start failure: close the socket and keep accepting
+
+## The problem
+
+After a successful `accept`, the acceptor calls `ThousandIsland.Connection.start/5`, which asks the connection `DynamicSupervisor` to start the handler process. If that start fails for any reason other than `:max_children`, `Connection.start` falls through its final clause:
+
+```elixir
+other -&amp;gt;
+  other
+```
+
+and returns the raw value to the acceptor. For `{:error, reason}` (a handler whose `init/1` returned `{:stop, reason}`, say) the acceptor&amp;#39;s catch all raises &amp;quot;Unexpected error in accept: ...&amp;quot;. For `:ignore` (a handler whose `init/1` opted out) nothing in the `with` else block matches at all, and the acceptor dies with a `WithClauseError` instead. Either way the acceptor crashes on a per connection condition, and repeated occurrences escalate through the supervision tree exactly as described in the descriptor exhaustion PR: 4 crashes in 5 seconds kill the `AcceptorSupervisor` and its live connections.
+
+There is also a socket ownership loose end on this path: the accepted socket is never explicitly closed. Today that is masked, because the socket dies with the crashing acceptor process. But it means the crash is load bearing for cleanup, and any fix that keeps the acceptor alive must add the close, which this PR does.
+
+Verified on unmodified main: with a handler whose `init/1` returns `{:stop, reason}`, a single connection crashes the acceptor, and six connections in a row replace the acceptor pid and kill its supervisor.
+
+## Why it matters
+
+A handler can fail to start for ordinary reasons: it registers itself in a `Registry` during `init` and hits a conflict, it acquires a limited resource that is momentarily exhausted, or it returns `{:stop, reason}` or `:ignore` under some condition. None of these should take down the acceptor that accepted the connection, and none of them should leave the client hanging. The failure is per connection and should be handled per connection.
+
+## Prior art
+
+This is Ranch parity. When a connection process fails to start, Ranch logs the error, closes the socket, and keeps going. From `ranch_conns_sup.erl`:
+
+```erlang
+Ret -&amp;gt;
+    To ! self(),
+    ranch:log(error,
+        &amp;quot;Ranch listener ~p connection process start failure; &amp;quot;
+        &amp;quot;~p:start_link/3 returned: ~0p~n&amp;quot;,
+        [Ref, Protocol, Ret], Logger),
+    Transport:close(Socket),
+```
+
+The supervisor and acceptor stay up. A handler that cannot start is a connection level problem, not an acceptor level fault.
+
+## Design
+
+Two small, matched changes:
+
+- `ThousandIsland.Connection.start/5` now handles the non-`:max_children` failure returns explicitly: it closes the raw socket (which it still owns at that point) and returns a structured `{:error, {:spawn_error, reason}}`. `{:error, reason}` from the supervisor unwraps to the inner reason; `:ignore` or any nonstandard `start_link` return is passed through as is. The spec is tightened to the two outcomes that can actually occur, `:ok` or an error tuple.
+- `ThousandIsland.Acceptor` gains a clause matching `{:error, {:spawn_error, reason}}` which emits the existing `:spawn_error` telemetry event and continues the accept loop.
+
+Reusing the existing `:spawn_error` event is deliberate: from an operator&amp;#39;s point of view, &amp;quot;could not start a handler for this connection&amp;quot; is the same category whether the cause is the connection limit or a failed handler start, and consumers already handle the event. To keep the two cases distinguishable, the handler start failure now carries the failure reason in the event&amp;#39;s `error` measurement (the connection limit case is unchanged and carries none), and the event documentation says so.
+
+Closing the socket in `Connection.start` rather than in the acceptor keeps ownership logic in one place: it is where the socket is handed off on success, so it is also the right place to clean up on failure. This matches the `:max_children` branch a few lines up, which already closes there.
+
+## Regression tests
+
+Three tests in `test/thousand_island/spawn_failure_test.exs`, driven by a handler whose `init/1` fails in a mode chosen via `handler_options` (`{:stop, reason}` or `:ignore`):
+
+- For each failure mode: six connections in a row (past the acceptor&amp;#39;s restart budget, were it crashing) against a single acceptor. Asserts every client socket is actively closed (`recv` returns `{:error, :closed}` rather than hanging), and that the very same acceptor pid is still in place afterward, so the acceptor never crashed at all, let alone escalated. On unmodified main these fail deterministically.
+- A spawn failure emits the `:spawn_error` event with the init failure reason in its `error` measurement.
+
+## Verification
+
+- All three tests fail on unmodified main across seeds and pass on the branch.
+- Full suite on the branch: no new failures beyond the sandbox&amp;#39;s usual reuseport and IPv6 environment set.
+- `mix format --check-formatted`, `mix credo --strict`, and `mix dialyzer` are all clean on the branch.
+
+## Performance and compatibility
+
+No hot path impact: the new logic runs only when a handler fails to start. The `Connection.start` spec is narrowed to match what the function actually returns; the module is `@moduledoc false`, so there is no public API change. The `:spawn_error` event gains an optional documented measurement; its existing shape for the connection limit case is unchanged.
+
+## Note
+
+The explicit close also means a client whose connection was accepted but could not be handled sees a prompt close instead of a dead air socket. As with the companion acceptor PRs, this can be reviewed alone or folded into a combined &amp;quot;harden the acceptor&amp;quot; change.
+
+* Update and rename spawn_failure_test.exs to acceptor_test.exs&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/14de02fc6e86b79b1837e8cc6d66b2944c275301</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/14de02fc6e86b79b1837e8cc6d66b2944c275301"/>
+    <title>
+        Back off on :emfile / :enfile in the accept loop instead of crashing …
+    </title>
+    <updated>2026-08-20T21:10:01Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/94031664?s=30&amp;v=4"/>
+    <author>
+      <name>mpettibone</name>
+      <uri>https://github.com/mpettibone</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Back off on :emfile / :enfile in the accept loop instead of crashing the server (#206)
+
+* Add files via upload
+
+* Update and rename acceptor_emfile_test.exs to acceptor_test.exs&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/4887de28d262d6fb35f6dca5195c49df44f5e9d1</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/4887de28d262d6fb35f6dca5195c49df44f5e9d1"/>
+    <title>
+        Telemetry performance: reduce intermediate map allocations (#181)
+    </title>
+    <updated>2025-10-21T22:42:33Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/27267603?s=30&amp;v=4"/>
+    <author>
+      <name>NelsonVides</name>
+      <uri>https://github.com/NelsonVides</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Telemetry performance: reduce intermediate map allocations (#181)
+
+* Telemetry performance: reduce map allocations
+
+Optimize telemetry span operations to minimize allocations during
+high-throughput socket operations (send, recv, async_recv, etc).
+
+Changes:
+- Modified stop_span/3 to use single Map.merge operation instead of
+  Map.put_new_lazy followed by Map.put, reducing intermediate map
+  allocations from 2 to 1 per span stop
+
+- Added span_metadata field to telemetry span struct that pre-builds the
+  common metadata map (%{telemetry_span_context:, handler:}) once during
+  span creation instead of constructing it on every event
+
+- Added handler field directly to span struct to avoid repeated map
+  lookup of start_metadata.handler, replacing map access with faster
+  struct field access
+
+- Updated untimed_span_event/4 to merge with pre-built span_metadata
+  instead of constructing a new map literal on each call
+
+* Apply suggestions from code revieNit: use full monotonic_time name
+
+---------
+
+Co-authored-by: Mat Trudel &amp;lt;mat@geeky.net&amp;gt;&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/e9b711d7134337f29f406e66d5e36a342cbf9352</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/e9b711d7134337f29f406e66d5e36a342cbf9352"/>
+    <title>
+        Improve tests (#149)
+    </title>
+    <updated>2025-01-05T17:45:05Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Improve tests (#149)
+
+* Move telemetry tests to use message based helper from Bandit
+
+* Use async tests&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/92f6cbcde594a0aae8c07076a30f59692ca3528f</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/92f6cbcde594a0aae8c07076a30f59692ca3528f"/>
+    <title>
+        Refine acceptor behaviour on abnormal conditions (#103)
+    </title>
+    <updated>2023-12-29T17:36:30Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Refine acceptor behaviour on abnormal conditions (#103)
+
+* Fix case where acceptors shut down forever after max_connections is hit
+
+* Don&amp;#39;t exit the acceptor process when handling an econnaborted error&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/1c960ca480ac4ecbee030e9dc247ef8d0931aaf1</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/1c960ca480ac4ecbee030e9dc247ef8d0931aaf1"/>
+    <title>
+        Redesign Telemetry so its implementation details won&#39;t leak outside (…
+    </title>
+    <updated>2023-06-14T13:34:23Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/29058?s=30&amp;v=4"/>
+    <author>
+      <name>asakura</name>
+      <uri>https://github.com/asakura</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Redesign Telemetry so its implementation details won&amp;#39;t leak outside (#65)
+
+* Redesign Telemetry so its implementation details won&amp;#39;t leak outside
+
+* Partially revert &amp;quot;Redesign Telemetry so its implementation details won&amp;#39;t leak outside&amp;quot;
+
+This reverts commit 77717c8afdc8034131d80bb7efe3950904b67dfd.
+
+* Tidy up specs in Telemetry&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/3d1b1b568e548d93121e85210700181c10812f6c</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/3d1b1b568e548d93121e85210700181c10812f6c"/>
+    <title>
+        Tackle some rough edges (#64)
+    </title>
+    <updated>2023-06-05T16:58:30Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/29058?s=30&amp;v=4"/>
+    <author>
+      <name>asakura</name>
+      <uri>https://github.com/asakura</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Tackle some rough edges (#64)
+
+* Use elixirc paths to require modules in the support folder
+
+* Convert private types to public to reveal their internals in docs
+
+* Fixes couple of things in doc strings
+
+* Adds transport_module type
+
+* Fixes Dialyzer warnings in macro generated code in Handler module
+
+* Ignore :unmatch_return in telemetry_collector.exs&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/99288bb9f2b85f8c79367a122246d2ef4c1908da</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/99288bb9f2b85f8c79367a122246d2ef4c1908da"/>
+    <title>
+        Adds missing specs and enables additional checks in Dialyzer (#61)
+    </title>
+    <updated>2023-05-25T13:16:44Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/29058?s=30&amp;v=4"/>
+    <author>
+      <name>asakura</name>
+      <uri>https://github.com/asakura</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Adds missing specs and enables additional checks in Dialyzer (#61)&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/afe6e70a12cb990209b41276d4f9f4871a4b1f81</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/afe6e70a12cb990209b41276d4f9f4871a4b1f81"/>
+    <title>
+        Add `num_connections` support and associated configuration (#54)
+    </title>
+    <updated>2023-04-07T16:59:43Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Add `num_connections` support and associated configuration (#54)
+
+* Add `num_connections` config option &amp;amp; pass it to acceptor supervisors
+
+* Handle supervisor errors at connection startup
+
+* Also move connection span construction into handler process
+
+* Add telemetry support for spawn errors
+
+* Add configurable retry parameters
+
+* Add test coverage
+
+* Refactor into with block&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/2a43791718ef35999fd4bd5dd13a4665e1c38b11</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/2a43791718ef35999fd4bd5dd13a4665e1c38b11"/>
+    <title>
+        Telemetry improvements (#46)
+    </title>
+    <updated>2023-03-17T13:41:55Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Telemetry improvements (#46)
+
+* Use &amp;#39;monotonic_time&amp;#39; in preference to &amp;#39;time&amp;#39;
+
+* Remove parent_span_id startup option
+
+* Replace span_id with telemetry_span_context
+
+* Copy start metadata into stop metadata, per telemetry recommendations
+
+* Rename telemetry_parent_span_context to parent_telemetry_span_context
+
+* Comment formatting&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/9b6b3a31d47b7f35b3d12dfff9d3b997b33b3edc</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/9b6b3a31d47b7f35b3d12dfff9d3b997b33b3edc"/>
+    <title>
+        Update internal config plumbing
+    </title>
+    <updated>2023-03-14T18:28:33Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Update internal config plumbing
+
+* Set read_timeout default to 60_000ms
+* Set num_acceptors default to 100
+* Add missing docs for read_timeout&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/cdf8e6a1f45bbccdf1f2c6b1c31bf8549d0c9552</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/cdf8e6a1f45bbccdf1f2c6b1c31bf8549d0c9552"/>
+    <title>
+        Expose telemetry span type
+    </title>
+    <updated>2023-02-19T19:53:00Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Expose telemetry span type&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/d418d5478815caaafc2cb45cab6cbceca24d3de7</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/d418d5478815caaafc2cb45cab6cbceca24d3de7"/>
+    <title>
+        Update telemetry documentation viz a viz where errors are passed
+    </title>
+    <updated>2023-02-19T19:53:00Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Update telemetry documentation viz a viz where errors are passed&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/d5ab1bb3278350a505edc31c80ff110e7f58d41a</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/d5ab1bb3278350a505edc31c80ff110e7f58d41a"/>
+    <title>
+        Allow telemetry callers to pass times in
+    </title>
+    <updated>2023-02-19T19:53:00Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Allow telemetry callers to pass times in
+
+Included to keep in sync with bandit&amp;#39;s implementation&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/3e52851e4048f3d4f6a6e615ae2dc688acd165a4</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/3e52851e4048f3d4f6a6e615ae2dc688acd165a4"/>
+    <title>
+        Implement new telemetry events &amp; tests (#27)
+    </title>
+    <updated>2023-02-04T21:42:58Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Implement new telemetry events &amp;amp; tests (#27)&lt;/pre&gt;
+    </content>
+  </entry>
+</feed>

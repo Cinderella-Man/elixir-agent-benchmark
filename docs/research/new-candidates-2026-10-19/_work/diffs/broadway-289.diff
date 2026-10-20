@@ -1,0 +1,529 @@
+diff --git a/lib/broadway.ex b/lib/broadway.ex
+index c520a632..5f7dc285 100644
+--- a/lib/broadway.ex
++++ b/lib/broadway.ex
+@@ -979,6 +979,13 @@ defmodule Broadway do
+         raise ArgumentError, format_error(error)
+ 
+       {:ok, opts} ->
++        Enum.each(opts[:batchers], fn {_batcher_name, batcher_opt} ->
++          if batcher_opt[:max_demand] == nil and is_tuple(batcher_opt[:batch_size]) do
++            raise ArgumentError,
++                  "you must set the :max_demand option to an integer when :batch_size is a tuple"
++          end
++        end)
++
+         opts =
+           opts
+           |> carry_over_one(:producer, [:hibernate_after, :spawn_opt])
+diff --git a/lib/broadway/options.ex b/lib/broadway/options.ex
+index c8c6f05d..bfa6c58c 100644
+--- a/lib/broadway/options.ex
++++ b/lib/broadway/options.ex
+@@ -218,10 +218,33 @@ defmodule Broadway.Options do
+               """
+             ],
+             batch_size: [
+-              type: :pos_integer,
++              type: {:custom, __MODULE__, :validate_batch_size, []},
+               default: 100,
+               doc: """
+-              The size of the generated batches.
++              The size of the generated batches. Default value is `100`.
++
++              It is typically an integer but it can also be tuple of `{init_acc, fun}`
++              where `fun` receives two arguments: a `Broadway.Message` and
++              an `acc`. The function must return either `{:emit, acc}` to indicate
++              all batched messages must be emitted or `{:cont, acc}` to continue
++              batching. `init_acc` is the initial accumulator used on the first call.
++
++              You can consider that setting the accumulator to an integer is the
++              equivalent to custom batching function of:
++
++                  {batch_size,
++                   fn
++                     _message, 1 -> {:emit, batch_size}
++                     _message, count -> {:cont, count - 1}
++                   end}
++              """
++            ],
++            max_demand: [
++              type: :pos_integer,
++              doc: """
++              Sets the maximum demand of batcher stages.
++              By default it is set to `:batch_size`, if `:batch_size` is an integer.
++              Must be set if the `:batch_size` is a function.
+               """
+             ],
+             batch_timeout: [
+@@ -300,4 +323,19 @@ defmodule Broadway.Options do
+     {:error,
+      "expected :name to be an atom or a {:via, module, term} tuple, got: #{inspect(name)}"}
+   end
++
++  def validate_batch_size(size) when is_integer(size) and size > 0, do: {:ok, size}
++
++  def validate_batch_size({_acc, func} = batch_splitter) when is_function(func) do
++    if is_function(func, 2) do
++      {:ok, batch_splitter}
++    else
++      {:error, "expected `:batch_size` to include a function of 2 arity, got: #{inspect(func)}\n"}
++    end
++  end
++
++  def validate_batch_size(batch_size) do
++    {:error,
++     "expected :batch_size to be a positive integer or a {acc, &fun/2} tuple, got: #{inspect(batch_size)}\n"}
++  end
+ end
+diff --git a/lib/broadway/topology/batcher_stage.ex b/lib/broadway/topology/batcher_stage.ex
+index 444155bf..d9993571 100644
+--- a/lib/broadway/topology/batcher_stage.ex
++++ b/lib/broadway/topology/batcher_stage.ex
+@@ -11,7 +11,7 @@ defmodule Broadway.Topology.BatcherStage do
+       __MODULE__,
+       args[:processors],
+       args,
+-      [max_demand: args[:batch_size]],
++      [max_demand: args[:max_demand] || args[:batch_size]],
+       stage_options
+     )
+   end
+@@ -77,9 +77,9 @@ defmodule Broadway.Topology.BatcherStage do
+   @impl true
+   def handle_info({:timeout, timer, batch_key}, state) do
+     case get_timed_out_batch(batch_key, timer) do
+-      {current, pending_count, _} ->
++      {current, _, _, _} ->
+         delete_batch(batch_key)
+-        {:noreply, [wrap_for_delivery(batch_key, current, pending_count, state)], state}
++        {:noreply, [wrap_for_delivery(batch_key, current, :timeout, state)], state}
+ 
+       :error ->
+         {:noreply, [], state}
+@@ -89,9 +89,9 @@ defmodule Broadway.Topology.BatcherStage do
+   def handle_info(:cancel_consumers, state) do
+     events =
+       for {batch_key, _} <- all_batches() do
+-        {current, pending_count, timer} = delete_batch(batch_key)
++        {current, _, _, timer} = delete_batch(batch_key)
+         cancel_batch_timeout(timer)
+-        wrap_for_delivery(batch_key, current, pending_count, state)
++        wrap_for_delivery(batch_key, current, :flush, state)
+       end
+ 
+     {:noreply, events, state}
+@@ -110,43 +110,76 @@ defmodule Broadway.Topology.BatcherStage do
+   defp handle_events_per_batch_key([event | _] = events, acc, state) do
+     %{partition_by: partition_by} = state
+     batch_key = batch_key(event, partition_by)
+-    {current, pending_count, timer} = init_or_get_batch(batch_key, state)
++    {current, batch_state, batch_splitter, timer} = init_or_get_batch(batch_key, state)
++
++    {current, batch_state, events, flush} =
++      split_counting(
++        batch_key,
++        events,
++        batch_state,
++        batch_splitter,
++        nil,
++        current,
++        partition_by
++      )
+ 
+-    {current, pending_count, events, flush?} =
+-      split_counting(batch_key, events, pending_count, false, current, partition_by)
++    acc =
++      if flush do
++        deliver_batch(batch_key, current, flush, timer, acc, state)
++      else
++        put_batch(batch_key, {current, batch_state, batch_splitter, timer})
++        acc
++      end
+ 
+-    acc = deliver_or_update_batch(batch_key, current, pending_count, flush?, timer, acc, state)
+     handle_events_per_batch_key(events, acc, state)
+   end
+ 
+-  defp split_counting(batch_key, events, count, flush?, acc, partition_by) do
+-    with [event | events] when count > 0 <- events,
+-         ^batch_key <- batch_key(event, partition_by) do
+-      flush? = flush? or event.batch_mode == :flush
+-      split_counting(batch_key, events, count - 1, flush?, [event | acc], partition_by)
+-    else
+-      _ ->
+-        {acc, count, events, flush?}
+-    end
++  defp split_counting(_batch_key, [], count, _batch_splitter, flush?, acc, _partition_by) do
++    {acc, count, [], flush?}
+   end
+ 
+-  defp deliver_or_update_batch(batch_key, current, pending_count, true, timer, acc, state) do
+-    deliver_batch(batch_key, current, pending_count, timer, acc, state)
+-  end
+-
+-  defp deliver_or_update_batch(batch_key, current, 0, _flush?, timer, acc, state) do
+-    deliver_batch(batch_key, current, 0, timer, acc, state)
++  defp split_counting(
++         batch_key,
++         [event | remained] = events,
++         batch_state,
++         batch_splitter,
++         flush,
++         acc,
++         partition_by
++       ) do
++    event_batch_key = batch_key(event, partition_by)
++
++    # Switch to a different batch key
++    if event_batch_key != batch_key do
++      {acc, batch_state, events, flush}
++    else
++      case batch_splitter.(event, batch_state) do
++        # Batch splitter indicates a full batch
++        {:emit, next_state} ->
++          {[event | acc], next_state, remained, :size}
++
++        # Same batch key but not fulfill one batch size yet
++        {:cont, next_state} ->
++          split_counting(
++            batch_key,
++            remained,
++            next_state,
++            batch_splitter,
++            flush || flush_batch(event),
++            [event | acc],
++            partition_by
++          )
++      end
++    end
+   end
+ 
+-  defp deliver_or_update_batch(batch_key, current, pending_count, _flush?, timer, acc, _state) do
+-    put_batch(batch_key, {current, pending_count, timer})
+-    acc
+-  end
++  defp flush_batch(%{batch_mode: :flush}), do: :flush
++  defp flush_batch(%{}), do: nil
+ 
+-  defp deliver_batch(batch_key, current, pending_count, timer, acc, state) do
++  defp deliver_batch(batch_key, current, trigger, timer, acc, state) do
+     delete_batch(batch_key)
+     cancel_batch_timeout(timer)
+-    [wrap_for_delivery(batch_key, current, pending_count, state) | acc]
++    [wrap_for_delivery(batch_key, current, trigger, state) | acc]
+   end
+ 
+   ## General batch handling
+@@ -164,20 +197,35 @@ defmodule Broadway.Topology.BatcherStage do
+       batch
+     else
+       %{batch_size: batch_size, batch_timeout: batch_timeout} = state
++
++      {batch_state, batch_splitter} = get_batch_splitter(batch_size)
+       timer = schedule_batch_timeout(batch_key, batch_timeout)
+       update_all_batches(&Map.put(&1, batch_key, true))
+-      {[], batch_size, timer}
++      {[], batch_state, batch_splitter, timer}
++    end
++  end
++
++  defp get_batch_splitter(batch_size) do
++    if is_number(batch_size) do
++      {batch_size,
++       fn
++         _message, 1 -> {:emit, batch_size}
++         _message, count -> {:cont, count - 1}
++       end}
++    else
++      # Customized batch splitter with initial state and function
++      batch_size
+     end
+   end
+ 
+   defp get_timed_out_batch(batch_key, timer) do
+     case Process.get(batch_key) do
+-      {_, _, ^timer} = batch -> batch
++      {_, _, _, ^timer} = batch -> batch
+       _ -> :error
+     end
+   end
+ 
+-  defp put_batch(batch_key, {_, _, _} = batch) do
++  defp put_batch(batch_key, {_, _, _, _} = batch) do
+     Process.put(batch_key, batch)
+   end
+ 
+@@ -212,29 +260,22 @@ defmodule Broadway.Topology.BatcherStage do
+     end
+   end
+ 
+-  defp wrap_for_delivery(batch_key, reversed_events, pending, %{partition_by: nil} = state) do
+-    wrap_for_delivery(batch_key, nil, reversed_events, pending, state)
++  defp wrap_for_delivery(batch_key, reversed_events, trigger, %{partition_by: nil} = state) do
++    wrap_for_delivery(batch_key, nil, reversed_events, trigger, state)
+   end
+ 
+-  defp wrap_for_delivery([batch_key | partition], reversed_events, pending, state) do
+-    wrap_for_delivery(batch_key, partition, reversed_events, pending, state)
++  defp wrap_for_delivery([batch_key | partition], reversed_events, trigger, state) do
++    wrap_for_delivery(batch_key, partition, reversed_events, trigger, state)
+   end
+ 
+-  defp wrap_for_delivery(batch_key, partition, reversed_events, pending, state) do
+-    %{batcher: batcher, batch_size: batch_size} = state
+-    [event | _] = reversed_events
+-
+-    trigger =
+-      case event.batch_mode do
+-        :bulk -> if(pending == 0, do: :size, else: :timeout)
+-        :flush -> :flush
+-      end
++  defp wrap_for_delivery(batch_key, partition, reversed_events, trigger, state) do
++    %{batcher: batcher} = state
+ 
+     batch_info = %BatchInfo{
+       batcher: batcher,
+       batch_key: batch_key,
+       partition: partition,
+-      size: batch_size - pending,
++      size: length(reversed_events),
+       trigger: trigger
+     }
+ 
+diff --git a/test/broadway_test.exs b/test/broadway_test.exs
+index 96ff1220..757e0739 100644
+--- a/test/broadway_test.exs
++++ b/test/broadway_test.exs
+@@ -156,6 +156,18 @@ defmodule BroadwayTest do
+     end
+   end
+ 
++  defmodule BatchSplitter do
++    def odd(message, total_size) do
++      remained = total_size - message.data
++      if(remained > 0, do: {:cont, remained}, else: {:emit, 16})
++    end
++
++    def even(message, total_size) do
++      remained = total_size - message.data * 2
++      if(remained > 0, do: {:cont, remained}, else: {:emit, 24})
++    end
++  end
++
+   describe "use Broadway" do
+     test "generates child_spec/1" do
+       defmodule MyBroadway do
+@@ -203,7 +215,56 @@ defmodule BroadwayTest do
+       message = """
+       invalid configuration given to Broadway.start_link/2 for key [:batchers, :sqs], \
+       unknown options [:batch_sizy], valid options are: \
+-      [:concurrency, :batch_size, :batch_timeout, :partition_by, :spawn_opt, :hibernate_after]\
++      [:concurrency, :batch_size, :max_demand, :batch_timeout, :partition_by, :spawn_opt, :hibernate_after]\
++      """
++
++      assert_raise ArgumentError, message, fn ->
++        Broadway.start_link(Forwarder, opts)
++      end
++    end
++
++    test "invalid batch_size configuration option with function having wrong arity" do
++      captured_fn = &wrong_splitter/1
++
++      opts = [
++        name: MyBroadway,
++        producer: [module: {ManualProducer, []}],
++        processors: [default: []],
++        batchers: [
++          sqs: [batch_size: {0, captured_fn}]
++        ]
++      ]
++
++      message = """
++      invalid configuration given to Broadway.start_link/2 for key [:batchers, :sqs], \
++      expected `:batch_size` to include a function of 2 arity, got: #{inspect(captured_fn)}
++      """
++
++      assert_raise ArgumentError, message, fn ->
++        Broadway.start_link(Forwarder, opts)
++      end
++    end
++
++    defp wrong_splitter(_) do
++      :dummy
++    end
++
++    test "invalid batch_size configuration option: either function or integer" do
++      captured_fn = &wrong_splitter/1
++
++      opts = [
++        name: new_unique_name(),
++        producer: [module: {ManualProducer, []}],
++        processors: [default: []],
++        batchers: [
++          sqs: [batch_size: captured_fn]
++        ]
++      ]
++
++      message = """
++      invalid configuration given to Broadway.start_link/2 for key [:batchers, :sqs], \
++      expected :batch_size to be a positive integer or a {acc, &fun/2} tuple, \
++      got: #{inspect(captured_fn)}
+       """
+ 
+       assert_raise ArgumentError, message, fn ->
+@@ -211,6 +272,23 @@ defmodule BroadwayTest do
+       end
+     end
+ 
++    test "no demand_size option is provided when batch_size is tuple" do
++      opts = [
++        name: new_unique_name(),
++        producer: [module: {ManualProducer, []}],
++        processors: [default: []],
++        batchers: [
++          sqs: [batch_size: {10, &BatchSplitter.even/2}]
++        ]
++      ]
++
++      assert_raise ArgumentError,
++                   "you must set the :max_demand option to an integer when :batch_size is a tuple",
++                   fn ->
++                     Broadway.start_link(Forwarder, opts)
++                   end
++    end
++
+     test "default number of producers is 1" do
+       broadway = new_unique_name()
+ 
+@@ -1146,6 +1224,130 @@ defmodule BroadwayTest do
+     end
+   end
+ 
++  describe "customized batch splitter - one batcher different batch keys" do
++    setup do
++      broadway_name = new_unique_name()
++      test_pid = self()
++
++      handle_message = fn message, _ ->
++        if is_odd(message.data) do
++          Message.put_batch_key(message, :odd)
++        else
++          Message.put_batch_key(message, :even)
++        end
++      end
++
++      context = %{
++        handle_message: handle_message,
++        handle_batch: fn batcher, batch, batch_info, _ ->
++          send(test_pid, {:batch_handled, batcher, batch, batch_info})
++          batch
++        end
++      }
++
++      {:ok, _broadway} =
++        Broadway.start_link(CustomHandlers,
++          name: broadway_name,
++          context: context,
++          producer: [module: {ManualProducer, []}],
++          processors: [default: []],
++          batchers: [
++            default: [batch_size: {16, &BatchSplitter.odd/2}, batch_timeout: 20, max_demand: 10]
++          ]
++        )
++
++      %{broadway: broadway_name}
++    end
++
++    test "generate batches", %{broadway: broadway} do
++      Broadway.test_batch(broadway, [40, 1, 13, 3])
++
++      assert_receive {:batch_handled, :default, messages,
++                      %BatchInfo{batcher: :default, size: 1, trigger: :size}}
++                     when length(messages) == 1
++
++      assert_receive {:batch_handled, :default, messages,
++                      %BatchInfo{batcher: :default, size: 3, trigger: :size}}
++                     when length(messages) == 3
++
++      refute_received {:batch_handled, _, _}
++    end
++  end
++
++  describe "customized batch splitter - multiple batcher" do
++    setup do
++      broadway_name = new_unique_name()
++      test_pid = self()
++
++      handle_message = fn message, _ ->
++        if is_odd(message.data) do
++          Message.put_batch_key(message, :odd)
++          |> Message.put_batcher(:odd)
++        else
++          Message.put_batch_key(message, :even)
++          |> Message.put_batcher(:even)
++        end
++      end
++
++      context = %{
++        handle_message: handle_message,
++        handle_batch: fn batcher, batch, batch_info, _ ->
++          send(test_pid, {:batch_handled, batcher, batch, batch_info})
++          batch
++        end
++      }
++
++      {:ok, _broadway} =
++        Broadway.start_link(CustomHandlers,
++          name: broadway_name,
++          context: context,
++          producer: [module: {ManualProducer, []}],
++          processors: [default: []],
++          batchers: [
++            odd: [batch_size: {16, &BatchSplitter.odd/2}, batch_timeout: 20, max_demand: 10],
++            even: [batch_size: {24, &BatchSplitter.even/2}, batch_timeout: 20, max_demand: 10]
++          ]
++        )
++
++      %{broadway: broadway_name}
++    end
++
++    test "generate batches based on :batch_size", %{broadway: broadway} do
++      Broadway.test_batch(broadway, Enum.to_list(1..10))
++
++      assert_receive {:batch_handled, :odd, messages,
++                      %BatchInfo{batcher: :odd, size: 4, trigger: :size}}
++                     when length(messages) == 4
++
++      assert_receive {:batch_handled, :odd, messages,
++                      %BatchInfo{batcher: :odd, size: 1, trigger: :timeout}}
++                     when length(messages) == 1
++
++      assert_receive {:batch_handled, :even, messages,
++                      %BatchInfo{batcher: :even, size: 3, trigger: :size}}
++                     when length(messages) == 3
++
++      assert_receive {:batch_handled, :even, messages,
++                      %BatchInfo{batcher: :even, size: 2, trigger: :size}}
++                     when length(messages) == 2
++
++      refute_received {:batch_handled, _, _}
++    end
++
++    test "generate batches with the remaining messages after :batch_timeout is reached",
++         %{broadway: broadway} do
++      Broadway.test_batch(broadway, [1, 2, 3, 4], batch_mode: :flush)
++
++      assert_receive {:batch_handled, :odd, messages, %BatchInfo{trigger: :flush}}
++                     when length(messages) == 2
++
++      assert_receive {:batch_handled, :even, messages, %BatchInfo{trigger: :flush}}
++                     when length(messages) == 2
++
++      refute_received {:batch_handled, _, _, _}
++    end
++  end
++
+   describe "partition_by" do
+     @describetag processors_options: [], batchers_options: []
+ 

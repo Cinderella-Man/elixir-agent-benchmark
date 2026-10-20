@@ -1,0 +1,311 @@
+diff --git a/lib/nerves_hub/devices/updates.ex b/lib/nerves_hub/devices/updates.ex
+index 83853badc..fbc90bca6 100644
+--- a/lib/nerves_hub/devices/updates.ex
++++ b/lib/nerves_hub/devices/updates.ex
+@@ -428,15 +428,32 @@ defmodule NervesHub.Devices.Updates do
+ 
+         {:error, :updates_blocked, device}
+ 
+-      failure_rate_met?(device, deployment_group) ->
+-        {:ok, device} = put_device_in_penalty_box(device, deployment_group, :exceeded_failure_rate)
++      true ->
++        enforce_failure_limits(device, deployment_group)
++    end
++  end
+ 
+-        {:error, :updates_blocked, device}
++  @doc """
++  Put the device in the penalty box if it has failed to update too often, by the
++  deployment group's failure rate or its failure threshold.
+ 
+-      failure_threshold_met?(device, deployment_group) ->
+-        {:ok, device} = put_device_in_penalty_box(device, deployment_group, :exceeded_failure_threshold)
++  The penalty clears the device's update attempts, so once it ends the device has
++  a full set of tries again. This is the one place a device is penalized for its
++  failures, whether the orchestrator is about to send it an update or
++  `verify_update_eligibility/3` is about to hand one out.
+ 
+-        {:error, :updates_blocked, device}
++  A device over its limits is never updated, even when recording the penalty
++  fails; the failure is logged instead.
++  """
++  @spec enforce_failure_limits(Device.t(), DeploymentGroup.t()) ::
++          {:ok, Device.t()} | {:error, :updates_blocked, Device.t()}
++  def enforce_failure_limits(device, deployment_group) do
++    cond do
++      failure_rate_met?(device, deployment_group) ->
++        put_device_in_penalty_box(device, deployment_group, :exceeded_failure_rate)
++
++      failure_threshold_met?(device, deployment_group) ->
++        put_device_in_penalty_box(device, deployment_group, :exceeded_failure_threshold)
+ 
+       true ->
+         {:ok, device}
+@@ -463,12 +480,25 @@ defmodule NervesHub.Devices.Updates do
+       org: device.org.name,
+       product: device.product.name,
+       platform: deployment_group.platform,
+-      current_firmware_version: device.current_device_firmware.firmware_metadata.version,
++      # A device that has not reported its firmware since device firmwares were
++      # introduced has none on record
++      current_firmware_version: get_in(device.current_device_firmware.firmware_metadata.version),
+       upgrading_firmware_version: target_release.firmware.version,
+       reason: reason
+     })
+ 
+-    Devices.update_device(device, %{updates_blocked_until: blocked_until, update_attempts: []})
++    case Devices.update_device(device, %{updates_blocked_until: blocked_until, update_attempts: []}) do
++      {:ok, device} ->
++        {:error, :updates_blocked, device}
++
++      {:error, changeset} ->
++        Logger.warning("Device #{device.identifier} could not be put in the penalty box", %{
++          identifier: device.identifier,
++          errors: inspect(changeset.errors)
++        })
++
++        {:error, :updates_blocked, device}
++    end
+   end
+ 
+   @spec update_attempted(DeviceInfo.t(), DateTime.t()) :: :ok | {:error, Changeset.t()}
+@@ -701,17 +731,4 @@ defmodule NervesHub.Devices.Updates do
+     params = %{updates_blocked_until: nil, update_attempts: []}
+     Devices.update_device_with_audit(device, params, user, description)
+   end
+-
+-  def update_blocked_until(device, deployment) do
+-    blocked_until =
+-      DateTime.utc_now()
+-      |> DateTime.truncate(:second)
+-      |> DateTime.add(deployment.penalty_timeout_minutes * 60, :second)
+-
+-    target_release = ManagedDeployments.target_release(deployment, device)
+-
+-    DeviceTemplates.audit_firmware_upgrade_blocked(deployment, device, target_release.firmware)
+-
+-    Devices.update_device(device, %{updates_blocked_until: blocked_until})
+-  end
+ end
+diff --git a/lib/nerves_hub/managed_deployments/orchestrator/coordinator.ex b/lib/nerves_hub/managed_deployments/orchestrator/coordinator.ex
+index 99f3c4d76..7b94d021c 100644
+--- a/lib/nerves_hub/managed_deployments/orchestrator/coordinator.ex
++++ b/lib/nerves_hub/managed_deployments/orchestrator/coordinator.ex
+@@ -26,31 +26,22 @@ defmodule NervesHub.ManagedDeployments.Orchestrator.Coordinator do
+       alias NervesHub.ManagedDeployments.DeploymentGroup
+ 
+       @doc """
+-      Given a list of devices, confirm they haven't had too many update failures, then
+-      message the devices to schedule their updates, or update their `blocked_until`.
++      Given a list of devices, message the ones that haven't had too many update
++      failures to schedule their updates, and put the rest in the penalty box (see
++      `Updates.enforce_failure_limits/2`).
+ 
+       Returns the number of devices that were allowed to update.
+       """
+       @spec schedule_devices!([Device.t()], DeploymentGroup.t(), boolean()) :: non_neg_integer()
+       def schedule_devices!(available, deployment_group, priority_queue \\ false) do
+         Enum.count(available, fn device ->
+-          case can_device_update?(device, deployment_group) do
+-            true ->
+-              tell_device_to_update(device.id, deployment_group, priority_queue)
+-
+-            false ->
+-              _ = Updates.update_blocked_until(device, deployment_group)
+-              false
++          case Updates.enforce_failure_limits(device, deployment_group) do
++            {:ok, _device} -> tell_device_to_update(device.id, deployment_group, priority_queue)
++            {:error, :updates_blocked, _device} -> false
+           end
+         end)
+       end
+ 
+-      @spec can_device_update?(Device.t(), DeploymentGroup.t()) :: boolean()
+-      defp can_device_update?(device, deployment_group) do
+-        not (Updates.failure_rate_met?(device, deployment_group) or
+-               Updates.failure_threshold_met?(device, deployment_group))
+-      end
+-
+       @spec tell_device_to_update(integer(), DeploymentGroup.t(), boolean()) :: boolean()
+       defp tell_device_to_update(device_id, deployment_group, priority_queue) do
+         :telemetry.execute([:nerves_hub, :deployments, :trigger_update, :device], %{count: 1})
+diff --git a/test/nerves_hub/devices/updates_test.exs b/test/nerves_hub/devices/updates_test.exs
+index 1f57a6fc8..131599918 100644
+--- a/test/nerves_hub/devices/updates_test.exs
++++ b/test/nerves_hub/devices/updates_test.exs
+@@ -2,6 +2,8 @@ defmodule NervesHub.Devices.UpdatesTest do
+   use NervesHub.DataCase, async: true
+   use Mimic
+ 
++  import ExUnit.CaptureLog
++
+   alias NervesHub.DeploymentOrchestratorEvents
+   alias NervesHub.DeviceLink.DeviceInfo
+   alias NervesHub.Devices
+@@ -45,6 +47,40 @@ defmodule NervesHub.Devices.UpdatesTest do
+     end
+   end
+ 
++  describe "enforce_failure_limits/2" do
++    test "lets a device under its limits through", %{device: device, deployment_group: deployment_group} do
++      assert {:ok, ^device} = Updates.enforce_failure_limits(device, deployment_group)
++    end
++
++    test "penalty boxes a device that has met its failure threshold and clears its attempts", %{
++      device: device,
++      deployment_group: deployment_group
++    } do
++      {:ok, device} = Devices.update_device(device, %{update_attempts: attempts_days_apart(3)})
++
++      assert {:error, :updates_blocked, device} = Updates.enforce_failure_limits(device, deployment_group)
++
++      assert Updates.device_in_penalty_box?(device)
++      assert Repo.reload(device).update_attempts == []
++    end
++
++    test "doesn't let a device update when its penalty can't be recorded", %{
++      device: device,
++      deployment_group: deployment_group
++    } do
++      {:ok, device} = Devices.update_device(device, %{update_attempts: attempts_days_apart(3)})
++      {:ok, device} = Devices.delete_device(device)
++
++      log =
++        capture_log(fn ->
++          assert {:error, :updates_blocked, _device} = Updates.enforce_failure_limits(device, deployment_group)
++        end)
++
++      assert log =~ "could not be put in the penalty box"
++      refute Repo.reload(device).updates_blocked_until
++    end
++  end
++
+   describe "device_in_penalty_box?/2" do
+     test "returns false for DeviceInfo with nil updates_blocked_until" do
+       device_info = %DeviceInfo{device_updates_blocked_until: nil}
+@@ -192,6 +228,13 @@ defmodule NervesHub.Devices.UpdatesTest do
+ 
+   # ---- helpers ----
+ 
++  # Far enough apart that only the failure threshold is met, never the rate
++  defp attempts_days_apart(count) do
++    now = DateTime.utc_now(:second)
++
++    for days <- 1..count, do: DateTime.add(now, -days * 86_400, :second)
++  end
++
+   defp set_different_firmware_uuid(device) do
+     firmware_metadata = %{
+       architecture: "x86_64",
+diff --git a/test/nerves_hub/managed_deployments/default_coordinator_test.exs b/test/nerves_hub/managed_deployments/default_coordinator_test.exs
+new file mode 100644
+index 000000000..89951b58d
+--- /dev/null
++++ b/test/nerves_hub/managed_deployments/default_coordinator_test.exs
+@@ -0,0 +1,80 @@
++defmodule NervesHub.ManagedDeployments.DefaultCoordinatorTest do
++  use NervesHub.DataCase, async: false
++
++  import ExUnit.CaptureLog
++
++  alias NervesHub.Devices
++  alias NervesHub.Devices.Connections
++  alias NervesHub.Devices.Deployments
++  alias NervesHub.Devices.InflightUpdate
++  alias NervesHub.Devices.Updates
++  alias NervesHub.Fixtures
++  alias NervesHub.ManagedDeployments.Orchestrator.DefaultCoordinator
++
++  setup %{tmp_dir: tmp_dir} do
++    user = Fixtures.user_fixture()
++    org = Fixtures.org_fixture(user)
++    product = Fixtures.product_fixture(user, org)
++    org_key = Fixtures.org_key_fixture(org, user, tmp_dir)
++    firmware = Fixtures.firmware_fixture(org_key, product, %{dir: tmp_dir})
++    deployment_group = Fixtures.deployment_group_fixture(firmware, %{is_active: true, user: user})
++
++    device = Fixtures.device_fixture(org, product, firmware, %{status: :provisioned})
++
++    {:ok, device} =
++      Devices.update_firmware_metadata(
++        device,
++        %{"version" => "0.9.0", "uuid" => Ecto.UUID.generate()},
++        :validated,
++        false
++      )
++
++    device = Deployments.update_deployment_group(device, deployment_group)
++
++    {:ok, connection} = Connections.device_connecting(device.org_id, device.product_id, device.id)
++    :ok = Connections.device_connected(connection.id)
++
++    %{deployment_group: deployment_group, device: device}
++  end
++
++  test "a device penalty boxed for its failures gets a full set of tries once the penalty ends", %{
++    deployment_group: deployment_group,
++    device: device
++  } do
++    now = DateTime.utc_now(:second)
++    {:ok, device} = Devices.update_device(device, %{update_attempts: [now, now, now]})
++
++    # Skipping a device asks for another pass, to find someone else for the slot
++    assert DefaultCoordinator.schedule_updates(deployment_group)
++
++    device = Repo.reload(device)
++    assert Updates.device_in_penalty_box?(device)
++    assert device.update_attempts == []
++    refute inflight_update?(device)
++
++    {:ok, _device} = Devices.update_device(device, %{updates_blocked_until: DateTime.add(now, -1, :second)})
++
++    refute DefaultCoordinator.schedule_updates(deployment_group)
++    assert inflight_update?(device)
++  end
++
++  test "penalty boxes a device that has no firmware on record", %{deployment_group: deployment_group, device: device} do
++    now = DateTime.utc_now(:second)
++
++    device
++    |> change(current_device_firmware_id: nil, update_attempts: [now, now, now])
++    |> Repo.update!()
++
++    # config/test.exs pins the logger to :warning, and the penalty is logged at :info
++    level = Logger.level()
++    Logger.configure(level: :info)
++    on_exit(fn -> Logger.configure(level: level) end)
++
++    log = capture_log(fn -> assert DefaultCoordinator.schedule_updates(deployment_group) end)
++
++    assert log =~ "put in penalty box"
++    assert Updates.device_in_penalty_box?(Repo.reload(device))
++  end
++
++  defp inflight_update?(device), do: Repo.exists?(where(InflightUpdate, device_id: ^device.id))
++end
+diff --git a/test/nerves_hub/managed_deployments/orchestrator_test.exs b/test/nerves_hub/managed_deployments/orchestrator_test.exs
+index 629531650..18fda3573 100644
+--- a/test/nerves_hub/managed_deployments/orchestrator_test.exs
++++ b/test/nerves_hub/managed_deployments/orchestrator_test.exs
+@@ -1062,7 +1062,7 @@ defmodule NervesHub.ManagedDeployments.OrchestratorTest do
+ 
+       # Give device1 enough failed update attempts to meet the failure threshold
+       # The default device_failure_threshold is 3, so we'll add 3 attempts
+-      # This will cause it to fail can_device_update? and be skipped
++      # This will cause Updates.enforce_failure_limits/2 to penalty box it, so it is skipped
+       :ok = to_device_info(old_device1) |> Updates.update_attempted()
+       :ok = to_device_info(old_device1) |> Updates.update_attempted()
+       :ok = to_device_info(old_device1) |> Updates.update_attempted()
+diff --git a/test/nerves_hub/managed_deployments/required_release_test.exs b/test/nerves_hub/managed_deployments/required_release_test.exs
+index c47ed1ed9..67bc69392 100644
+--- a/test/nerves_hub/managed_deployments/required_release_test.exs
++++ b/test/nerves_hub/managed_deployments/required_release_test.exs
+@@ -392,7 +392,7 @@ defmodule NervesHub.ManagedDeployments.RequiredReleaseTest do
+     test "names the required release's firmware when the orchestrator blocks a device", context do
+       %{deployment_group: deployment_group, device: device} = context
+ 
+-      assert {:ok, _device} = Updates.update_blocked_until(device, deployment_group)
++      assert {:error, :updates_blocked, _device} = Updates.enforce_failure_limits(device, deployment_group)
+ 
+       assert [audit_log | _] = AuditLogs.logs_for(device)
+       assert audit_log.description =~ "Device failure rate met for firmware #{context.fw2.uuid}"

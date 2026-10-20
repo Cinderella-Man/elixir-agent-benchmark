@@ -1,0 +1,355 @@
+diff --git a/lib/absinthe/phase/document/validation/one_of_directive.ex b/lib/absinthe/phase/document/validation/one_of_directive.ex
+new file mode 100644
+index 0000000000..7ca9a3ddba
+--- /dev/null
++++ b/lib/absinthe/phase/document/validation/one_of_directive.ex
+@@ -0,0 +1,43 @@
++defmodule Absinthe.Phase.Document.Validation.OneOfDirective do
++  @moduledoc false
++
++  # Document validation phase that ensures that only one value is provided for input types
++  # that have the oneOf directive set
++
++  use Absinthe.Phase
++
++  alias Absinthe.Blueprint
++  alias Absinthe.Blueprint.Input.Argument
++  alias Absinthe.Blueprint.Input.Object
++  alias Absinthe.Phase.Error
++
++  def run(blueprint, _options \\ []) do
++    {:ok, Blueprint.prewalk(blueprint, &process/1)}
++  end
++
++  # Ignore input objects without schema nodes
++  defp process(%Argument{input_value: %{normalized: %Object{schema_node: nil}}} = node), do: node
++
++  defp process(%Argument{input_value: %{normalized: %Object{} = object}} = node) do
++    if Keyword.has_key?(object.schema_node.__private__, :one_of) and
++         field_count(object.fields) > 1 do
++      message =
++        ~s[The Input Type "#{object.schema_node.name}" has the @oneOf directive. It must have exactly one non-null field.]
++
++      error = %Error{locations: [node.source_location], message: message, phase: __MODULE__}
++      put_error(node, error)
++    else
++      node
++    end
++  end
++
++  defp process(node), do: node
++
++  defp field_count(fields) do
++    fields
++    |> Enum.map(fn field ->
++      get_in(field, Enum.map(~w[input_value normalized __struct__]a, &Access.key/1))
++    end)
++    |> Enum.count(&(&1 != Absinthe.Blueprint.Input.Null))
++  end
++end
+diff --git a/lib/absinthe/phase/schema/validation/one_of_directive.ex b/lib/absinthe/phase/schema/validation/one_of_directive.ex
+new file mode 100644
+index 0000000000..c14ac05906
+--- /dev/null
++++ b/lib/absinthe/phase/schema/validation/one_of_directive.ex
+@@ -0,0 +1,48 @@
++defmodule Absinthe.Phase.Schema.Validation.OneOfDirective do
++  @moduledoc false
++
++  # Schema validation phase that ensures that uses of the `@oneOf` directive comply with the spec
++
++  use Absinthe.Phase
++
++  alias Absinthe.Blueprint
++  alias Absinthe.Blueprint.Schema.InputObjectTypeDefinition
++  alias Absinthe.Blueprint.TypeReference.NonNull
++
++  def run(blueprint, _options \\ []) do
++    {:ok, Blueprint.prewalk(blueprint, &process/1)}
++  end
++
++  defp process(%InputObjectTypeDefinition{directives: [_ | _] = directives} = node) do
++    one_of? = Enum.any?(directives, &(&1.name == "one_of"))
++
++    cond do
++      one_of? and length(node.fields) == 1 ->
++        add_error(node, """
++        The oneOf directive is only valid on input types with more then one field.
++        The input type "#{node.name}" only defines one field.
++        """)
++
++      one_of? and Enum.any?(node.fields, &match?(%NonNull{}, &1.type)) ->
++        add_error(node, """
++        The oneOf directive is only valid on input types with all nullable fields.
++        The input type "#{node.name}" has one or more nullable fields.
++        """)
++
++      true ->
++        node
++    end
++  end
++
++  defp process(node), do: node
++
++  defp add_error(node, message) do
++    error = %Absinthe.Phase.Error{
++      locations: [node.__reference__.location],
++      message: message,
++      phase: __MODULE__
++    }
++
++    put_error(node, error)
++  end
++end
+diff --git a/lib/absinthe/pipeline.ex b/lib/absinthe/pipeline.ex
+index 2855b1db5e..2c065957a8 100644
+--- a/lib/absinthe/pipeline.ex
++++ b/lib/absinthe/pipeline.ex
+@@ -103,6 +103,7 @@ defmodule Absinthe.Pipeline do
+       Phase.Document.Validation.UniqueArgumentNames,
+       Phase.Document.Validation.UniqueInputFieldNames,
+       Phase.Document.Validation.FieldsOnCorrectType,
++      Phase.Document.Validation.OneOfDirective,
+       Phase.Document.Validation.OnlyOneSubscription,
+       # Check Validation
+       {Phase.Document.Validation.Result, options},
+@@ -187,6 +188,7 @@ defmodule Absinthe.Pipeline do
+       Phase.Schema.Validation.QueryTypeMustBeObject,
+       Phase.Schema.Validation.NamesMustBeValid,
+       Phase.Schema.Validation.UniqueFieldNames,
++      Phase.Schema.Validation.OneOfDirective,
+       Phase.Schema.RegisterTriggers,
+       Phase.Schema.MarkReferenced,
+       Phase.Schema.ReformatDescriptions,
+diff --git a/lib/absinthe/schema/prototype/notation.ex b/lib/absinthe/schema/prototype/notation.ex
+index 68dce53c2e..1c3faa1a38 100644
+--- a/lib/absinthe/schema/prototype/notation.ex
++++ b/lib/absinthe/schema/prototype/notation.ex
+@@ -45,6 +45,23 @@ defmodule Absinthe.Schema.Prototype.Notation do
+         on [:scalar]
+       end
+ 
++      # https://spec.graphql.org/September2025/#sec--oneOf
++      directive :one_of do
++        description """
++        The @oneOf built-in directive is used within the type system definition language to indicate an Input Object is a OneOf Input Object.
++
++        A OneOf Input Object is a special variant of Input Object where exactly one field must be set and non-null, all others being omitted.
++        This is useful for representing situations where an input may be one of many different options.
++        """
++
++        repeatable false
++        on [:input_object]
++
++        expand(fn _args, node ->
++          %{node | __private__: Keyword.put(node.__private__, :one_of, true)}
++        end)
++      end
++
+       def pipeline(pipeline) do
+         pipeline
+         |> Absinthe.Pipeline.without(Absinthe.Phase.Schema.Validation.QueryTypeMustBeObject)
+diff --git a/test/absinthe/integration/execution/introspection/directives_test.exs b/test/absinthe/integration/execution/introspection/directives_test.exs
+index 764afc0c1c..481bdc3267 100644
+--- a/test/absinthe/integration/execution/introspection/directives_test.exs
++++ b/test/absinthe/integration/execution/introspection/directives_test.exs
+@@ -56,6 +56,15 @@ defmodule Elixir.Absinthe.Integration.Execution.Introspection.DirectivesTest do
+                       "onOperation" => false,
+                       "isRepeatable" => false
+                     },
++                    %{
++                      "args" => [],
++                      "isRepeatable" => false,
++                      "locations" => ["INPUT_OBJECT"],
++                      "name" => "oneOf",
++                      "onField" => false,
++                      "onFragment" => false,
++                      "onOperation" => false
++                    },
+                     %{
+                       "args" => [
+                         %{
+diff --git a/test/absinthe/introspection_test.exs b/test/absinthe/introspection_test.exs
+index 943210920e..43806b18f5 100644
+--- a/test/absinthe/introspection_test.exs
++++ b/test/absinthe/introspection_test.exs
+@@ -62,6 +62,16 @@ defmodule Absinthe.IntrospectionTest do
+                         "onFragment" => true,
+                         "onOperation" => false
+                       },
++                      %{
++                        "description" =>
++                          "The @oneOf built-in directive is used within the type system definition language to indicate an Input Object is a OneOf Input Object.\n\nA OneOf Input Object is a special variant of Input Object where exactly one field must be set and non-null, all others being omitted.\nThis is useful for representing situations where an input may be one of many different options.",
++                        "isRepeatable" => false,
++                        "locations" => ["INPUT_OBJECT"],
++                        "name" => "oneOf",
++                        "onField" => false,
++                        "onFragment" => false,
++                        "onOperation" => false
++                      },
+                       %{
+                         "description" =>
+                           "Directs the executor to skip this field or fragment when the `if` argument is true.",
+diff --git a/test/absinthe/phase/document/validation/one_of_directive_test.exs b/test/absinthe/phase/document/validation/one_of_directive_test.exs
+new file mode 100644
+index 0000000000..66d989fa74
+--- /dev/null
++++ b/test/absinthe/phase/document/validation/one_of_directive_test.exs
+@@ -0,0 +1,67 @@
++defmodule Absinthe.Phase.Document.Validation.OneOfDirectiveTest do
++  use Absinthe.Case, async: true
++
++  defmodule Schema do
++    use Absinthe.Schema
++
++    input_object :valid_input do
++      directive :one_of
++      field :id, :id
++      field :name, :string
++    end
++
++    query do
++      field :valid, :boolean do
++        arg :input, :valid_input
++        resolve fn _, _ -> {:ok, true} end
++      end
++    end
++  end
++
++  @query "query NamedQuery($input: ValidInput!) { valid(input: $input) }"
++  @message ~s[The Input Type "ValidInput" has the @oneOf directive. It must have exactly one non-null field.]
++
++  describe "run/2" do
++    test "without arg" do
++      assert {:ok, %{data: _} = result} = Absinthe.run("query { valid }", Schema)
++      refute result[:errors]
++    end
++
++    test "with one inline arg" do
++      assert {:ok, %{data: _} = result} = Absinthe.run("query { valid(input: {id: 1}) }", Schema)
++      refute result[:errors]
++    end
++
++    test "with both inline args but one is null" do
++      query = "query { valid(input: {id: 1, name: null}) }"
++      assert {:ok, %{data: _} = result} = Absinthe.run(query, Schema)
++      refute result[:errors]
++    end
++
++    test "with one variable arg" do
++      options = [variables: %{"input" => %{"id" => 1}}]
++      assert {:ok, %{data: _} = result} = Absinthe.run(@query, Schema, options)
++      refute result[:errors]
++    end
++
++    test "with both variable args but one is null" do
++      options = [variables: %{"input" => %{"id" => 1, "name" => nil}}]
++      assert {:ok, %{data: _} = result} = Absinthe.run(@query, Schema, options)
++      refute result[:errors]
++    end
++
++    test "with both inline args" do
++      query = ~s[query { valid(input: {id: 1, name: "a"}) }]
++      assert {:ok, %{errors: [error]} = result} = Absinthe.run(query, Schema)
++      assert %{locations: [%{column: 15, line: 1}], message: @message} = error
++      refute result[:data]
++    end
++
++    test "with both variable args" do
++      options = [variables: %{"input" => %{"id" => 1, "name" => "a"}}]
++      assert {:ok, %{errors: [error]} = result} = Absinthe.run(@query, Schema, options)
++      assert %{locations: [%{column: 47, line: 1}], message: @message} = error
++      refute result[:data]
++    end
++  end
++end
+diff --git a/test/absinthe/phase/schema/validation/one_of_directive_test.exs b/test/absinthe/phase/schema/validation/one_of_directive_test.exs
+new file mode 100644
+index 0000000000..9337dc66cd
+--- /dev/null
++++ b/test/absinthe/phase/schema/validation/one_of_directive_test.exs
+@@ -0,0 +1,84 @@
++defmodule Absinthe.Phase.Schema.Validation.OneOfDirectiveTest do
++  use Absinthe.Case, async: true
++
++  alias Absinthe.Phase.Schema.Validation.OneOfDirective
++  alias Absinthe.Pipeline
++
++  defmodule Modifier do
++    def pipeline(pipeline), do: Pipeline.upto(pipeline, OneOfDirective)
++  end
++
++  defmodule Schema do
++    use Absinthe.Schema
++
++    @pipeline_modifier Modifier
++
++    input_object :no_directive_input do
++      field :id, non_null(:id)
++    end
++
++    input_object :valid_input do
++      directive :one_of
++      field :id, :id
++      field :name, :string
++    end
++
++    input_object :single_field_input do
++      directive :one_of
++      field :id, :id
++    end
++
++    input_object :non_null_field_input do
++      directive :one_of
++      field :id, non_null(:id)
++      field :name, :string
++    end
++
++    query do
++      field :valid, :boolean do
++        arg :no_directive, :no_directive_input
++        arg :valid, :valid_input
++        arg :single_field, :single_field_input
++        arg :non_null_field, :non_null_field_input
++      end
++    end
++  end
++
++  setup_all do
++    {:ok, blueprint} = OneOfDirective.run(Schema.__absinthe_blueprint__())
++    [blueprint: blueprint]
++  end
++
++  describe "run/2" do
++    test "field without directive is a noop", %{blueprint: blueprint} do
++      assert %{errors: []} = find_definition(blueprint, :no_directive_input)
++    end
++
++    test "valid use is a noop", %{blueprint: blueprint} do
++      assert %{errors: []} = find_definition(blueprint, :valid_input)
++    end
++
++    test "on an object with a single field adds an error", %{blueprint: blueprint} do
++      assert %{errors: [error]} = find_definition(blueprint, :single_field_input)
++      assert %Absinthe.Phase.Error{message: message, phase: OneOfDirective} = error
++
++      assert message =~
++               "The oneOf directive is only valid on input types with more then one field."
++    end
++
++    test "on an object with a non_null field adds an error", %{blueprint: blueprint} do
++      assert %{errors: [error]} = find_definition(blueprint, :non_null_field_input)
++      assert %Absinthe.Phase.Error{message: message, phase: OneOfDirective} = error
++
++      assert message =~
++               "The oneOf directive is only valid on input types with all nullable fields."
++    end
++  end
++
++  defp find_definition(blueprint, identifier) do
++    blueprint.schema_definitions
++    |> Enum.flat_map(& &1.type_definitions)
++    |> Enum.filter(&is_struct/1)
++    |> Enum.find(&(&1.identifier == identifier))
++  end
++end

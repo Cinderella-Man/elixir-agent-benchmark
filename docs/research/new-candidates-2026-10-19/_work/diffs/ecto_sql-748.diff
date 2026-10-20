@@ -1,0 +1,184 @@
+diff --git a/lib/ecto/adapters/myxql/connection.ex b/lib/ecto/adapters/myxql/connection.ex
+index 4a03e821..1823a9d3 100644
+--- a/lib/ecto/adapters/myxql/connection.ex
++++ b/lib/ecto/adapters/myxql/connection.ex
+@@ -508,9 +508,9 @@ if Code.ensure_loaded?(MyXQL) do
+         end)
+ 
+       wheres =
+-        for %JoinExpr{on: %QueryExpr{expr: value} = expr} <- joins,
++        for %JoinExpr{on: %BooleanExpr{expr: value} = expr} <- joins,
+             value != true,
+-            do: expr |> Map.put(:__struct__, BooleanExpr) |> Map.put(:op, :and)
++            do: expr
+ 
+       {[?,, ?\s | froms], wheres}
+     end
+@@ -519,7 +519,7 @@ if Code.ensure_loaded?(MyXQL) do
+ 
+     defp join(%{joins: joins} = query, sources) do
+       Enum.map(joins, fn
+-        %JoinExpr{on: %QueryExpr{expr: expr}, qual: qual, ix: ix, source: source, hints: hints} ->
++        %JoinExpr{on: %BooleanExpr{expr: expr}, qual: qual, ix: ix, source: source, hints: hints} ->
+           {join, name} = get_source(query, sources, ix, source)
+ 
+           [
+diff --git a/lib/ecto/adapters/postgres/connection.ex b/lib/ecto/adapters/postgres/connection.ex
+index df9ccbaf..95e89388 100644
+--- a/lib/ecto/adapters/postgres/connection.ex
++++ b/lib/ecto/adapters/postgres/connection.ex
+@@ -717,9 +717,9 @@ if Code.ensure_loaded?(Postgrex) do
+       join_clauses = join(%{query | joins: other_joins}, sources)
+ 
+       wheres =
+-        for %JoinExpr{on: %QueryExpr{expr: value} = expr} <- inner_joins,
++        for %JoinExpr{on: %BooleanExpr{expr: value} = expr} <- inner_joins,
+             value != true,
+-            do: expr |> Map.put(:__struct__, BooleanExpr) |> Map.put(:op, :and)
++            do: expr
+ 
+       {[?\s, prefix, ?\s, froms | join_clauses], wheres}
+     end
+@@ -736,9 +736,9 @@ if Code.ensure_loaded?(Postgrex) do
+         end)
+ 
+       wheres =
+-        for %JoinExpr{on: %QueryExpr{expr: value} = expr} <- joins,
++        for %JoinExpr{on: %BooleanExpr{expr: value} = expr} <- joins,
+             value != true,
+-            do: expr |> Map.put(:__struct__, BooleanExpr) |> Map.put(:op, :and)
++            do: expr
+ 
+       {[?\s, prefix, ?\s | froms], wheres}
+     end
+@@ -750,7 +750,7 @@ if Code.ensure_loaded?(Postgrex) do
+         ?\s
+         | Enum.map_intersperse(joins, ?\s, fn
+             %JoinExpr{
+-              on: %QueryExpr{expr: expr},
++              on: %BooleanExpr{expr: expr},
+               qual: qual,
+               ix: ix,
+               source: source,
+diff --git a/lib/ecto/adapters/tds/connection.ex b/lib/ecto/adapters/tds/connection.ex
+index 9198df80..170b832f 100644
+--- a/lib/ecto/adapters/tds/connection.ex
++++ b/lib/ecto/adapters/tds/connection.ex
+@@ -542,7 +542,13 @@ if Code.ensure_loaded?(Tds) do
+       [
+         ?\s,
+         Enum.map_intersperse(joins, ?\s, fn
+-          %JoinExpr{on: %QueryExpr{expr: expr}, qual: qual, ix: ix, source: source, hints: hints} ->
++          %JoinExpr{
++            on: %BooleanExpr{expr: expr},
++            qual: qual,
++            ix: ix,
++            source: source,
++            hints: hints
++          } ->
+             {join, name} = get_source(query, sources, ix, source)
+             qual_text = join_qual(qual, query)
+             join = join || ["(", expr(source, sources, query) | ")"]
+diff --git a/mix.lock b/mix.lock
+index e07107e0..7938d5fd 100644
+--- a/mix.lock
++++ b/mix.lock
+@@ -6,7 +6,7 @@
+   "decimal": {:hex, :decimal, "3.1.1", "430d87b04011ce6cbd4fd205be758311a81f87d552d40904abd00f015935b1d0", [:mix], [], "hexpm", "c5f25f2ced74a0587d03e6023f595db8e924c9d3922c8c8ffd9edfc4498cf1f6"},
+   "deep_merge": {:hex, :deep_merge, "1.0.0", "b4aa1a0d1acac393bdf38b2291af38cb1d4a52806cf7a4906f718e1feb5ee961", [:mix], [], "hexpm", "ce708e5f094b9cd4e8f2be4f00d2f4250c4095be93f8cd6d018c753894885430"},
+   "earmark_parser": {:hex, :earmark_parser, "1.4.44", "f20830dd6b5c77afe2b063777ddbbff09f9759396500cdbe7523efd58d7a339c", [:mix], [], "hexpm", "4778ac752b4701a5599215f7030989c989ffdc4f6df457c5f36938cc2d2a2750"},
+-  "ecto": {:git, "https://github.com/elixir-ecto/ecto.git", "d4add51346eb282f69eefd387503be49064a6304", []},
++  "ecto": {:git, "https://github.com/elixir-ecto/ecto.git", "8959c439c7618ed88be98fe7741ba9986a57a7e5", []},
+   "ex_doc": {:hex, :ex_doc, "0.40.2", "f50edec428c4b0a457a167de42414c461122a3585a99515a69d09fff19e5597e", [:mix], [{:earmark_parser, "~> 1.4.44", [hex: :earmark_parser, repo: "hexpm", optional: false]}, {:makeup_c, ">= 0.1.0", [hex: :makeup_c, repo: "hexpm", optional: true]}, {:makeup_elixir, "~> 0.14 or ~> 1.0", [hex: :makeup_elixir, repo: "hexpm", optional: false]}, {:makeup_erlang, "~> 0.1 or ~> 1.0", [hex: :makeup_erlang, repo: "hexpm", optional: false]}, {:makeup_html, ">= 0.1.0", [hex: :makeup_html, repo: "hexpm", optional: true]}], "hexpm", "4fa426e2beb47854a162e2c488727fdec51cd4692e319b23810c2804cb1a40fe"},
+   "jason": {:hex, :jason, "1.4.5", "2e3a008590b0b8d7388c20293e9dcc9cf3e5d642fd2a114e4cbbb52e595d940a", [:mix], [{:decimal, "~> 1.0 or ~> 2.0 or ~> 3.0", [hex: :decimal, repo: "hexpm", optional: true]}], "hexpm", "b0c823996102bcd0239b3c2444eb00409b72f6a140c1950bc8b457d836b30684"},
+   "makeup": {:hex, :makeup, "1.2.1", "e90ac1c65589ef354378def3ba19d401e739ee7ee06fb47f94c687016e3713d1", [:mix], [{:nimble_parsec, "~> 1.4", [hex: :nimble_parsec, repo: "hexpm", optional: false]}], "hexpm", "d36484867b0bae0fea568d10131197a4c2e47056a6fbe84922bf6ba71c8d17ce"},
+diff --git a/test/ecto/adapters/myxql_test.exs b/test/ecto/adapters/myxql_test.exs
+index 024f231e..9170a945 100644
+--- a/test/ecto/adapters/myxql_test.exs
++++ b/test/ecto/adapters/myxql_test.exs
+@@ -1377,6 +1377,25 @@ defmodule Ecto.Adapters.MyXQLTest do
+              "SELECT s0.`id`, s1.`id` FROM `schema` AS s0 LEFT OUTER JOIN `schema2` AS s1 ON TRUE"
+   end
+ 
++  test "update all with interpolated join query" do
++    inner = from(s in Schema2, where: s.z > 10)
++
++    query =
++      from(m in Schema, join: x in ^inner, on: m.x == x.z, update: [set: [x: 0]])
++      |> plan(:update_all)
++
++    assert update_all(query) ==
++             ~s{UPDATE `schema` AS s0, `schema2` AS s1 SET s0.`x` = 0 WHERE ((s1.`z` > 10) AND (s0.`x` = s1.`z`))}
++  end
++
++  test "delete all with interpolated join query" do
++    inner = from(s in Schema2, where: s.z > 10)
++    query = from(m in Schema, join: x in ^inner, on: m.x == x.z) |> plan(:delete_all)
++
++    assert delete_all(query) ==
++             ~s{DELETE s0.* FROM `schema` AS s0 INNER JOIN `schema2` AS s1 ON (s1.`z` > 10) AND (s0.`x` = s1.`z`)}
++  end
++
+   test "lateral join with fragment" do
+     query =
+       Schema
+diff --git a/test/ecto/adapters/postgres_test.exs b/test/ecto/adapters/postgres_test.exs
+index b7be9339..764c0a4c 100644
+--- a/test/ecto/adapters/postgres_test.exs
++++ b/test/ecto/adapters/postgres_test.exs
+@@ -1757,6 +1757,25 @@ defmodule Ecto.Adapters.PostgresTest do
+              "SELECT s0.\"id\", s1.\"id\" FROM \"schema\" AS s0 LEFT OUTER JOIN \"schema2\" AS s1 ON TRUE"
+   end
+ 
++  test "update all with interpolated join query" do
++    inner = from(s in Schema2, where: s.z > 10)
++
++    query =
++      from(m in Schema, join: x in ^inner, on: m.x == x.z, update: [set: [x: 0]])
++      |> plan(:update_all)
++
++    assert update_all(query) ==
++             ~s{UPDATE "schema" AS s0 SET "x" = 0 FROM "schema2" AS s1 WHERE ((s1."z" > 10) AND (s0."x" = s1."z"))}
++  end
++
++  test "delete all with interpolated join query" do
++    inner = from(s in Schema2, where: s.z > 10)
++    query = from(m in Schema, join: x in ^inner, on: m.x == x.z) |> plan(:delete_all)
++
++    assert delete_all(query) ==
++             ~s{DELETE FROM "schema" AS s0 USING "schema2" AS s1 WHERE ((s1."z" > 10) AND (s0."x" = s1."z"))}
++  end
++
+   test "lateral join with fragment" do
+     query =
+       Schema
+diff --git a/test/ecto/adapters/tds_test.exs b/test/ecto/adapters/tds_test.exs
+index e1c55928..2e94de19 100644
+--- a/test/ecto/adapters/tds_test.exs
++++ b/test/ecto/adapters/tds_test.exs
+@@ -1223,6 +1223,25 @@ defmodule Ecto.Adapters.TdsTest do
+              "SELECT s0.[id], s1.[id] FROM [schema] AS s0 LEFT OUTER JOIN [schema2] AS s1 ON 1 = 1"
+   end
+ 
++  test "update all with interpolated join query" do
++    inner = from(s in Schema2, where: s.z > 10)
++
++    query =
++      from(m in Schema, join: x in ^inner, on: m.x == x.z, update: [set: [x: 0]])
++      |> plan(:update_all)
++
++    assert update_all(query) ==
++             ~s{UPDATE s0 SET s0.[x] = 0 FROM [schema] AS s0 INNER JOIN [schema2] AS s1 ON (s1.[z] > 10) AND (s0.[x] = s1.[z])}
++  end
++
++  test "delete all with interpolated join query" do
++    inner = from(s in Schema2, where: s.z > 10)
++    query = from(m in Schema, join: x in ^inner, on: m.x == x.z) |> plan(:delete_all)
++
++    assert delete_all(query) ==
++             ~s{DELETE s0 FROM [schema] AS s0 INNER JOIN [schema2] AS s1 ON (s1.[z] > 10) AND (s0.[x] = s1.[z])}
++  end
++
+   test "join produces correct bindings" do
+     query = from(p in Schema, join: c in Schema2, on: true)
+     query = from(p in query, join: c in Schema2, on: true, select: {p.id, c.id})

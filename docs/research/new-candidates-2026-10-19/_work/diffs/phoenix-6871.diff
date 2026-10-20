@@ -1,0 +1,265 @@
+diff --git a/lib/phoenix/endpoint.ex b/lib/phoenix/endpoint.ex
+index 7ab586df6e..d38a3c8b6a 100644
+--- a/lib/phoenix/endpoint.ex
++++ b/lib/phoenix/endpoint.ex
+@@ -746,7 +746,7 @@ defmodule Phoenix.Endpoint do
+ 
+     paths =
+       if websocket do
+-        websocket = put_auth_token(websocket, opts[:auth_token])
++        websocket = put_socket_opts(websocket, opts)
+         config = Phoenix.Socket.Transport.load_config(websocket, Phoenix.Transports.WebSocket)
+         plug_init = {endpoint, socket, config}
+         {conn_ast, match_path} = socket_path(path, config)
+@@ -757,7 +757,7 @@ defmodule Phoenix.Endpoint do
+ 
+     paths =
+       if longpoll do
+-        longpoll = put_auth_token(longpoll, opts[:auth_token])
++        longpoll = put_socket_opts(longpoll, opts)
+         config = Phoenix.Socket.Transport.load_config(longpoll, Phoenix.Transports.LongPoll)
+         plug_init = {endpoint, socket, config}
+         {conn_ast, match_path} = socket_path(path, config)
+@@ -769,8 +769,25 @@ defmodule Phoenix.Endpoint do
+     paths
+   end
+ 
+-  defp put_auth_token(true, enabled), do: [auth_token: enabled]
+-  defp put_auth_token(opts, enabled), do: Keyword.put(opts, :auth_token, enabled)
++  # Copies top-level socket options into the transport config,
++  # which is what the socket receives on connect.
++  defp put_socket_opts(true, opts), do: put_socket_opts([], opts)
++
++  defp put_socket_opts(transport_opts, opts) do
++    transport_opts = Keyword.put(transport_opts, :auth_token, opts[:auth_token])
++
++    case Keyword.fetch(opts, :max_channels_per_transport) do
++      {:ok, max} when is_integer(max) and max > 0 ->
++        Keyword.put(transport_opts, :max_channels_per_transport, max)
++
++      {:ok, other} ->
++        raise ArgumentError,
++              ":max_channels_per_transport must be a positive integer, got: #{inspect(other)}"
++
++      :error ->
++        transport_opts
++    end
++  end
+ 
+   defp socket_path(path, config) do
+     end_path_fragment = Keyword.fetch!(config, :path)
+@@ -865,6 +882,15 @@ defmodule Phoenix.Endpoint do
+ 
+       Custom transports might implement their own mechanism.
+ 
++    * `:max_channels_per_transport` - the maximum number of channels that may be
++      joined per transport process. Overrides the value given to `use Phoenix.Socket`,
++      which defaults to `100`. This is useful for sockets you don't define yourself,
++      such as `Phoenix.LiveView.Socket`:
++
++          socket "/live", Phoenix.LiveView.Socket,
++            websocket: [connect_info: [session: @session_options]],
++            max_channels_per_transport: 200
++
+   You can also pass the options below on `use Phoenix.Socket`.
+   The values specified here override the value in `use Phoenix.Socket`.
+ 
+diff --git a/lib/phoenix/socket.ex b/lib/phoenix/socket.ex
+index 5a9551ffee..9471c9c2f9 100644
+--- a/lib/phoenix/socket.ex
++++ b/lib/phoenix/socket.ex
+@@ -80,7 +80,9 @@ defmodule Phoenix.Socket do
+       to handle channels. Defaults to the number of cores.
+ 
+     * `:max_channels_per_transport` - the maximum number of channels that may be
+-      joined per transport process. Defaults to `100`.
++      joined per transport process. Defaults to `100`. It can also be set when
++      mounting the socket in your endpoint, which overrides the value given here.
++      See `Phoenix.Endpoint.socket/3`.
+ 
+   ## Garbage collection
+ 
+diff --git a/test/phoenix/endpoint/endpoint_test.exs b/test/phoenix/endpoint/endpoint_test.exs
+index 41dc026650..3e991f0cf1 100644
+--- a/test/phoenix/endpoint/endpoint_test.exs
++++ b/test/phoenix/endpoint/endpoint_test.exs
+@@ -438,5 +438,21 @@ defmodule Phoenix.Endpoint.EndpointTest do
+         socket "/ws", UserSocket, longpoll: [path: "/ws", check_origin: false, drainer: []]
+       end
+     end
++
++    assert_raise ArgumentError, ~r/:max_channels_per_transport must be a positive integer/, fn ->
++      defmodule MyInvalidSocketEndpoint3 do
++        use Phoenix.Endpoint, otp_app: :phoenix
++
++        socket "/ws", UserSocket, max_channels_per_transport: nil
++      end
++    end
++
++    assert_raise ArgumentError, ~r/:max_channels_per_transport must be a positive integer/, fn ->
++      defmodule MyInvalidSocketEndpoint4 do
++        use Phoenix.Endpoint, otp_app: :phoenix
++
++        socket "/ws", UserSocket, longpoll: true, max_channels_per_transport: 0
++      end
++    end
+   end
+ end
+diff --git a/test/phoenix/integration/long_poll_channels_test.exs b/test/phoenix/integration/long_poll_channels_test.exs
+index 833485320b..2513f61b66 100644
+--- a/test/phoenix/integration/long_poll_channels_test.exs
++++ b/test/phoenix/integration/long_poll_channels_test.exs
+@@ -148,6 +148,14 @@ defmodule Phoenix.Integration.LongPollChannelsTest do
+         check_origin: ["//example.com"]
+       ]
+ 
++    socket "/ws/limited", UserSocket,
++      longpoll: [
++        window_ms: 200,
++        pubsub_timeout_ms: 200,
++        check_origin: ["//example.com"]
++      ],
++      max_channels_per_transport: 1
++
+     socket "/ws/connect_info", UserSocketConnectInfo,
+       longpoll: [
+         window_ms: 200,
+@@ -456,6 +464,44 @@ defmodule Phoenix.Integration.LongPollChannelsTest do
+                  ] = resp.body["messages"]
+         end
+ 
++        test "#{@mode}: honors max_channels_per_transport given to socket/3" do
++          prefix = "room:limited-#{System.unique_integer([:positive])}"
++          first_topic = "#{prefix}-1"
++          session = join("/ws/limited", first_topic, @vsn, "1", @mode)
++
++          resp = poll(:get, "/ws/limited", @vsn, session)
++          assert resp.body["status"] == 200
++
++          assert [
++                   %Message{
++                     event: "phx_reply",
++                     payload: %{"response" => %{}, "status" => "ok"},
++                     topic: ^first_topic
++                   },
++                   %Message{event: "user_entered", topic: ^first_topic},
++                   %Message{event: "joined", topic: ^first_topic}
++                 ] = resp.body["messages"]
++
++          overflow_topic = "#{prefix}-2"
++          resp = join_existing_session("/ws/limited", session, overflow_topic, @vsn, "2", "2")
++          assert resp.body["status"] == 200
++
++          resp = poll(:get, "/ws/limited", @vsn, session)
++          assert resp.body["status"] == 200
++
++          assert [
++                   %Message{
++                     event: "phx_reply",
++                     payload: %{
++                       "response" => %{"reason" => "too many channels joined"},
++                       "status" => "error"
++                     },
++                     ref: "2",
++                     topic: ^overflow_topic
++                   }
++                 ] = resp.body["messages"]
++        end
++
+         test "#{@mode}: transport x_headers are extracted to the socket connect_info" do
+           session =
+             join("/ws/connect_info", "room:lobby", @vsn, "1", @mode, %{}, %{}, %{
+diff --git a/test/phoenix/integration/websocket_channels_test.exs b/test/phoenix/integration/websocket_channels_test.exs
+index 9be06bf90e..0c72ecd431 100644
+--- a/test/phoenix/integration/websocket_channels_test.exs
++++ b/test/phoenix/integration/websocket_channels_test.exs
+@@ -197,6 +197,20 @@ defmodule Phoenix.Integration.WebSocketChannelsTest do
+         timeout: 200
+       ]
+ 
++    socket "/ws/endpoint_limited", UserSocket,
++      websocket: [
++        check_origin: ["//example.com"],
++        timeout: 200
++      ],
++      max_channels_per_transport: 1
++
++    socket "/ws/endpoint_override", LimitedUserSocket,
++      websocket: [
++        check_origin: ["//example.com"],
++        timeout: 200
++      ],
++      max_channels_per_transport: 2
++
+     socket "/ws/connect_info", UserSocketConnectInfo,
+       websocket: [
+         check_origin: ["//example.com"],
+@@ -397,6 +411,68 @@ defmodule Phoenix.Integration.WebSocketChannelsTest do
+           }
+         end
+ 
++        test "honors max_channels_per_transport given to socket/3" do
++          {:ok, sock} =
++            WebsocketClient.connect(
++              self(),
++              "ws://127.0.0.1:#{@port}/ws/endpoint_limited/websocket?vsn=#{@vsn}",
++              @serializer
++            )
++
++          WebsocketClient.join(sock, "room:limited-1", %{})
++
++          assert_receive %Message{
++            event: "phx_reply",
++            payload: %{"response" => %{}, "status" => "ok"},
++            ref: "1",
++            topic: "room:limited-1"
++          }
++
++          WebsocketClient.join(sock, "room:limited-2", %{})
++
++          assert_receive %Message{
++            event: "phx_reply",
++            payload: %{
++              "response" => %{"reason" => "too many channels joined"},
++              "status" => "error"
++            },
++            ref: "2",
++            topic: "room:limited-2"
++          }
++        end
++
++        test "max_channels_per_transport given to socket/3 overrides the use Phoenix.Socket value" do
++          {:ok, sock} =
++            WebsocketClient.connect(
++              self(),
++              "ws://127.0.0.1:#{@port}/ws/endpoint_override/websocket?vsn=#{@vsn}",
++              @serializer
++            )
++
++          for index <- 1..2 do
++            topic = "room:limited-#{index}"
++            WebsocketClient.join(sock, topic, %{})
++
++            assert_receive %Message{
++              event: "phx_reply",
++              payload: %{"response" => %{}, "status" => "ok"},
++              topic: ^topic
++            }
++          end
++
++          WebsocketClient.join(sock, "room:limited-3", %{})
++
++          assert_receive %Message{
++            event: "phx_reply",
++            payload: %{
++              "response" => %{"reason" => "too many channels joined"},
++              "status" => "error"
++            },
++            ref: "3",
++            topic: "room:limited-3"
++          }
++        end
++
+         test "transport x_headers are extracted to the socket connect_info" do
+           extra_headers = [{"x-application", "Phoenix"}]
+ 

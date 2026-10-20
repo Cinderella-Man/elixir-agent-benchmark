@@ -1,0 +1,129 @@
+diff --git a/docs/architecture/mastodon-api.md b/docs/architecture/mastodon-api.md
+index 70fc55109..4a71b99d5 100644
+--- a/docs/architecture/mastodon-api.md
++++ b/docs/architecture/mastodon-api.md
+@@ -419,7 +419,10 @@ after a day) and audience proxy as a photo added in the web composer — an
+ unattached `Vutuv.Posts.PostImage` row simply *is* the Mastodon attachment.
+ Accepted: `.jpg .jpeg .png .webp`, plus `.heic/.heif` where the host supports
+ them, up to `Posts.max_image_filesize/0` and `Posts.max_images_per_post/0` per
+-status. Uploads are rate limited per member.
++status. Uploads are rate limited per member. A filename that names none of
++those is not a refusal: `Vutuv.Uploads.image_extension_from_content/1` reads the
++format from the file's first bytes, because Buffer uploads every picture under
++a name without a usable extension.
+ 
+ **The AI image scan is why the v2 endpoint is worth having.** A fresh upload is
+ `pending` and `Posts.moderation_hidden?/1` keeps the whole post owner-only
+diff --git a/lib/vutuv/uploads.ex b/lib/vutuv/uploads.ex
+index 0520e3042..651f87104 100644
+--- a/lib/vutuv/uploads.ex
++++ b/lib/vutuv/uploads.ex
+@@ -922,6 +922,30 @@ defmodule Vutuv.Uploads do
+ 
+   defp valid_extension?(file_name), do: valid_extension?(file_name, extension_whitelist())
+ 
++  @doc """
++  The extension a picture's own first bytes name (`".jpg"`, `".png"`,
++  `".webp"`, `".heic"`), or `nil` for anything else.
++
++  For an upload whose filename says nothing: a client that hands its HTTP
++  library a bare buffer sends `blob`, or a name with a signed URL's query still
++  attached. The answer names the container only, so the caller still checks it
++  against its whitelist and the uploader still has to decode the file.
++  """
++  def image_extension_from_content(path) do
++    case File.open(path, [:read, :binary], &IO.binread(&1, 12)) do
++      {:ok, <<0xFF, 0xD8, 0xFF, _::binary>>} -> ".jpg"
++      {:ok, <<0x89, "PNG\r\n", 0x1A, "\n", _::binary>>} -> ".png"
++      {:ok, <<"RIFF", _size::binary-size(4), "WEBP">>} -> ".webp"
++      {:ok, <<_size::binary-size(4), "ftyp", brand::binary-size(4)>>} -> heif_extension(brand)
++      _other -> nil
++    end
++  end
++
++  defp heif_extension(brand) when brand in ~w(heic heix heim heis hevc hevx mif1 msf1),
++    do: ".heic"
++
++  defp heif_extension(_brand), do: nil
++
+   @doc """
+   A fresh unguessable URL token (~128 bits, URL-safe Base64) for the
+   token-keyed uploaders (`Vutuv.PostImageStore`, `Vutuv.OrganizationImageStore`,
+diff --git a/lib/vutuv_web/controllers/mastodon_api/media_controller.ex b/lib/vutuv_web/controllers/mastodon_api/media_controller.ex
+index ed500e711..20b0b5c15 100644
+--- a/lib/vutuv_web/controllers/mastodon_api/media_controller.ex
++++ b/lib/vutuv_web/controllers/mastodon_api/media_controller.ex
+@@ -162,7 +162,22 @@ defmodule VutuvWeb.MastodonApi.MediaController do
+         other -> other
+       end
+     else
+-      Posts.create_pending_image(user, upload)
++      Posts.create_pending_image(user, upload.path, image_filename(upload))
++    end
++  end
++
++  # A picture is named by its content when its filename does not name it.
++  # Buffer uploads every picture under a name without a usable extension, and
++  # judging by the name alone refused each one with a 422 that Buffer shows its
++  # member as "An unknown error has occurred". Mastodon reads the content too.
++  defp image_filename(%Plug.Upload{filename: filename, path: path}) do
++    whitelist = Vutuv.PostImageStore.extension_whitelist()
++
++    with false <- Vutuv.Uploads.valid_extension?(filename, whitelist),
++         extension when is_binary(extension) <- Vutuv.Uploads.image_extension_from_content(path) do
++      "upload" <> extension
++    else
++      _named_or_unknown -> filename
+     end
+   end
+ 
+diff --git a/test/vutuv_web/controllers/mastodon_api/media_controller_test.exs b/test/vutuv_web/controllers/mastodon_api/media_controller_test.exs
+index c234bfd17..331f86c57 100644
+--- a/test/vutuv_web/controllers/mastodon_api/media_controller_test.exs
++++ b/test/vutuv_web/controllers/mastodon_api/media_controller_test.exs
+@@ -56,6 +56,45 @@ defmodule VutuvWeb.MastodonApi.MediaControllerTest do
+     |> Repo.update!()
+   end
+ 
++  # Buffer uploads every picture under a filename that carries no usable
++  # extension, so judging the upload by its name refused each one with a 422
++  # that Buffer shows as "An unknown error has occurred".
++  for filename <- ["blob", "photo", "photo.jpg?X-Amz-Expires=300", "upload.bin"] do
++    test "a picture named #{inspect(filename)} is recognised by its content", %{
++      conn: conn,
++      tmp: tmp
++    } do
++      user = insert(:activated_user)
++      token = mastodon_token(user, ["read", "write"])
++      upload = %Plug.Upload{jpeg!(tmp) | filename: unquote(filename), content_type: nil}
++
++      uploaded =
++        conn
++        |> mastodon_conn(token)
++        |> post("/api/v2/media", %{"file" => upload})
++        |> json_response(200)
++
++      assert uploaded["type"] == "image"
++      assert Repo.get!(PostImage, uploaded["id"]).content_type == "image/jpeg"
++    end
++  end
++
++  test "a file that is no picture is still refused, whatever it is called", %{tmp: tmp} do
++    user = insert(:activated_user)
++    token = mastodon_token(user, ["read", "write"])
++    path = Path.join(tmp, "notes")
++    File.write!(path, "just some text, long enough to read a header from")
++
++    for filename <- ["blob", "notes.jpg"] do
++      upload = %Plug.Upload{path: path, filename: filename, content_type: "image/jpeg"}
++
++      assert build_conn()
++             |> mastodon_conn(token)
++             |> post("/api/v2/media", %{"file" => upload})
++             |> json_response(422)
++    end
++  end
++
+   test "an unposted upload can be taken back again", %{conn: conn, tmp: tmp} do
+     user = insert(:activated_user)
+     token = mastodon_token(user, ["read", "write"])

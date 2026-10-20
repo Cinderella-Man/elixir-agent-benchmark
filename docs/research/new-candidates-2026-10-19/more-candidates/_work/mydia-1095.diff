@@ -1,0 +1,146 @@
+diff --git a/lib/mydia/library/file_organizer.ex b/lib/mydia/library/file_organizer.ex
+index 39f638fa0..b62dd99ca 100644
+--- a/lib/mydia/library/file_organizer.ex
++++ b/lib/mydia/library/file_organizer.ex
+@@ -406,7 +406,7 @@ defmodule Mydia.Library.FileOrganizer do
+   defp do_fallback(source, dest, :move), do: do_move_file(source, dest)
+ 
+   defp do_fallback(source, dest, :copy) do
+-    case File.cp(source, dest) do
++    case Storage.Local.copy_file(source, dest) do
+       :ok -> {:ok, :copy}
+       {:error, reason} -> {:error, {:copy_failed, reason}}
+     end
+@@ -560,7 +560,7 @@ defmodule Mydia.Library.FileOrganizer do
+ 
+       {:error, :exdev} ->
+         # Cross-device move: copy then delete
+-        with :ok <- File.cp(source, dest),
++        with :ok <- Storage.Local.copy_file(source, dest),
+              :ok <- File.rm(source) do
+           {:ok, :move}
+         else
+diff --git a/lib/mydia/library/trash_store.ex b/lib/mydia/library/trash_store.ex
+index b4e8c6244..4e5d3592a 100644
+--- a/lib/mydia/library/trash_store.ex
++++ b/lib/mydia/library/trash_store.ex
+@@ -521,7 +521,7 @@ defmodule Mydia.Library.TrashStore do
+       to: destination
+     )
+ 
+-    case File.cp(source, destination) do
++    case Storage.Local.copy_file(source, destination) do
+       :ok ->
+         remove_source_after_copy(source, destination)
+ 
+diff --git a/lib/mydia/storage/local.ex b/lib/mydia/storage/local.ex
+index 9772b9636..2f18eca33 100644
+--- a/lib/mydia/storage/local.ex
++++ b/lib/mydia/storage/local.ex
+@@ -4,6 +4,8 @@ defmodule Mydia.Storage.Local do
+ 
+   alias Mydia.Storage.{Entry, Error, Location}
+ 
++  require Logger
++
+   @chunk_size 256 * 1024
+ 
+   @impl true
+@@ -77,7 +79,7 @@ defmodule Mydia.Storage.Local do
+     dest = Path.join(root, rel)
+ 
+     with :ok <- mkdir_parent(dest) do
+-      case File.cp(local_path, dest) do
++      case copy_file(local_path, dest) do
+         :ok -> :ok
+         {:error, reason} -> {:error, Error.from_posix(reason, dest)}
+       end
+@@ -101,7 +103,7 @@ defmodule Mydia.Storage.Local do
+     to = Path.join(to_root, to_rel)
+ 
+     with :ok <- mkdir_parent(to) do
+-      case File.cp(from, to) do
++      case copy_file(from, to) do
+         :ok -> :ok
+         {:error, reason} -> {:error, Error.from_posix(reason, from)}
+       end
+@@ -141,6 +143,42 @@ defmodule Mydia.Storage.Local do
+     end
+   end
+ 
++  @doc """
++  Copies `source` to `dest`, overwriting `dest`, then gives `dest` the
++  source's mode when the filesystem allows it.
++
++  `File.cp/2` reports a refused chmod as a failed copy although every byte
++  has landed. SMB/CIFS, some NFS exports and FUSE mounts refuse it with
++  `:eperm`, and there the mount options decide the mode anyway, so only the
++  byte copy can fail here.
++  """
++  @spec copy_file(Path.t(), Path.t()) :: :ok | {:error, File.posix()}
++  def copy_file(source, dest) do
++    case :file.copy(source, dest) do
++      {:ok, _bytes} ->
++        copy_mode(source, dest)
++        :ok
++
++      {:error, reason} ->
++        {:error, reason}
++    end
++  end
++
++  defp copy_mode(source, dest) do
++    with {:ok, %{mode: mode}} <- File.stat(source),
++         {:ok, dest_stat} <- File.stat(dest),
++         :ok <- File.write_stat(dest, %{dest_stat | mode: mode}) do
++      :ok
++    else
++      {:error, reason} ->
++        Logger.debug("Copied file but could not copy its mode",
++          reason: reason,
++          from: source,
++          to: dest
++        )
++    end
++  end
++
+   @impl true
+   def delete(%Location{root: root}, rel) do
+     path = Path.join(root, rel)
+diff --git a/test/mydia/storage/local_test.exs b/test/mydia/storage/local_test.exs
+index 2ea11cdd3..8753f64bf 100644
+--- a/test/mydia/storage/local_test.exs
++++ b/test/mydia/storage/local_test.exs
+@@ -44,4 +44,32 @@ defmodule Mydia.Storage.LocalTest do
+     assert {:error, %Mydia.Storage.Error{kind: :not_found}} =
+              Mydia.Storage.validate(Location.local("/definitely/not/here"))
+   end
++
++  describe "copy_file/2" do
++    test "copies the bytes and the source's mode", %{tmp_dir: dir} do
++      src = Path.join(dir, "src.mkv")
++      dest = Path.join(dir, "dest.mkv")
++      File.write!(src, "bytes")
++      File.chmod!(src, 0o640)
++
++      assert :ok = Mydia.Storage.Local.copy_file(src, dest)
++      assert File.read!(dest) == "bytes"
++      assert Bitwise.band(File.stat!(dest).mode, 0o777) == 0o640
++    end
++
++    test "overwrites an existing destination", %{tmp_dir: dir} do
++      src = Path.join(dir, "src.mkv")
++      dest = Path.join(dir, "dest.mkv")
++      File.write!(src, "new")
++      File.write!(dest, "old and longer")
++
++      assert :ok = Mydia.Storage.Local.copy_file(src, dest)
++      assert File.read!(dest) == "new"
++    end
++
++    test "returns the posix error when the source is missing", %{tmp_dir: dir} do
++      assert {:error, :enoent} =
++               Mydia.Storage.Local.copy_file(Path.join(dir, "absent"), Path.join(dir, "dest"))
++    end
++  end
+ end

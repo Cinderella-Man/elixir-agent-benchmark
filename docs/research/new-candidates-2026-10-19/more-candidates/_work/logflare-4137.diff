@@ -1,0 +1,278 @@
+diff --git a/lib/logflare/networking.ex b/lib/logflare/networking.ex
+index 21e60766b8..3e30ea6c57 100644
+--- a/lib/logflare/networking.ex
++++ b/lib/logflare/networking.ex
+@@ -187,6 +187,7 @@ defmodule Logflare.Networking do
+        pools: %{
+          default: [
+            protocols: [:http1],
++           conn_max_idle_time: 5_000,
+            conn_opts: [
+              transport_opts: [
+                timeout: @s3_connect_timeout,
+diff --git a/lib/telemetry.ex b/lib/telemetry.ex
+index fc3e5d6921..f50e377a84 100644
+--- a/lib/telemetry.ex
++++ b/lib/telemetry.ex
+@@ -737,6 +737,8 @@ defmodule Logflare.Telemetry do
+       ),
+       counter("finch.conn_max_idle_time_exceeded.idle_time",
+         tags: [:host, :port],
++        # S3 drain endpoints are customer-supplied, so they are left out rather than tagged.
++        keep: &(not s3_drain_pool?(&1)),
+         description: "Count of connections discarded due to exceeding max idle time"
+       )
+     ]
+@@ -1006,6 +1008,14 @@ defmodule Logflare.Telemetry do
+ 
+   defp spool_batch?(_metadata), do: false
+ 
++  # Finch's idle-expiry metadata carries no pool name, but Finch emits it from the pool process,
++  # which registers itself in its Finch instance's Registry.
++  defp s3_drain_pool?(_metadata) do
++    Registry.keys(Logflare.FinchS3, self()) != []
++  rescue
++    ArgumentError -> false
++  end
++
+   defp backend_scoped_drop?(%{backend_id: _, backend_type: _}), do: true
+   defp backend_scoped_drop?(_metadata), do: false
+ 
+diff --git a/test/logflare/networking/s3_pool_integration_test.exs b/test/logflare/networking/s3_pool_integration_test.exs
+new file mode 100644
+index 0000000000..f726a84565
+--- /dev/null
++++ b/test/logflare/networking/s3_pool_integration_test.exs
+@@ -0,0 +1,124 @@
++defmodule Logflare.Networking.S3PoolIntegrationTest do
++  @behaviour Plug
++
++  use ExUnit.Case, async: false
++
++  alias Logflare.Backends.Adaptor.S3Adaptor.HttpClient
++  alias Logflare.Networking
++  alias Logflare.Telemetry
++  alias Logflare.TestUtils
++  alias OtelMetricExporter.MetricStore
++
++  @exporter :logflare_s3_pool_idle_expiry_metrics_test
++
++  setup do
++    TestUtils.attach_forwarder([:finch, :conn_max_idle_time_exceeded])
++
++    metric =
++      Enum.find(Telemetry.metrics(), &(&1.event_name == [:finch, :conn_max_idle_time_exceeded]))
++
++    start_supervised!(
++      {OtelMetricExporter,
++       name: @exporter,
++       metrics: [metric],
++       export_period: :timer.minutes(5),
++       otlp_protocol: :http_protobuf,
++       otlp_endpoint: "http://127.0.0.1:4318",
++       otlp_headers: %{},
++       otlp_compression: nil}
++    )
++
++    :ok
++  end
++
++  test "reuses a drain connection before the configured idle limit and replaces it afterward" do
++    port = start_http_server()
++    idle_limit = drain_config() |> Keyword.fetch!(:conn_max_idle_time)
++    assert idle_limit == 5_000
++
++    get(port)
++    assert_receive {:http_request, _, first_peer_port, "/"}
++
++    get(port)
++    assert_receive {:http_request, _, ^first_peer_port, "/"}
++    refute_received {:telemetry_event, [:finch, :conn_max_idle_time_exceeded], _, %{port: ^port}}
++
++    Process.sleep(idle_limit + 1)
++
++    get(port)
++    assert_receive {:http_request, _, next_peer_port, "/"}
++    refute next_peer_port == first_peer_port
++
++    assert_receive {:telemetry_event, [:finch, :conn_max_idle_time_exceeded],
++                    %{idle_time: idle_time}, %{scheme: :http, host: "127.0.0.1", port: ^port}}
++
++    assert System.convert_time_unit(idle_time, :native, :millisecond) > idle_limit
++
++    # Emitted from the drain pool's process, so the endpoint-tagged counter leaves it out.
++    assert MetricStore.get_metrics(@exporter)[
++             {:counter, "finch.conn_max_idle_time_exceeded.idle_time"}
++           ] in [nil, %{}]
++  end
++
++  @impl Plug
++  @spec init(pid()) :: pid()
++  def init(parent), do: parent
++
++  @impl Plug
++  @spec call(Plug.Conn.t(), pid()) :: Plug.Conn.t()
++  def call(conn, parent) do
++    send(parent, {:http_request, self(), Plug.Conn.get_peer_data(conn).port, conn.request_path})
++
++    Plug.Conn.send_resp(conn, 200, "ok")
++  end
++
++  @spec start_http_server() :: pos_integer()
++  defp start_http_server do
++    ref = make_ref()
++
++    start_supervised!(
++      {Plug.Cowboy,
++       scheme: :http,
++       plug: {__MODULE__, self()},
++       options: [
++         ref: ref,
++         ip: {127, 0, 0, 1},
++         port: 0,
++         protocol_options: [idle_timeout: 60_000, request_timeout: 60_000]
++       ]}
++    )
++
++    port = :ranch.get_port(ref)
++    on_exit(fn -> Finch.stop_pool(Logflare.FinchS3, origin(port)) end)
++    port
++  end
++
++  @spec drain_config() :: keyword()
++  defp drain_config do
++    {Finch, opts} =
++      Enum.find(Networking.pools(), fn
++        {Finch, opts} -> opts[:name] == Logflare.FinchS3
++        _ -> false
++      end)
++
++    Keyword.fetch!(opts, :pools).default
++  end
++
++  @spec get(pos_integer()) :: :ok
++  defp get(port) do
++    assert {:ok, %{status_code: 200, body: "ok"}} =
++             HttpClient.request(:get, "http://127.0.0.1:#{port}/", "", [],
++               pool_timeout: 5_000,
++               receive_timeout: 5_000
++             )
++
++    for {pool, Finch.HTTP1.Pool} <- Registry.lookup(Logflare.FinchS3, origin(port)) do
++      :sys.get_state(pool)
++    end
++
++    :ok
++  end
++
++  @spec origin(pos_integer()) :: Finch.scheme_host_port()
++  defp origin(port), do: {:http, "127.0.0.1", port}
++end
+diff --git a/test/logflare/networking_test.exs b/test/logflare/networking_test.exs
+index 0a7fc63ad2..5d37d83e44 100644
+--- a/test/logflare/networking_test.exs
++++ b/test/logflare/networking_test.exs
+@@ -91,6 +91,7 @@ defmodule Logflare.NetworkingTest do
+                 pools: %{
+                   :default => [
+                     protocols: [:http1],
++                    conn_max_idle_time: 5_000,
+                     conn_opts: [
+                       transport_opts: [
+                         timeout: 5_000,
+@@ -171,6 +172,28 @@ defmodule Logflare.NetworkingTest do
+     end
+   end
+ 
++  describe "S3 drain pool" do
++    test "expires idle drain connections without enabling pool metrics or tuning spool pools" do
++      previous = Application.get_env(:logflare, :spool, [])
++      Application.put_env(:logflare, :spool, provider: :aws, mode: :both)
++      on_exit(fn -> Application.put_env(:logflare, :spool, previous) end)
++
++      pools =
++        for {Finch, opts} <- Networking.pools(), into: %{} do
++          {Keyword.fetch!(opts, :name), Keyword.fetch!(opts, :pools)}
++        end
++
++      drain_config = pools[Logflare.FinchS3].default
++      assert Keyword.fetch!(drain_config, :conn_max_idle_time) == 5_000
++      refute Keyword.get(drain_config, :start_pool_metrics?, false)
++      assert Keyword.fetch!(drain_config, :protocols) == [:http1]
++
++      for name <- [Logflare.FinchSpoolS3, Logflare.FinchSpoolSQS] do
++        refute Keyword.has_key?(pools[name].default, :conn_max_idle_time)
++      end
++    end
++  end
++
+   describe "ClickHouse ingest pools" do
+     test "bound the request send path in addition to connect" do
+       for name <- [Logflare.FinchClickHouseIngest, Logflare.FinchClickHouseAsyncIngest] do
+diff --git a/test/logflare/system_cache_test.exs b/test/logflare/system_cache_test.exs
+index 69078c97ab..ef87e19abe 100644
+--- a/test/logflare/system_cache_test.exs
++++ b/test/logflare/system_cache_test.exs
+@@ -5,6 +5,7 @@ defmodule Logflare.SystemCacheTest do
+   import ExUnit.CaptureLog
+   import Mimic
+ 
++  setup :set_mimic_private
+   setup :verify_on_exit!
+ 
+   alias Logflare.SystemCache
+diff --git a/test/logflare/telemetry_test.exs b/test/logflare/telemetry_test.exs
+index 0debc4968c..4ad94ec611 100644
+--- a/test/logflare/telemetry_test.exs
++++ b/test/logflare/telemetry_test.exs
+@@ -108,6 +108,50 @@ defmodule Logflare.TelemetryTest do
+              end)
+     end
+ 
++    test "tags Finch idle expiry by endpoint, except for S3 drain pools" do
++      event = [:finch, :conn_max_idle_time_exceeded]
++      name = "finch.conn_max_idle_time_exceeded.idle_time"
++      metric = Enum.find(Telemetry.metrics(), &(&1.event_name == event))
++      exporter = :logflare_finch_idle_expiry_metrics_test
++
++      assert %Elixir.Telemetry.Metrics.Counter{tags: [:host, :port]} = metric
++
++      start_supervised!(
++        {OtelMetricExporter,
++         name: exporter,
++         metrics: [metric],
++         export_period: :timer.minutes(5),
++         otlp_protocol: :http_protobuf,
++         otlp_endpoint: "http://127.0.0.1:4318",
++         otlp_headers: %{},
++         otlp_compression: nil}
++      )
++
++      :telemetry.execute(event, %{idle_time: 123_456}, %{
++        scheme: :https,
++        host: "clickhouse.internal",
++        port: 8443
++      })
++
++      # Stands in for a drain pool: Finch emits the event from a pool process registered in
++      # Logflare.FinchS3's Registry.
++      drain_shp = {:https, "private-bucket.s3.amazonaws.com", 443}
++
++      Task.async(fn ->
++        {:ok, _} = Registry.register(Logflare.FinchS3, drain_shp, Finch.HTTP1.Pool)
++
++        :telemetry.execute(event, %{idle_time: 123_456}, %{
++          scheme: :https,
++          host: elem(drain_shp, 1),
++          port: 443
++        })
++      end)
++      |> Task.await()
++
++      assert %{%{host: "clickhouse.internal", port: 8443} => 1} ==
++               MetricStore.get_metrics(exporter)[{:counter, name}]
++    end
++
+     test "includes the spool telemetry metrics added for throttling/storage/queue observability" do
+       names = Telemetry.metrics() |> Enum.map(& &1.name)
+ 

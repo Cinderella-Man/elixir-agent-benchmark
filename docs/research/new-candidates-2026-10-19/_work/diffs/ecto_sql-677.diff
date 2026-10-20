@@ -1,0 +1,352 @@
+diff --git a/integration_test/myxql/test_helper.exs b/integration_test/myxql/test_helper.exs
+index 1c2b4f5b2..29a0944eb 100644
+--- a/integration_test/myxql/test_helper.exs
++++ b/integration_test/myxql/test_helper.exs
+@@ -116,8 +116,11 @@ excludes = [
+   :map_boolean_in_expression,
+   # MySQL doesn't support indexed parameters
+   :placeholders,
+-  # MySQL doesn't support specifying columns for ON DELETE SET NULL
++  # MySQL doesn't support ON DELETE SET DEFAULT
++  :on_delete_default_all,
++  # MySQL doesn't support specifying columns for ON DELETE SET NULL or ON DELETE SET DEFAULT
+   :on_delete_nilify_column_list,
++  :on_delete_default_column_list,
+   # MySQL doesnt' support anything except a single column in DISTINCT
+   :multicolumn_distinct,
+   # uncertain whether we can support this. needs more exploring
+diff --git a/integration_test/pg/test_helper.exs b/integration_test/pg/test_helper.exs
+index 761457407..e61c7b505 100644
+--- a/integration_test/pg/test_helper.exs
++++ b/integration_test/pg/test_helper.exs
+@@ -115,7 +115,7 @@ excludes = [:selected_as_with_having, :selected_as_with_order_by_expression]
+ excludes_above_9_5 = [:without_conflict_target]
+ excludes_below_9_6 = [:add_column_if_not_exists, :no_error_on_conditional_column_migration]
+ excludes_below_12_0 = [:plan_cache_mode]
+-excludes_below_15_0 = [:on_delete_nilify_column_list]
++excludes_below_15_0 = [:on_delete_nilify_column_list, :on_delete_default_column_list]
+ 
+ exclude_list = excludes ++ excludes_above_9_5
+ 
+diff --git a/integration_test/sql/migration.exs b/integration_test/sql/migration.exs
+index fe4429c58..96b216ed0 100644
+--- a/integration_test/sql/migration.exs
++++ b/integration_test/sql/migration.exs
+@@ -254,6 +254,64 @@ defmodule Ecto.Integration.MigrationTest do
+     end
+   end
+ 
++  defmodule OnDeleteDefaultAllMigration do
++    use Ecto.Migration
++
++    def up do
++      create table(:parent, primary_key: [type: :bigint]) do
++        add :col1, :integer
++        add :col2, :integer
++      end
++
++      create unique_index(:parent, [:id, :col1, :col2])
++
++      create table(:ref) do
++        add :col1, :integer, default: 2
++        add :col2, :integer, default: 3
++
++        add :parent_id,
++            references(:parent,
++              with: [col1: :col1, col2: :col2],
++              on_delete: :default_all
++            ), default: 1
++      end
++    end
++
++    def down do
++      drop table(:ref)
++      drop table(:parent)
++    end
++  end
++
++  defmodule OnDeleteDefaultColumnsMigration do
++    use Ecto.Migration
++
++    def up do
++      create table(:parent, primary_key: [type: :bigint]) do
++        add :col1, :integer
++        add :col2, :integer
++      end
++
++      create unique_index(:parent, [:id, :col1, :col2])
++
++      create table(:ref) do
++        add :col1, :integer, default: 2
++        add :col2, :integer, default: 3
++
++        add :parent_id,
++            references(:parent,
++              with: [col1: :col1, col2: :col2],
++              on_delete: {:default, [:parent_id, :col2]}
++            ), default: 1
++      end
++    end
++
++    def down do
++      drop table(:ref)
++      drop table(:parent)
++    end
++  end
++
+   defmodule CompositeForeignKeyMigration do
+     use Ecto.Migration
+ 
+@@ -683,4 +741,35 @@ defmodule Ecto.Integration.MigrationTest do
+ 
+     :ok = down(PoolRepo, num, OnDeleteNilifyColumnsMigration, log: false)
+   end
++
++  @tag :on_delete_default_all
++  test "default all on_delete constraint", %{migration_number: num} do
++    assert :ok == up(PoolRepo, num, OnDeleteDefaultAllMigration, log: false)
++
++    PoolRepo.insert_all("parent", [%{id: 1, col1: 2, col2: 3}])
++    {id, col1, col2} = {Enum.random(10..1000), Enum.random(10..1000), Enum.random(10..1000)}
++
++    PoolRepo.insert_all("parent", [%{id: id, col1: col1, col2: col2}])
++    PoolRepo.insert_all("ref", [%{parent_id: id, col1: col1, col2: col2}])
++    PoolRepo.delete_all(from p in "parent", where: p.id == ^id)
++    assert [{1, 2, 3}] == PoolRepo.all from r in "ref", select: {r.parent_id, r.col1, r.col2}
++
++    :ok = down(PoolRepo, num, OnDeleteDefaultAllMigration, log: false)
++  end
++
++  @tag :on_delete_default_column_list
++  test "default list of columns on_delete constraint", %{migration_number: num} do
++    assert :ok == up(PoolRepo, num, OnDeleteDefaultColumnsMigration, log: false)
++
++    PoolRepo.insert_all("parent", [%{id: 1, col1: 20, col2: 3}])
++
++    {id, col2} = {Enum.random(10..1000), Enum.random(10..1000)}
++
++    PoolRepo.insert_all("parent", [%{id: id, col1: 20, col2: col2}])
++    PoolRepo.insert_all("ref", [%{parent_id: id, col1: 20, col2: col2}])
++    PoolRepo.delete_all(from p in "parent", where: p.id == ^id)
++    assert [{1, 20, 3}] == PoolRepo.all from r in "ref", select: {r.parent_id, r.col1, r.col2}
++
++    :ok = down(PoolRepo, num, OnDeleteDefaultColumnsMigration, log: false)
++  end
+ end
+diff --git a/integration_test/tds/test_helper.exs b/integration_test/tds/test_helper.exs
+index 213329dd7..3f0c2ce36 100644
+--- a/integration_test/tds/test_helper.exs
++++ b/integration_test/tds/test_helper.exs
+@@ -57,8 +57,9 @@ ExUnit.start(
+     :selected_as_with_having,
+     # MSSQL can't reference aliased columns in ORDER BY expressions
+     :selected_as_with_order_by_expression,
+-    # MSSQL doesn't support specifying columns for ON DELETE SET NULL
++    # MSSQL doesn't support specifying columns for ON DELETE SET NULL or ON DELETE SET DEFAULT
+     :on_delete_nilify_column_list,
++    :on_delete_default_column_list,
+     # MSSQL doesnt' support anything except a single column in DISTINCT
+     :multicolumn_distinct,
+     # MSSQL doesnt' support subqueries in group by or in distinct
+diff --git a/lib/ecto/adapters/myxql/connection.ex b/lib/ecto/adapters/myxql/connection.ex
+index e1ff49e01..63d355207 100644
+--- a/lib/ecto/adapters/myxql/connection.ex
++++ b/lib/ecto/adapters/myxql/connection.ex
+@@ -1484,6 +1484,20 @@ if Code.ensure_loaded?(MyXQL) do
+       )
+     end
+ 
++    defp reference_on_delete(:default_all) do
++      error!(
++        nil,
++        "MySQL adapter does not support the `:default_all` action for `:on_delete`"
++      )
++    end
++
++    defp reference_on_delete({:default, _columns}) do
++      error!(
++        nil,
++        "MySQL adapter does not support the `{:default, columns}` action for `:on_delete`"
++      )
++    end
++
+     defp reference_on_delete(:delete_all), do: " ON DELETE CASCADE"
+     defp reference_on_delete(:restrict), do: " ON DELETE RESTRICT"
+     defp reference_on_delete(_), do: []
+diff --git a/lib/ecto/adapters/postgres/connection.ex b/lib/ecto/adapters/postgres/connection.ex
+index 0f33ab895..c94860203 100644
+--- a/lib/ecto/adapters/postgres/connection.ex
++++ b/lib/ecto/adapters/postgres/connection.ex
+@@ -1912,6 +1912,11 @@ if Code.ensure_loaded?(Postgrex) do
+     defp reference_on_delete({:nilify, columns}),
+       do: [" ON DELETE SET NULL (", quote_names(columns), ")"]
+ 
++    defp reference_on_delete(:default_all), do: " ON DELETE SET DEFAULT"
++
++    defp reference_on_delete({:default, columns}),
++      do: [" ON DELETE SET DEFAULT (", quote_names(columns), ")"]
++
+     defp reference_on_delete(:delete_all), do: " ON DELETE CASCADE"
+     defp reference_on_delete(:restrict), do: " ON DELETE RESTRICT"
+     defp reference_on_delete(_), do: []
+diff --git a/lib/ecto/adapters/tds/connection.ex b/lib/ecto/adapters/tds/connection.ex
+index 8aaae1e9d..206d2f4f8 100644
+--- a/lib/ecto/adapters/tds/connection.ex
++++ b/lib/ecto/adapters/tds/connection.ex
+@@ -1674,6 +1674,15 @@ if Code.ensure_loaded?(Tds) do
+       error!(nil, "Tds adapter does not support the `{:nilify, columns}` action for `:on_delete`")
+     end
+ 
++    defp reference_on_delete(:default_all), do: " ON DELETE SET DEFAULT"
++
++    defp reference_on_delete({:default, _columns}) do
++      error!(
++        nil,
++        "Tds adapter does not support the `{:default, columns}` action for `:on_delete`"
++      )
++    end
++
+     defp reference_on_delete(:delete_all), do: " ON DELETE CASCADE"
+     defp reference_on_delete(:nothing), do: " ON DELETE NO ACTION"
+     defp reference_on_delete(_), do: []
+diff --git a/lib/ecto/migration.ex b/lib/ecto/migration.ex
+index a920e47d4..2513e71e6 100644
+--- a/lib/ecto/migration.ex
++++ b/lib/ecto/migration.ex
+@@ -1515,8 +1515,8 @@ defmodule Ecto.Migration do
+       the example above), or `nil`.
+     * `:type` - The foreign key type, which defaults to `:bigserial`.
+     * `:on_delete` - What to do if the referenced entry is deleted. May be
+-      `:nothing` (default), `:delete_all`, `:nilify_all`, `{:nilify, columns}`,
+-      or `:restrict`. `{:nilify, columns}` expects a list of atoms for `columns`
++      `:nothing` (default), `:delete_all`, `:nilify_all`, `{:nilify, columns}`, `:default_all`, `{:default, columns}`
++      or `:restrict`. `{:nilify, columns}` and `{:default, columns}` expect a list of atoms for `columns`
+       and is not supported by all databases.
+     * `:on_update` - What to do if the referenced entry is updated. May be
+       `:nothing` (default), `:update_all`, `:nilify_all`, or `:restrict`.
+@@ -1561,13 +1561,14 @@ defmodule Ecto.Migration do
+   end
+ 
+   defp check_on_delete!(on_delete)
+-       when on_delete in [:nothing, :delete_all, :nilify_all, :restrict],
++       when on_delete in [:nothing, :delete_all, :nilify_all, :default_all, :restrict],
+        do: :ok
+ 
+-  defp check_on_delete!({:nilify, columns}) when is_list(columns) do
++  defp check_on_delete!({option, columns})
++       when option in [:nilify, :default] and is_list(columns) do
+     unless Enum.all?(columns, &is_atom/1) do
+       raise ArgumentError,
+-            "expected `columns` in `{:nilify, columns}` to be a list of atoms, got: #{inspect(columns)}"
++            "expected `columns` in `{#{inspect(option)}, columns}` to be a list of atoms, got: #{inspect(columns)}"
+     end
+ 
+     :ok
+diff --git a/test/ecto/adapters/myxql_test.exs b/test/ecto/adapters/myxql_test.exs
+index 1989daa34..43576b7c8 100644
+--- a/test/ecto/adapters/myxql_test.exs
++++ b/test/ecto/adapters/myxql_test.exs
+@@ -1781,6 +1781,25 @@ defmodule Ecto.Adapters.MyXQLTest do
+ 
+     msg = "MySQL adapter does not support the `{:nilify, columns}` action for `:on_delete`"
+     assert_raise ArgumentError, msg, fn -> execute_ddl(create) end
++
++    create =
++      {:create, table(:posts),
++       [
++         {:add, :category_1, %Reference{table: :categories, on_delete: :default_all}, []}
++       ]}
++
++    msg = "MySQL adapter does not support the `:default_all` action for `:on_delete`"
++    assert_raise ArgumentError, msg, fn -> execute_ddl(create) end
++
++    create =
++      {:create, table(:posts),
++       [
++         {:add, :category_1, %Reference{table: :categories, on_delete: {:default, [:category_1]}},
++          []}
++       ]}
++
++    msg = "MySQL adapter does not support the `{:default, columns}` action for `:on_delete`"
++    assert_raise ArgumentError, msg, fn -> execute_ddl(create) end
+   end
+ 
+   test "create table with options" do
+diff --git a/test/ecto/adapters/postgres_test.exs b/test/ecto/adapters/postgres_test.exs
+index 6f59ac58d..f95e47830 100644
+--- a/test/ecto/adapters/postgres_test.exs
++++ b/test/ecto/adapters/postgres_test.exs
+@@ -2231,6 +2231,19 @@ defmodule Ecto.Adapters.PostgresTest do
+             table: :categories,
+             with: [here: :there, here2: :there2],
+             on_delete: {:nilify, [:here, :here2]}
++          }, []},
++         {:add, :category_15, %Reference{table: :categories, on_delete: :default_all}, []},
++         {:add, :category_16,
++          %Reference{
++            table: :categories,
++            with: [here: :there, here2: :there2],
++            on_delete: :default_all
++          }, []},
++         {:add, :category_17,
++          %Reference{
++            table: :categories,
++            with: [here: :there, here2: :there2],
++            on_delete: {:default, [:here, :here2]}
+           }, []}
+        ]}
+ 
+@@ -2252,6 +2265,9 @@ defmodule Ecto.Adapters.PostgresTest do
+              "category_12" bigint, CONSTRAINT "posts_category_12_fkey" FOREIGN KEY ("category_12","here") REFERENCES "categories"("id","there"),
+              "category_13" bigint, CONSTRAINT "posts_category_13_fkey" FOREIGN KEY ("category_13","here") REFERENCES "categories"("id","there") MATCH FULL ON UPDATE RESTRICT,
+              "category_14" bigint, CONSTRAINT "posts_category_14_fkey" FOREIGN KEY ("category_14","here","here2") REFERENCES "categories"("id","there","there2") ON DELETE SET NULL ("here","here2"),
++             "category_15" bigint, CONSTRAINT "posts_category_15_fkey" FOREIGN KEY ("category_15") REFERENCES "categories"("id") ON DELETE SET DEFAULT,
++             "category_16" bigint, CONSTRAINT "posts_category_16_fkey" FOREIGN KEY ("category_16","here","here2") REFERENCES "categories"("id","there","there2") ON DELETE SET DEFAULT,
++             "category_17" bigint, CONSTRAINT "posts_category_17_fkey" FOREIGN KEY ("category_17","here","here2") REFERENCES "categories"("id","there","there2") ON DELETE SET DEFAULT ("here","here2"),
+              PRIMARY KEY ("id"))
+              """
+              |> remove_newlines
+diff --git a/test/ecto/adapters/tds_test.exs b/test/ecto/adapters/tds_test.exs
+index 61a8d3e7f..1e332401e 100644
+--- a/test/ecto/adapters/tds_test.exs
++++ b/test/ecto/adapters/tds_test.exs
+@@ -1483,7 +1483,10 @@ defmodule Ecto.Adapters.TdsTest do
+          {:add, :category_5,
+           %Reference{table: :categories, options: [prefix: "foo"], on_delete: :nilify_all}, []},
+          {:add, :category_6,
+-          %Reference{table: :categories, with: [here: :there], on_delete: :nilify_all}, []}
++          %Reference{table: :categories, with: [here: :there], on_delete: :nilify_all}, []},
++         {:add, :category_7, %Reference{table: :categories, on_delete: :default_all}, []},
++         {:add, :category_8,
++          %Reference{table: :categories, with: [here: :there], on_delete: :default_all}, []}
+        ]}
+ 
+     assert execute_ddl(create) == [
+@@ -1503,6 +1506,10 @@ defmodule Ecto.Adapters.TdsTest do
+              CONSTRAINT [posts_category_5_fkey] FOREIGN KEY ([category_5]) REFERENCES [foo].[categories]([id]) ON DELETE SET NULL ON UPDATE NO ACTION,
+              [category_6] BIGINT,
+              CONSTRAINT [posts_category_6_fkey] FOREIGN KEY ([category_6],[here]) REFERENCES [categories]([id],[there]) ON DELETE SET NULL ON UPDATE NO ACTION,
++             [category_7] BIGINT,
++             CONSTRAINT [posts_category_7_fkey] FOREIGN KEY ([category_7]) REFERENCES [categories]([id]) ON DELETE SET DEFAULT ON UPDATE NO ACTION,
++             [category_8] BIGINT,
++             CONSTRAINT [posts_category_8_fkey] FOREIGN KEY ([category_8],[here]) REFERENCES [categories]([id],[there]) ON DELETE SET DEFAULT ON UPDATE NO ACTION,
+              CONSTRAINT [posts_pkey] PRIMARY KEY CLUSTERED ([id]));
+              """
+              |> remove_newlines
+@@ -1518,6 +1525,16 @@ defmodule Ecto.Adapters.TdsTest do
+ 
+     msg = "Tds adapter does not support the `{:nilify, columns}` action for `:on_delete`"
+     assert_raise ArgumentError, msg, fn -> execute_ddl(create) end
++
++    create =
++      {:create, table(:posts),
++       [
++         {:add, :category_1, %Reference{table: :categories, on_delete: {:default, [:category_1]}},
++          []}
++       ]}
++
++    msg = "Tds adapter does not support the `{:default, columns}` action for `:on_delete`"
++    assert_raise ArgumentError, msg, fn -> execute_ddl(create) end
+   end
+ 
+   test "create table with options" do

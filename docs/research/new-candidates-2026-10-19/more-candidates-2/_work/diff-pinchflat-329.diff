@@ -1,0 +1,656 @@
+diff --git a/lib/pinchflat/downloading/downloading_helpers.ex b/lib/pinchflat/downloading/downloading_helpers.ex
+index cb679a821..5898533e8 100644
+--- a/lib/pinchflat/downloading/downloading_helpers.ex
++++ b/lib/pinchflat/downloading/downloading_helpers.ex
+@@ -91,8 +91,7 @@ defmodule Pinchflat.Downloading.DownloadingHelpers do
+         [m, s, mp],
+         ^MediaQuery.for_source(source) and
+           ^MediaQuery.downloaded() and
+-          not (^MediaQuery.download_prevented()) and
+-          not (^MediaQuery.culled())
++          not (^MediaQuery.download_prevented())
+       )
+     )
+     |> Repo.all()
+diff --git a/lib/pinchflat/downloading/media_downloader.ex b/lib/pinchflat/downloading/media_downloader.ex
+index eb7a09fe9..a10e6b9b6 100644
+--- a/lib/pinchflat/downloading/media_downloader.ex
++++ b/lib/pinchflat/downloading/media_downloader.ex
+@@ -79,6 +79,7 @@ defmodule Pinchflat.Downloading.MediaDownloader do
+       |> MetadataParser.parse_for_media_item()
+       |> Map.merge(%{
+         media_downloaded_at: DateTime.utc_now(),
++        culled_at: nil,
+         nfo_filepath: determine_nfo_filepath(media_with_preloads, parsed_json),
+         metadata: %{
+           # IDEA: might be worth kicking off a job for this since thumbnail fetching
+diff --git a/lib/pinchflat/downloading/media_quality_upgrade_worker.ex b/lib/pinchflat/downloading/media_quality_upgrade_worker.ex
+index 4f554fae5..8fcfb22b1 100644
+--- a/lib/pinchflat/downloading/media_quality_upgrade_worker.ex
++++ b/lib/pinchflat/downloading/media_quality_upgrade_worker.ex
+@@ -23,10 +23,10 @@ defmodule Pinchflat.Downloading.MediaQualityUpgradeWorker do
+   """
+   @impl Oban.Worker
+   def perform(%Oban.Job{}) do
+-    redownloadable_media = Media.list_redownloadable_media_items()
+-    Logger.info("Redownloading #{length(redownloadable_media)} media items")
++    upgradable_media = Media.list_upgradeable_media_items()
++    Logger.info("Redownloading #{length(upgradable_media)} media items")
+ 
+-    Enum.each(redownloadable_media, fn media_item ->
++    Enum.each(upgradable_media, fn media_item ->
+       MediaDownloadWorker.kickoff_with_task(media_item, %{quality_upgrade?: true})
+     end)
+   end
+diff --git a/lib/pinchflat/downloading/media_retention_worker.ex b/lib/pinchflat/downloading/media_retention_worker.ex
+index 3e5c0d0f8..083543844 100644
+--- a/lib/pinchflat/downloading/media_retention_worker.ex
++++ b/lib/pinchflat/downloading/media_retention_worker.ex
+@@ -6,8 +6,11 @@ defmodule Pinchflat.Downloading.MediaRetentionWorker do
+     unique: [period: :infinity, states: [:available, :scheduled, :retryable, :executing]],
+     tags: ["media_item", "local_metadata"]
+ 
++  use Pinchflat.Media.MediaQuery
++
+   require Logger
+ 
++  alias Pinchflat.Repo
+   alias Pinchflat.Media
+ 
+   @doc """
+@@ -20,14 +23,51 @@ defmodule Pinchflat.Downloading.MediaRetentionWorker do
+   """
+   @impl Oban.Worker
+   def perform(%Oban.Job{}) do
+-    cullable_media = Media.list_cullable_media_items()
++    cull_cullable_media_items()
++    delete_media_items_from_before_cutoff()
++
++    :ok
++  end
++
++  defp cull_cullable_media_items do
++    cullable_media =
++      MediaQuery.new()
++      |> MediaQuery.require_assoc(:source)
++      |> where(^MediaQuery.cullable())
++      |> Repo.all()
++
+     Logger.info("Culling #{length(cullable_media)} media items past their retention date")
+ 
+     Enum.each(cullable_media, fn media_item ->
++      # Setting `prevent_download` does what it says on the tin, but `culled_at` is purely informational.
++      # We don't actually do anything with that in terms of queries and it gets set to nil if the media item
++      # gets re-downloaded.
+       Media.delete_media_files(media_item, %{
+         prevent_download: true,
+         culled_at: DateTime.utc_now()
+       })
+     end)
+   end
++
++  defp delete_media_items_from_before_cutoff do
++    deletable_media =
++      MediaQuery.new()
++      |> MediaQuery.require_assoc(:source)
++      |> where(^MediaQuery.deletable_based_on_source_cutoff())
++      |> Repo.all()
++
++    Logger.info("Deleting #{length(deletable_media)} media items that are from before the source cutoff")
++
++    Enum.each(deletable_media, fn media_item ->
++      # Note that I'm not setting `prevent_download` on the media_item here.
++      # That's because cutoff_date can easily change and it's a valid behavior to re-download older
++      # media items if the cutoff_date changes.
++      # Download is ultimately prevented because `MediaQuery.pending()` only returns media items
++      # from after the cutoff date (among other things), so it's not like the media will just immediately
++      # be re-downloaded.
++      Media.delete_media_files(media_item, %{
++        culled_at: DateTime.utc_now()
++      })
++    end)
++  end
+ end
+diff --git a/lib/pinchflat/media/media.ex b/lib/pinchflat/media/media.ex
+index 159c8b70e..ba46e7c48 100644
+--- a/lib/pinchflat/media/media.ex
++++ b/lib/pinchflat/media/media.ex
+@@ -25,21 +25,10 @@ defmodule Pinchflat.Media do
+   end
+ 
+   @doc """
+-  Returns a list of media_items that are cullable based on the retention period
+-  of the source they belong to.
+-
+-  Returns [%MediaItem{}, ...]
+-  """
+-  def list_cullable_media_items do
+-    MediaQuery.new()
+-    |> MediaQuery.require_assoc(:source)
+-    |> where(^MediaQuery.cullable())
+-    |> Repo.all()
+-  end
+-
+-  @doc """
+-  Returns a list of media_items that are redownloadable based on the redownload delay
+-  of the media_profile their source belongs to.
++  Returns a list of media_items that are upgradeable based on the redownload delay
++  of the media_profile their source belongs to. In this context, upgradeable means
++  that it's been long enough since upload that the video may be in a higher quality
++  or have better sponsorblock segments (or similar).
+ 
+   The logic is that a media_item is past_redownload_delay if the media_item's uploaded_at is
+   at least redownload_delay_days ago AND `media_downloaded_at` - `redownload_delay_days`
+@@ -52,10 +41,10 @@ defmodule Pinchflat.Media do
+ 
+   Returns [%MediaItem{}, ...]
+   """
+-  def list_redownloadable_media_items do
++  def list_upgradeable_media_items do
+     MediaQuery.new()
+     |> MediaQuery.require_assoc(:media_profile)
+-    |> where(^MediaQuery.redownloadable())
++    |> where(^MediaQuery.upgradeable())
+     |> Repo.all()
+   end
+ 
+diff --git a/lib/pinchflat/media/media_query.ex b/lib/pinchflat/media/media_query.ex
+index 2adb0ce27..e038683a7 100644
+--- a/lib/pinchflat/media/media_query.ex
++++ b/lib/pinchflat/media/media_query.ex
+@@ -33,7 +33,6 @@ defmodule Pinchflat.Media.MediaQuery do
+   def downloaded, do: dynamic([mi], not is_nil(mi.media_filepath))
+   def download_prevented, do: dynamic([mi], mi.prevent_download == true)
+   def culling_prevented, do: dynamic([mi], mi.prevent_culling == true)
+-  def culled, do: dynamic([mi], not is_nil(mi.culled_at))
+   def redownloaded, do: dynamic([mi], not is_nil(mi.media_redownloaded_at))
+   def upload_date_matches(other_date), do: dynamic([mi], fragment("date(?) = date(?)", mi.uploaded_at, ^other_date))
+ 
+@@ -108,6 +107,15 @@ defmodule Pinchflat.Media.MediaQuery do
+     )
+   end
+ 
++  def deletable_based_on_source_cutoff do
++    dynamic(
++      [mi, source],
++      ^downloaded() and
++        not (^upload_date_after_source_cutoff()) and
++        not (^culling_prevented())
++    )
++  end
++
+   def pending do
+     dynamic(
+       [mi],
+@@ -119,12 +127,11 @@ defmodule Pinchflat.Media.MediaQuery do
+     )
+   end
+ 
+-  def redownloadable do
++  def upgradeable do
+     dynamic(
+       [mi, source],
+       ^downloaded() and
+         not (^download_prevented()) and
+-        not (^culled()) and
+         not (^redownloaded()) and
+         ^past_redownload_delay()
+     )
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex b/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
+index 93c29bec9..409b328cb 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
+@@ -94,7 +94,7 @@
+       maxlength="10"
+       pattern="((?:19|20)[0-9][0-9])-(0[1-9]|1[012])-(0[1-9]|[12][0-9]|3[01])"
+       title="YYYY-MM-DD"
+-      help="Only download media uploaded after this date. Leave blank to download all media. Must be in YYYY-MM-DD format"
++      help="Only download media uploaded after this date. Leave blank to download all media. Must be in YYYY-MM-DD format. Old media may be deleted or downloaded if you change this date"
+     />
+ 
+     <.input
+diff --git a/test/pinchflat/downloading/downloading_helpers_test.exs b/test/pinchflat/downloading/downloading_helpers_test.exs
+index 01b0518c5..5ab4f4026 100644
+--- a/test/pinchflat/downloading/downloading_helpers_test.exs
++++ b/test/pinchflat/downloading/downloading_helpers_test.exs
+@@ -130,9 +130,6 @@ defmodule Pinchflat.Downloading.DownloadingHelpersTest do
+       _download_prevented =
+         media_item_fixture(source_id: source.id, media_filepath: "some/filepath.mp4", prevent_download: true)
+ 
+-      _culled =
+-        media_item_fixture(source_id: source.id, media_filepath: "some/filepath.mp4", culled_at: now())
+-
+       assert [] = DownloadingHelpers.kickoff_redownload_for_existing_media(source)
+ 
+       refute_enqueued(worker: MediaDownloadWorker)
+diff --git a/test/pinchflat/downloading/media_downloader_test.exs b/test/pinchflat/downloading/media_downloader_test.exs
+index 0aa5a8b7d..be5f10eba 100644
+--- a/test/pinchflat/downloading/media_downloader_test.exs
++++ b/test/pinchflat/downloading/media_downloader_test.exs
+@@ -5,6 +5,7 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+   import Pinchflat.SourcesFixtures
+   import Pinchflat.ProfilesFixtures
+ 
++  alias Pinchflat.Media
+   alias Pinchflat.Downloading.MediaDownloader
+ 
+   setup do
+@@ -123,6 +124,12 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+       assert DateTime.diff(DateTime.utc_now(), updated_media_item.media_downloaded_at) < 2
+     end
+ 
++    test "it sets the culled_at to nil", %{media_item: media_item} do
++      Media.update_media_item(media_item, %{culled_at: DateTime.utc_now()})
++      assert {:ok, updated_media_item} = MediaDownloader.download_for_media_item(media_item)
++      assert updated_media_item.culled_at == nil
++    end
++
+     test "it extracts the title", %{media_item: media_item} do
+       assert {:ok, updated_media_item} = MediaDownloader.download_for_media_item(media_item)
+       assert updated_media_item.title == "Pinchflat Example Video"
+diff --git a/test/pinchflat/downloading/media_retention_worker_test.exs b/test/pinchflat/downloading/media_retention_worker_test.exs
+index 85ffdd90c..e49bb39b5 100644
+--- a/test/pinchflat/downloading/media_retention_worker_test.exs
++++ b/test/pinchflat/downloading/media_retention_worker_test.exs
+@@ -7,15 +7,36 @@ defmodule Pinchflat.Downloading.MediaRetentionWorkerTest do
+   alias Pinchflat.Media
+   alias Pinchflat.Downloading.MediaRetentionWorker
+ 
++  setup do
++    stub(UserScriptRunnerMock, :run, fn _event_type, _data -> :ok end)
++
++    :ok
++  end
++
+   describe "perform/1" do
+-    setup do
+-      stub(UserScriptRunnerMock, :run, fn _event_type, _data -> :ok end)
++    test "sets deleted media to not re-download" do
++      {_source, old_media_item, new_media_item} = prepare_records_for_retention_date()
++
++      perform_job(MediaRetentionWorker, %{})
++
++      refute Repo.reload!(new_media_item).prevent_download
++      assert Repo.reload!(old_media_item).prevent_download
++    end
++
++    test "sets culled_at timestamp on deleted media" do
++      {_source, old_media_item, new_media_item} = prepare_records_for_retention_date()
++
++      perform_job(MediaRetentionWorker, %{})
+ 
+-      :ok
++      refute Repo.reload!(new_media_item).culled_at
++      assert Repo.reload!(old_media_item).culled_at
++      assert DateTime.diff(now(), Repo.reload!(old_media_item).culled_at) < 1
+     end
++  end
+ 
++  describe "perform/1 when testing retention_period-based culling" do
+     test "deletes media files that are past their retention date" do
+-      {_source, old_media_item, new_media_item} = prepare_records()
++      {_source, old_media_item, new_media_item} = prepare_records_for_retention_date()
+ 
+       perform_job(MediaRetentionWorker, %{})
+ 
+@@ -25,27 +46,110 @@ defmodule Pinchflat.Downloading.MediaRetentionWorkerTest do
+       refute Repo.reload!(old_media_item).media_filepath
+     end
+ 
+-    test "sets deleted media to not re-download" do
+-      {_source, old_media_item, new_media_item} = prepare_records()
++    test "sets culled_at and prevent_download" do
++      {_source, old_media_item, new_media_item} = prepare_records_for_retention_date()
+ 
+       perform_job(MediaRetentionWorker, %{})
+ 
++      refute Repo.reload!(new_media_item).culled_at
++      assert Repo.reload!(old_media_item).culled_at
+       refute Repo.reload!(new_media_item).prevent_download
+       assert Repo.reload!(old_media_item).prevent_download
+     end
+ 
+-    test "sets culled_at timestamp on deleted media" do
+-      {_source, old_media_item, new_media_item} = prepare_records()
++    test "doesn't cull if the source doesn't have a retention period" do
++      {_source, old_media_item, new_media_item} = prepare_records_for_retention_date(nil)
++
++      perform_job(MediaRetentionWorker, %{})
++
++      assert File.exists?(new_media_item.media_filepath)
++      assert File.exists?(old_media_item.media_filepath)
++      assert Repo.reload!(new_media_item).media_filepath
++      assert Repo.reload!(old_media_item).media_filepath
++
++      refute Repo.reload!(new_media_item).culled_at
++      refute Repo.reload!(old_media_item).culled_at
++    end
++
++    test "doesn't cull media items that have prevent_culling set" do
++      {_source, old_media_item, _new_media_item} = prepare_records_for_retention_date()
++
++      Media.update_media_item(old_media_item, %{prevent_culling: true})
++
++      perform_job(MediaRetentionWorker, %{})
++
++      assert File.exists?(old_media_item.media_filepath)
++      assert Repo.reload!(old_media_item).media_filepath
++      refute Repo.reload!(old_media_item).culled_at
++    end
++
++    test "doesn't cull if the media item has no media_filepath" do
++      {_source, old_media_item, _new_media_item} = prepare_records_for_retention_date()
++
++      Media.update_media_item(old_media_item, %{media_filepath: nil})
++
++      perform_job(MediaRetentionWorker, %{})
++
++      refute Repo.reload!(old_media_item).culled_at
++    end
++  end
++
++  describe "perform/1 when testing source cutoff-based culling" do
++    test "culls media from before the cutoff date" do
++      {_source, old_media_item, new_media_item} = prepare_records_for_source_cutoff_date()
++
++      perform_job(MediaRetentionWorker, %{})
++
++      assert File.exists?(new_media_item.media_filepath)
++      refute File.exists?(old_media_item.media_filepath)
++      assert Repo.reload!(new_media_item).media_filepath
++      refute Repo.reload!(old_media_item).media_filepath
++    end
++
++    test "sets culled_at but not prevent_download" do
++      {_source, old_media_item, new_media_item} = prepare_records_for_source_cutoff_date()
+ 
+       perform_job(MediaRetentionWorker, %{})
+ 
+       refute Repo.reload!(new_media_item).culled_at
+       assert Repo.reload!(old_media_item).culled_at
+-      assert DateTime.diff(now(), Repo.reload!(old_media_item).culled_at) < 1
++      refute Repo.reload!(new_media_item).prevent_download
++      refute Repo.reload!(old_media_item).prevent_download
++    end
++
++    test "doesn't cull media if the source doesn't have a cutoff date" do
++      {_source, old_media_item, new_media_item} = prepare_records_for_source_cutoff_date(nil)
++
++      perform_job(MediaRetentionWorker, %{})
++
++      assert File.exists?(new_media_item.media_filepath)
++      assert File.exists?(old_media_item.media_filepath)
++      assert Repo.reload!(new_media_item).media_filepath
++      assert Repo.reload!(old_media_item).media_filepath
++
++      refute Repo.reload!(new_media_item).culled_at
++      refute Repo.reload!(old_media_item).culled_at
++    end
++
++    test "doesn't cull media from on or after the cutoff date" do
++      {_source, old_media_item, new_media_item} = prepare_records_for_source_cutoff_date(2)
++
++      Media.update_media_item(old_media_item, %{uploaded_at: now_minus(2, :days)})
++      Media.update_media_item(new_media_item, %{uploaded_at: now_minus(1, :day)})
++
++      perform_job(MediaRetentionWorker, %{})
++
++      assert File.exists?(new_media_item.media_filepath)
++      assert File.exists?(old_media_item.media_filepath)
++      assert Repo.reload!(new_media_item).media_filepath
++      assert Repo.reload!(old_media_item).media_filepath
++
++      refute Repo.reload!(new_media_item).culled_at
++      refute Repo.reload!(old_media_item).culled_at
+     end
+ 
+     test "doesn't cull media items that have prevent_culling set" do
+-      {_source, old_media_item, _new_media_item} = prepare_records()
++      {_source, old_media_item, _new_media_item} = prepare_records_for_source_cutoff_date()
+ 
+       Media.update_media_item(old_media_item, %{prevent_culling: true})
+ 
+@@ -53,11 +157,22 @@ defmodule Pinchflat.Downloading.MediaRetentionWorkerTest do
+ 
+       assert File.exists?(old_media_item.media_filepath)
+       assert Repo.reload!(old_media_item).media_filepath
++      refute Repo.reload!(old_media_item).culled_at
++    end
++
++    test "doesn't cull if the media item has no media_filepath" do
++      {_source, old_media_item, _new_media_item} = prepare_records_for_source_cutoff_date()
++
++      Media.update_media_item(old_media_item, %{media_filepath: nil})
++
++      perform_job(MediaRetentionWorker, %{})
++
++      refute Repo.reload!(old_media_item).culled_at
+     end
+   end
+ 
+-  defp prepare_records do
+-    source = source_fixture(%{retention_period_days: 2})
++  defp prepare_records_for_retention_date(retention_period_days \\ 2) do
++    source = source_fixture(%{retention_period_days: retention_period_days})
+ 
+     old_media_item =
+       media_item_with_attachments(%{
+@@ -73,4 +188,23 @@ defmodule Pinchflat.Downloading.MediaRetentionWorkerTest do
+ 
+     {source, old_media_item, new_media_item}
+   end
++
++  defp prepare_records_for_source_cutoff_date(download_cutoff_date_days_ago \\ 2) do
++    cutoff_date = if download_cutoff_date_days_ago, do: now_minus(download_cutoff_date_days_ago, :days), else: nil
++    source = source_fixture(%{download_cutoff_date: cutoff_date})
++
++    old_media_item =
++      media_item_with_attachments(%{
++        source_id: source.id,
++        uploaded_at: now_minus(3, :days)
++      })
++
++    new_media_item =
++      media_item_with_attachments(%{
++        source_id: source.id,
++        uploaded_at: now_minus(1, :day)
++      })
++
++    {source, old_media_item, new_media_item}
++  end
+ end
+diff --git a/test/pinchflat/media_test.exs b/test/pinchflat/media_test.exs
+index c95b4d05d..5f1efb545 100644
+--- a/test/pinchflat/media_test.exs
++++ b/test/pinchflat/media_test.exs
+@@ -41,99 +41,7 @@ defmodule Pinchflat.MediaTest do
+     end
+   end
+ 
+-  describe "list_cullable_media_items/0" do
+-    test "returns media items where the source has a retention period" do
+-      source_one = source_fixture(%{retention_period_days: 2})
+-      source_two = source_fixture(%{retention_period_days: 0})
+-      source_three = source_fixture(%{retention_period_days: nil})
+-
+-      _media_item =
+-        media_item_fixture(%{
+-          source_id: source_two.id,
+-          media_filepath: "/video/#{Faker.File.file_name(:video)}",
+-          media_downloaded_at: now_minus(3, :days)
+-        })
+-
+-      _media_item =
+-        media_item_fixture(%{
+-          source_id: source_three.id,
+-          media_filepath: "/video/#{Faker.File.file_name(:video)}",
+-          media_downloaded_at: now_minus(3, :days)
+-        })
+-
+-      expected_media_item =
+-        media_item_fixture(%{
+-          source_id: source_one.id,
+-          media_filepath: "/video/#{Faker.File.file_name(:video)}",
+-          media_downloaded_at: now_minus(3, :days)
+-        })
+-
+-      assert Media.list_cullable_media_items() == [expected_media_item]
+-    end
+-
+-    test "returns media_items with a media_filepath" do
+-      source = source_fixture(%{retention_period_days: 2})
+-
+-      _media_item =
+-        media_item_fixture(%{
+-          source_id: source.id,
+-          media_filepath: nil,
+-          media_downloaded_at: now_minus(3, :days)
+-        })
+-
+-      expected_media_item =
+-        media_item_fixture(%{
+-          source_id: source.id,
+-          media_filepath: "/video/#{Faker.File.file_name(:video)}",
+-          media_downloaded_at: now_minus(3, :days)
+-        })
+-
+-      assert Media.list_cullable_media_items() == [expected_media_item]
+-    end
+-
+-    test "returns items that have passed their retention period" do
+-      source = source_fixture(%{retention_period_days: 2})
+-
+-      _media_item =
+-        media_item_fixture(%{
+-          source_id: source.id,
+-          media_filepath: "/video/#{Faker.File.file_name(:video)}",
+-          media_downloaded_at: now_minus(2, :days)
+-        })
+-
+-      expected_media_item =
+-        media_item_fixture(%{
+-          source_id: source.id,
+-          media_filepath: "/video/#{Faker.File.file_name(:video)}",
+-          media_downloaded_at: now_minus(3, :days)
+-        })
+-
+-      assert Media.list_cullable_media_items() == [expected_media_item]
+-    end
+-
+-    test "doesn't return items that are set to prevent culling" do
+-      source = source_fixture(%{retention_period_days: 2})
+-
+-      _media_item =
+-        media_item_fixture(%{
+-          source_id: source.id,
+-          media_filepath: "/video/#{Faker.File.file_name(:video)}",
+-          media_downloaded_at: now_minus(3, :days),
+-          prevent_culling: true
+-        })
+-
+-      expected_media_item =
+-        media_item_fixture(%{
+-          source_id: source.id,
+-          media_filepath: "/video/#{Faker.File.file_name(:video)}",
+-          media_downloaded_at: now_minus(3, :days)
+-        })
+-
+-      assert Media.list_cullable_media_items() == [expected_media_item]
+-    end
+-  end
+-
+-  describe "list_redownloadable_media_items/0" do
++  describe "list_upgradeable_media_items/0" do
+     setup do
+       media_profile = media_profile_fixture(%{redownload_delay_days: 4})
+       source = source_fixture(%{media_profile_id: media_profile.id, inserted_at: now_minus(10, :days)})
+@@ -149,7 +57,7 @@ defmodule Pinchflat.MediaTest do
+           media_downloaded_at: now_minus(5, :days)
+         })
+ 
+-      assert Media.list_redownloadable_media_items() == [media_item]
++      assert Media.list_upgradeable_media_items() == [media_item]
+     end
+ 
+     test "returns media items that were downloaded in past but still meet redownload delay", %{source: source} do
+@@ -160,7 +68,7 @@ defmodule Pinchflat.MediaTest do
+           media_downloaded_at: now_minus(19, :days)
+         })
+ 
+-      assert Media.list_redownloadable_media_items() == [media_item]
++      assert Media.list_upgradeable_media_items() == [media_item]
+     end
+ 
+     test "does not return media items without a media_downloaded_at", %{source: source} do
+@@ -171,7 +79,7 @@ defmodule Pinchflat.MediaTest do
+           media_downloaded_at: nil
+         })
+ 
+-      assert Media.list_redownloadable_media_items() == []
++      assert Media.list_upgradeable_media_items() == []
+     end
+ 
+     test "does not return media items that are set to prevent download", %{source: source} do
+@@ -183,7 +91,7 @@ defmodule Pinchflat.MediaTest do
+           prevent_download: true
+         })
+ 
+-      assert Media.list_redownloadable_media_items() == []
++      assert Media.list_upgradeable_media_items() == []
+     end
+ 
+     test "does not return media items that have been culled", %{source: source} do
+@@ -195,7 +103,7 @@ defmodule Pinchflat.MediaTest do
+           culled_at: now()
+         })
+ 
+-      assert Media.list_redownloadable_media_items() == []
++      assert Media.list_upgradeable_media_items() == []
+     end
+ 
+     test "does not return media items before the download delay", %{source: source} do
+@@ -206,7 +114,7 @@ defmodule Pinchflat.MediaTest do
+           media_downloaded_at: now_minus(3, :days)
+         })
+ 
+-      assert Media.list_redownloadable_media_items() == []
++      assert Media.list_upgradeable_media_items() == []
+     end
+ 
+     test "does not return media items that have already been redownloaded", %{source: source} do
+@@ -218,7 +126,7 @@ defmodule Pinchflat.MediaTest do
+           media_redownloaded_at: now()
+         })
+ 
+-      assert Media.list_redownloadable_media_items() == []
++      assert Media.list_upgradeable_media_items() == []
+     end
+ 
+     test "does not return media items that were first downloaded well after the uploaded_at", %{source: source} do
+@@ -229,7 +137,7 @@ defmodule Pinchflat.MediaTest do
+           uploaded_at: now_minus(20, :days)
+         })
+ 
+-      assert Media.list_redownloadable_media_items() == []
++      assert Media.list_upgradeable_media_items() == []
+     end
+ 
+     test "does not return media items that were recently uploaded", %{source: source} do
+@@ -240,7 +148,7 @@ defmodule Pinchflat.MediaTest do
+           uploaded_at: now_minus(2, :days)
+         })
+ 
+-      assert Media.list_redownloadable_media_items() == []
++      assert Media.list_upgradeable_media_items() == []
+     end
+ 
+     test "does not return media items without a redownload delay" do
+@@ -254,7 +162,7 @@ defmodule Pinchflat.MediaTest do
+           media_downloaded_at: now_minus(5, :days)
+         })
+ 
+-      assert Media.list_redownloadable_media_items() == []
++      assert Media.list_upgradeable_media_items() == []
+     end
+   end
+ 

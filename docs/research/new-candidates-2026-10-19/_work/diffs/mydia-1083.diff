@@ -1,0 +1,698 @@
+diff --git a/lib/mydia/watch_sync/engine.ex b/lib/mydia/watch_sync/engine.ex
+index 02b34305e..6f82f0f09 100644
+--- a/lib/mydia/watch_sync/engine.ex
++++ b/lib/mydia/watch_sync/engine.ex
+@@ -31,25 +31,28 @@ defmodule Mydia.WatchSync.Engine do
+     with :ok <- maybe_refresh(provider_mod, instance, provider, instance_id, opts),
+          cursor = cursor(user_scope.user_id, provider, instance_id),
+          {:ok, changes} <- provider_mod.list_changes(instance, user_scope, cursor) do
+-      index = mapping_index(provider, instance_id)
+-
++      {by_remote, by_content} = mapping_index(provider, instance_id)
++      {mapped, unmapped} = Enum.split_with(changes, &Map.has_key?(by_remote, &1.remote_id))
++      context = {provider, instance_id, origin, direction}
++      initial = %{@empty_counts | not_found: length(unmapped)}
++
++      # A server can hold one item as several copies (a 1080p and a 4K library).
++      # Reconciling each copy on its own would let an unwatched copy unwatch an
++      # item another copy has watched, so copies fold into one remote side first.
+       counts =
+-        Enum.reduce(changes, @empty_counts, fn change, acc ->
+-          case Map.get(index, change.remote_id) do
+-            nil ->
+-              bump(acc, :not_found)
+-
+-            content_id ->
+-              reconcile_one(
+-                provider_mod,
+-                instance,
+-                user_scope,
+-                {provider, instance_id, origin, direction},
+-                content_id,
+-                change,
+-                acc
+-              )
+-          end
++        mapped
++        |> Enum.group_by(&Map.fetch!(by_remote, &1.remote_id))
++        |> Enum.reduce(initial, fn {content_id, copies}, acc ->
++          reconcile_one(
++            provider_mod,
++            instance,
++            user_scope,
++            context,
++            content_id,
++            Map.fetch!(by_content, content_id),
++            copies,
++            acc
++          )
+         end)
+ 
+       {:ok, counts}
+@@ -76,6 +79,8 @@ defmodule Mydia.WatchSync.Engine do
+   end
+ 
+   defp do_refresh(provider_mod, instance, provider, instance_id) do
++    crawl_started_at = now()
++
+     with {:ok, mappings} <- provider_mod.refresh_mappings(instance, []) do
+       Enum.each(mappings, fn mapping ->
+         case resolve_local(mapping) do
+@@ -84,10 +89,25 @@ defmodule Mydia.WatchSync.Engine do
+         end
+       end)
+ 
+-      :ok
++      prune_unseen(provider, instance_id, mappings, crawl_started_at)
+     end
+   end
+ 
++  # Every copy the crawl resolved was just stamped with last_seen_at >= the
++  # crawl's start, so anything older is a deleted or re-scanned server item.
++  # An empty listing is far likelier a server hiccup than an emptied library,
++  # and pruning on it would drop every mapping until the next forced crawl.
++  defp prune_unseen(_provider, _instance_id, [], _crawl_started_at), do: :ok
++
++  defp prune_unseen(provider, instance_id, _mappings, crawl_started_at) do
++    Mapping
++    |> where([m], m.provider == ^provider and m.provider_instance_id == ^instance_id)
++    |> where([m], is_nil(m.last_seen_at) or m.last_seen_at < ^crawl_started_at)
++    |> Repo.delete_all()
++
++    :ok
++  end
++
+   defp resolve_local(%{type: :movie} = mapping) do
+     case Media.find_by_external_ids(Scope.system(), mapping.external_ids, type: "movie") do
+       nil -> nil
+@@ -125,7 +145,7 @@ defmodule Mydia.WatchSync.Engine do
+     %Mapping{}
+     |> Mapping.changeset(attrs)
+     |> Repo.insert(
+-      on_conflict: {:replace, [:remote_id, :last_seen_at, :updated_at]},
++      on_conflict: {:replace, [:last_seen_at, :updated_at]},
+       conflict_target: mapping_conflict_target(content_id)
+     )
+     |> case do
+@@ -137,10 +157,10 @@ defmodule Mydia.WatchSync.Engine do
+   end
+ 
+   defp mapping_conflict_target(media_item_id: _),
+-    do: [:provider, :provider_instance_id, :media_item_id]
++    do: [:provider, :provider_instance_id, :media_item_id, :remote_id]
+ 
+   defp mapping_conflict_target(episode_id: _),
+-    do: [:provider, :provider_instance_id, :episode_id]
++    do: [:provider, :provider_instance_id, :episode_id, :remote_id]
+ 
+   defp mapped_any?(provider, instance_id) do
+     Mapping
+@@ -150,15 +170,21 @@ defmodule Mydia.WatchSync.Engine do
+   end
+ 
+   defp mapping_index(provider, instance_id) do
+-    Mapping
+-    |> where([m], m.provider == ^provider and m.provider_instance_id == ^instance_id)
+-    |> Repo.all()
+-    |> Map.new(fn m ->
+-      content_id =
+-        if m.episode_id, do: [episode_id: m.episode_id], else: [media_item_id: m.media_item_id]
++    rows =
++      Mapping
++      |> where([m], m.provider == ^provider and m.provider_instance_id == ^instance_id)
++      |> select([m], {m.remote_id, m.media_item_id, m.episode_id})
++      |> Repo.all()
++      |> Enum.map(fn {remote_id, media_item_id, episode_id} ->
++        content_id =
++          if episode_id, do: [episode_id: episode_id], else: [media_item_id: media_item_id]
++
++        {remote_id, content_id}
++      end)
+ 
+-      {m.remote_id, content_id}
+-    end)
++    by_remote = Map.new(rows)
++    by_content = Enum.group_by(rows, &elem(&1, 1), &elem(&1, 0))
++    {by_remote, by_content}
+   end
+ 
+   # ── Reconciliation ─────────────────────────────────────────────────
+@@ -169,14 +195,15 @@ defmodule Mydia.WatchSync.Engine do
+          user_scope,
+          {provider, instance_id, origin, direction},
+          content_id,
+-         change,
++         remote_ids,
++         copies,
+          acc
+        ) do
+     user_id = user_scope.user_id
+ 
+     local = local_side(user_id, content_id)
+-    remote = %{watched: change.watched, position_seconds: change.position_seconds, at: change.at}
+     state_row = get_state(user_id, provider, instance_id, content_id)
++    remote = remote_side(copies, remote_ids, state_row)
+ 
+     case Reconciler.resolve(local, remote, snapshot_side(state_row)) do
+       :noop ->
+@@ -199,13 +226,18 @@ defmodule Mydia.WatchSync.Engine do
+         bump(acc, :imported)
+ 
+       {:push, resolved} ->
+-        case provider_mod.apply_change(instance, user_scope, change.remote_id, resolved) do
+-          :ok ->
++        case push_to_copies(provider_mod, instance, user_scope, remote_ids, resolved) do
++          [] ->
+             put_state(state_row, user_id, provider, instance_id, content_id, resolved, remote.at)
+             bump(acc, :exported)
+ 
+-          {:error, reason} ->
+-            Logger.warning("watch sync push failed: #{inspect(reason)}")
++          # Recording the snapshot after a partial push would make the next run
++          # see local and snapshot agree and never retry the failed copies.
++          failures ->
++            Logger.warning(
++              "watch sync push failed for #{inspect(content_id)}: #{inspect(failures)}"
++            )
++
+             acc
+         end
+ 
+@@ -215,6 +247,30 @@ defmodule Mydia.WatchSync.Engine do
+     end
+   end
+ 
++  # Folds the listed copies into one remote side. When the listing omits some
++  # of the item's mapped copies (an incremental run drops copies not played
++  # since the cursor), the absent ones are assumed to still hold the last agreed
++  # state, so a snapshot of watched keeps the item watched. Consequence: an
++  # incremental run never unwatches a multi-copy item through a partial
++  # listing; only a full listing (first sync) can.
++  defp remote_side(copies, remote_ids, state_row) do
++    merged = Reconciler.merge_remotes(copies)
++    listed = copies |> Enum.map(& &1.remote_id) |> Enum.uniq() |> length()
++
++    if state_row && listed < length(remote_ids),
++      do: %{merged | watched: merged.watched or state_row.synced_watched},
++      else: merged
++  end
++
++  defp push_to_copies(provider_mod, instance, user_scope, remote_ids, resolved) do
++    Enum.flat_map(remote_ids, fn remote_id ->
++      case provider_mod.apply_change(instance, user_scope, remote_id, resolved) do
++        :ok -> []
++        {:error, reason} -> [{remote_id, reason}]
++      end
++    end)
++  end
++
+   # An absent progress row is not "no information": it is the state a local
+   # unwatch leaves behind, since unwatching deletes the row outright.
+   defp local_side(user_id, content_id) do
+diff --git a/lib/mydia/watch_sync/mapping.ex b/lib/mydia/watch_sync/mapping.ex
+index 67cd890a0..650b5e2af 100644
+--- a/lib/mydia/watch_sync/mapping.ex
++++ b/lib/mydia/watch_sync/mapping.ex
+@@ -48,16 +48,31 @@ defmodule Mydia.WatchSync.Mapping do
+     ])
+     |> validate_required([:provider, :provider_instance_id, :remote_id])
+     |> validate_one_parent()
+-    |> unique_constraint([:provider, :provider_instance_id, :media_item_id],
+-      name: :remote_item_mappings_movie_index
+-    )
+-    |> unique_constraint([:provider, :provider_instance_id, :episode_id],
+-      name: :remote_item_mappings_episode_index
+-    )
++    |> unique_copy_constraints()
+     |> foreign_key_constraint(:media_item_id)
+     |> foreign_key_constraint(:episode_id)
+   end
+ 
++  # Two names per index. Postgres reports the real index name on a violation;
++  # SQLite reports only the columns, and ecto_sqlite3 guesses Ecto's
++  # conventional "<table>_<cols>_index" name from them. Declaring both lets
++  # either adapter resolve to the same changeset error. See priv/repo/README.md.
++  @copy_index_names [
++    :remote_item_mappings_movie_copy_index,
++    :remote_item_mappings_provider_provider_instance_id_media_item_id_remote_id_index,
++    :remote_item_mappings_episode_copy_index,
++    :remote_item_mappings_provider_provider_instance_id_episode_id_remote_id_index
++  ]
++
++  defp unique_copy_constraints(changeset) do
++    Enum.reduce(@copy_index_names, changeset, fn name, acc ->
++      unique_constraint(acc, :remote_id,
++        name: name,
++        message: "already mapped to this remote item"
++      )
++    end)
++  end
++
+   # Ensure either media_item_id or episode_id is set, but not both
+   defp validate_one_parent(changeset) do
+     media_item_id = get_field(changeset, :media_item_id)
+diff --git a/lib/mydia/watch_sync/reconciler.ex b/lib/mydia/watch_sync/reconciler.ex
+index 470a4217e..b7b8321e1 100644
+--- a/lib/mydia/watch_sync/reconciler.ex
++++ b/lib/mydia/watch_sync/reconciler.ex
+@@ -66,6 +66,31 @@ defmodule Mydia.WatchSync.Reconciler do
+     end
+   end
+ 
++  @doc """
++  Folds several remote copies of one local item into a single remote side.
++
++  A server can hold one movie or episode as several items, for instance a
++  1080p library and a 4K library, each with its own played flag. The item is
++  watched if any copy is. Position and time come from the most recently played
++  copy; when no copy carries a date (Jellyfin's `UpdatePlayState` never stamps
++  one), the furthest position wins.
++  """
++  @spec merge_remotes([side(), ...]) :: side()
++  def merge_remotes([_ | _] = sides) do
++    source = Enum.max_by(sides, &recency_key/1)
++
++    %{
++      watched: Enum.any?(sides, & &1.watched),
++      position_seconds: source.position_seconds,
++      at: source.at
++    }
++  end
++
++  defp recency_key(%{at: nil} = side), do: {0, 0, side.position_seconds || 0}
++
++  defp recency_key(%{at: at} = side),
++    do: {1, DateTime.to_unix(at, :microsecond), side.position_seconds || 0}
++
+   defp resolve_position(local, remote, snapshot) do
+     local_delta = position_delta(local.position_seconds, snapshot.position_seconds)
+     remote_delta = position_delta(remote.position_seconds, snapshot.position_seconds)
+diff --git a/priv/repo/migrations/20261007211437_allow_many_remote_copies_per_item.exs b/priv/repo/migrations/20261007211437_allow_many_remote_copies_per_item.exs
+new file mode 100644
+index 000000000..fcdf44dcd
+--- /dev/null
++++ b/priv/repo/migrations/20261007211437_allow_many_remote_copies_per_item.exs
+@@ -0,0 +1,70 @@
++defmodule Mydia.Repo.Migrations.AllowManyRemoteCopiesPerItem do
++  @moduledoc """
++  Lets one local item map to several items on the same media server.
++
++  Jellyfin users commonly keep a separate 4K library, so one movie is two
++  Jellyfin items with independent played flags. One mapping per item meant the
++  crawl kept whichever copy came last and dropped watches on the other
++  (getmydia/mydia#1079). Uniqueness moves to (item, remote_id).
++  """
++  use Ecto.Migration
++
++  def up do
++    drop index(:remote_item_mappings, [:provider, :provider_instance_id, :media_item_id],
++           name: :remote_item_mappings_movie_index
++         )
++
++    drop index(:remote_item_mappings, [:provider, :provider_instance_id, :episode_id],
++           name: :remote_item_mappings_episode_index
++         )
++
++    create unique_index(
++             :remote_item_mappings,
++             [:provider, :provider_instance_id, :media_item_id, :remote_id],
++             name: :remote_item_mappings_movie_copy_index
++           )
++
++    create unique_index(
++             :remote_item_mappings,
++             [:provider, :provider_instance_id, :episode_id, :remote_id],
++             name: :remote_item_mappings_episode_copy_index
++           )
++  end
++
++  def down do
++    # The old indexes allow one row per item. Keep the most recently seen copy.
++    execute("""
++    DELETE FROM remote_item_mappings
++    WHERE id IN (
++      SELECT older.id
++      FROM remote_item_mappings older
++      JOIN remote_item_mappings newer
++        ON newer.provider = older.provider
++       AND newer.provider_instance_id = older.provider_instance_id
++       AND (newer.media_item_id = older.media_item_id OR newer.episode_id = older.episode_id)
++       AND newer.id <> older.id
++      WHERE COALESCE(newer.last_seen_at, newer.inserted_at) > COALESCE(older.last_seen_at, older.inserted_at)
++         OR (COALESCE(newer.last_seen_at, newer.inserted_at) = COALESCE(older.last_seen_at, older.inserted_at)
++             AND newer.id > older.id)
++    )
++    """)
++
++    drop index(
++           :remote_item_mappings,
++           [:provider, :provider_instance_id, :media_item_id, :remote_id],
++           name: :remote_item_mappings_movie_copy_index
++         )
++
++    drop index(:remote_item_mappings, [:provider, :provider_instance_id, :episode_id, :remote_id],
++           name: :remote_item_mappings_episode_copy_index
++         )
++
++    create unique_index(:remote_item_mappings, [:provider, :provider_instance_id, :media_item_id],
++             name: :remote_item_mappings_movie_index
++           )
++
++    create unique_index(:remote_item_mappings, [:provider, :provider_instance_id, :episode_id],
++             name: :remote_item_mappings_episode_index
++           )
++  end
++end
+diff --git a/test/mydia/watch_sync/engine_test.exs b/test/mydia/watch_sync/engine_test.exs
+index 039a552a2..06a8e75f8 100644
+--- a/test/mydia/watch_sync/engine_test.exs
++++ b/test/mydia/watch_sync/engine_test.exs
+@@ -4,9 +4,12 @@ defmodule Mydia.WatchSync.EngineTest do
+   import Mydia.MediaFixtures
+   import Mydia.AccountsFixtures
+ 
++  import Ecto.Query
++
+   alias Mydia.Accounts.Scope
+   alias Mydia.Playback
+   alias Mydia.WatchSync
++  alias Mydia.WatchSync.{Mapping, State}
+ 
+   defmodule StubProvider do
+     @behaviour Mydia.WatchSync.Provider
+@@ -20,7 +23,10 @@ defmodule Mydia.WatchSync.EngineTest do
+     @impl true
+     def apply_change(instance, _scope, remote_id, change) do
+       send(instance.test_pid, {:applied, remote_id, change})
+-      :ok
++
++      if remote_id in Map.get(instance, :fail_remote_ids, []),
++        do: {:error, :unreachable},
++        else: :ok
+     end
+   end
+ 
+@@ -221,4 +227,197 @@ defmodule Mydia.WatchSync.EngineTest do
+     assert counts.imported == 1
+     assert %{watched: true} = Playback.get_progress(user.id, episode_id: episode.id)
+   end
++
++  describe "a movie with two copies on one server (#1079)" do
++    test "every copy gets a mapping", %{user: user} do
++      {:ok, _} = WatchSync.sync(StubProvider, two_copies([]), scope(user), provider: "stub")
++
++      assert mapped_remote_ids("inst-copies") == ["rk-1080", "rk-4k"]
++    end
++
++    test "a watch on the copy crawled first is imported", %{user: user, movie: movie} do
++      instance =
++        two_copies([
++          %{remote_id: "rk-4k", watched: true, position_seconds: 0, at: DateTime.utc_now()}
++        ])
++
++      {:ok, counts} = WatchSync.sync(StubProvider, instance, scope(user), provider: "stub")
++
++      assert counts.not_found == 0
++      assert counts.imported == 1
++      assert %{watched: true} = Playback.get_progress(user.id, media_item_id: movie.id)
++    end
++
++    test "an unwatched copy does not unwatch a movie another copy has watched",
++         %{user: user, movie: movie} do
++      watched = %{remote_id: "rk-4k", watched: true, position_seconds: 0, at: DateTime.utc_now()}
++      unwatched = %{remote_id: "rk-1080", watched: false, position_seconds: nil, at: nil}
++
++      # The first sync imports the watch and records a watched snapshot.
++      {:ok, _} =
++        WatchSync.sync(StubProvider, two_copies([watched, unwatched]), scope(user),
++          provider: "stub"
++        )
++
++      # A full listing reports the unwatched copy first.
++      {:ok, counts} =
++        WatchSync.sync(StubProvider, two_copies([unwatched, watched]), scope(user),
++          provider: "stub"
++        )
++
++      assert counts.imported == 0
++      assert counts.unchanged == 1
++      assert %{watched: true} = Playback.get_progress(user.id, media_item_id: movie.id)
++    end
++
++    test "a partial listing does not unwatch a movie whose other copy was watched",
++         %{user: user, movie: movie} do
++      watched = %{
++        remote_id: "rk-1080",
++        watched: true,
++        position_seconds: 0,
++        at: DateTime.utc_now()
++      }
++
++      unwatched = %{remote_id: "rk-4k", watched: false, position_seconds: nil, at: nil}
++
++      {:ok, _} =
++        WatchSync.sync(StubProvider, two_copies([watched, unwatched]), scope(user),
++          provider: "stub"
++        )
++
++      # An incremental run only lists the copy played since the cursor.
++      partial = %{
++        remote_id: "rk-4k",
++        watched: false,
++        position_seconds: 300,
++        at: DateTime.utc_now()
++      }
++
++      {:ok, _} =
++        WatchSync.sync(StubProvider, two_copies([partial]), scope(user), provider: "stub")
++
++      assert %{watched: true} = Playback.get_progress(user.id, media_item_id: movie.id)
++    end
++
++    test "a local watch is pushed to every copy, including ones not in the changes",
++         %{user: user, movie: movie} do
++      {:ok, _} =
++        Playback.save_progress(user.id, [media_item_id: movie.id], %{
++          position_seconds: 100,
++          duration_seconds: 100
++        })
++
++      instance =
++        two_copies([
++          %{remote_id: "rk-4k", watched: false, position_seconds: nil, at: DateTime.utc_now()}
++        ])
++
++      {:ok, counts} = WatchSync.sync(StubProvider, instance, scope(user), provider: "stub")
++
++      assert counts.exported == 1
++      assert_received {:applied, "rk-4k", %{watched: true}}
++      assert_received {:applied, "rk-1080", %{watched: true}}
++
++      assert %State{synced_watched: true} =
++               Repo.get_by(State, user_id: user.id, media_item_id: movie.id)
++    end
++
++    test "a push that fails on one copy records no snapshot", %{user: user, movie: movie} do
++      {:ok, _} =
++        Playback.save_progress(user.id, [media_item_id: movie.id], %{
++          position_seconds: 100,
++          duration_seconds: 100
++        })
++
++      instance =
++        two_copies(
++          [%{remote_id: "rk-4k", watched: false, position_seconds: nil, at: DateTime.utc_now()}],
++          %{fail_remote_ids: ["rk-1080"]}
++        )
++
++      log =
++        ExUnit.CaptureLog.capture_log(fn ->
++          assert {:ok, %{exported: 0}} =
++                   WatchSync.sync(StubProvider, instance, scope(user), provider: "stub")
++        end)
++
++      assert log =~ "watch sync push failed"
++      assert Repo.get_by(State, user_id: user.id, media_item_id: movie.id) == nil
++    end
++
++    test "a forced crawl prunes copies the server no longer lists", %{user: user, movie: movie} do
++      an_hour_ago = DateTime.utc_now() |> DateTime.add(-3600) |> DateTime.truncate(:second)
++
++      Repo.insert!(%Mapping{
++        provider: "stub",
++        provider_instance_id: "inst-copies",
++        media_item_id: movie.id,
++        remote_id: "rk-gone",
++        last_seen_at: an_hour_ago
++      })
++
++      {:ok, _} =
++        WatchSync.sync(StubProvider, two_copies([]), scope(user),
++          provider: "stub",
++          refresh_mappings: :force
++        )
++
++      assert mapped_remote_ids("inst-copies") == ["rk-1080", "rk-4k"]
++    end
++
++    test "an empty crawl prunes nothing", %{user: user, movie: movie} do
++      an_hour_ago = DateTime.utc_now() |> DateTime.add(-3600) |> DateTime.truncate(:second)
++
++      Repo.insert!(%Mapping{
++        provider: "stub",
++        provider_instance_id: "inst-copies",
++        media_item_id: movie.id,
++        remote_id: "rk-4k",
++        last_seen_at: an_hour_ago
++      })
++
++      {:ok, _} =
++        WatchSync.sync(StubProvider, two_copies([], %{mappings: []}), scope(user),
++          provider: "stub",
++          refresh_mappings: :force
++        )
++
++      assert mapped_remote_ids("inst-copies") == ["rk-4k"]
++    end
++  end
++
++  defp scope(user), do: %{user_id: user.id, access_token: nil}
++
++  defp copy(remote_id) do
++    %{
++      remote_id: remote_id,
++      type: :movie,
++      external_ids: %{tmdb: "12345"},
++      season_number: nil,
++      episode_number: nil
++    }
++  end
++
++  # The 4K copy is crawled first, so the old one-mapping-per-item upsert let the
++  # 1080p copy overwrite it and every 4K watch came back as not_found.
++  defp two_copies(changes, extra \\ %{}) do
++    Map.merge(
++      %{
++        id: "inst-copies",
++        test_pid: self(),
++        mappings: [copy("rk-4k"), copy("rk-1080")],
++        changes: changes
++      },
++      extra
++    )
++  end
++
++  defp mapped_remote_ids(instance_id) do
++    Mapping
++    |> where([m], m.provider_instance_id == ^instance_id)
++    |> select([m], m.remote_id)
++    |> Repo.all()
++    |> Enum.sort()
++  end
+ end
+diff --git a/test/mydia/watch_sync/reconciler_test.exs b/test/mydia/watch_sync/reconciler_test.exs
+index a183eb547..ecc591cd8 100644
+--- a/test/mydia/watch_sync/reconciler_test.exs
++++ b/test/mydia/watch_sync/reconciler_test.exs
+@@ -105,4 +105,37 @@ defmodule Mydia.WatchSync.ReconcilerTest do
+       assert change.watched == true
+     end
+   end
++
++  describe "merge_remotes/1" do
++    test "a single copy passes through" do
++      assert Reconciler.merge_remotes([side(true, 30, at(5))]) == side(true, 30, at(5))
++    end
++
++    test "any watched copy makes the item watched" do
++      merged = Reconciler.merge_remotes([side(false, nil, at(10)), side(true, nil, at(1))])
++      assert merged.watched
++    end
++
++    test "position and time come from the most recently played copy" do
++      merged = Reconciler.merge_remotes([side(false, 900, at(1)), side(false, 120, at(10))])
++      assert merged == side(false, 120, at(10))
++    end
++
++    test "a dated copy outranks an undated one" do
++      merged = Reconciler.merge_remotes([side(false, 900, nil), side(false, 120, at(10))])
++      assert merged == side(false, 120, at(10))
++    end
++
++    test "with no dates at all the furthest position wins" do
++      merged =
++        Reconciler.merge_remotes([side(false, 120, nil), side(true, 900, nil), side(false)])
++
++      assert merged == side(true, 900, nil)
++    end
++
++    test "extra keys on the inputs are dropped" do
++      merged = Reconciler.merge_remotes([Map.put(side(true, 5, at(0)), :remote_id, "x")])
++      assert merged == side(true, 5, at(0))
++    end
++  end
+ end
+diff --git a/test/mydia/watch_sync/schemas_test.exs b/test/mydia/watch_sync/schemas_test.exs
+index b0424a590..f40802a88 100644
+--- a/test/mydia/watch_sync/schemas_test.exs
++++ b/test/mydia/watch_sync/schemas_test.exs
+@@ -1,6 +1,8 @@
+ defmodule Mydia.WatchSync.SchemasTest do
+   use Mydia.DataCase, async: true
+ 
++  import Mydia.MediaFixtures
++
+   alias Mydia.WatchSync.{Mapping, State}
+ 
+   test "a mapping requires exactly one of media_item_id or episode_id" do
+@@ -32,4 +34,50 @@ defmodule Mydia.WatchSync.SchemasTest do
+ 
+     refute changeset.valid?
+   end
++
++  test "a local item can map to several remote copies, each only once" do
++    movie = media_item_fixture()
++    attrs = %{provider: "jellyfin", provider_instance_id: "i", media_item_id: movie.id}
++
++    insert = fn remote_id ->
++      %Mapping{}
++      |> Mapping.changeset(Map.put(attrs, :remote_id, remote_id))
++      |> Repo.insert()
++    end
++
++    assert {:ok, _} = insert.("copy-a")
++    assert {:ok, _} = insert.("copy-b")
++    assert {:error, changeset} = insert.("copy-a")
++    assert {"already mapped to this remote item", _} = changeset.errors[:remote_id]
++  end
++
++  test "an episode can map to several remote copies, each only once" do
++    {:ok, show} =
++      Mydia.Media.create_media_item(
++        Mydia.Accounts.Scope.unrestricted(),
++        %{title: "Copy Index Show", type: "tv_show", tvdb_id: 900_001},
++        skip_episode_refresh: true
++      )
++
++    {:ok, episode} =
++      Mydia.Media.create_episode(%{
++        media_item_id: show.id,
++        season_number: 1,
++        episode_number: 1,
++        title: "Pilot"
++      })
++
++    attrs = %{provider: "jellyfin", provider_instance_id: "i", episode_id: episode.id}
++
++    insert = fn remote_id ->
++      %Mapping{}
++      |> Mapping.changeset(Map.put(attrs, :remote_id, remote_id))
++      |> Repo.insert()
++    end
++
++    assert {:ok, _} = insert.("copy-a")
++    assert {:ok, _} = insert.("copy-b")
++    assert {:error, changeset} = insert.("copy-a")
++    assert {"already mapped to this remote item", _} = changeset.errors[:remote_id]
++  end
+ end

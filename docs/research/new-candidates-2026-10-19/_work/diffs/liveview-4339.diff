@@ -1,0 +1,448 @@
+diff --git a/assets/js/phoenix_live_view/constants.ts b/assets/js/phoenix_live_view/constants.ts
+index 9f2d69c2c0..73739cc74c 100644
+--- a/assets/js/phoenix_live_view/constants.ts
++++ b/assets/js/phoenix_live_view/constants.ts
+@@ -75,6 +75,7 @@ export const PHX_HOOK = "hook";
+ export const PHX_DEBOUNCE = "debounce";
+ export const PHX_THROTTLE = "throttle";
+ export const PHX_UPDATE = "update";
++export const PHX_PATCH_FOCUSED = "patch-focused";
+ export const PHX_STREAM = "stream";
+ export const PHX_STREAM_REF = "data-phx-stream";
+ export const PHX_PORTAL = "data-phx-portal";
+diff --git a/assets/js/phoenix_live_view/dom_patch.ts b/assets/js/phoenix_live_view/dom_patch.ts
+index c52e44a585..8d1e77bd85 100644
+--- a/assets/js/phoenix_live_view/dom_patch.ts
++++ b/assets/js/phoenix_live_view/dom_patch.ts
+@@ -8,6 +8,7 @@ import {
+   PHX_STATIC,
+   PHX_TRIGGER_ACTION,
+   PHX_UPDATE,
++  PHX_PATCH_FOCUSED,
+   PHX_REF_SRC,
+   PHX_REF_LOCK,
+   PHX_STREAM,
+@@ -168,6 +169,7 @@ export default class DOMPatch {
+     const phxViewportTop = liveSocket.binding(PHX_VIEWPORT_TOP);
+     const phxViewportBottom = liveSocket.binding(PHX_VIEWPORT_BOTTOM);
+     const phxTriggerExternal = liveSocket.binding(PHX_TRIGGER_ACTION);
++    const phxPatchFocused = liveSocket.binding(PHX_PATCH_FOCUSED);
+     const added: Array<Node> = [];
+     const updates: Array<Element> = [];
+     const appendPrependUpdates: Array<DOMPostMorphRestorer> = [];
+@@ -468,11 +470,13 @@ export default class DOMPatch {
+             return false;
+           }
+ 
+-          // skip patching focused inputs unless focus is a select that has changed options
++          // skip patching focused inputs unless explicitly opted in or focus is
++          // a select that has changed options
+           if (
+             isFocusedFormEl &&
+             fromEl.type !== "hidden" &&
+-            !focusedSelectChanged
++            !focusedSelectChanged &&
++            !toEl.hasAttribute(phxPatchFocused)
+           ) {
+             this.trackBeforeUpdated(fromEl, toEl);
+             DOM.mergeFocusedInput(fromEl, toEl);
+diff --git a/assets/test/integration/focused_patch_test.ts b/assets/test/integration/focused_patch_test.ts
+new file mode 100644
+index 0000000000..ef9d61bce1
+--- /dev/null
++++ b/assets/test/integration/focused_patch_test.ts
+@@ -0,0 +1,190 @@
++import { Socket } from "phoenix";
++import DOM from "phoenix_live_view/dom";
++import DOMPatch from "phoenix_live_view/dom_patch";
++import LiveSocket from "phoenix_live_view/live_socket";
++import { simulateJoinedView } from "../test_helpers";
++
++const CUSTOM_ELEMENT_NAME = "lv-focused-form-control";
++
++if (!customElements.get(CUSTOM_ELEMENT_NAME)) {
++  customElements.define(
++    CUSTOM_ELEMENT_NAME,
++    class extends HTMLElement {
++      static formAssociated = true;
++    },
++  );
++}
++
++function createView(content: string, bindingPrefix = "phx-") {
++  document.body.innerHTML = `
++    <div data-phx-session="abc123"
++         data-phx-root-id="root"
++         data-phx-static="456"
++         id="root">
++      <div id="content">${content}</div>
++    </div>
++  `;
++
++  const root = document.getElementById("root")!;
++  const liveSocket = new LiveSocket("/live", Socket, { bindingPrefix });
++  const view = simulateJoinedView(root, liveSocket);
++  const container = document.getElementById("content")!;
++
++  return { liveSocket, view, container };
++}
++
++function buildPatch(view, container, html: string) {
++  const source = document.createElement("div");
++  source.innerHTML = html;
++  return new DOMPatch(view, container, source, new Set(), null);
++}
++
++describe("focused form element patching", () => {
++  const liveSockets: LiveSocket[] = [];
++
++  afterEach(() => {
++    liveSockets.forEach((liveSocket) => liveSocket.destroyAllViews());
++    liveSockets.length = 0;
++    document.body.innerHTML = "";
++  });
++
++  function setup(content: string, bindingPrefix?: string) {
++    const result = createView(content, bindingPrefix);
++    liveSockets.push(result.liveSocket);
++    return result;
++  }
++
++  test("does not patch focused form-associated custom elements by default", () => {
++    const { view, container } = setup(`
++      <${CUSTOM_ELEMENT_NAME} id="control" tabindex="0">
++        <span id="child">client</span>
++      </${CUSTOM_ELEMENT_NAME}>
++    `);
++    const control = document.getElementById("control") as HTMLElement;
++    control.focus();
++
++    const patch = buildPatch(
++      view,
++      container,
++      `
++        <${CUSTOM_ELEMENT_NAME} id="control" tabindex="0">
++          <span id="child">server</span>
++        </${CUSTOM_ELEMENT_NAME}>
++      `,
++    );
++    patch.perform(false);
++
++    expect(document.activeElement).toBe(control);
++    expect(document.getElementById("child")!.textContent).toBe("client");
++  });
++
++  test("phx-patch-focused patches a focused form-associated custom element", () => {
++    const { view, container } = setup(`
++      <${CUSTOM_ELEMENT_NAME} id="control" tabindex="0" phx-patch-focused>
++        <span id="child">client</span>
++      </${CUSTOM_ELEMENT_NAME}>
++    `);
++    const control = document.getElementById("control") as HTMLElement;
++    control.focus();
++
++    const patch = buildPatch(
++      view,
++      container,
++      `
++        <${CUSTOM_ELEMENT_NAME} id="control" tabindex="0" phx-patch-focused>
++          <span id="child">server</span>
++        </${CUSTOM_ELEMENT_NAME}>
++      `,
++    );
++    patch.perform(false);
++
++    expect(document.activeElement).toBe(control);
++    expect(document.getElementById("child")!.textContent).toBe("server");
++  });
++
++  test("phx-patch-focused opts native inputs into server value updates", () => {
++    const { view, container } = setup(
++      '<input id="control" value="initial" phx-patch-focused>',
++    );
++    const control = document.getElementById("control") as HTMLInputElement;
++    control.focus();
++    control.value = "client";
++
++    const patch = buildPatch(
++      view,
++      container,
++      '<input id="control" value="server" phx-patch-focused>',
++    );
++    patch.perform(false);
++
++    expect(document.activeElement).toBe(control);
++    expect(control.value).toBe("server");
++  });
++
++  test("uses the configured binding prefix", () => {
++    const { view, container } = setup(
++      `
++        <${CUSTOM_ELEMENT_NAME} id="control" tabindex="0" company-patch-focused>
++          <span id="child">client</span>
++        </${CUSTOM_ELEMENT_NAME}>
++      `,
++      "company-",
++    );
++    const control = document.getElementById("control") as HTMLElement;
++    control.focus();
++
++    const patch = buildPatch(
++      view,
++      container,
++      `
++        <${CUSTOM_ELEMENT_NAME} id="control" tabindex="0" company-patch-focused>
++          <span id="child">server</span>
++        </${CUSTOM_ELEMENT_NAME}>
++      `,
++    );
++    patch.perform(false);
++
++    expect(document.getElementById("child")!.textContent).toBe("server");
++  });
++
++  test("applies sticky operations and reports the focused element once", () => {
++    const { view, container } = setup(`
++      <${CUSTOM_ELEMENT_NAME}
++        id="control"
++        class="server"
++        tabindex="0"
++        phx-patch-focused
++      >
++        <span id="child">client</span>
++      </${CUSTOM_ELEMENT_NAME}>
++    `);
++    const control = document.getElementById("control") as HTMLElement;
++    control.focus();
++    DOM.putSticky(control, "test-class", (el) =>
++      el.classList.add("client-sticky"),
++    );
++
++    const patch = buildPatch(
++      view,
++      container,
++      `
++        <${CUSTOM_ELEMENT_NAME}
++          id="control"
++          class="server"
++          tabindex="0"
++          phx-patch-focused
++        >
++          <span id="child">server</span>
++        </${CUSTOM_ELEMENT_NAME}>
++      `,
++    );
++    let updates = 0;
++    patch.afterUpdated((el) => {
++      if (el.id === "control") updates++;
++    });
++    patch.perform(false);
++
++    expect(control.classList.contains("client-sticky")).toBe(true);
++    expect(updates).toBe(1);
++  });
++});
+diff --git a/guides/client/bindings.md b/guides/client/bindings.md
+index 58addeaac9..878661770f 100644
+--- a/guides/client/bindings.md
++++ b/guides/client/bindings.md
+@@ -23,7 +23,7 @@ which is then handled on the server with the `handle_event` callback, for exampl
+ | [Focus Events](#focus-and-blur-events) | `phx-blur`, `phx-focus`, `phx-window-blur`, `phx-window-focus` |
+ | [Key Events](#key-events) | `phx-keydown`, `phx-keyup`, `phx-window-keydown`, `phx-window-keyup`, `phx-key` |
+ | [Scroll Events](#scroll-events-and-infinite-pagination) | `phx-viewport-top`, `phx-viewport-bottom` |
+-| [DOM Patching](#dom-patching) | `phx-update`, `phx-mounted`, `phx-remove` |
++| [DOM Patching](#dom-patching) | `phx-update`, `phx-patch-focused`, `phx-mounted`, `phx-remove` |
+ | [JS Interop](js-interop.md#client-hooks-via-phx-hook) | `phx-hook` |
+ | [Lifecycle Events](#lifecycle-events) | `phx-connected`, `phx-disconnected` |
+ | [Rate Limiting](#rate-limiting-events-with-debounce-and-throttle) | `phx-debounce`, `phx-throttle` |
+@@ -340,6 +340,22 @@ and attributes are ignored, *except for data attributes*. Changes, additions,
+ and removals from the server to data attributes are merged with the ignored
+ element which can be used to pass data to the JS handler.
+ 
++Focused form controls are not patched by default, so that client-side input
++always wins over potentially stale server updates. The `phx-patch-focused`
++attribute opts a form control into normal DOM patching while it is focused,
++including its attributes and children:
++
++```heex
++<my-form-control phx-patch-focused>
++  ...
++</my-form-control>
++```
++
++This is useful for form-associated custom elements whose editable state is
++kept outside of their light DOM. Because the normal patch can overwrite the
++control's current value or other client-managed state, only use this attribute
++when the server-rendered DOM should win.
++
+ To react to elements being mounted to the DOM, the `phx-mounted` binding
+ can be used. For example, to animate an element on mount:
+ 
+diff --git a/guides/client/form-bindings.md b/guides/client/form-bindings.md
+index 27251eba06..3b85a2ab20 100644
+--- a/guides/client/form-bindings.md
++++ b/guides/client/form-bindings.md
+@@ -299,6 +299,8 @@ For any given input with focus, LiveView will never overwrite the input's curren
+ value, even if it deviates from the server's rendered updates. This works well
+ for updates where major side effects are not expected, such as form validation
+ errors, or additive UX around the user's input values as they fill out a form.
++An input can explicitly opt into normal DOM patching while focused with
++[`phx-patch-focused`](bindings.md#dom-patching).
+ 
+ For these use cases, the `phx-change` input does not concern itself with disabling
+ input editing while an event to the server is in flight. When a `phx-change` event
+diff --git a/test/e2e/support/issues/issue_4323.ex b/test/e2e/support/issues/issue_4323.ex
+new file mode 100644
+index 0000000000..8f3d48b9c0
+--- /dev/null
++++ b/test/e2e/support/issues/issue_4323.ex
+@@ -0,0 +1,57 @@
++defmodule Phoenix.LiveViewTest.E2E.Issue4323Live do
++  use Phoenix.LiveView
++
++  def mount(_params, _session, socket) do
++    socket =
++      socket
++      |> assign(:counter, 0)
++      |> assign(:render_in_root, fn assigns ->
++        ~H"""
++        <script>
++          class Issue4323Face extends HTMLElement {
++            static formAssociated = true;
++            constructor() {
++              super();
++              this.attachInternals();
++            }
++          }
++          customElements.define("issue-4323-face", Issue4323Face);
++
++          class Issue4323DelegatesFace extends HTMLElement {
++            static formAssociated = true;
++            constructor() {
++              super();
++              this.attachInternals();
++              this.attachShadow({ mode: "open", delegatesFocus: true });
++              this.shadowRoot.innerHTML = '<input type="text"><slot></slot>';
++            }
++          }
++          customElements.define("issue-4323-delegates-face", Issue4323DelegatesFace);
++        </script>
++        """
++      end)
++
++    {:ok, socket}
++  end
++
++  def render(assigns) do
++    ~H"""
++    <form id="test-form">
++      <issue-4323-face id="face-default" tabindex="0">
++        <span id="face-default-child">count:{@counter}</span>
++      </issue-4323-face>
++
++      <issue-4323-face id="face-opt-in" tabindex="0" phx-patch-focused>
++        <span id="face-opt-in-child">count:{@counter}</span>
++      </issue-4323-face>
++
++      <issue-4323-delegates-face id="face-delegates" phx-patch-focused>
++        <span id="face-delegates-child">count:{@counter}</span>
++      </issue-4323-delegates-face>
++
++      <input id="native-default" value={@counter} />
++      <input id="native-opt-in" value={@counter} phx-patch-focused />
++    </form>
++    """
++  end
++end
+diff --git a/test/e2e/test_helper.exs b/test/e2e/test_helper.exs
+index 5c48cc2cf4..7ce0e96d10 100644
+--- a/test/e2e/test_helper.exs
++++ b/test/e2e/test_helper.exs
+@@ -218,6 +218,7 @@ defmodule Phoenix.LiveViewTest.E2E.Router do
+       live "/4212", Issue4212Live
+       live "/4290/a", Issue4290.ALive
+       live "/4290/b", Issue4290.BLive
++      live "/4323", Issue4323Live
+       live "/4325", Issue4325Live
+     end
+   end
+diff --git a/test/e2e/tests/issues/4323.spec.js b/test/e2e/tests/issues/4323.spec.js
+new file mode 100644
+index 0000000000..bfdd2d7898
+--- /dev/null
++++ b/test/e2e/tests/issues/4323.spec.js
+@@ -0,0 +1,74 @@
++import { test, expect } from "../../test-fixtures";
++import { evalLV, syncLV } from "../../utils";
++
++const incrementCounter = async (page) => {
++  await evalLV(
++    page,
++    "{:noreply, Phoenix.Component.assign(socket, :counter, socket.assigns.counter + 1)}",
++  );
++  await syncLV(page);
++};
++
++test.describe("phx-patch-focused", () => {
++  test.beforeEach(async ({ page }) => {
++    await page.goto("/issues/4323");
++    await syncLV(page);
++  });
++
++  test("preserves focused form-associated custom elements by default", async ({
++    page,
++  }) => {
++    const control = page.locator("#face-default");
++    await control.focus();
++    await expect(control).toBeFocused();
++
++    await incrementCounter(page);
++
++    await expect(page.locator("#face-default-child")).toHaveText("count:0");
++  });
++
++  test("patches an opted-in focused form-associated custom element", async ({
++    page,
++  }) => {
++    const control = page.locator("#face-opt-in");
++    await control.focus();
++    await expect(control).toBeFocused();
++
++    await incrementCounter(page);
++
++    await expect(page.locator("#face-opt-in-child")).toHaveText("count:1");
++  });
++
++  test("patches opted-in slotted children when focus is delegated", async ({
++    page,
++  }) => {
++    await page.locator("#face-delegates").click();
++    await expect
++      .poll(() => page.evaluate(() => document.activeElement?.id))
++      .toBe("face-delegates");
++
++    await incrementCounter(page);
++
++    await expect(page.locator("#face-delegates-child")).toHaveText("count:1");
++  });
++
++  test("preserves a focused native input by default", async ({ page }) => {
++    const input = page.locator("#native-default");
++    await input.fill("client");
++    await expect(input).toBeFocused();
++
++    await incrementCounter(page);
++
++    await expect(input).toHaveValue("client");
++  });
++
++  test("patches an opted-in focused native input", async ({ page }) => {
++    const input = page.locator("#native-opt-in");
++    await input.fill("client");
++    await expect(input).toBeFocused();
++
++    await incrementCounter(page);
++
++    await expect(input).toHaveValue("1");
++  });
++});

@@ -1,0 +1,118 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 0d35561328..2d495c861c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,8 @@
+ # Changelog
+ 
++## Unreleased
++- POTENTIALLY BREAKING Bug Fix: [Validate variable usage in nested input arguments](https://github.com/absinthe-graphql/absinthe/pull/1290).This could break incoming documents previously considered valid. Skip the Absinthe.Phase.Document.Arguments.VariableTypesMatch phase to avoid this check. See Absinthe.Pipeline on adjusting the document pipeline.
++
+ ## 1.7.6
+ 
+ - Bugfix: [Handle non_null(list_of(:thing)) with null list elements properly](https://github.com/absinthe-graphql/absinthe/pull/1259)
+diff --git a/lib/absinthe/phase/document/arguments/variable_types_match.ex b/lib/absinthe/phase/document/arguments/variable_types_match.ex
+index 2ba712e427..5b6638f54e 100644
+--- a/lib/absinthe/phase/document/arguments/variable_types_match.ex
++++ b/lib/absinthe/phase/document/arguments/variable_types_match.ex
+@@ -59,6 +59,18 @@ defmodule Absinthe.Phase.Document.Arguments.VariableTypesMatch do
+     {:halt, node}
+   end
+ 
++  defp check_variable_type(
++         %Absinthe.Blueprint.Input.Field{
++           input_value: %Blueprint.Input.Value{
++             raw: %{content: %Blueprint.Input.Variable{} = variable}
++           }
++         } = node,
++         operation_name,
++         variable_defs
++       ) do
++    compare_variable_with_definition(variable, node, operation_name, variable_defs)
++  end
++
+   defp check_variable_type(
+          %Absinthe.Blueprint.Input.Argument{
+            input_value: %Blueprint.Input.Value{
+@@ -68,6 +80,14 @@ defmodule Absinthe.Phase.Document.Arguments.VariableTypesMatch do
+          operation_name,
+          variable_defs
+        ) do
++    compare_variable_with_definition(variable, node, operation_name, variable_defs)
++  end
++
++  defp check_variable_type(node, _, _) do
++    node
++  end
++
++  defp compare_variable_with_definition(variable, node, operation_name, variable_defs) do
+     location_type = node.input_value.schema_node
+     location_definition = node.schema_node
+ 
+@@ -95,10 +115,6 @@ defmodule Absinthe.Phase.Document.Arguments.VariableTypesMatch do
+     end
+   end
+ 
+-  defp check_variable_type(node, _, _) do
+-    node
+-  end
+-
+   def types_compatible?(type, type, _, _) do
+     true
+   end
+diff --git a/test/absinthe/execution/arguments/input_object_test.exs b/test/absinthe/execution/arguments/input_object_test.exs
+index 882cffef0c..c194b43246 100644
+--- a/test/absinthe/execution/arguments/input_object_test.exs
++++ b/test/absinthe/execution/arguments/input_object_test.exs
+@@ -32,7 +32,7 @@ defmodule Absinthe.Execution.Arguments.InputObjectTest do
+   end
+ 
+   @graphql """
+-  query ($email: String) {
++  query ($email: String!) {
+     contacts(contacts: [{email: $email}, {email: $email}])
+   }
+   """
+@@ -67,7 +67,7 @@ defmodule Absinthe.Execution.Arguments.InputObjectTest do
+   end
+ 
+   @graphql """
+-  query ($email: String, $defaultWithString: String) {
++  query ($email: String!, $defaultWithString: String) {
+     user(contact: {email: $email, defaultWithString: $defaultWithString})
+   }
+   """
+diff --git a/test/absinthe/integration/execution/input_object_test.exs b/test/absinthe/integration/execution/input_object_test.exs
+index 2bd1b7ae75..51d1b08ae5 100644
+--- a/test/absinthe/integration/execution/input_object_test.exs
++++ b/test/absinthe/integration/execution/input_object_test.exs
+@@ -43,4 +43,29 @@ defmodule Elixir.Absinthe.Integration.Execution.InputObjectTest do
+                variables: %{"input" => true}
+              )
+   end
++
++  @query """
++  mutation ($input: String) {
++    updateThing(id: "foo", thing: {value: $input}) {
++      name
++      value
++    }
++  }
++  """
++
++  test "errors if an invalid type is passed to nested arg" do
++    assert {:ok,
++            %{
++              errors: [
++                %{
++                  locations: [%{column: 41, line: 2}],
++                  message:
++                    "Variable `$input` of type `String` found as input to argument of type `Int`."
++                }
++              ]
++            }} ==
++             Absinthe.run(@query, Absinthe.Fixtures.Things.MacroSchema,
++               variables: %{"input" => 1}
++             )
++  end
+ end

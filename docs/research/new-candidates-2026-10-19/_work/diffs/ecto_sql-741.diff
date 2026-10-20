@@ -1,0 +1,306 @@
+diff --git a/lib/ecto/adapters/myxql/connection.ex b/lib/ecto/adapters/myxql/connection.ex
+index 833c6d35..97402138 100644
+--- a/lib/ecto/adapters/myxql/connection.ex
++++ b/lib/ecto/adapters/myxql/connection.ex
+@@ -27,6 +27,12 @@ if Code.ensure_loaded?(MyXQL) do
+       MyXQL.query(conn, sql, params, opts)
+     end
+ 
++    @impl true
++    def read_only_transaction(conn, opts, fun) do
++      {:ok, _} = query(conn, "SET TRANSACTION READ ONLY", [], log: opts[:log])
++      DBConnection.transaction(conn, fun, opts)
++    end
++
+     @impl true
+     def query_many(conn, sql, params, opts) do
+       ensure_list_params!(params)
+diff --git a/lib/ecto/adapters/postgres/connection.ex b/lib/ecto/adapters/postgres/connection.ex
+index b6398531..769bcfbb 100644
+--- a/lib/ecto/adapters/postgres/connection.ex
++++ b/lib/ecto/adapters/postgres/connection.ex
+@@ -131,6 +131,18 @@ if Code.ensure_loaded?(Postgrex) do
+       Postgrex.query(conn, sql, params, opts)
+     end
+ 
++    @impl true
++    def read_only_transaction(conn, opts, fun) do
++      DBConnection.transaction(
++        conn,
++        fn transaction_conn ->
++          {:ok, _} = query(transaction_conn, "SET TRANSACTION READ ONLY", [], log: opts[:log])
++          fun.(transaction_conn)
++        end,
++        opts
++      )
++    end
++
+     @impl true
+     def query_many(_conn, _sql, _params, _opts) do
+       raise RuntimeError, "query_many is not supported in the PostgreSQL adapter"
+diff --git a/lib/ecto/adapters/sql.ex b/lib/ecto/adapters/sql.ex
+index 4ae24c14..4dac125c 100644
+--- a/lib/ecto/adapters/sql.ex
++++ b/lib/ecto/adapters/sql.ex
+@@ -281,6 +281,11 @@ defmodule Ecto.Adapters.SQL do
+         Ecto.Adapters.SQL.transaction(meta, opts, fun)
+       end
+ 
++      @doc false
++      def read_only_transaction(repo, opts, fun) do
++        Ecto.Adapters.SQL.read_only_transaction(Ecto.Adapter.lookup_meta(repo), @conn, opts, fun)
++      end
++
+       @impl true
+       def in_transaction?(meta) do
+         Ecto.Adapters.SQL.in_transaction?(meta)
+@@ -1468,6 +1473,34 @@ defmodule Ecto.Adapters.SQL do
+ 
+   ## Connection helpers
+ 
++  @doc false
++  def read_only_transaction(adapter_meta, connection, opts, callback) do
++    %{pid: pool, telemetry: telemetry, opts: default_opts, log_stacktrace_mfa: log_stacktrace_mfa} =
++      adapter_meta
++
++    opts = with_log(telemetry, log_stacktrace_mfa, [], opts ++ default_opts)
++
++    callback = fn transaction_conn ->
++      previous_conn = put_conn(pool, transaction_conn)
++
++      try do
++        callback.()
++      after
++        reset_conn(pool, previous_conn)
++      end
++    end
++
++    if function_exported?(connection, :read_only_transaction, 3) do
++      DBConnection.run(
++        get_conn_or_pool(pool, adapter_meta),
++        &connection.read_only_transaction(&1, opts, callback),
++        opts
++      )
++    else
++      raise ArgumentError, "read-only transactions are not supported by #{inspect(connection)}"
++    end
++  end
++
+   defp checkout_or_transaction(fun, adapter_meta, opts, callback) do
+     %{pid: pool, telemetry: telemetry, opts: default_opts, log_stacktrace_mfa: log_stacktrace_mfa} =
+       adapter_meta
+diff --git a/lib/ecto/adapters/sql/connection.ex b/lib/ecto/adapters/sql/connection.ex
+index 19eee158..89a571f3 100644
+--- a/lib/ecto/adapters/sql/connection.ex
++++ b/lib/ecto/adapters/sql/connection.ex
+@@ -45,6 +45,15 @@ defmodule Ecto.Adapters.SQL.Connection do
+   @callback query_many(connection, statement, params, options :: Keyword.t()) ::
+               {:ok, term} | {:error, Exception.t()}
+ 
++  @doc """
++  Runs the given function inside a read-only transaction.
++  """
++  @callback read_only_transaction(connection, options :: Keyword.t(), (connection -> result)) ::
++              {:ok, result} | {:error, term()}
++            when result: var
++
++  @optional_callbacks read_only_transaction: 3
++
+   @doc """
+   Returns a stream that prepares and executes the given query with
+   `DBConnection`.
+diff --git a/lib/mix/tasks/ecto.query.ex b/lib/mix/tasks/ecto.query.ex
+index 1739a398..b294997b 100644
+--- a/lib/mix/tasks/ecto.query.ex
++++ b/lib/mix/tasks/ecto.query.ex
+@@ -145,35 +145,6 @@ defmodule Mix.Tasks.Ecto.Query do
+   defp alias?({:alias, _, [_aliases, _opts]}), do: true
+   defp alias?(_), do: false
+ 
+-  defp read_only_transaction(repo, fun) do
+-    do_read_only_transaction(repo.__adapter__(), repo, fun)
+-  end
+-
+-  defp do_read_only_transaction(Ecto.Adapters.Postgres, repo, fun) do
+-    repo.transaction(fn ->
+-      repo.query!("SET TRANSACTION READ ONLY", [], log: false)
+-      fun.()
+-    end)
+-  end
+-
+-  defp do_read_only_transaction(Ecto.Adapters.MyXQL, repo, fun) do
+-    repo.checkout(fn ->
+-      repo.query!("START TRANSACTION READ ONLY", [], log: false)
+-
+-      try do
+-        {:ok, fun.()}
+-      after
+-        repo.query!("ROLLBACK", [], log: false)
+-      end
+-    end)
+-  end
+-
+-  defp do_read_only_transaction(adapter, _repo, _fun) do
+-    Mix.raise(
+-      "ecto.query requires read-only transactions, which are not supported by #{inspect(adapter)}"
+-    )
+-  end
+-
+   defp format_sql(repo, query) do
+     {sql, params} = repo.to_sql(:all, query)
+ 
+@@ -186,6 +157,10 @@ defmodule Mix.Tasks.Ecto.Query do
+     """
+   end
+ 
++  defp read_only_transaction(repo, fun) do
++    repo.__adapter__().read_only_transaction(repo.get_dynamic_repo(), [], fun)
++  end
++
+   defp inspect_entries(entries) do
+     previous_fun = Inspect.Opts.default_inspect_fun()
+ 
+diff --git a/test/mix/tasks/ecto.query_test.exs b/test/mix/tasks/ecto.query_test.exs
+index aa49f729..7ca1e671 100644
+--- a/test/mix/tasks/ecto.query_test.exs
++++ b/test/mix/tasks/ecto.query_test.exs
+@@ -52,9 +52,7 @@ defmodule Mix.Tasks.Ecto.QueryTest do
+ 
+       run(["-r", to_string(__MODULE__.PostgresRepo), "from(p in Post)"])
+ 
+-      assert_received {:transaction, __MODULE__.PostgresRepo, _fun}
+-      assert_received {:query!, "SET TRANSACTION READ ONLY", [], opts}
+-      assert opts[:log] == false
++      assert_received {:read_only_transaction, __MODULE__.PostgresRepo, _fun, []}
+       assert_received {:all, %Ecto.Query{}}
+       assert_received {:mix_shell, :info, [output]}
+ 
+@@ -78,7 +76,7 @@ defmodule Mix.Tasks.Ecto.QueryTest do
+ 
+       run(["from(p in Post)"])
+ 
+-      assert_received {:query!, "SET TRANSACTION READ ONLY", [], _opts}
++      assert_received {:read_only_transaction, __MODULE__.PostgresRepo, _fun, []}
+     end)
+   end
+ 
+@@ -196,7 +194,7 @@ defmodule Mix.Tasks.Ecto.QueryTest do
+ 
+       assert_received {:to_sql, :all, %Ecto.Query{}, []}
+       refute_received {:all, _query}
+-      refute_received {:query!, "SET TRANSACTION READ ONLY", [], _opts}
++      refute_received {:read_only_transaction, __MODULE__.PostgresRepo, _fun, _opts}
+       assert_received {:mix_shell, :info, [output]}
+ 
+       assert output =~ ~s[SQL:\nSELECT p0."id" FROM "posts" AS p0 WHERE (p0."id" = $1)]
+@@ -204,17 +202,13 @@ defmodule Mix.Tasks.Ecto.QueryTest do
+     end)
+   end
+ 
+-  test "starts MySQL read-only transactions explicitly" do
++  test "runs MySQL queries in a read-only transaction" do
+     Process.put(:test_repo_all_results, [[1, "first", "hunter2"]])
+ 
+     run(["-r", to_string(__MODULE__.MyXQLRepo), inspect(Post)])
+ 
+-    assert_received {:checkout, __MODULE__.MyXQLRepo}
+-    assert_received {:myxql_query!, "START TRANSACTION READ ONLY", [], opts}
+-    assert opts[:log] == false
++    assert_received {:myxql_read_only_transaction, __MODULE__.MyXQLRepo, _fun, []}
+     assert_received {:myxql_all, %Ecto.Query{}}
+-    assert_received {:myxql_query!, "ROLLBACK", [], rollback_opts}
+-    assert rollback_opts[:log] == false
+     assert_received {:mix_shell, :info, [output]}
+     assert output =~ ~s(title: "first")
+   end
+@@ -224,9 +218,7 @@ defmodule Mix.Tasks.Ecto.QueryTest do
+ 
+     run(["-r", to_string(__MODULE__.MyXQLRepo), "--sql", inspect(Post)])
+ 
+-    refute_received {:checkout, __MODULE__.MyXQLRepo}
+-    refute_received {:myxql_query!, "START TRANSACTION READ ONLY", [], _opts}
+-    refute_received {:myxql_query!, "ROLLBACK", [], _opts}
++    refute_received {:myxql_read_only_transaction, __MODULE__.MyXQLRepo, _fun, _opts}
+     assert_received {:myxql_to_sql, :all, %Ecto.Query{}, []}
+     assert_received {:mix_shell, :info, [output]}
+     assert output =~ ~s[SQL:\nSELECT p0.`id` FROM `posts` AS p0]
+@@ -278,20 +270,30 @@ defmodule Mix.Tasks.Ecto.QueryTest do
+   end
+ 
+   test "raises when the adapter does not support read-only transactions" do
+-    assert_raise Mix.Error, ~r/read-only transactions.*Ecto.Adapters.Tds/s, fn ->
++    assert_raise ArgumentError, ~r/read-only transactions are not supported/, fn ->
+       run(["-r", to_string(__MODULE__.NoReadOnlyRepo), inspect(Post)])
+     end
+   end
+ 
+   defmodule NoReadOnlyRepo do
+-    def __adapter__, do: Ecto.Adapters.Tds
++    def __adapter__, do: Mix.Tasks.Ecto.QueryTest.NoReadOnlyAdapter
++
++    def get_dynamic_repo, do: __MODULE__
++  end
++
++  defmodule NoReadOnlyAdapter do
++    def read_only_transaction(_repo, _opts, _fun) do
++      raise ArgumentError, "read-only transactions are not supported"
++    end
+   end
+ 
+   defmodule PostgresRepo do
+-    def __adapter__, do: Ecto.Adapters.Postgres
++    def __adapter__, do: Mix.Tasks.Ecto.QueryTest.PostgresAdapter
++
++    def get_dynamic_repo, do: __MODULE__
+ 
+-    def transaction(fun, _opts \\ []) do
+-      send(self(), {:transaction, __MODULE__, fun})
++    def transaction(fun, opts \\ []) do
++      send(self(), {:transaction, __MODULE__, fun, opts})
+       {:ok, fun.()}
+     end
+ 
+@@ -323,17 +325,21 @@ defmodule Mix.Tasks.Ecto.QueryTest do
+     end
+   end
+ 
++  defmodule PostgresAdapter do
++    def read_only_transaction(repo, opts, fun) do
++      send(self(), {:read_only_transaction, repo, fun, opts})
++      {:ok, fun.()}
++    end
++  end
++
+   defmodule MyXQLRepo do
+-    def __adapter__, do: Ecto.Adapters.MyXQL
++    def __adapter__, do: Mix.Tasks.Ecto.QueryTest.MyXQLAdapter
+ 
+-    def checkout(fun, _opts \\ []) do
+-      send(test_process(), {:checkout, __MODULE__})
+-      fun.()
+-    end
++    def get_dynamic_repo, do: __MODULE__
+ 
+-    def query!(sql, params \\ [], opts \\ []) do
+-      send(test_process(), {:myxql_query!, sql, params, opts})
+-      %{rows: [], num_rows: 0}
++    def transaction(fun, opts \\ []) do
++      send(test_process(), {:myxql_transaction, __MODULE__, fun, opts})
++      {:ok, fun.()}
+     end
+ 
+     def all(query) do
+@@ -356,6 +362,13 @@ defmodule Mix.Tasks.Ecto.QueryTest do
+     end
+   end
+ 
++  defmodule MyXQLAdapter do
++    def read_only_transaction(repo, opts, fun) do
++      send(self(), {:myxql_read_only_transaction, repo, fun, opts})
++      {:ok, fun.()}
++    end
++  end
++
+   @tmp_path Path.expand("../../../tmp", __DIR__)
+ 
+   defp in_tmp(path, fun) do

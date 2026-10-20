@@ -1,0 +1,180 @@
+diff --git a/lib/mydia/application.ex b/lib/mydia/application.ex
+index 06ba20add..6539ac52a 100644
+--- a/lib/mydia/application.ex
++++ b/lib/mydia/application.ex
+@@ -66,6 +66,9 @@ defmodule Mydia.Application do
+       Mydia.Plugins.register_plugins()
+       # Ensure default quality profiles exist (skip in test environment)
+       if Application.get_env(:mydia, :start_health_monitors, true) do
++        # First health checks, deferred until the adapters above exist.
++        Mydia.Downloads.ClientHealth.refresh_all_clients()
++        Mydia.Indexers.Health.refresh_all_indexers()
+         ensure_default_quality_profiles()
+         validate_library_paths()
+         # Sync library paths and populate relative paths for media files
+diff --git a/lib/mydia/downloads/client_health.ex b/lib/mydia/downloads/client_health.ex
+index ee1f1a523..f38ebd0ae 100644
+--- a/lib/mydia/downloads/client_health.ex
++++ b/lib/mydia/downloads/client_health.ex
+@@ -130,12 +130,11 @@ defmodule Mydia.Downloads.ClientHealth do
+     # Register as health check provider
+     Health.register_provider(:download_client, __MODULE__)
+ 
+-    # Schedule periodic health checks
++    # Schedule periodic health checks. The first check is not run here: init
++    # happens before Mydia.Application registers the client adapters.
++    # Mydia.Application calls refresh_all_clients/0 once they are registered.
+     schedule_health_check()
+ 
+-    # Perform initial health check
+-    perform_all_health_checks()
+-
+     {:ok, %{}}
+   end
+ 
+diff --git a/lib/mydia/indexers/health.ex b/lib/mydia/indexers/health.ex
+index 685a4df85..edca80c8c 100644
+--- a/lib/mydia/indexers/health.ex
++++ b/lib/mydia/indexers/health.ex
+@@ -163,12 +163,12 @@ defmodule Mydia.Indexers.Health do
+     # Register as health check provider
+     Health.register_provider(:indexer, __MODULE__)
+ 
+-    # Schedule periodic health checks
++    # Schedule periodic health checks. The first check is not run here: init
++    # happens inside the supervisor's start, before Mydia.Application registers
++    # the indexer adapters, so every indexer would fail as an unknown type.
++    # Mydia.Application calls refresh_all_indexers/0 once they are registered.
+     schedule_health_check()
+ 
+-    # Perform initial health check
+-    perform_all_health_checks()
+-
+     Logger.info("Indexer health monitoring started")
+     {:ok, %{}}
+   end
+diff --git a/lib/mydia/plugins/notifier/delivery.ex b/lib/mydia/plugins/notifier/delivery.ex
+index 9d9fd475d..d030122fe 100644
+--- a/lib/mydia/plugins/notifier/delivery.ex
++++ b/lib/mydia/plugins/notifier/delivery.ex
+@@ -61,8 +61,23 @@ defmodule Mydia.Plugins.Notifier.Delivery do
+   end
+ 
+   defp deliver(slug, instance, payload) do
+-    full_payload = Map.put(payload, "config", Instances.config_for(instance))
++    config = Instances.config_for(instance)
+ 
++    if webhook_configured?(config) do
++      call_guest(slug, instance, Map.put(payload, "config", config))
++    else
++      # An enabled instance nobody has pointed anywhere yet. Retrying cannot
++      # change that, so cancel instead of failing every event five times.
++      {:cancel, "no webhook_url configured"}
++    end
++  end
++
++  defp webhook_configured?(%{"webhook_url" => url}) when is_binary(url),
++    do: String.trim(url) != ""
++
++  defp webhook_configured?(_config), do: false
++
++  defp call_guest(slug, instance, full_payload) do
+     case Host.call(slug, "handle", full_payload, instance_id: instance.id) do
+       {:ok, %{"delivered" => true}} ->
+         :ok
+diff --git a/lib/mydia_web/live/dashboard_live/index.ex b/lib/mydia_web/live/dashboard_live/index.ex
+index b829aa175..8f2c1832b 100644
+--- a/lib/mydia_web/live/dashboard_live/index.ex
++++ b/lib/mydia_web/live/dashboard_live/index.ex
+@@ -665,12 +665,12 @@ defmodule MydiaWeb.DashboardLive.Index do
+     end
+   end
+ 
+-  # Grab outcomes are broadcast on the "downloads" topic and handled by
+-  # MediaLive.Show, which owns the manual-search UI. Ignore them quietly here
+-  # so the catch-all below keeps meaning "genuinely unexpected message".
+-  def handle_info({:grab_completed, _payload}, socket), do: {:noreply, socket}
+-  def handle_info({:grab_failed, _payload}, socket), do: {:noreply, socket}
+-  def handle_info({:grab_duplicate, _payload}, socket), do: {:noreply, socket}
++  # "downloads" events other LiveViews own; ignored so the catch-all means "unexpected".
++  def handle_info({event, _payload}, socket)
++      when event in [:grab_completed, :grab_failed, :grab_duplicate],
++      do: {:noreply, socket}
++
++  def handle_info(:external_scan_updated, socket), do: {:noreply, socket}
+ 
+   @impl true
+   def handle_info(:refresh_health, socket) do
+diff --git a/test/mydia/indexers/health_test.exs b/test/mydia/indexers/health_test.exs
+index 82b5f5b8a..71b5d4a73 100644
+--- a/test/mydia/indexers/health_test.exs
++++ b/test/mydia/indexers/health_test.exs
+@@ -53,6 +53,46 @@ defmodule Mydia.Indexers.HealthTest do
+     end
+   end
+ 
++  describe "startup" do
++    # init/1 runs before Mydia.Application registers the indexer adapters, so a
++    # probe from there fails every indexer as an unknown type on every boot.
++    test "starting the monitor does not probe; refresh_all_indexers/0 does" do
++      bypass = Bypass.open()
++      test_pid = self()
++
++      Bypass.stub(bypass, "GET", "/api/v1/system/status", fn conn ->
++        send(test_pid, :probed)
++        Plug.Conn.resp(conn, 500, "")
++      end)
++
++      {:ok, indexer} =
++        Settings.create_indexer_config(%{
++          name: "Startup Prowlarr",
++          type: :prowlarr,
++          base_url: "http://localhost:#{bypass.port}",
++          api_key: "key",
++          enabled: true
++        })
++
++      start_supervised!(Health)
++      refute_receive :probed, 300
++
++      Health.refresh_all_indexers()
++      assert_receive :probed, 2_000
++
++      # Let the probe task finish before the monitor (and its ETS tables) stops.
++      assert wait_until(fn -> Health.status_map([indexer])[indexer.id].status != :unknown end)
++    end
++
++    defp wait_until(fun, attempts \\ 40) do
++      cond do
++        fun.() -> true
++        attempts == 0 -> false
++        true -> Process.sleep(50) && wait_until(fun, attempts - 1)
++      end
++    end
++  end
++
+   describe "paused Prowlarr indexers" do
+     test "a healthy Prowlarr check carries the paused list in details" do
+       start_supervised!(Health)
+diff --git a/test/mydia/plugins/notifier/delivery_test.exs b/test/mydia/plugins/notifier/delivery_test.exs
+index 30c1ab9c8..5cc66407c 100644
+--- a/test/mydia/plugins/notifier/delivery_test.exs
++++ b/test/mydia/plugins/notifier/delivery_test.exs
+@@ -160,6 +160,17 @@ defmodule Mydia.Plugins.Notifier.DeliveryTest do
+     assert {:error, _} = Delivery.perform(job(added_payload(item)))
+   end
+ 
++  # An enabled instance with no URL is a configuration state, not a delivery
++  # failure: retrying cannot fix it, so the job is cancelled on the first try.
++  for blank <- [nil, "", "   "] do
++    test "cancels without retrying when webhook_url is #{inspect(blank)}", %{bypass: bypass} do
++      start_notifier!(bypass, settings: %{"webhook_url" => unquote(blank)})
++      item = media_item_fixture()
++
++      assert {:cancel, "no webhook_url configured"} = Delivery.perform(job(added_payload(item)))
++    end
++  end
++
+   test "AE2: a webhook host that is not on the grant is blocked by the gate", %{bypass: bypass} do
+     # Granted discord.com, but the configured webhook points at webhook.test.
+     start_notifier!(bypass, granted_host: "discord.com", webhook_host: "webhook.test")

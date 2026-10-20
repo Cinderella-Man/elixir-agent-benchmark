@@ -1,0 +1,191 @@
+diff --git a/lib/cachex/router.ex b/lib/cachex/router.ex
+index 3890d460..84545267 100644
+--- a/lib/cachex/router.ex
++++ b/lib/cachex/router.ex
+@@ -27,17 +27,17 @@ defmodule Cachex.Router do
+ 
+   Please see all child implementations for supported options.
+   """
+-  @callback init(cache :: Cachex.t(), options :: Keyword.t()) :: any
++  @callback init(cache :: Cachex.t(), options :: Keyword.t()) :: any()
+ 
+   @doc """
+   Retrieve the list of nodes from a routing state.
+   """
+-  @callback nodes(state :: any) :: [atom]
++  @callback nodes(state :: any()) :: [atom()]
+ 
+   @doc """
+   Route a key to a node in a routing state.
+   """
+-  @callback route(state :: any, key :: any) :: atom
++  @callback route(state :: any(), key :: any()) :: atom()
+ 
+   @doc """
+   Create a child specification to back a routing state.
+@@ -74,14 +74,14 @@ defmodule Cachex.Router do
+   @doc """
+   Retrieve all currently connected nodes (including this one).
+   """
+-  @spec connected() :: [atom]
++  @spec connected() :: [atom()]
+   def connected(),
+     do: [node() | :erlang.nodes(:connected)]
+ 
+   @doc """
+   Retrieve all routable nodes for a cache.
+   """
+-  @spec nodes(cache :: Cachex.t()) :: {:ok, [atom]}
++  @spec nodes(cache :: Cachex.t()) :: {:ok, [atom()]}
+   def nodes(cache(router: router(module: module, state: state))),
+     do: {:ok, module.nodes(state)}
+ 
+@@ -89,7 +89,7 @@ defmodule Cachex.Router do
+   Executes a previously dispatched action..
+   """
+   # The first match short circuits local-only caches
+-  @spec route(Cachex.t(), atom, {atom, [any]}) :: any
++  @spec route(Cachex.t(), atom(), {atom(), [any()]}) :: any()
+   def route(cache(router: router(module: Router.Local)) = cache, module, call),
+     do: route_local(cache, module, call)
+ 
+diff --git a/lib/cachex/router/jump.ex b/lib/cachex/router/jump.ex
+index 240088b1..e00c23f6 100644
+--- a/lib/cachex/router/jump.ex
++++ b/lib/cachex/router/jump.ex
+@@ -29,7 +29,7 @@ defmodule Cachex.Router.Jump do
+       by using `Node.self/0` and `Node.list/1`.
+ 
+   """
+-  @spec init(cache :: Cachex.t(), options :: Keyword.t()) :: [atom]
++  @spec init(cache :: Cachex.t(), options :: Keyword.t()) :: [atom()]
+   def init(_cache, options) do
+     options
+     |> Keyword.get_lazy(:nodes, &Router.connected/0)
+@@ -40,14 +40,14 @@ defmodule Cachex.Router.Jump do
+   @doc """
+   Retrieve the list of nodes from a jump hash routing state.
+   """
+-  @spec nodes(nodes :: [atom]) :: [atom]
++  @spec nodes(nodes :: [atom()]) :: [atom()]
+   def nodes(nodes),
+     do: nodes
+ 
+   @doc """
+   Route a key to a node in a jump hash routing state.
+   """
+-  @spec route(nodes :: [atom], key :: any) :: atom
++  @spec route(nodes :: [atom()], key :: any) :: atom()
+   def route(nodes, key) do
+     slot =
+       key
+diff --git a/lib/cachex/router/local.ex b/lib/cachex/router/local.ex
+index fa012b4f..bf74033a 100644
+--- a/lib/cachex/router/local.ex
++++ b/lib/cachex/router/local.ex
+@@ -10,14 +10,14 @@ defmodule Cachex.Router.Local do
+   @doc """
+   Retrieve the list of nodes from a local routing state.
+   """
+-  @spec nodes(state :: nil) :: [atom]
++  @spec nodes(state :: nil) :: [atom()]
+   def nodes(_state),
+     do: [node()]
+ 
+   @doc """
+   Route a key to a node in a local routing state.
+   """
+-  @spec route(state :: nil, key :: any) :: atom
++  @spec route(state :: nil, key :: any()) :: atom()
+   def route(_state, _key),
+     do: node()
+ end
+diff --git a/lib/cachex/router/mod.ex b/lib/cachex/router/mod.ex
+index 0539b454..f040697c 100644
+--- a/lib/cachex/router/mod.ex
++++ b/lib/cachex/router/mod.ex
+@@ -26,7 +26,7 @@ defmodule Cachex.Router.Mod do
+       by using `Node.self/0` and `Node.list/1`.
+ 
+   """
+-  @spec init(cache :: Cachex.t(), options :: Keyword.t()) :: [atom]
++  @spec init(cache :: Cachex.t(), options :: Keyword.t()) :: [atom()]
+   def init(_cache, options) do
+     options
+     |> Keyword.get_lazy(:nodes, &Router.connected/0)
+@@ -37,14 +37,14 @@ defmodule Cachex.Router.Mod do
+   @doc """
+   Retrieve the list of nodes from a modulo routing state.
+   """
+-  @spec nodes(nodes :: [atom]) :: [atom]
++  @spec nodes(nodes :: [atom()]) :: [atom()]
+   def nodes(nodes),
+     do: Enum.sort(nodes)
+ 
+   @doc """
+   Route a key to a node in a modulo routing state.
+   """
+-  @spec route(nodes :: [atom], key :: any) :: atom
++  @spec route(nodes :: [atom()], key :: any()) :: atom()
+   def route(nodes, key) do
+     slot =
+       key
+diff --git a/lib/cachex/router/ring.ex b/lib/cachex/router/ring.ex
+index 6b9e8ac6..5af6a398 100644
+--- a/lib/cachex/router/ring.ex
++++ b/lib/cachex/router/ring.ex
+@@ -66,7 +66,7 @@ defmodule Cachex.Router.Ring do
+   @doc """
+   Retrieve the list of nodes from a ring routing state.
+   """
+-  @spec nodes(ring :: Ring.t()) :: {:ok, [atom]}
++  @spec nodes(ring :: Ring.t()) :: {:ok, [atom()]}
+   def nodes(ring) do
+     with {:ok, nodes} <- Ring.get_nodes(ring) do
+       nodes
+@@ -76,8 +76,14 @@ defmodule Cachex.Router.Ring do
+   @doc """
+   Route a key to a node in a ring routing state.
+   """
+-  @spec route(ring :: Ring.t(), key :: any) :: {:ok, atom}
++  @spec route(ring :: Ring.t(), key :: any()) :: {:ok, atom()}
+   def route(ring, key) do
++    key =
++      case String.Chars.impl_for(key) do
++        nil -> :erlang.term_to_binary(key)
++        _na -> key
++      end
++
+     with {:ok, node} <- Ring.find_node(ring, key) do
+       node
+     end
+diff --git a/test/cachex/router/ring_test.exs b/test/cachex/router/ring_test.exs
+index 390c820a..4aada21b 100644
+--- a/test/cachex/router/ring_test.exs
++++ b/test/cachex/router/ring_test.exs
+@@ -20,6 +20,25 @@ defmodule Cachex.Router.RingTest do
+     assert Cachex.Router.Ring.route(state, "erlang") in nodes
+   end
+ 
++  test "routing keys via a ring router with no protocol" do
++    # create a test cache cluster for nodes
++    {cache, nodes, _cluster} =
++      TestUtils.create_cache_cluster(3,
++        router: Cachex.Router.Ring
++      )
++
++    # convert the name to a cache and sort
++    cache = Services.Overseer.lookup(cache)
++
++    # fetch the router state after initialize
++    cache(router: router(state: state)) = cache
++
++    # test that we can route to expected nodes
++    assert Cachex.Router.nodes(cache) == {:ok, nodes}
++    assert Cachex.Router.Ring.route(state, {"elixir"}) in nodes
++    assert Cachex.Router.Ring.route(state, {"erlang"}) in nodes
++  end
++
+   test "routing keys via a ring router with defined nodes" do
+     # create a test cache cluster for nodes
+     {cache, _nodes, _cluster} =

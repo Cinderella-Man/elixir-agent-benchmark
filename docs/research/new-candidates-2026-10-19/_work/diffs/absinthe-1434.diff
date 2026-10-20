@@ -1,0 +1,181 @@
+diff --git a/guides/telemetry.md b/guides/telemetry.md
+index a9c607b878..cdbd44df4b 100644
+--- a/guides/telemetry.md
++++ b/guides/telemetry.md
+@@ -13,7 +13,13 @@ handler function to any of the following event names:
+ - `[:absinthe, :resolve, :field, :stop]` when field resolution finishes
+ - `[:absinthe, :middleware, :batch, :start]` when the batch processing starts
+ - `[:absinthe, :middleware, :batch, :stop]` when the batch processing finishes
+-- `[:absinthe, :middleware, :batch, :timeout]` whe the batch processing times out
++- `[:absinthe, :middleware, :batch, :exception]` when the batch function raises,
++  throws, or exits. The metadata includes `:kind`, `:reason`, and `:stacktrace`
++  in addition to the start metadata. `:stacktrace` may be an empty list when the
++  task is killed externally (no stacktrace is available in that case). The
++  exception is re-raised after the event is emitted, so existing error-handling
++  code is not affected.
++- `[:absinthe, :middleware, :batch, :timeout]` when the batch processing times out
+ 
+ Telemetry handlers are called with `measurements` and `metadata`. For details on
+ what is passed, checkout `Absinthe.Phase.Telemetry`, `Absinthe.Middleware.Telemetry`,
+diff --git a/lib/absinthe/middleware/batch.ex b/lib/absinthe/middleware/batch.ex
+index fe0d116e74..9339a06031 100644
+--- a/lib/absinthe/middleware/batch.ex
++++ b/lib/absinthe/middleware/batch.ex
+@@ -140,7 +140,12 @@ defmodule Absinthe.Middleware.Batch do
+ 
+       task =
+         async(fn ->
+-          {batch_fun, call_batch_fun(batch_fun, batch_data)}
++          try do
++            {:ok, call_batch_fun(batch_fun, batch_data)}
++          catch
++            kind, reason ->
++              {:exception, kind, reason, __STACKTRACE__}
++          end
+         end)
+ 
+       metadata = emit_start_event(system_time, batch_fun, batch_opts, batch_data)
+@@ -153,22 +158,37 @@ defmodule Absinthe.Middleware.Batch do
+   defp yield_batching_result({batch_opts, task, start_time_mono, metadata, batch_fun}) do
+     timeout = Keyword.get(batch_opts, :timeout, 5_000)
+ 
+-    case Task.yield(task, timeout) || Task.shutdown(task) do
+-      {:ok, result} ->
++    case Task.yield(task, timeout) do
++      {:ok, {:ok, batch_result}} ->
+         end_time_mono = System.monotonic_time()
+         duration = end_time_mono - start_time_mono
++        result = {batch_fun, batch_result}
+         emit_stop_event(duration, end_time_mono, metadata, result)
+ 
+         result
+ 
+-      _ ->
++      {:ok, {:exception, kind, reason, stacktrace}} ->
++        end_time_mono = System.monotonic_time()
++        duration = end_time_mono - start_time_mono
++        emit_exception_event(duration, metadata, kind, reason, stacktrace)
++        :erlang.raise(kind, reason, stacktrace)
++
++      nil ->
++        Task.shutdown(task)
+         emit_timeout_event(batch_fun, timeout)
+         exit({:timeout, timeout, batch_fun})
++
++      {:exit, reason} ->
++        end_time_mono = System.monotonic_time()
++        duration = end_time_mono - start_time_mono
++        emit_exception_event(duration, metadata, :exit, reason, [])
++        exit(reason)
+     end
+   end
+ 
+   @batch_start [:absinthe, :middleware, :batch, :start]
+   @batch_stop [:absinthe, :middleware, :batch, :stop]
++  @batch_exception [:absinthe, :middleware, :batch, :exception]
+   @batch_timeout [:absinthe, :middleware, :batch, :timeout]
+   defp emit_start_event(system_time, batch_fun, batch_opts, batch_data) do
+     id = :erlang.unique_integer()
+@@ -198,6 +218,17 @@ defmodule Absinthe.Middleware.Batch do
+     )
+   end
+ 
++  defp emit_exception_event(duration, metadata, kind, reason, stacktrace) do
++    :telemetry.execute(
++      @batch_exception,
++      %{duration: duration},
++      metadata
++      |> Map.put(:kind, kind)
++      |> Map.put(:reason, reason)
++      |> Map.put(:stacktrace, stacktrace)
++    )
++  end
++
+   defp emit_timeout_event(batch_fun, timeout) do
+     metadata = %{
+       fn: inspect(batch_fun),
+diff --git a/test/absinthe/middleware/batch_test.exs b/test/absinthe/middleware/batch_test.exs
+index 20ad3bd3e3..3e4990862c 100644
+--- a/test/absinthe/middleware/batch_test.exs
++++ b/test/absinthe/middleware/batch_test.exs
+@@ -7,6 +7,12 @@ defmodule Absinthe.Middleware.BatchTest do
+     end
+   end
+ 
++  defmodule RaisingModule do
++    def boom(_, _) do
++      raise "kaboom"
++    end
++  end
++
+   defmodule Schema do
+     use Absinthe.Schema
+ 
+@@ -77,6 +83,16 @@ defmodule Absinthe.Middleware.BatchTest do
+           )
+         end
+       end
++
++      field :raising, :string do
++        resolve fn _, _, _ ->
++          batch(
++            {RaisingModule, :boom},
++            nil,
++            fn batch -> {:ok, batch} end
++          )
++        end
++      end
+     end
+ 
+     def by_id(_, ids) do
+@@ -197,6 +213,50 @@ defmodule Absinthe.Middleware.BatchTest do
+                      }, _}}
+   end
+ 
++  test "when batch function raises it emits an :exception telemetry event", %{test: test} do
++    doc = """
++    {raising}
++    """
++
++    :ok =
++      :telemetry.attach_many(
++        "#{test}",
++        [
++          [:absinthe, :middleware, :batch, :start],
++          [:absinthe, :middleware, :batch, :exception]
++        ],
++        &Absinthe.TestTelemetryHelper.send_to_pid/4,
++        pid: self()
++      )
++
++    on_exit(fn -> :telemetry.detach("#{test}") end)
++
++    pid =
++      spawn(fn ->
++        Absinthe.run(doc, Schema)
++      end)
++
++    wait_for_process_to_exit(pid)
++
++    assert_receive {:telemetry_event,
++                    {[:absinthe, :middleware, :batch, :start], %{system_time: _},
++                     %{id: start_id, batch_fun: {RaisingModule, :boom}}, _}}
++
++    assert_receive {:telemetry_event,
++                    {[:absinthe, :middleware, :batch, :exception], %{duration: duration},
++                     %{
++                       id: stop_id,
++                       batch_fun: {RaisingModule, :boom},
++                       batch_opts: _,
++                       batch_data: _,
++                       kind: :error,
++                       reason: %RuntimeError{message: "kaboom"},
++                       stacktrace: stacktrace
++                     }, _}}
++
++    assert start_id == stop_id
++  end
++
+   defp wait_for_process_to_exit(pid) do
+     :timer.sleep(1)
+     if Process.alive?(pid), do: wait_for_process_to_exit(pid)

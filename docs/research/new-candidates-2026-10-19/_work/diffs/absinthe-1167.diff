@@ -1,0 +1,1391 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 83ba2682d3..d5a99d5ea0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@
+ - Bug Fix: [Add `__private__` field to EnumValueDefinition](https://github.com/absinthe-graphql/absinthe/pull/1148)
+ - Bug Fix: [Fix bug in Schema.**absinthe_types**(:all) for Persistent Term](https://github.com/absinthe-graphql/absinthe/pull/1161)
+ - Bug Fix: [Fix default enum value check for SDL schema's](https://github.com/absinthe-graphql/absinthe/pull/1188)
++- Bug Fix: [Add "Objects must define fields" schema validation](https://github.com/absinthe-graphql/absinthe/pull/1167)
+ - Feature: [Add `import_directives` macro](https://github.com/absinthe-graphql/absinthe/pull/1158)
+ - Feature: [Support type extensions on schema declarations](https://github.com/absinthe-graphql/absinthe/pull/1176)
+ - Bug Fix: [Root objects are marked as referenced correctly](https://github.com/absinthe-graphql/absinthe/pull/1186)
+diff --git a/lib/absinthe/blueprint/schema.ex b/lib/absinthe/blueprint/schema.ex
+index 8f1d7a6b50..d45f7e679d 100644
+--- a/lib/absinthe/blueprint/schema.ex
++++ b/lib/absinthe/blueprint/schema.ex
+@@ -69,12 +69,14 @@ defmodule Absinthe.Blueprint.Schema do
+     build_types(attrs, [bp], [])
+   end
+ 
++  def struct_to_kind(%struct{}), do: struct_to_kind(struct)
+   def struct_to_kind(Blueprint.Schema.DirectiveDefinition), do: "directive"
+   def struct_to_kind(Blueprint.Schema.EnumTypeDefinition), do: "enum type"
+   def struct_to_kind(Blueprint.Schema.EnumValueDefinition), do: "enum value"
+   def struct_to_kind(Blueprint.Schema.FieldDefinition), do: "field"
+   def struct_to_kind(Blueprint.Schema.InputObjectTypeDefinition), do: "input object"
+   def struct_to_kind(Blueprint.Schema.InputValueDefinition), do: "argument"
++  def struct_to_kind(Blueprint.Schema.InterfaceTypeDefinition), do: "interface"
+   def struct_to_kind(Blueprint.Schema.ObjectTypeDefinition), do: "object"
+   def struct_to_kind(Blueprint.Schema.ScalarTypeDefinition), do: "scalar"
+   def struct_to_kind(Blueprint.Schema.UnionTypeDefinition), do: "union"
+diff --git a/lib/absinthe/phase/schema/validation/object_must_define_fields.ex b/lib/absinthe/phase/schema/validation/object_must_define_fields.ex
+new file mode 100644
+index 0000000000..c1e6899bd6
+--- /dev/null
++++ b/lib/absinthe/phase/schema/validation/object_must_define_fields.ex
+@@ -0,0 +1,61 @@
++defmodule Absinthe.Phase.Schema.Validation.ObjectMustDefineFields do
++  @moduledoc false
++
++  use Absinthe.Phase
++  alias Absinthe.Blueprint
++
++  def run(bp, _) do
++    bp = Blueprint.prewalk(bp, &handle_schemas/1)
++    {:ok, bp}
++  end
++
++  defp handle_schemas(%Blueprint.Schema.SchemaDefinition{} = schema) do
++    schema = Blueprint.prewalk(schema, &validate_objects/1)
++    {:halt, schema}
++  end
++
++  defp handle_schemas(obj) do
++    obj
++  end
++
++  defp validate_objects(%struct{} = node)
++       when struct in [
++              Blueprint.Schema.ObjectTypeDefinition,
++              Blueprint.Schema.InterfaceTypeDefinition,
++              Blueprint.Schema.InputObjectTypeDefinition
++            ] do
++    if defines_fields?(node) do
++      node
++    else
++      put_error(node, error(node))
++    end
++  end
++
++  defp validate_objects(node) do
++    node
++  end
++
++  defp defines_fields?(%{fields: []}) do
++    false
++  end
++
++  defp defines_fields?(object) do
++    !Enum.all?(object.fields, &introspection?(&1))
++  end
++
++  defp introspection?(%{name: "__" <> _}), do: true
++  defp introspection?(_), do: false
++
++  defp error(object) do
++    %Absinthe.Phase.Error{
++      message: explanation(object),
++      locations: [object.__reference__.location],
++      phase: __MODULE__
++    }
++  end
++
++  def explanation(object) do
++    kind = Absinthe.Blueprint.Schema.struct_to_kind(object)
++    "The #{kind} type `#{object.identifier}` must define one or more fields."
++  end
++end
+diff --git a/lib/absinthe/pipeline.ex b/lib/absinthe/pipeline.ex
+index dd4b9be3e9..89a22fc59b 100644
+--- a/lib/absinthe/pipeline.ex
++++ b/lib/absinthe/pipeline.ex
+@@ -176,6 +176,7 @@ defmodule Absinthe.Pipeline do
+       Phase.Schema.Directives,
+       Phase.Schema.Validation.DefaultEnumValuePresent,
+       Phase.Schema.Validation.DirectivesMustBeValid,
++      Phase.Schema.Validation.ObjectMustDefineFields,
+       Phase.Schema.Validation.InputOutputTypesCorrectlyPlaced,
+       Phase.Schema.Validation.InterfacesMustResolveTypes,
+       Phase.Schema.Validation.ObjectInterfacesMustBeValid,
+diff --git a/test/absinthe/execution/subscription_test.exs b/test/absinthe/execution/subscription_test.exs
+index eabee18521..28233c0d4b 100644
+--- a/test/absinthe/execution/subscription_test.exs
++++ b/test/absinthe/execution/subscription_test.exs
+@@ -41,7 +41,7 @@ defmodule Absinthe.Execution.SubscriptionTest do
+     use Absinthe.Schema
+ 
+     query do
+-      # Query type must exist
++      field :foo, :string
+     end
+ 
+     object :user do
+diff --git a/test/absinthe/integration/execution/introspection/full_test.exs b/test/absinthe/integration/execution/introspection/full_test.exs
+index 23856c6d41..aa930d119a 100644
+--- a/test/absinthe/integration/execution/introspection/full_test.exs
++++ b/test/absinthe/integration/execution/introspection/full_test.exs
+@@ -16,6 +16,11 @@ defmodule Elixir.Absinthe.Integration.Execution.Introspection.FullTest do
+     use Absinthe.Schema
+ 
+     query do
++      field :foo, :string
++    end
++
++    def middleware(middleware, %{identifier: :foo}, _) do
++      middleware
+     end
+ 
+     def middleware(_, _, _) do
+diff --git a/test/absinthe/phase/schema/reformat_description_test.exs b/test/absinthe/phase/schema/reformat_description_test.exs
+index 9567df3da5..3d946308b0 100644
+--- a/test/absinthe/phase/schema/reformat_description_test.exs
++++ b/test/absinthe/phase/schema/reformat_description_test.exs
+@@ -5,7 +5,7 @@ defmodule Absinthe.Phase.Schema.ReformatDescriptionTest do
+     use Absinthe.Schema
+ 
+     query do
+-      # Must exist
++      field :foo, :string
+     end
+ 
+     object :via_macro do
+diff --git a/test/absinthe/pipeline_test.exs b/test/absinthe/pipeline_test.exs
+index c4ac6e78d4..b4e1aa3c0e 100644
+--- a/test/absinthe/pipeline_test.exs
++++ b/test/absinthe/pipeline_test.exs
+@@ -7,7 +7,7 @@ defmodule Absinthe.PipelineTest do
+     use Absinthe.Schema
+ 
+     query do
+-      # Query type must exist
++      field :foo, :string
+     end
+   end
+ 
+diff --git a/test/absinthe/schema/notation/experimental/import_directives_test.exs b/test/absinthe/schema/notation/experimental/import_directives_test.exs
+index 78ea6f0df5..364c7dcc7b 100644
+--- a/test/absinthe/schema/notation/experimental/import_directives_test.exs
++++ b/test/absinthe/schema/notation/experimental/import_directives_test.exs
+@@ -23,6 +23,7 @@ defmodule Absinthe.Schema.Notation.Experimental.ImportDirectivesTest do
+     use Absinthe.Schema
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     import_directives Source
+@@ -32,6 +33,7 @@ defmodule Absinthe.Schema.Notation.Experimental.ImportDirectivesTest do
+     use Absinthe.Schema
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     import_directives Source, only: [:one, :two]
+@@ -41,12 +43,12 @@ defmodule Absinthe.Schema.Notation.Experimental.ImportDirectivesTest do
+     use Absinthe.Schema
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     import_directives Source, except: [:one, :two]
+   end
+ 
+-  @tag :skip
+   describe "import_directives" do
+     test "without options" do
+       assert [{Source, []}] == imports(WithoutOptions)
+diff --git a/test/absinthe/schema/notation/experimental/import_type_extensions_test.exs b/test/absinthe/schema/notation/experimental/import_type_extensions_test.exs
+index 25d86617de..f7970c2985 100644
+--- a/test/absinthe/schema/notation/experimental/import_type_extensions_test.exs
++++ b/test/absinthe/schema/notation/experimental/import_type_extensions_test.exs
+@@ -23,6 +23,7 @@ defmodule Absinthe.Schema.Notation.Experimental.ImportTypeExtensionsTest do
+     use Absinthe.Schema
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     object :one do
+@@ -41,6 +42,7 @@ defmodule Absinthe.Schema.Notation.Experimental.ImportTypeExtensionsTest do
+     use Absinthe.Schema
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     object :one do
+@@ -50,6 +52,7 @@ defmodule Absinthe.Schema.Notation.Experimental.ImportTypeExtensionsTest do
+     end
+ 
+     object :three do
++      field :foo, :string
+     end
+ 
+     import_type_extensions Source, only: [:one, :two]
+@@ -59,12 +62,15 @@ defmodule Absinthe.Schema.Notation.Experimental.ImportTypeExtensionsTest do
+     use Absinthe.Schema
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     object :one do
++      field :foo, :string
+     end
+ 
+     object :two do
++      field :foo, :string
+     end
+ 
+     object :three do
+@@ -87,14 +93,14 @@ defmodule Absinthe.Schema.Notation.Experimental.ImportTypeExtensionsTest do
+ 
+       assert [%{identifier: :one}] = fields(UsingOnlyOption, :one)
+       assert [%{identifier: :two}] = fields(UsingOnlyOption, :two)
+-      assert [] = fields(UsingOnlyOption, :three)
++      assert [%{identifier: :foo}] = fields(UsingOnlyOption, :three)
+     end
+ 
+     test "with :except" do
+       assert [{Source, except: [:one, :two]}] == imports(UsingExceptOption)
+ 
+-      assert [] = fields(UsingExceptOption, :one)
+-      assert [] = fields(UsingExceptOption, :two)
++      assert [%{identifier: :foo}] = fields(UsingExceptOption, :one)
++      assert [%{identifier: :foo}] = fields(UsingExceptOption, :two)
+       assert [%{identifier: :three}] = fields(UsingExceptOption, :three)
+     end
+   end
+diff --git a/test/absinthe/schema/notation/experimental/import_types_test.exs b/test/absinthe/schema/notation/experimental/import_types_test.exs
+index 6229d9ccc5..51ee507d6f 100644
+--- a/test/absinthe/schema/notation/experimental/import_types_test.exs
++++ b/test/absinthe/schema/notation/experimental/import_types_test.exs
+@@ -7,12 +7,15 @@ defmodule Absinthe.Schema.Notation.Experimental.ImportTypesTest do
+     use Absinthe.Schema.Notation
+ 
+     object :one do
++      field :foo, :string
+     end
+ 
+     object :two do
++      field :foo, :string
+     end
+ 
+     object :three do
++      field :foo, :string
+     end
+   end
+ 
+@@ -20,6 +23,7 @@ defmodule Absinthe.Schema.Notation.Experimental.ImportTypesTest do
+     use Absinthe.Schema
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     import_types Source
+@@ -29,6 +33,7 @@ defmodule Absinthe.Schema.Notation.Experimental.ImportTypesTest do
+     use Absinthe.Schema
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     import_types(Source, only: [:one, :two])
+@@ -38,6 +43,7 @@ defmodule Absinthe.Schema.Notation.Experimental.ImportTypesTest do
+     use Absinthe.Schema
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     import_types(Source, except: [:one, :two])
+diff --git a/test/absinthe/schema/notation/experimental/macro_extensions_test.exs b/test/absinthe/schema/notation/experimental/macro_extensions_test.exs
+index 4defd38ac7..39fdaa21af 100644
+--- a/test/absinthe/schema/notation/experimental/macro_extensions_test.exs
++++ b/test/absinthe/schema/notation/experimental/macro_extensions_test.exs
+@@ -24,6 +24,7 @@ defmodule Absinthe.Schema.Notation.Experimental.MacroExtensionsTest do
+     @prototype_schema WithFeatureDirective
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     extend schema do
+@@ -181,6 +182,10 @@ defmodule Absinthe.Schema.Notation.Experimental.MacroExtensionsTest do
+                name: "__typename",
+                type: :string
+              },
++             %{
++               name: "foo",
++               type: :string
++             },
+              %{
+                name: "value",
+                type: :integer
+@@ -291,6 +296,7 @@ defmodule Absinthe.Schema.Notation.Experimental.MacroExtensionsTest do
+     use Absinthe.Schema
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     import_type_extensions ImportedSchema
+diff --git a/test/absinthe/schema/notation/experimental/sdl_extensions_test.exs b/test/absinthe/schema/notation/experimental/sdl_extensions_test.exs
+index 8f2beabacb..bcf85d3139 100644
+--- a/test/absinthe/schema/notation/experimental/sdl_extensions_test.exs
++++ b/test/absinthe/schema/notation/experimental/sdl_extensions_test.exs
+@@ -24,6 +24,7 @@ defmodule Absinthe.Schema.Notation.Experimental.SdlExtensionsTest do
+     @prototype_schema WithFeatureDirective
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     import_sdl """
+@@ -246,6 +247,7 @@ defmodule Absinthe.Schema.Notation.Experimental.SdlExtensionsTest do
+     use Absinthe.Schema
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     import_type_extensions ImportedSchema
+diff --git a/test/absinthe/schema/notation/import_test.exs b/test/absinthe/schema/notation/import_test.exs
+index 9baad0c820..0ea984d0c0 100644
+--- a/test/absinthe/schema/notation/import_test.exs
++++ b/test/absinthe/schema/notation/import_test.exs
+@@ -20,7 +20,7 @@ defmodule Absinthe.Schema.Notation.ImportTest do
+         use Absinthe.Schema
+ 
+         query do
+-          # Query type must exist
++          field :foo, :string
+         end
+ 
+         object :foo do
+@@ -41,7 +41,7 @@ defmodule Absinthe.Schema.Notation.ImportTest do
+         use Absinthe.Schema
+ 
+         query do
+-          # Query type must exist
++          field :foo, :string
+         end
+ 
+         input_object :foo do
+@@ -64,7 +64,7 @@ defmodule Absinthe.Schema.Notation.ImportTest do
+         use Absinthe.Schema
+ 
+         query do
+-          # Query type must exist
++          field :foo, :string
+         end
+ 
+         object :cool_fields do
+@@ -92,7 +92,7 @@ defmodule Absinthe.Schema.Notation.ImportTest do
+         use Absinthe.Schema
+ 
+         query do
+-          # Query type must exist
++          field :foo, :string
+         end
+ 
+         object :foo do
+@@ -211,7 +211,7 @@ defmodule Absinthe.Schema.Notation.ImportTest do
+         use Absinthe.Schema
+ 
+         query do
+-          # Query type must exist
++          field :foo, :string
+         end
+ 
+         object :foo do
+@@ -223,7 +223,7 @@ defmodule Absinthe.Schema.Notation.ImportTest do
+         use Absinthe.Schema
+ 
+         query do
+-          # Query type must exist
++          field :foo, :string
+         end
+ 
+         object :bar do
+@@ -235,7 +235,7 @@ defmodule Absinthe.Schema.Notation.ImportTest do
+         use Absinthe.Schema
+ 
+         query do
+-          # Query type must exist
++          field :foo, :string
+         end
+ 
+         import_types Source1
+diff --git a/test/absinthe/schema/notation_test.exs b/test/absinthe/schema/notation_test.exs
+index 00f72009f6..858a78416e 100644
+--- a/test/absinthe/schema/notation_test.exs
++++ b/test/absinthe/schema/notation_test.exs
+@@ -163,6 +163,7 @@ defmodule Absinthe.Schema.NotationTest do
+     test "can be toplevel" do
+       assert_no_notation_error("InputObjectValid", """
+       input_object :foo do
++        field :foo, :string
+       end
+       """)
+     end
+@@ -299,6 +300,7 @@ defmodule Absinthe.Schema.NotationTest do
+     test "can be under object as an attribute" do
+       assert_no_notation_error("IsTypeOfValid", """
+       object :bar do
++        field :foo, :string
+         is_type_of fn _, _ -> true end
+       end
+       """)
+@@ -331,6 +333,7 @@ defmodule Absinthe.Schema.NotationTest do
+     test "can be toplevel" do
+       assert_no_notation_error("ObjectValid", """
+       object :foo do
++        field :foo, :string
+       end
+       """)
+     end
+@@ -427,6 +430,7 @@ defmodule Absinthe.Schema.NotationTest do
+     test "can be under interface as an attribute" do
+       assert_no_notation_error("ResolveTypeValidInterface", """
+       interface :bar do
++        field :foo, :string
+         resolve_type fn _, _ -> :baz end
+       end
+       """)
+@@ -509,8 +513,10 @@ defmodule Absinthe.Schema.NotationTest do
+     test "can be under union as an attribute" do
+       assert_no_notation_error("TypesValid", """
+       object :audi do
++        field :foo, :string
+       end
+       object :volvo do
++        field :foo, :string
+       end
+       union :brand do
+         types [:audi, :volvo]
+@@ -554,6 +560,7 @@ defmodule Absinthe.Schema.NotationTest do
+         description \"""
+         Here's a description
+         \"""
++        field :foo, :string
+       end
+       """)
+     end
+@@ -665,7 +672,7 @@ defmodule Absinthe.Schema.NotationTest do
+         @prototype_schema WithFeatureDirective
+ 
+         query do
+-          #Query type must exist
++          field :foo, :string
+         end
+ 
+         #{text}
+@@ -683,7 +690,7 @@ defmodule Absinthe.Schema.NotationTest do
+              @prototype_schema WithFeatureDirective
+ 
+              query do
+-               #Query type must exist
++               field :foo, :string
+              end
+ 
+              #{text}
+diff --git a/test/absinthe/schema/rule/input_output_types_correctly_placed_test.exs b/test/absinthe/schema/rule/input_output_types_correctly_placed_test.exs
+index 18e7dd6999..6173598df7 100644
+--- a/test/absinthe/schema/rule/input_output_types_correctly_placed_test.exs
++++ b/test/absinthe/schema/rule/input_output_types_correctly_placed_test.exs
+@@ -14,7 +14,7 @@ defmodule Absinthe.Schema.Rule.InputOutputTypesCorrectlyPlacedTest do
+           locations: [
+             %{
+               file: "test/support/fixtures/dynamic/invalid_output_types.exs",
+-              line: 11
++              line: 13
+             }
+           ],
+           phase: Absinthe.Phase.Schema.Validation.InputOutputTypesCorrectlyPlaced
+@@ -28,7 +28,7 @@ defmodule Absinthe.Schema.Rule.InputOutputTypesCorrectlyPlacedTest do
+           locations: [
+             %{
+               file: "test/support/fixtures/dynamic/invalid_output_types.exs",
+-              line: 16
++              line: 18
+             }
+           ],
+           phase: Absinthe.Phase.Schema.Validation.InputOutputTypesCorrectlyPlaced
+@@ -48,7 +48,7 @@ defmodule Absinthe.Schema.Rule.InputOutputTypesCorrectlyPlacedTest do
+           locations: [
+             %{
+               file: "test/support/fixtures/dynamic/invalid_input_types.exs",
+-              line: 8
++              line: 9
+             }
+           ],
+           phase: Absinthe.Phase.Schema.Validation.InputOutputTypesCorrectlyPlaced
+diff --git a/test/absinthe/schema/rule/object_must_define_fields_test.exs b/test/absinthe/schema/rule/object_must_define_fields_test.exs
+new file mode 100644
+index 0000000000..ca70303fca
+--- /dev/null
++++ b/test/absinthe/schema/rule/object_must_define_fields_test.exs
+@@ -0,0 +1,124 @@
++defmodule Absinthe.Schema.Rule.ObjectMustDefineFieldsTest do
++  use Absinthe.Case, async: true
++
++  @schema ~S(
++  defmodule InputObjectSchema do
++    use Absinthe.Schema
++
++    query do
++      field :foo, :string
++    end
++
++    import_sdl """
++    input PetInput
++    """
++  end
++  )
++
++  test "errors on input object not declaring fields" do
++    error = ~r/The input object type `pet_input` must define one or more fields./
++
++    assert_raise(Absinthe.Schema.Error, error, fn ->
++      Code.eval_string(@schema)
++    end)
++  end
++
++  @schema ~S(
++  defmodule ObjectSchema do
++    use Absinthe.Schema
++
++    query do
++      field :foo, :string
++    end
++
++    import_sdl """
++    type Pet
++    """
++  end
++  )
++  test "errors on object not declaring fields" do
++    error = ~r/The object type `pet` must define one or more fields./
++
++    assert_raise(Absinthe.Schema.Error, error, fn ->
++      Code.eval_string(@schema)
++    end)
++  end
++
++  @schema ~S(
++  defmodule InterfaceSchema do
++    use Absinthe.Schema
++
++    query do
++      field :foo, :string
++    end
++
++    import_sdl """
++    interface Named
++    """
++  end
++  )
++  test "errors on interface not declaring fields" do
++    error = ~r/The interface type `named` must define one or more fields./
++
++    assert_raise(Absinthe.Schema.Error, error, fn ->
++      Code.eval_string(@schema)
++    end)
++  end
++
++  @schema ~S(
++  defmodule QuerySchema do
++    use Absinthe.Schema
++
++    query do
++
++    end
++  end
++  )
++  test "errors on query not declaring fields" do
++    error = ~r/The object type `query` must define one or more fields./
++
++    assert_raise(Absinthe.Schema.Error, error, fn ->
++      Code.eval_string(@schema)
++    end)
++  end
++
++  @schema ~S(
++  defmodule MutationSchema do
++    use Absinthe.Schema
++
++    query do
++      field :foo, :string
++    end
++
++    mutation do
++    end
++  end
++  )
++  test "errors on mutation not declaring fields" do
++    error = ~r/The object type `mutation` must define one or more fields./
++
++    assert_raise(Absinthe.Schema.Error, error, fn ->
++      Code.eval_string(@schema)
++    end)
++  end
++
++  @schema ~S(
++  defmodule SubscriptionSchema do
++    use Absinthe.Schema
++
++    query do
++      field :foo, :string
++    end
++
++    subscription do
++    end
++  end
++  )
++  test "errors on subscription not declaring fields" do
++    error = ~r/The object type `subscription` must define one or more fields./
++
++    assert_raise(Absinthe.Schema.Error, error, fn ->
++      Code.eval_string(@schema)
++    end)
++  end
++end
+diff --git a/test/absinthe/schema/rule/object_must_implement_interfaces_test.exs b/test/absinthe/schema/rule/object_must_implement_interfaces_test.exs
+index fc07ce8914..700b85c910 100644
+--- a/test/absinthe/schema/rule/object_must_implement_interfaces_test.exs
++++ b/test/absinthe/schema/rule/object_must_implement_interfaces_test.exs
+@@ -134,6 +134,7 @@ defmodule Absinthe.Schema.Rule.ObjectMustImplementInterfacesTest do
+     def resolve_type(_), do: false
+ 
+     query do
++      field :foo, :string
+     end
+   end
+ 
+@@ -175,6 +176,7 @@ defmodule Absinthe.Schema.Rule.ObjectMustImplementInterfacesTest do
+     """
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def hydrate(%{identifier: :pet}, _) do
+diff --git a/test/absinthe/schema/rule/repeatable_directives_test.exs b/test/absinthe/schema/rule/repeatable_directives_test.exs
+index e83136a009..939e6caa7b 100644
+--- a/test/absinthe/schema/rule/repeatable_directives_test.exs
++++ b/test/absinthe/schema/rule/repeatable_directives_test.exs
+@@ -64,6 +64,7 @@ defmodule Absinthe.Schema.Rule.RepeatedDirectivesTest do
+     @prototype_schema WithFeatureDirective
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     object :dog do
+@@ -85,6 +86,7 @@ defmodule Absinthe.Schema.Rule.RepeatedDirectivesTest do
+     @prototype_schema WithFeatureDirective
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     import_sdl ~s"""
+diff --git a/test/absinthe/schema_test.exs b/test/absinthe/schema_test.exs
+index 542178fa13..38da3b75fc 100644
+--- a/test/absinthe/schema_test.exs
++++ b/test/absinthe/schema_test.exs
+@@ -11,7 +11,7 @@ defmodule Absinthe.SchemaTest do
+       use Absinthe.Schema
+ 
+       query do
+-        # Query type must exist
++        field :foo, :string
+       end
+ 
+       object :person do
+@@ -396,7 +396,7 @@ defmodule Absinthe.SchemaTest do
+     use Absinthe.Schema
+ 
+     query do
+-      # Query type must exist
++      field :foo, :string
+     end
+ 
+     object :foo, meta: [foo: "bar"] do
+diff --git a/test/absinthe/subscription/pipeline_serializer_test.exs b/test/absinthe/subscription/pipeline_serializer_test.exs
+index eeafa9be85..70a519987b 100644
+--- a/test/absinthe/subscription/pipeline_serializer_test.exs
++++ b/test/absinthe/subscription/pipeline_serializer_test.exs
+@@ -8,7 +8,7 @@ defmodule Absinthe.Subscription.PipelineSerializerTest do
+     use Absinthe.Schema
+ 
+     query do
+-      # Query type must exist
++      field :foo, :string
+     end
+   end
+ 
+diff --git a/test/absinthe/type/built_ins/scalars_test.exs b/test/absinthe/type/built_ins/scalars_test.exs
+index a453ae4758..ca3c5c61ca 100644
+--- a/test/absinthe/type/built_ins/scalars_test.exs
++++ b/test/absinthe/type/built_ins/scalars_test.exs
+@@ -7,7 +7,7 @@ defmodule Absinthe.Type.BuiltIns.ScalarsTest do
+     use Absinthe.Schema
+ 
+     query do
+-      # Query type must exist
++      field :foo, :string
+     end
+   end
+ 
+diff --git a/test/absinthe/type/custom_test.exs b/test/absinthe/type/custom_test.exs
+index 060bea0533..84d3af05d4 100644
+--- a/test/absinthe/type/custom_test.exs
++++ b/test/absinthe/type/custom_test.exs
+@@ -9,6 +9,7 @@ defmodule Absinthe.Type.CustomTest do
+     import_types Type.Custom
+ 
+     query do
++      field :foo, :string
+     end
+   end
+ 
+diff --git a/test/absinthe/type/deprecation_test.exs b/test/absinthe/type/deprecation_test.exs
+index 539a455346..82399a0ecb 100644
+--- a/test/absinthe/type/deprecation_test.exs
++++ b/test/absinthe/type/deprecation_test.exs
+@@ -7,7 +7,7 @@ defmodule Absinthe.Type.DeprecationTest do
+     use Absinthe.Schema
+ 
+     query do
+-      # Query type must exist
++      field :foo, :string
+     end
+ 
+     object :profile do
+diff --git a/test/absinthe/type/input_object_test.exs b/test/absinthe/type/input_object_test.exs
+index fb96cbfbac..03ec1d28de 100644
+--- a/test/absinthe/type/input_object_test.exs
++++ b/test/absinthe/type/input_object_test.exs
+@@ -9,7 +9,7 @@ defmodule Absinthe.Type.InputObjectTest do
+     use Absinthe.Schema
+ 
+     query do
+-      # Query type must exist
++      field :foo, :string
+     end
+ 
+     @desc "A profile"
+diff --git a/test/absinthe/type/mutation_test.exs b/test/absinthe/type/mutation_test.exs
+index 50e55918af..f14765314e 100644
+--- a/test/absinthe/type/mutation_test.exs
++++ b/test/absinthe/type/mutation_test.exs
+@@ -16,6 +16,7 @@ defmodule Absinthe.Type.MutationTest do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     mutation do
+diff --git a/test/absinthe/type/object_test.exs b/test/absinthe/type/object_test.exs
+index 2e4b090412..65f19991ab 100644
+--- a/test/absinthe/type/object_test.exs
++++ b/test/absinthe/type/object_test.exs
+@@ -8,7 +8,7 @@ defmodule Absinthe.Type.ObjectTest do
+     use Absinthe.Fixture
+ 
+     query do
+-      # Must exist
++      field :foo, :string
+     end
+ 
+     @desc "A person"
+diff --git a/test/absinthe/type/union_test.exs b/test/absinthe/type/union_test.exs
+index 074bef85d9..4f5424046f 100644
+--- a/test/absinthe/type/union_test.exs
++++ b/test/absinthe/type/union_test.exs
+@@ -8,7 +8,7 @@ defmodule Absinthe.Type.UnionTest do
+     use Absinthe.Schema
+ 
+     query do
+-      # Query type must exist
++      field :foo, :string
+     end
+ 
+     object :person do
+diff --git a/test/absinthe/type_test.exs b/test/absinthe/type_test.exs
+index 636a1c2047..4f10e2d68d 100644
+--- a/test/absinthe/type_test.exs
++++ b/test/absinthe/type_test.exs
+@@ -68,14 +68,16 @@ defmodule Absinthe.TypeTest do
+     use Absinthe.Schema
+ 
+     query do
+-      # Query type must exist
++      field :foo, :string
+     end
+ 
+     object :with_meta do
+       meta :foo, "bar"
++      field :foo, :string
+     end
+ 
+     object :without_meta do
++      field :foo, :string
+     end
+   end
+ 
+diff --git a/test/support/fixtures/contact_schema.ex b/test/support/fixtures/contact_schema.ex
+index 79286637f6..ef0d247783 100644
+--- a/test/support/fixtures/contact_schema.ex
++++ b/test/support/fixtures/contact_schema.ex
+@@ -66,6 +66,7 @@ defmodule Absinthe.Fixtures.ContactSchema do
+   end
+ 
+   subscription do
++    field :contact_added, :person
+   end
+ 
+   input_object :profile_input do
+diff --git a/test/support/fixtures/directive.ex b/test/support/fixtures/directive.ex
+index 911b631738..e5f1bf610e 100644
+--- a/test/support/fixtures/directive.ex
++++ b/test/support/fixtures/directive.ex
+@@ -10,6 +10,7 @@ defmodule Absinthe.Fixtures.Directive do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     directive :normal_string, description: "string" do
+@@ -62,6 +63,7 @@ defmodule Absinthe.Fixtures.Directive do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+@@ -124,6 +126,7 @@ defmodule Absinthe.Fixtures.Directive do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+@@ -182,6 +185,7 @@ defmodule Absinthe.Fixtures.Directive do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     directive :normal_string do
+diff --git a/test/support/fixtures/dynamic/bad_directives_schema.exs b/test/support/fixtures/dynamic/bad_directives_schema.exs
+index bc8974536a..84cc7e1262 100644
+--- a/test/support/fixtures/dynamic/bad_directives_schema.exs
++++ b/test/support/fixtures/dynamic/bad_directives_schema.exs
+@@ -9,5 +9,6 @@ defmodule Absinthe.TestSupport.Schema.BadDirectivesSchema do
+   end
+ 
+   query do
++    field :foo, :string
+   end
+ end
+diff --git a/test/support/fixtures/dynamic/bad_names_schema.exs b/test/support/fixtures/dynamic/bad_names_schema.exs
+index 8a93fb9b73..c090b2ead4 100644
+--- a/test/support/fixtures/dynamic/bad_names_schema.exs
++++ b/test/support/fixtures/dynamic/bad_names_schema.exs
+@@ -2,7 +2,7 @@ defmodule Absinthe.TestSupport.Schema.BadNamesSchema do
+   use Absinthe.Schema
+ 
+   object :car, name: "bad object name" do
+-    # ...
++    field :foo, :string
+   end
+ 
+   input_object :contact_input, name: "bad input name" do
+diff --git a/test/support/fixtures/dynamic/invalid_input_types.exs b/test/support/fixtures/dynamic/invalid_input_types.exs
+index 50b347b2a3..ad3a650c90 100644
+--- a/test/support/fixtures/dynamic/invalid_input_types.exs
++++ b/test/support/fixtures/dynamic/invalid_input_types.exs
+@@ -2,6 +2,7 @@ defmodule Absinthe.Fixtures.InvalidOutputTypesSchema do
+   use Absinthe.Schema
+ 
+   object :user do
++    field :name, :string
+   end
+ 
+   input_object :foo do
+diff --git a/test/support/fixtures/dynamic/invalid_input_types_sdl.exs b/test/support/fixtures/dynamic/invalid_input_types_sdl.exs
+index 0f87f2dc77..3ddd31fbfd 100644
+--- a/test/support/fixtures/dynamic/invalid_input_types_sdl.exs
++++ b/test/support/fixtures/dynamic/invalid_input_types_sdl.exs
+@@ -2,7 +2,9 @@ defmodule Absinthe.Fixtures.InvalidOutputTypesSdlSchema do
+   use Absinthe.Schema
+ 
+   import_sdl """
+-    type User
++    type User {
++      name: String
++    }
+ 
+     input Foo {
+       blah: User
+diff --git a/test/support/fixtures/dynamic/invalid_interface_types.exs b/test/support/fixtures/dynamic/invalid_interface_types.exs
+index d1402b561f..3c8263a38a 100644
+--- a/test/support/fixtures/dynamic/invalid_interface_types.exs
++++ b/test/support/fixtures/dynamic/invalid_interface_types.exs
+@@ -24,5 +24,6 @@ defmodule Absinthe.Fixtures.InvalidInterfaceTypes do
+   end
+ 
+   query do
++    field :foo, :string
+   end
+ end
+diff --git a/test/support/fixtures/dynamic/invalid_output_types.exs b/test/support/fixtures/dynamic/invalid_output_types.exs
+index 9259d12fa1..60cbbcda50 100644
+--- a/test/support/fixtures/dynamic/invalid_output_types.exs
++++ b/test/support/fixtures/dynamic/invalid_output_types.exs
+@@ -2,9 +2,11 @@ defmodule Absinthe.Fixtures.InvalidInputTypesSchema do
+   use Absinthe.Schema
+ 
+   object :user do
++    field :name, :string
+   end
+ 
+   input_object :input do
++    field :foo, :string
+   end
+ 
+   object :bad_object do
+diff --git a/test/support/fixtures/dynamic/invalid_output_types_sdl.exs b/test/support/fixtures/dynamic/invalid_output_types_sdl.exs
+index c313726e4b..953f3a2135 100644
+--- a/test/support/fixtures/dynamic/invalid_output_types_sdl.exs
++++ b/test/support/fixtures/dynamic/invalid_output_types_sdl.exs
+@@ -2,9 +2,13 @@ defmodule Absinthe.Fixtures.InvalidInputTypesSdlSchema do
+   use Absinthe.Schema
+ 
+   import_sdl """
+-    type User
++    type User {
++      name: String
++    }
+ 
+-    input Input
++    input Input {
++      foo: String
++    }
+ 
+     type BadObject {
+       blah: Input
+diff --git a/test/support/fixtures/enums.ex b/test/support/fixtures/enums.ex
+index d4d3083624..35b865ca38 100644
+--- a/test/support/fixtures/enums.ex
++++ b/test/support/fixtures/enums.ex
+@@ -10,6 +10,7 @@ defmodule Absinthe.Fixtures.Enums do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+@@ -46,6 +47,7 @@ defmodule Absinthe.Fixtures.Enums do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     enum :normal_string, description: "string" do
+@@ -90,6 +92,7 @@ defmodule Absinthe.Fixtures.Enums do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+@@ -144,6 +147,7 @@ defmodule Absinthe.Fixtures.Enums do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+diff --git a/test/support/fixtures/import_types.ex b/test/support/fixtures/import_types.ex
+index 5210ba5a3b..603a34608c 100644
+--- a/test/support/fixtures/import_types.ex
++++ b/test/support/fixtures/import_types.ex
+@@ -207,6 +207,7 @@ defmodule Absinthe.Fixtures.ImportTypes do
+     import_types(SchemaWithFunctionEvaluationImports)
+ 
+     query do
++      field :foo, :string
+     end
+   end
+ end
+diff --git a/test/support/fixtures/input_object.ex b/test/support/fixtures/input_object.ex
+index 9dd5e84693..9b24bffd08 100644
+--- a/test/support/fixtures/input_object.ex
++++ b/test/support/fixtures/input_object.ex
+@@ -10,32 +10,41 @@ defmodule Absinthe.Fixtures.InputObject do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     input_object :normal_string, description: "string" do
++      field :foo, :string
+     end
+ 
+     input_object :local_function_call, description: test_function("red") do
++      field :foo, :string
+     end
+ 
+     input_object :function_call_using_absolute_path_to_current_module,
+       description: Absinthe.Fixtures.InputObject.TestSchemaDescriptionKeyword.test_function("red") do
++      field :foo, :string
+     end
+ 
+     input_object :standard_library_function, description: String.replace("red", "e", "a") do
++      field :foo, :string
+     end
+ 
+     input_object :function_in_nested_module, description: NestedModule.nested_function("hello") do
++      field :foo, :string
+     end
+ 
+     input_object :external_module_function_call,
+       description: Absinthe.Fixtures.FunctionEvaluationHelpers.external_function("hello") do
++      field :foo, :string
+     end
+ 
+     input_object :module_attribute_string_concat, description: "hello " <> @module_attribute do
++      field :foo, :string
+     end
+ 
+     input_object :interpolation_of_module_attribute, description: "hello #{@module_attribute}" do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+@@ -54,6 +63,7 @@ defmodule Absinthe.Fixtures.InputObject do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+@@ -62,6 +72,7 @@ defmodule Absinthe.Fixtures.InputObject do
+ 
+     @desc "string"
+     input_object :normal_string do
++      field :foo, :string
+     end
+ 
+     # These tests do not work as test_function is not available at compile time, and the
+@@ -78,22 +89,27 @@ defmodule Absinthe.Fixtures.InputObject do
+ 
+     @desc String.replace("red", "e", "a")
+     input_object :standard_library_function do
++      field :foo, :string
+     end
+ 
+     @desc NestedModule.nested_function("hello")
+     input_object :function_in_nested_module do
++      field :foo, :string
+     end
+ 
+     @desc Absinthe.Fixtures.FunctionEvaluationHelpers.external_function("hello")
+     input_object :external_module_function_call do
++      field :foo, :string
+     end
+ 
+     @desc "hello " <> @module_attribute
+     input_object :module_attribute_string_concat do
++      field :foo, :string
+     end
+ 
+     @desc "hello #{@module_attribute}"
+     input_object :interpolation_of_module_attribute do
++      field :foo, :string
+     end
+   end
+ 
+@@ -108,6 +124,7 @@ defmodule Absinthe.Fixtures.InputObject do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+@@ -116,34 +133,42 @@ defmodule Absinthe.Fixtures.InputObject do
+ 
+     input_object :normal_string do
+       description "string"
++      field :foo, :string
+     end
+ 
+     input_object :local_function_call do
+       description test_function("red")
++      field :foo, :string
+     end
+ 
+     input_object :function_call_using_absolute_path_to_current_module do
+       description Absinthe.Fixtures.InputObject.TestSchemaDescriptionMacro.test_function("red")
++      field :foo, :string
+     end
+ 
+     input_object :standard_library_function do
+       description String.replace("red", "e", "a")
++      field :foo, :string
+     end
+ 
+     input_object :function_in_nested_module do
+       description NestedModule.nested_function("hello")
++      field :foo, :string
+     end
+ 
+     input_object :external_module_function_call do
+       description Absinthe.Fixtures.FunctionEvaluationHelpers.external_function("hello")
++      field :foo, :string
+     end
+ 
+     input_object :module_attribute_string_concat do
+       description "hello " <> @module_attribute
++      field :foo, :string
+     end
+ 
+     input_object :interpolation_of_module_attribute do
+       description "hello #{@module_attribute}"
++      field :foo, :string
+     end
+   end
+ 
+@@ -158,6 +183,7 @@ defmodule Absinthe.Fixtures.InputObject do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+diff --git a/test/support/fixtures/object.ex b/test/support/fixtures/object.ex
+index bcba7e18f8..416d5c5141 100644
+--- a/test/support/fixtures/object.ex
++++ b/test/support/fixtures/object.ex
+@@ -10,32 +10,41 @@ defmodule Absinthe.Fixtures.Object do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     object :normal_string, description: "string" do
++      field :foo, :string
+     end
+ 
+     object :local_function_call, description: test_function("red") do
++      field :foo, :string
+     end
+ 
+     object :function_call_using_absolute_path_to_current_module,
+       description: Absinthe.Fixtures.Object.TestSchemaDescriptionKeyword.test_function("red") do
++      field :foo, :string
+     end
+ 
+     object :standard_library_function, description: String.replace("red", "e", "a") do
++      field :foo, :string
+     end
+ 
+     object :function_in_nested_module, description: NestedModule.nested_function("hello") do
++      field :foo, :string
+     end
+ 
+     object :external_module_function_call,
+       description: Absinthe.Fixtures.FunctionEvaluationHelpers.external_function("hello") do
++      field :foo, :string
+     end
+ 
+     object :module_attribute_string_concat, description: "hello " <> @module_attribute do
++      field :foo, :string
+     end
+ 
+     object :interpolation_of_module_attribute, description: "hello #{@module_attribute}" do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+@@ -54,6 +63,7 @@ defmodule Absinthe.Fixtures.Object do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+@@ -62,6 +72,7 @@ defmodule Absinthe.Fixtures.Object do
+ 
+     @desc "string"
+     object :normal_string do
++      field :foo, :string
+     end
+ 
+     # These tests do not work as test_function is not available at compile time, and the
+@@ -78,22 +89,27 @@ defmodule Absinthe.Fixtures.Object do
+ 
+     @desc String.replace("red", "e", "a")
+     object :standard_library_function do
++      field :foo, :string
+     end
+ 
+     @desc NestedModule.nested_function("hello")
+     object :function_in_nested_module do
++      field :foo, :string
+     end
+ 
+     @desc Absinthe.Fixtures.FunctionEvaluationHelpers.external_function("hello")
+     object :external_module_function_call do
++      field :foo, :string
+     end
+ 
+     @desc "hello " <> @module_attribute
+     object :module_attribute_string_concat do
++      field :foo, :string
+     end
+ 
+     @desc "hello #{@module_attribute}"
+     object :interpolation_of_module_attribute do
++      field :foo, :string
+     end
+   end
+ 
+@@ -108,6 +124,7 @@ defmodule Absinthe.Fixtures.Object do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+@@ -116,34 +133,42 @@ defmodule Absinthe.Fixtures.Object do
+ 
+     object :normal_string do
+       description "string"
++      field :foo, :string
+     end
+ 
+     object :local_function_call do
+       description test_function("red")
++      field :foo, :string
+     end
+ 
+     object :function_call_using_absolute_path_to_current_module do
+       description Absinthe.Fixtures.Object.TestSchemaDescriptionMacro.test_function("red")
++      field :foo, :string
+     end
+ 
+     object :standard_library_function do
+       description String.replace("red", "e", "a")
++      field :foo, :string
+     end
+ 
+     object :function_in_nested_module do
+       description NestedModule.nested_function("hello")
++      field :foo, :string
+     end
+ 
+     object :external_module_function_call do
+       description Absinthe.Fixtures.FunctionEvaluationHelpers.external_function("hello")
++      field :foo, :string
+     end
+ 
+     object :module_attribute_string_concat do
+       description "hello " <> @module_attribute
++      field :foo, :string
+     end
+ 
+     object :interpolation_of_module_attribute do
+       description "hello #{@module_attribute}"
++      field :foo, :string
+     end
+   end
+ 
+@@ -158,6 +183,7 @@ defmodule Absinthe.Fixtures.Object do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+diff --git a/test/support/fixtures/scalar.ex b/test/support/fixtures/scalar.ex
+index b2ba80bb06..5d7e7c39be 100644
+--- a/test/support/fixtures/scalar.ex
++++ b/test/support/fixtures/scalar.ex
+@@ -15,6 +15,7 @@ defmodule Absinthe.Fixtures.Scalar do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     scalar :normal_string, description: "string" do
+@@ -75,6 +76,7 @@ defmodule Absinthe.Fixtures.Scalar do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+@@ -145,6 +147,7 @@ defmodule Absinthe.Fixtures.Scalar do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+diff --git a/test/support/fixtures/union.ex b/test/support/fixtures/union.ex
+index 51cd4ad936..09716303dd 100644
+--- a/test/support/fixtures/union.ex
++++ b/test/support/fixtures/union.ex
+@@ -10,6 +10,7 @@ defmodule Absinthe.Fixtures.Union do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     union :normal_string, description: "string" do
+@@ -54,6 +55,7 @@ defmodule Absinthe.Fixtures.Union do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do
+@@ -110,6 +112,7 @@ defmodule Absinthe.Fixtures.Union do
+     end
+ 
+     query do
++      field :foo, :string
+     end
+ 
+     def test_function(arg1) do

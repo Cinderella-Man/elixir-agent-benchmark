@@ -1,0 +1,69 @@
+diff --git a/.gitignore b/.gitignore
+index 1076668b4..bb3a94e71 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -47,3 +47,6 @@ beacon-*.tar
+ 
+ # Local iex config
+ .iex.exs
++
++# Local tool-versions
++.tool-versions
+diff --git a/lib/beacon/content.ex b/lib/beacon/content.ex
+index da01e6232..48e8716e0 100644
+--- a/lib/beacon/content.ex
++++ b/lib/beacon/content.ex
+@@ -954,9 +954,8 @@ defmodule Beacon.Content do
+ 
+     * `:per_page` - limit how many records are returned, or pass `:infinity` to return all records. Defaults to 20.
+     * `:page` - returns records from a specific page. Defaults to 1.
+-    * `:search` - search by either one or more fields or dynamic query function.
+-                  Available fields: `path`, `title`, `format`, `extra`. Defaults to `nil` (do not apply search filter).
+-    * `:sort` - column in which the result will be ordered by. Defaults to `:title`.
++    * `:search` - search by either one or more fields or dynamic query function. Available fields: `path`, `title`, `format`, `extra`. Defaults to `nil` (do not apply search filter).
++    * `:sort` - column or keyword in which the result will be ordered by. Defaults to `:title`.
+ 
+   ## Examples
+ 
+@@ -969,6 +968,9 @@ defmodule Beacon.Content do
+       iex> list_published_pages(:my_site, search: fn -> dynamic([q], fragment("extra->>'tags' ilike 'year-20%'")) end)
+       [%Page{}]
+ 
++      iex> list_published_pages(:my_site, sort: [desc: :path])
++      [%Page{}]
++
+   """
+   @doc type: :pages
+   @spec list_published_pages(Site.t(), keyword()) :: [Page.t()]
+@@ -1049,6 +1051,7 @@ defmodule Beacon.Content do
+   defp query_list_published_pages_search(query, _search), do: query
+ 
+   defp query_list_published_pages_sort(query, {:length, key}), do: from(q in query, order_by: [{:asc, fragment("length(?)", field(q, ^key))}])
++  defp query_list_published_pages_sort(query, sort) when is_list(sort), do: from(q in query, order_by: ^sort)
+   defp query_list_published_pages_sort(query, sort), do: from(q in query, order_by: [asc: ^sort])
+ 
+   @doc """
+diff --git a/test/beacon/content_test.exs b/test/beacon/content_test.exs
+index 0830a95df..797519d27 100644
+--- a/test/beacon/content_test.exs
++++ b/test/beacon/content_test.exs
+@@ -304,6 +304,19 @@ defmodule Beacon.ContentTest do
+              ] = Content.list_published_pages(:my_site, sort: {:length, :path})
+     end
+ 
++    test "list_published_pages sort param as a keyword" do
++      page_a = beacon_page_fixture(path: "/a", title: "page_a")
++      {:ok, _page_a} = Content.publish_page(page_a)
++
++      page_b = beacon_page_fixture(path: "/b", title: "page_b")
++      {:ok, _page_b} = Content.publish_page(page_b)
++
++      # default sorting by title is working
++      assert [%Page{title: "page_a"} | _] = Content.list_published_pages(:my_site)
++
++      assert [%Page{title: "page_b"} | _] = Content.list_published_pages(:my_site, sort: [desc: :path])
++    end
++
+     test "list_published_pages_for_paths/2" do
+       beacon_published_page_fixture(path: "/foo")
+       beacon_published_page_fixture(path: "/bar")

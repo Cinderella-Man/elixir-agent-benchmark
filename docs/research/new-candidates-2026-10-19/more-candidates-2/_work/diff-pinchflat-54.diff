@@ -1,0 +1,758 @@
+diff --git a/.iex.exs b/.iex.exs
+index e7c2cf746..52a238bbb 100644
+--- a/.iex.exs
++++ b/.iex.exs
+@@ -11,6 +11,7 @@ alias Pinchflat.Tasks
+ alias Pinchflat.Media
+ alias Pinchflat.Profiles
+ alias Pinchflat.Sources
++alias Pinchflat.Settings
+ 
+ alias Pinchflat.MediaClient.{SourceDetails, MediaDownloader}
+ alias Pinchflat.Metadata.{Zipper, ThumbnailFetcher}
+diff --git a/lib/pinchflat/application.ex b/lib/pinchflat/application.ex
+index 81ba2f044..1527d7d73 100644
+--- a/lib/pinchflat/application.ex
++++ b/lib/pinchflat/application.ex
+@@ -10,6 +10,8 @@ defmodule Pinchflat.Application do
+     children = [
+       PinchflatWeb.Telemetry,
+       Pinchflat.Repo,
++      # {Task, &run_startup_tasks/0},
++      Pinchflat.StartupTasks,
+       {Oban, Application.fetch_env!(:pinchflat, Oban)},
+       {DNSCluster, query: Application.get_env(:pinchflat, :dns_cluster_query) || :ignore},
+       {Phoenix.PubSub, name: Pinchflat.PubSub},
+diff --git a/lib/pinchflat/profiles/media_profile.ex b/lib/pinchflat/profiles/media_profile.ex
+index 7b72b8cd0..c8e3aeeed 100644
+--- a/lib/pinchflat/profiles/media_profile.ex
++++ b/lib/pinchflat/profiles/media_profile.ex
+@@ -1,6 +1,6 @@
+ defmodule Pinchflat.Profiles.MediaProfile do
+   @moduledoc """
+-  A media profile is a set of settings that can be applied to many media sources
++  A media profile is a set of configuration options that can be applied to many media sources
+   """
+ 
+   use Ecto.Schema
+diff --git a/lib/pinchflat/settings.ex b/lib/pinchflat/settings.ex
+new file mode 100644
+index 000000000..29db08578
+--- /dev/null
++++ b/lib/pinchflat/settings.ex
+@@ -0,0 +1,95 @@
++defmodule Pinchflat.Settings do
++  @moduledoc """
++  The Settings context.
++  """
++
++  import Ecto.Query, warn: false
++  alias Pinchflat.Repo
++
++  alias Pinchflat.Settings.Setting
++
++  @doc """
++  Returns the list of settings.
++
++  Returns [%Setting{}, ...]
++  """
++  def list_settings do
++    Repo.all(Setting)
++  end
++
++  @doc """
++  Creates or updates a setting, returning the parsed value.
++  Raises if an unsupported datatype is used. Optionally allows
++  specifying the datatype.
++
++  Returns value in type of `Ecto.Enum.mappings(Setting, :datatype)`
++  """
++  def set!(name, value) do
++    set!(name, value, infer_datatype(value))
++  end
++
++  def set!(name, value, datatype) do
++    # Only create if doesn't exist
++    case Repo.get_by(Setting, name: to_string(name)) do
++      nil -> create_setting!(name, value, datatype)
++      setting -> update_setting!(setting, value, datatype)
++    end
++  end
++
++  @doc """
++  Gets the parsed value of a setting. Raises if the setting does not exist.
++
++  Returns value in type of `Ecto.Enum.mappings(Setting, :datatype)`
++  """
++  def get!(name) do
++    Setting
++    |> Repo.get_by!(name: to_string(name))
++    |> read_setting()
++  end
++
++  @doc """
++  Attempts to find a setting by name or creates a setting with value
++  if one doesn't exist, returning the parsed value. Optionally allows
++  specifying the datatype.
++
++  Returns value in type of `Ecto.Enum.mappings(Setting, :datatype)`
++  """
++  def fetch!(name, value) do
++    fetch!(name, value, infer_datatype(value))
++  end
++
++  def fetch!(name, value, datatype) do
++    case Repo.get_by(Setting, name: to_string(name)) do
++      nil -> create_setting!(name, value, datatype)
++      setting -> read_setting(setting)
++    end
++  end
++
++  defp change_setting(setting, attrs) do
++    Setting.changeset(setting, attrs)
++  end
++
++  defp create_setting!(name, value, datatype) do
++    %Setting{}
++    |> change_setting(%{name: to_string(name), value: to_string(value), datatype: datatype})
++    |> Repo.insert!()
++    |> read_setting()
++  end
++
++  defp update_setting!(setting, value, datatype) do
++    setting
++    |> change_setting(%{value: to_string(value), datatype: datatype})
++    |> Repo.update!()
++    |> read_setting()
++  end
++
++  defp read_setting(%{value: value, datatype: :string}), do: value
++  defp read_setting(%{value: value, datatype: :boolean}), do: value in ["true", "t", "1"]
++  defp read_setting(%{value: value, datatype: :integer}), do: String.to_integer(value)
++  defp read_setting(%{value: value, datatype: :float}), do: String.to_float(value)
++
++  defp infer_datatype(value) when is_boolean(value), do: :boolean
++  defp infer_datatype(value) when is_integer(value), do: :integer
++  defp infer_datatype(value) when is_float(value), do: :float
++  defp infer_datatype(value) when is_binary(value), do: :string
++end
+diff --git a/lib/pinchflat/settings/setting.ex b/lib/pinchflat/settings/setting.ex
+new file mode 100644
+index 000000000..fab97b980
+--- /dev/null
++++ b/lib/pinchflat/settings/setting.ex
+@@ -0,0 +1,24 @@
++defmodule Pinchflat.Settings.Setting do
++  @moduledoc """
++  A Setting is a key-value pair with a datatype used to track user-level settings.
++  """
++
++  use Ecto.Schema
++  import Ecto.Changeset
++
++  schema "settings" do
++    field :name, :string
++    field :value, :string
++    field :datatype, Ecto.Enum, values: ~w(boolean string integer float)a
++
++    timestamps(type: :utc_datetime)
++  end
++
++  @doc false
++  def changeset(setting, attrs) do
++    setting
++    |> cast(attrs, [:name, :value, :datatype])
++    |> validate_required([:name, :value, :datatype])
++    |> unique_constraint([:name])
++  end
++end
+diff --git a/lib/pinchflat/startup_tasks.ex b/lib/pinchflat/startup_tasks.ex
+new file mode 100644
+index 000000000..41d0597aa
+--- /dev/null
++++ b/lib/pinchflat/startup_tasks.ex
+@@ -0,0 +1,36 @@
++defmodule Pinchflat.StartupTasks do
++  @moduledoc """
++  This module is responsible for running startup tasks on app boot.
++
++  It's a GenServer because that plays REALLY nicely with the existing
++  Phoenix supervision tree.
++  """
++
++  # restart: :temporary means that this process will never be restarted (ie: will run once and then die)
++  use GenServer, restart: :temporary
++
++  alias Pinchflat.Settings
++
++  def start_link(opts \\ []) do
++    GenServer.start_link(__MODULE__, %{}, opts)
++  end
++
++  @doc """
++  Runs application startup tasks.
++
++  Any code defined here will run every time the application starts. You must
++  make sure that the code is idempotent and safe to run multiple times.
++
++  This is a good place to set up default settings, create initial records, stuff like that
++  """
++  @impl true
++  def init(state) do
++    apply_default_settings()
++
++    {:ok, state}
++  end
++
++  defp apply_default_settings do
++    Settings.fetch!(:onboarding, true)
++  end
++end
+diff --git a/lib/pinchflat_web.ex b/lib/pinchflat_web.ex
+index 6f301ff08..b9b303afc 100644
+--- a/lib/pinchflat_web.ex
++++ b/lib/pinchflat_web.ex
+@@ -45,6 +45,7 @@ defmodule PinchflatWeb do
+       import Plug.Conn
+       import PinchflatWeb.Gettext
+ 
++      alias Pinchflat.Settings
+       alias PinchflatWeb.Layouts
+ 
+       unquote(verified_routes())
+@@ -56,6 +57,8 @@ defmodule PinchflatWeb do
+       use Phoenix.LiveView,
+         layout: {PinchflatWeb.Layouts, :app}
+ 
++      alias Pinchflat.Settings
++
+       unquote(html_helpers())
+     end
+   end
+@@ -64,6 +67,8 @@ defmodule PinchflatWeb do
+     quote do
+       use Phoenix.LiveComponent
+ 
++      alias Pinchflat.Settings
++
+       unquote(html_helpers())
+     end
+   end
+@@ -76,6 +81,8 @@ defmodule PinchflatWeb do
+       import Phoenix.Controller,
+         only: [get_csrf_token: 0, view_module: 1, view_template: 1]
+ 
++      alias Pinchflat.Settings
++
+       # Include general helpers for rendering HTML
+       unquote(html_helpers())
+     end
+@@ -93,6 +100,7 @@ defmodule PinchflatWeb do
+       import PinchflatWeb.CustomComponents.TableComponents
+       import PinchflatWeb.CustomComponents.ButtonComponents
+ 
++      alias Pinchflat.Settings
+       alias Pinchflat.Utils.StringUtils
+ 
+       # Shortcut for generating JS commands
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_controller.ex b/lib/pinchflat_web/controllers/media_profiles/media_profile_controller.ex
+index f0d78d951..4b130e7eb 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_controller.ex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_controller.ex
+@@ -13,29 +13,21 @@ defmodule PinchflatWeb.MediaProfiles.MediaProfileController do
+   def new(conn, _params) do
+     changeset = Profiles.change_media_profile(%MediaProfile{})
+ 
+-    if get_session(conn, :onboarding) do
+-      render(conn, :new, changeset: changeset, layout: {Layouts, :onboarding})
+-    else
+-      render(conn, :new, changeset: changeset)
+-    end
++    render(conn, :new, changeset: changeset, layout: get_onboarding_layout())
+   end
+ 
+   def create(conn, %{"media_profile" => media_profile_params}) do
+     case Profiles.create_media_profile(media_profile_params) do
+       {:ok, media_profile} ->
+         redirect_location =
+-          if get_session(conn, :onboarding), do: ~p"/?onboarding=1", else: ~p"/media_profiles/#{media_profile}"
++          if Settings.get!(:onboarding), do: ~p"/?onboarding=1", else: ~p"/media_profiles/#{media_profile}"
+ 
+         conn
+         |> put_flash(:info, "Media profile created successfully.")
+         |> redirect(to: redirect_location)
+ 
+       {:error, %Ecto.Changeset{} = changeset} ->
+-        if get_session(conn, :onboarding) do
+-          render(conn, :new, changeset: changeset, layout: {Layouts, :onboarding})
+-        else
+-          render(conn, :new, changeset: changeset)
+-        end
++        render(conn, :new, changeset: changeset, layout: get_onboarding_layout())
+     end
+   end
+ 
+@@ -85,4 +77,12 @@ defmodule PinchflatWeb.MediaProfiles.MediaProfileController do
+     |> put_flash(:info, flash_message)
+     |> redirect(to: ~p"/media_profiles")
+   end
++
++  defp get_onboarding_layout do
++    if Settings.get!(:onboarding) do
++      {Layouts, :onboarding}
++    else
++      {Layouts, :app}
++    end
++  end
+ end
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/new.html.heex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/new.html.heex
+index 707c9f643..a0311ab5a 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/new.html.heex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/new.html.heex
+@@ -1,5 +1,5 @@
+ <div class="mb-6 flex gap-3 flex-row items-center">
+-  <.link :if={!Plug.Conn.get_session(@conn, :onboarding)} navigate={~p"/media_profiles"}>
++  <.link :if={!Settings.get!(:onboarding)} navigate={~p"/media_profiles"}>
+     <.icon name="hero-arrow-left" class="w-10 h-10 hover:dark:text-white" />
+   </.link>
+   <h2 class="text-title-md2 font-bold text-black dark:text-white ml-4">New Media Profile</h2>
+diff --git a/lib/pinchflat_web/controllers/pages/page_controller.ex b/lib/pinchflat_web/controllers/pages/page_controller.ex
+index 5265796bc..3f9ccf839 100644
+--- a/lib/pinchflat_web/controllers/pages/page_controller.ex
++++ b/lib/pinchflat_web/controllers/pages/page_controller.ex
+@@ -20,12 +20,12 @@ defmodule PinchflatWeb.Pages.PageController do
+   end
+ 
+   defp render_home_page(conn) do
++    Settings.set!(:onboarding, false)
+     media_profile_count = Repo.aggregate(MediaProfile, :count, :id)
+     source_count = Repo.aggregate(Source, :count, :id)
+     media_item_count = Repo.aggregate(MediaItem, :count, :id)
+ 
+     conn
+-    |> put_session(:onboarding, false)
+     |> render(:home,
+       media_profile_count: media_profile_count,
+       source_count: source_count,
+@@ -34,8 +34,9 @@ defmodule PinchflatWeb.Pages.PageController do
+   end
+ 
+   defp render_onboarding_page(conn, media_profiles_exist, sources_exist) do
++    Settings.set!(:onboarding, true)
++
+     conn
+-    |> put_session(:onboarding, true)
+     |> render(:onboarding_checklist,
+       media_profiles_exist: media_profiles_exist,
+       sources_exist: sources_exist,
+diff --git a/lib/pinchflat_web/controllers/sources/source_controller.ex b/lib/pinchflat_web/controllers/sources/source_controller.ex
+index f2cb342a5..757fb4426 100644
+--- a/lib/pinchflat_web/controllers/sources/source_controller.ex
++++ b/lib/pinchflat_web/controllers/sources/source_controller.ex
+@@ -16,37 +16,29 @@ defmodule PinchflatWeb.Sources.SourceController do
+   def new(conn, _params) do
+     changeset = Sources.change_source(%Source{})
+ 
+-    if get_session(conn, :onboarding) do
+-      render(conn, :new,
+-        changeset: changeset,
+-        media_profiles: media_profiles(),
+-        layout: {Layouts, :onboarding}
+-      )
+-    else
+-      render(conn, :new, changeset: changeset, media_profiles: media_profiles())
+-    end
++    render(conn, :new,
++      changeset: changeset,
++      media_profiles: media_profiles(),
++      layout: get_onboarding_layout()
++    )
+   end
+ 
+   def create(conn, %{"source" => source_params}) do
+     case Sources.create_source(source_params) do
+       {:ok, source} ->
+         redirect_location =
+-          if get_session(conn, :onboarding), do: ~p"/?onboarding=1", else: ~p"/sources/#{source}"
++          if Settings.get!(:onboarding), do: ~p"/?onboarding=1", else: ~p"/sources/#{source}"
+ 
+         conn
+         |> put_flash(:info, "Source created successfully.")
+         |> redirect(to: redirect_location)
+ 
+       {:error, %Ecto.Changeset{} = changeset} ->
+-        if get_session(conn, :onboarding) do
+-          render(conn, :new,
+-            changeset: changeset,
+-            media_profiles: media_profiles(),
+-            layout: {Layouts, :onboarding}
+-          )
+-        else
+-          render(conn, :new, changeset: changeset, media_profiles: media_profiles())
+-        end
++        render(conn, :new,
++          changeset: changeset,
++          media_profiles: media_profiles(),
++          layout: get_onboarding_layout()
++        )
+     end
+   end
+ 
+@@ -107,4 +99,12 @@ defmodule PinchflatWeb.Sources.SourceController do
+   defp media_profiles do
+     Profiles.list_media_profiles()
+   end
++
++  defp get_onboarding_layout do
++    if Settings.get!(:onboarding) do
++      {Layouts, :onboarding}
++    else
++      {Layouts, :app}
++    end
++  end
+ end
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/new.html.heex b/lib/pinchflat_web/controllers/sources/source_html/new.html.heex
+index 5914e034a..4c9fbc486 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/new.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/new.html.heex
+@@ -1,5 +1,5 @@
+ <div class="mb-6 flex gap-3 flex-row items-center">
+-  <.link :if={!Plug.Conn.get_session(@conn, :onboarding)} navigate={~p"/sources"}>
++  <.link :if={!Settings.get!(:onboarding)} navigate={~p"/sources"}>
+     <.icon name="hero-arrow-left" class="w-10 h-10 hover:dark:text-white" />
+   </.link>
+   <h2 class="text-title-md2 font-bold text-black dark:text-white ml-4">New Source</h2>
+diff --git a/priv/repo/migrations/20240306173305_create_settings.exs b/priv/repo/migrations/20240306173305_create_settings.exs
+new file mode 100644
+index 000000000..5d84539b7
+--- /dev/null
++++ b/priv/repo/migrations/20240306173305_create_settings.exs
+@@ -0,0 +1,15 @@
++defmodule Pinchflat.Repo.Migrations.CreateSettings do
++  use Ecto.Migration
++
++  def change do
++    create table(:settings) do
++      add :name, :string, null: false
++      add :value, :string, null: false
++      add :datatype, :string, null: false
++
++      timestamps(type: :utc_datetime)
++    end
++
++    create unique_index(:settings, [:name])
++  end
++end
+diff --git a/test/pinchflat/settings_test.exs b/test/pinchflat/settings_test.exs
+new file mode 100644
+index 000000000..443538a63
+--- /dev/null
++++ b/test/pinchflat/settings_test.exs
+@@ -0,0 +1,108 @@
++defmodule Pinchflat.SettingsTest do
++  use Pinchflat.DataCase
++
++  alias Pinchflat.Settings
++  alias Pinchflat.Settings.Setting
++
++  # NOTE: We're treating some of these tests differently
++  # than in other modules because certain settings
++  # are always created on app boot (including in the test env),
++  # so we can't treat these like a clean slate.
++
++  describe "list_settings/0" do
++    test "returns all settings" do
++      Settings.set!("foo", "bar")
++      results = Settings.list_settings()
++
++      assert Enum.all?(results, fn setting -> match?(%Setting{}, setting) end)
++    end
++  end
++
++  describe "set/2" do
++    test "creates a new setting if one does not exist" do
++      original = Repo.aggregate(Setting, :count, :id)
++      Settings.set!("foo", "bar")
++      assert Repo.aggregate(Setting, :count, :id) == original + 1
++    end
++
++    test "updates an existing setting if one exists" do
++      Settings.set!("foo", "bar")
++      original = Repo.aggregate(Setting, :count, :id)
++      Settings.set!("foo", "baz")
++      assert Repo.aggregate(Setting, :count, :id) == original
++      assert Settings.get!("foo") == "baz"
++    end
++
++    test "returns the parsed value" do
++      assert Settings.set!("foo", true) == true
++      assert Settings.set!("foo", false) == false
++      assert Settings.set!("foo", 123) == 123
++      assert Settings.set!("foo", 12.34) == 12.34
++      assert Settings.set!("foo", "bar") == "bar"
++    end
++
++    test "allows for atom keys" do
++      assert Settings.set!(:foo, "bar") == "bar"
++    end
++
++    test "blows up when an unsupported datatype is used" do
++      assert_raise FunctionClauseError, fn ->
++        Settings.set!("foo", nil)
++      end
++    end
++  end
++
++  describe "set/3" do
++    test "allows manual specification of datatype" do
++      assert Settings.set!("foo", "true", :boolean) == true
++      assert Settings.set!("foo", "false", :boolean) == false
++      assert Settings.set!("foo", "123", :integer) == 123
++      assert Settings.set!("foo", "12.34", :float) == 12.34
++    end
++  end
++
++  describe "get/1" do
++    test "returns the value of the setting" do
++      Settings.set!("str", "bar")
++      Settings.set!("bool", true)
++      Settings.set!("int", 123)
++      Settings.set!("float", 12.34)
++
++      assert Settings.get!("str") == "bar"
++      assert Settings.get!("bool") == true
++      assert Settings.get!("int") == 123
++      assert Settings.get!("float") == 12.34
++    end
++
++    test "allows for atom keys" do
++      Settings.set!("str", "bar")
++      assert Settings.get!(:str) == "bar"
++    end
++
++    test "blows up when the setting does not exist" do
++      assert_raise Ecto.NoResultsError, fn ->
++        Settings.get!("foo")
++      end
++    end
++  end
++
++  describe "fetch/2" do
++    test "creates a setting if one doesn't exist" do
++      original = Repo.aggregate(Setting, :count, :id)
++      assert Settings.fetch!("foo", "bar") == "bar"
++      assert Repo.aggregate(Setting, :count, :id) == original + 1
++    end
++
++    test "returns an existing setting if one does exist" do
++      Settings.set!("foo", "bar")
++
++      assert Settings.fetch!("foo", "baz") == "bar"
++    end
++  end
++
++  describe "fetch/3" do
++    test "allows manual specification of datatype" do
++      assert Settings.fetch!("foo", "true", :boolean) == true
++    end
++  end
++end
+diff --git a/test/pinchflat/startup_tasks_test.exs b/test/pinchflat/startup_tasks_test.exs
+new file mode 100644
+index 000000000..ef06d0aa2
+--- /dev/null
++++ b/test/pinchflat/startup_tasks_test.exs
+@@ -0,0 +1,16 @@
++defmodule Pinchflat.StartupTasksTest do
++  use Pinchflat.DataCase
++
++  alias Pinchflat.Settings
++
++  # Since this runs on app boot (even in the test env),
++  # any actions in the `init/1` function will already have
++  # run. So we can only test the side effects of those actions,
++  # rather than the actions themselves.
++
++  describe "apply_default_settings" do
++    test "sets default settings" do
++      assert Settings.get!(:onboarding) == true
++    end
++  end
++end
+diff --git a/test/pinchflat_web/controllers/media_profile_controller_test.exs b/test/pinchflat_web/controllers/media_profile_controller_test.exs
+index c5cdd197b..1a2387bb7 100644
+--- a/test/pinchflat_web/controllers/media_profile_controller_test.exs
++++ b/test/pinchflat_web/controllers/media_profile_controller_test.exs
+@@ -6,6 +6,7 @@ defmodule PinchflatWeb.MediaProfileControllerTest do
+   import Pinchflat.ProfilesFixtures
+ 
+   alias Pinchflat.Repo
++  alias Pinchflat.Settings
+ 
+   @create_attrs %{name: "some name", output_path_template: "some output_path_template"}
+   @update_attrs %{
+@@ -14,6 +15,12 @@ defmodule PinchflatWeb.MediaProfileControllerTest do
+   }
+   @invalid_attrs %{name: nil, output_path_template: nil}
+ 
++  setup do
++    Settings.set!(:onboarding, false)
++
++    :ok
++  end
++
+   describe "index" do
+     test "lists all media_profiles", %{conn: conn} do
+       conn = get(conn, ~p"/media_profiles")
+@@ -27,13 +34,11 @@ defmodule PinchflatWeb.MediaProfileControllerTest do
+       assert html_response(conn, 200) =~ "New Media Profile"
+     end
+ 
+-    test "renders correct layout when onboarding", %{session_conn: session_conn} do
+-      session_conn =
+-        session_conn
+-        |> put_session(:onboarding, true)
+-        |> get(~p"/media_profiles/new")
++    test "renders correct layout when onboarding", %{conn: conn} do
++      Settings.set!(:onboarding, true)
++      conn = get(conn, ~p"/media_profiles/new")
+ 
+-      refute html_response(session_conn, 200) =~ "MENU"
++      refute html_response(conn, 200) =~ "MENU"
+     end
+   end
+ 
+@@ -53,22 +58,18 @@ defmodule PinchflatWeb.MediaProfileControllerTest do
+       assert html_response(conn, 200) =~ "New Media Profile"
+     end
+ 
+-    test "redirects to onboarding when onboarding", %{session_conn: session_conn} do
+-      session_conn =
+-        session_conn
+-        |> put_session(:onboarding, true)
+-        |> post(~p"/media_profiles", media_profile: @create_attrs)
++    test "redirects to onboarding when onboarding", %{conn: conn} do
++      Settings.set!(:onboarding, true)
++      conn = post(conn, ~p"/media_profiles", media_profile: @create_attrs)
+ 
+-      assert redirected_to(session_conn) == ~p"/?onboarding=1"
++      assert redirected_to(conn) == ~p"/?onboarding=1"
+     end
+ 
+-    test "renders correct layout on error when onboarding", %{session_conn: session_conn} do
+-      session_conn =
+-        session_conn
+-        |> put_session(:onboarding, true)
+-        |> post(~p"/media_profiles", media_profile: @invalid_attrs)
++    test "renders correct layout on error when onboarding", %{conn: conn} do
++      Settings.set!(:onboarding, true)
++      conn = post(conn, ~p"/media_profiles", media_profile: @invalid_attrs)
+ 
+-      refute html_response(session_conn, 200) =~ "MENU"
++      refute html_response(conn, 200) =~ "MENU"
+     end
+   end
+ 
+diff --git a/test/pinchflat_web/controllers/page_controller_test.exs b/test/pinchflat_web/controllers/page_controller_test.exs
+index 572e07dc9..ab1b536c5 100644
+--- a/test/pinchflat_web/controllers/page_controller_test.exs
++++ b/test/pinchflat_web/controllers/page_controller_test.exs
+@@ -4,10 +4,12 @@ defmodule PinchflatWeb.PageControllerTest do
+   import Pinchflat.ProfilesFixtures
+   import Pinchflat.SourcesFixtures
+ 
++  alias Pinchflat.Settings
++
+   describe "GET / when testing onboarding" do
+     test "sets the onboarding session to true when onboarding", %{conn: conn} do
+-      conn = get(conn, ~p"/")
+-      assert get_session(conn, :onboarding)
++      _conn = get(conn, ~p"/")
++      assert Settings.get!(:onboarding)
+     end
+ 
+     test "displays the onboarding page when no media profiles exist", %{conn: conn} do
+@@ -32,13 +34,13 @@ defmodule PinchflatWeb.PageControllerTest do
+ 
+     test "sets the onboarding session to false when not onboarding", %{conn: conn} do
+       conn = get(conn, ~p"/")
+-      assert get_session(conn, :onboarding)
++      assert Settings.get!(:onboarding)
+ 
+       _ = media_profile_fixture()
+       _ = source_fixture()
+ 
+-      conn = get(conn, ~p"/")
+-      refute get_session(conn, :onboarding)
++      _conn = get(conn, ~p"/")
++      refute Settings.get!(:onboarding)
+     end
+ 
+     test "displays the home page when not onboarding", %{conn: conn} do
+diff --git a/test/pinchflat_web/controllers/source_controller_test.exs b/test/pinchflat_web/controllers/source_controller_test.exs
+index 4f641f5a0..342ce17a4 100644
+--- a/test/pinchflat_web/controllers/source_controller_test.exs
++++ b/test/pinchflat_web/controllers/source_controller_test.exs
+@@ -7,9 +7,11 @@ defmodule PinchflatWeb.SourceControllerTest do
+   import Pinchflat.ProfilesFixtures
+ 
+   alias Pinchflat.Repo
++  alias Pinchflat.Settings
+ 
+   setup do
+     media_profile = media_profile_fixture()
++    Settings.set!(:onboarding, false)
+ 
+     {
+       :ok,
+@@ -42,13 +44,11 @@ defmodule PinchflatWeb.SourceControllerTest do
+       assert html_response(conn, 200) =~ "New Source"
+     end
+ 
+-    test "renders correct layout when onboarding", %{session_conn: session_conn} do
+-      session_conn =
+-        session_conn
+-        |> put_session(:onboarding, true)
+-        |> get(~p"/sources/new")
++    test "renders correct layout when onboarding", %{conn: conn} do
++      Settings.set!(:onboarding, true)
++      conn = get(conn, ~p"/sources/new")
+ 
+-      refute html_response(session_conn, 200) =~ "MENU"
++      refute html_response(conn, 200) =~ "MENU"
+     end
+   end
+ 
+@@ -69,24 +69,20 @@ defmodule PinchflatWeb.SourceControllerTest do
+       assert html_response(conn, 200) =~ "New Source"
+     end
+ 
+-    test "redirects to onboarding when onboarding", %{session_conn: session_conn, create_attrs: create_attrs} do
++    test "redirects to onboarding when onboarding", %{conn: conn, create_attrs: create_attrs} do
+       expect(YtDlpRunnerMock, :run, 1, &runner_function_mock/3)
+ 
+-      session_conn =
+-        session_conn
+-        |> put_session(:onboarding, true)
+-        |> post(~p"/sources", source: create_attrs)
++      Settings.set!(:onboarding, true)
++      conn = post(conn, ~p"/sources", source: create_attrs)
+ 
+-      assert redirected_to(session_conn) == ~p"/?onboarding=1"
++      assert redirected_to(conn) == ~p"/?onboarding=1"
+     end
+ 
+-    test "renders correct layout on error when onboarding", %{session_conn: session_conn, invalid_attrs: invalid_attrs} do
+-      session_conn =
+-        session_conn
+-        |> put_session(:onboarding, true)
+-        |> post(~p"/sources", source: invalid_attrs)
++    test "renders correct layout on error when onboarding", %{conn: conn, invalid_attrs: invalid_attrs} do
++      Settings.set!(:onboarding, true)
++      conn = post(conn, ~p"/sources", source: invalid_attrs)
+ 
+-      refute html_response(session_conn, 200) =~ "MENU"
++      refute html_response(conn, 200) =~ "MENU"
+     end
+   end
+ 

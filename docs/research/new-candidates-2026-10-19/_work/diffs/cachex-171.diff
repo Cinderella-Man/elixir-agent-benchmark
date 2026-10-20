@@ -1,0 +1,869 @@
+diff --git a/lib/cachex.ex b/lib/cachex.ex
+index 563907ba..29976a93 100644
+--- a/lib/cachex.ex
++++ b/lib/cachex.ex
+@@ -41,6 +41,7 @@ defmodule Cachex do
+   alias Cachex.Errors
+   alias Cachex.ExecutionError
+   alias Cachex.Options
++  alias Cachex.Query
+   alias Cachex.Services
+ 
+   # alias any services
+@@ -89,7 +90,7 @@ defmodule Cachex do
+     set_many:          [ 2, 3 ],
+     size:              [ 1, 2 ],
+     stats:             [ 1, 2 ],
+-    stream:            [ 1, 2 ],
++    stream:         [ 1, 2, 3 ],
+     take:              [ 2, 3 ],
+     touch:             [ 2, 3 ],
+     transaction:       [ 3, 4 ],
+@@ -1203,21 +1204,20 @@ defmodule Cachex do
+   @doc """
+   Creates a `Stream` of entries in a cache.
+ 
+-  The returned stream operates entirely on an ETS level in order
+-  to provide a moving view of a cache. As such, if you wish to
+-  operate on any keys as a result of the stream, please execute
+-  your modifications inside a transactional context.
++  This will stream all entries matching the provided match specification
++  as the second argument. If none if provided, it will default to all entries
++  which are yet to expire (in no particular order).
++
++  Consider using `Cachex.Query` to generate match specifications used when
++  querying the contents of a cache table.
+ 
+   ## Options
+ 
+-    * `:of`
++    * `:batch_size`
+ 
+       </br>
+-      Specifies the format of the entries to stream, allowing the
+-      caller to customize the seeded entry format. This will usually
+-      be `:key` or `:value` as users only interact with those fields
+-      directly. This can also be a Tuple and defaults to the pair of
+-      `{ :key, :value }`.
++      Allows customization of the internal batching when paginating the QLC
++      cursor coming back from ETS. It's unlikely this will ever need changing.
+ 
+   ## Examples
+ 
+@@ -1227,22 +1227,28 @@ defmodule Cachex do
+       {:ok, true}
+ 
+       iex> :my_cache |> Cachex.stream! |> Enum.to_list
+-      [{"b", 2}, {"c", 3}, {"a", 1}]
++      [{:entry, "b", 1519015801794, nil, 2},
++        {:entry, "c", 1519015805679, nil, 3},
++        {:entry, "a", 1519015794445, nil, 1}]
+ 
+-      iex> :my_cache |> Cachex.stream!(of: :key) |> Enum.to_list
++      iex> query = Cachex.Query.create_query(true, :key)
++      iex> :my_cache |> Cachex.stream!(query) |> Enum.to_list
+       ["b", "c", "a"]
+ 
+-      iex> :my_cache |> Cachex.stream!(of: :value) |> Enum.to_list
++      iex> query = Cachex.Query.create_query(true, :value)
++      iex> :my_cache |> Cachex.stream!(query) |> Enum.to_list
+       [2, 3, 1]
+ 
+-      iex> :my_cache |> Cachex.stream!(of: { { :key, :ttl } }) |> Enum.to_list
+-      [{"b", nil}, {"c", nil}, {"a", nil}]
++      iex> query = Cachex.Query.create_query(true, { :key, :value })
++      iex> :my_cache |> Cachex.stream!(query) |> Enum.to_list
++      [{"b", 2}, {"c", 3}, {"a", 1}]
+ 
+   """
+-  @spec stream(cache, Keyword.t) :: { status, Enumerable.t }
+-  def stream(cache, options \\ []) when is_list(options) do
++  @spec stream(cache, any, Keyword.t) :: { status, Enumerable.t }
++  def stream(cache, query \\ Query.create_query(true), options \\ [])
++  when is_list(options) do
+     Overseer.enforce(cache) do
+-      Actions.Stream.execute(cache, options)
++      Actions.Stream.execute(cache, query, options)
+     end
+   end
+ 
+diff --git a/lib/cachex/actions/count.ex b/lib/cachex/actions/count.ex
+index a04f9afa..af6c46d7 100644
+--- a/lib/cachex/actions/count.ex
++++ b/lib/cachex/actions/count.ex
+@@ -4,7 +4,7 @@ defmodule Cachex.Actions.Count do
+   #
+   # Counting a cache will make sure to take the expiration time of items into
+   # consideration, making the semantics different to those of the `size()` calls.
+-  alias Cachex.Util
++  alias Cachex.Query
+ 
+   # import needed macros
+   import Cachex.Actions
+@@ -22,5 +22,5 @@ defmodule Cachex.Actions.Count do
+   to the count. Lazy expiration does not apply to this call.
+   """
+   defaction count(cache(name: name) = cache, options),
+-    do: { :ok, :ets.select_count(name, Util.retrieve_all_rows(true)) }
++    do: { :ok, :ets.select_count(name, Query.create_unexpired_query(true)) }
+ end
+diff --git a/lib/cachex/actions/inspect.ex b/lib/cachex/actions/inspect.ex
+index 5bb6cc89..a354a729 100644
+--- a/lib/cachex/actions/inspect.ex
++++ b/lib/cachex/actions/inspect.ex
+@@ -7,8 +7,8 @@ defmodule Cachex.Actions.Inspect do
+   #
+   # Due to the nature of inspection, behaviour in this module can change
+   # at any time - not only with major increments of the library version.
++  alias Cachex.Query
+   alias Cachex.Services
+-  alias Cachex.Util
+   alias Services.Janitor
+   alias Services.Overseer
+ 
+@@ -77,20 +77,16 @@ defmodule Cachex.Actions.Inspect do
+   # The number of entries returned represents the number of records which will
+   # be removed on the next run of the Janitor service. It does not track the
+   # number of expired records which have already been purged or removed.
+-  def execute(cache(name: name), { :expired, :count }) do
+-    query = Util.retrieve_expired_rows(true)
+-    { :ok, :ets.select_count(name, query) }
+-  end
++  def execute(cache(name: name), { :expired, :count }),
++   do: { :ok, :ets.select_count(name, Query.create_expired_query(true)) }
+ 
+   # Returns the keys of expired entries currently inside the cache.
+   #
+   # This is essentially the same as the definition above, except that it will
+   # return the list of entry keys rather than just a count. Naturally this is
+   # an expensive call and should really only be used when debugging.
+-  def execute(cache(name: name), { :expired, :keys }) do
+-    query = Util.retrieve_expired_rows(:key)
+-    { :ok, :ets.select(name, query) }
+-  end
++  def execute(cache(name: name), { :expired, :keys }),
++    do: { :ok, :ets.select(name, Query.create_expired_query(:key)) }
+ 
+   # Returns information about the last run of the Janitor service.
+   #
+diff --git a/lib/cachex/actions/keys.ex b/lib/cachex/actions/keys.ex
+index c1f7fce9..67cc90ac 100644
+--- a/lib/cachex/actions/keys.ex
++++ b/lib/cachex/actions/keys.ex
+@@ -7,7 +7,7 @@ defmodule Cachex.Actions.Keys do
+   # be used instead.
+   #
+   # This command will take the expiration of entries into consideration.
+-  alias Cachex.Util
++  alias Cachex.Query
+ 
+   # we need our imports
+   import Cachex.Actions
+@@ -25,5 +25,5 @@ defmodule Cachex.Actions.Keys do
+   will not be included.
+   """
+   defaction keys(cache(name: name) = cache, options),
+-    do: { :ok, :ets.select(name, Util.retrieve_all_rows(:key)) }
++    do: { :ok, :ets.select(name, Query.create_query(true, :key)) }
+ end
+diff --git a/lib/cachex/actions/purge.ex b/lib/cachex/actions/purge.ex
+index ce52fa7a..abfe1993 100644
+--- a/lib/cachex/actions/purge.ex
++++ b/lib/cachex/actions/purge.ex
+@@ -5,8 +5,8 @@ defmodule Cachex.Actions.Purge do
+   # This is highly optimized using native ETS behaviour to purge as many
+   # entries as possible at a high rate. It is used internally by the Janitor
+   # service when purging on a schedule.
++  alias Cachex.Query
+   alias Cachex.Services.Locksmith
+-  alias Cachex.Util
+ 
+   # we need our imports
+   import Cachex.Actions
+@@ -20,7 +20,7 @@ defmodule Cachex.Actions.Purge do
+   Purges all expired records from the cache.
+ 
+   This is optimizes to use native ETS batch deletes using match specifications,
+-  which are compiled using the utility functions found in `Cachex.Util`.
++  which are compiled using the utility functions found in `Cachex.Query`.
+ 
+   This function is used by the Janitor process internally to sync behaviour in
+   both places rather than reimplementing the same logic in two places.
+@@ -30,7 +30,7 @@ defmodule Cachex.Actions.Purge do
+   """
+   defaction purge(cache(name: name) = cache, options) do
+     Locksmith.transaction(cache, [ ], fn ->
+-      { :ok, :ets.select_delete(name, Util.retrieve_expired_rows(true)) }
++      { :ok, :ets.select_delete(name, Query.create_expired_query(true)) }
+     end)
+   end
+ end
+diff --git a/lib/cachex/actions/stream.ex b/lib/cachex/actions/stream.ex
+index 6dbbaffa..f60e36b7 100644
+--- a/lib/cachex/actions/stream.ex
++++ b/lib/cachex/actions/stream.ex
+@@ -3,17 +3,22 @@ defmodule Cachex.Actions.Stream do
+   # Command module to allow streaming of cache entries.
+   #
+   # A cache `Stream` is a lazy consumer of a cache in that it allows iteration
+-  # of a cache on an as-needed basis. It should be noted that streams do not
+-  # currently support record expirations, although this may change in future.
+-  alias Cachex.Util
++  # of a cache on an as-needed basis. It acts as any other `Stream` from Elixir,
++  # and is fully compatible with the functions found in the `Enum` module.
++  alias Cachex.Options
+ 
+-  # we need our imports
++  # need our imports
+   import Cachex.Actions
+   import Cachex.Errors
+   import Cachex.Spec
+ 
+   # our test record for testing matches
+-  @test { "key", now(), 1000, "value" }
++  @test entry([
++    key: "key",
++    touched: now(),
++    ttl: 1000,
++    value: "value"
++  ])
+ 
+   ##############
+   # Public API #
+@@ -27,24 +32,18 @@ defmodule Cachex.Actions.Stream do
+   and consume it 15 minutes later, you'll see all changes which occurred in those
+   15 minutes.
+ 
+-  You can provide custom structures to stream using via the `:of` option, but
+-  as of yet there is no way to query before consumption - meaning that you'll
+-  have to filter the Stream itself rather than avoiding buffering in the first
+-  place - this may change in future.
+-
+   We execute an `:ets.test_ms/2` call before doing anything to ensure the user
+   has provided a valid return type. If they haven't, we return an error before
+   creating a cursor or the `Stream` itself.
+   """
+-  defaction stream(cache(name: name) = cache, options) do
+-    spec =
+-      options
+-      |> Keyword.get(:of, { { :key, :value } })
+-      |> Util.retrieve_all_rows
+-
++  defaction stream(cache(name: name) = cache, spec, options) do
+     case :ets.test_ms(@test, spec) do
+       { :ok, _result } ->
+-        { :ok, init_stream(name, spec) }
++        options
++        |> Options.get(:batch_size, &is_positive_integer/1, 25)
++        |> init_stream(name, spec)
++        |> wrap(:ok)
++
+       { :error, _result } ->
+         error(:invalid_match)
+     end
+@@ -58,7 +57,7 @@ defmodule Cachex.Actions.Stream do
+   #
+   # Each time more items are requested we pull another batch of entries until
+   # the cursor is spent, in which case we halt the stream and kill the cursor.
+-  defp init_stream(name, spec) do
++  defp init_stream(batch, name, spec) do
+     Stream.resource(
+       fn ->
+         name
+@@ -66,7 +65,7 @@ defmodule Cachex.Actions.Stream do
+         |> :qlc.cursor
+       end,
+       fn(cursor) ->
+-        case :qlc.next_answers(cursor) do
++        case :qlc.next_answers(cursor, batch) do
+           [ ] -> { :halt, cursor }
+           ans -> {   ans, cursor }
+         end
+diff --git a/lib/cachex/policy/lrw.ex b/lib/cachex/policy/lrw.ex
+index 864b8449..753cf54c 100644
+--- a/lib/cachex/policy/lrw.ex
++++ b/lib/cachex/policy/lrw.ex
+@@ -26,11 +26,11 @@ defmodule Cachex.Policy.LRW do
+   import Cachex.Spec
+ 
+   # add internal aliases
++  alias Cachex.Query
+   alias Cachex.Services.Informant
+-  alias Cachex.Util
+ 
+   # compile our QLC match at runtime to avoid recalculating
+-  @qlc_match Util.create_match([ { { :"$1", :"$2" } } ], [ ])
++  @qlc_match Query.create_query(true, { :key, :touched })
+ 
+   ####################
+   # Policy Behaviour #
+diff --git a/lib/cachex/query.ex b/lib/cachex/query.ex
+new file mode 100644
+index 00000000..5fd981a0
+--- /dev/null
++++ b/lib/cachex/query.ex
+@@ -0,0 +1,101 @@
++defmodule Cachex.Query do
++  @moduledoc """
++  Utility module based around creation of cache queries.
++
++  Queries are essentially just some minor convenience wrappers around the
++  internal match specification used by ETS. This module is exposed to make
++  it easier to query a cache (via `Cachex.stream/3`) without having to take
++  care of filtering for expirations by hand.
++
++  Note that there is almost no validation in here, so test thoroughly and
++  store compile-time versions of your queries when possible (as performance
++  is not taken into account inside this module; it can be slow to generate).
++  """
++  import Cachex.Spec
++
++  ##############
++  # Public API #
++  ##############
++
++  @doc """
++  Creates an expiration-aware query.
++  """
++  @spec create_query(any, any) :: [ { tuple, [ tuple ], [ any ] } ]
++  def create_query(condition, output \\ :"$_"),
++    do: create_raw_query({ :andalso, create_unexpired_clause(), condition }, output)
++
++  @doc """
++  Creates a raw query, ignoring expiration.
++  """
++  @spec create_raw_query(any, any) :: [ { tuple, [ tuple ], [ any ] } ]
++  def create_raw_query(condition, output \\ :"$_"),
++    do: [ {
++      { :_, :"$1", :"$2", :"$3", :"$4" },
++      [ map_clauses(condition) ],
++      [ clean_return(map_clauses(output)) ]
++    } ]
++
++  @doc """
++  Creates a match condition for expired records.
++  """
++  @spec create_expired_clause :: tuple
++  def create_expired_clause,
++    do: { :not, create_unexpired_clause() }
++
++  @doc """
++  Creates a query to retrieve all expired records.
++  """
++  @spec create_expired_query(any) :: [ { tuple, [ tuple ], [ any ] } ]
++  def create_expired_query(output \\ :"$_"),
++    do: create_raw_query(create_expired_clause(), output)
++
++  @doc """
++  Creates a match condition for unexpired records.
++  """
++  @spec create_unexpired_clause :: tuple
++  def create_unexpired_clause,
++    do: { :orelse, { :==, :"$3", nil }, { :>, { :+, :"$2", :"$3" }, now() } }
++
++  @doc """
++  Creates a query to retrieve all unexpired records.
++  """
++  @spec create_unexpired_query(any) :: [ { tuple, [ tuple ], [ any ] } ]
++  def create_unexpired_query(output \\ :"$_"),
++    do: create_raw_query(create_unexpired_clause(), output)
++
++  ###############
++  # Private API #
++  ###############
++
++  # Recursively replaces all entry tags in a clause value.
++  #
++  # This allows the use of entry fields, such as `:key` as references in
++  # query clauses (even if ETS doesn't). The fields will be mapped to the
++  # index equivalent and returned in a sanitized clause value.
++  defp map_clauses(tpl) when is_tuple(tpl) do
++    tpl
++    |> Tuple.to_list
++    |> map_clauses
++    |> List.to_tuple
++  end
++  defp map_clauses(list) when is_list(list),
++    do: Enum.map(list, &map_clauses/1)
++
++  # basic entry field name substitution
++  for key <- Keyword.keys(entry(entry())),
++    do: defp map_clauses(unquote(key)),
++      do: :"$#{entry(unquote(key))}"
++
++  # no-op, already valid
++  defp map_clauses(field),
++    do: field
++
++  # Sanitizes a returning value clause.
++  #
++  # This will just wrap any non-single element Tuples being returned as
++  # this is required in order to provide valid return formats.
++  defp clean_return(tpl) when tuple_size(tpl) > 1,
++    do: { tpl }
++  defp clean_return(val),
++    do: val
++end
+diff --git a/lib/cachex/util.ex b/lib/cachex/util.ex
+deleted file mode 100644
+index 9c6578f7..00000000
+--- a/lib/cachex/util.ex
++++ /dev/null
+@@ -1,95 +0,0 @@
+-defmodule Cachex.Util do
+-  @moduledoc false
+-  # Small utility module for common functions use through Cachex.
+-  #
+-  # This is 100% internal API, never use it from outside.
+-  import Cachex.Spec
+-
+-  ##############
+-  # Public API #
+-  ##############
+-
+-  # result tuple tag type
+-  @type result_tag :: :commit | :ignore | :error
+-
+-  @doc """
+-  Creates a match specification using the provided rules.
+-
+-  This is a shorthand to write a cache-compatible ETS match.
+-  """
+-  @spec create_match(any, any) :: [ { { }, [ any ], [ any ] }]
+-  def create_match(return, where) do
+-    nwhere = case where do
+-      [ where ] -> where
+-        where   -> where
+-    end
+-
+-    [
+-      {
+-        { :_, :"$1", :"$2", :"$3", :"$4" },
+-        List.wrap(do_field_normalize(nwhere)),
+-        List.wrap(do_field_normalize(return))
+-      }
+-    ]
+-  end
+-
+-  @doc """
+-  Returns a match for all entries in a table.
+-
+-  This allows you to customize what is returned using the return param.
+-  """
+-  @spec retrieve_all_rows([ any ]) :: [ { { }, [ any ], [ any ] }]
+-  def retrieve_all_rows(return) do
+-    create_match(return, [
+-      {
+-        :orelse,                                  # guards for matching
+-        { :"==", :"$3", nil },                    # where a TTL is not set
+-        { :">", { :"+", :"$2", :"$3" }, now() }   # or the TTL has not passed
+-      }
+-    ])
+-  end
+-
+-  @doc """
+-  Returns a match for all expired entries in a table.
+-
+-  This allows you to customize what is returned using the return param.
+-  """
+-  @spec retrieve_expired_rows([ any ]) :: [ { { }, [ any ], [ any ] }]
+-  def retrieve_expired_rows(return) do
+-    create_match(return, [
+-      {
+-        :andalso,                                 # guards for matching
+-        { :"/=", :"$3", nil },                    # where a TTL is set
+-        { :"<", { :"+", :"$2", :"$3" }, now() }   # and the TTL has passed
+-      }
+-    ])
+-  end
+-
+-  ###############
+-  # Private API #
+-  ###############
+-
+-  # Normalizes select syntax to valid Erlang handles.
+-  #
+-  # This is used to reference field names from an entry using the name from
+-  # the entry record. This is a recursive normalization to function all the
+-  # way down (as matches are arbitrarily nested).
+-  #
+-  # TODO: we need to kill this with fire at some point
+-  defp do_field_normalize(fields) when is_tuple(fields) do
+-    fields
+-    |> Tuple.to_list
+-    |> Enum.map(&do_field_normalize/1)
+-    |> List.to_tuple
+-  end
+-  defp do_field_normalize(:key),
+-    do: :"$#{entry(:key)}"
+-  defp do_field_normalize(:value),
+-    do: :"$#{entry(:value)}"
+-  defp do_field_normalize(:touched),
+-    do: :"$#{entry(:touched)}"
+-  defp do_field_normalize(:ttl),
+-    do: :"$#{entry(:ttl)}"
+-  defp do_field_normalize(field),
+-    do: field
+-end
+diff --git a/test/cachex/actions/stream_test.exs b/test/cachex/actions/stream_test.exs
+index 9a30575b..1e15e4a9 100644
+--- a/test/cachex/actions/stream_test.exs
++++ b/test/cachex/actions/stream_test.exs
+@@ -1,10 +1,10 @@
+ defmodule Cachex.Actions.StreamTest do
+   use CachexCase
+ 
+-  # This test ensures that a default cache stream will stream keys and values
+-  # back in Tuple pairs back to the calling process. This test just makes sure
++  # This test ensures that a default cache stream will stream cache entries
++  # back in record form back to the calling process. This test just makes sure
+   # that the Stream correctly forms these Tuples using the default structure.
+-  test "streaming keys and values" do
++  test "streaming cache entries" do
+     # create a test cache
+     cache = Helper.create_cache()
+ 
+@@ -13,18 +13,19 @@ defmodule Cachex.Actions.StreamTest do
+     { :ok, true } = Cachex.put(cache, "key2", "value2")
+     { :ok, true } = Cachex.put(cache, "key3", "value3")
+ 
++    # grab the raw versions of each record
++    { :ok, entry1 } = Cachex.inspect(cache, { :entry, "key1" })
++    { :ok, entry2 } = Cachex.inspect(cache, { :entry, "key2" })
++    { :ok, entry3 } = Cachex.inspect(cache, { :entry, "key3" })
++
+     # create a cache stream
+     { :ok, stream } = Cachex.stream(cache)
+ 
+     # consume the stream
+     result = Enum.sort(stream)
+ 
+-    # verify the results
+-    assert(result == [
+-      { "key1", "value1" },
+-      { "key2", "value2" },
+-      { "key3", "value3" }
+-    ])
++    # verify the results are the ordered entries
++    assert(result == [ entry1, entry2, entry3 ])
+   end
+ 
+   # This test covers the use case of custom match patterns, by testing various
+@@ -39,9 +40,13 @@ defmodule Cachex.Actions.StreamTest do
+     { :ok, true } = Cachex.put(cache, "key2", "value2")
+     { :ok, true } = Cachex.put(cache, "key3", "value3")
+ 
++    # create two test queries
++    query1 = Cachex.Query.create_query(true, { :key, :value })
++    query2 = Cachex.Query.create_query(true, :key)
++
+     # create cache streams
+-    { :ok, stream1 } = Cachex.stream(cache, [ of: { { :key, :value, :key, :ttl } } ])
+-    { :ok, stream2 } = Cachex.stream(cache, [ of: :key ])
++    { :ok, stream1 } = Cachex.stream(cache, query1)
++    { :ok, stream2 } = Cachex.stream(cache, query2)
+ 
+     # consume the streams
+     result1 = Enum.sort(stream1)
+@@ -49,9 +54,9 @@ defmodule Cachex.Actions.StreamTest do
+ 
+     # verify the first results
+     assert(result1 == [
+-      { "key1", "value1", "key1", nil },
+-      { "key2", "value2", "key2", nil },
+-      { "key3", "value3", "key3", nil }
++      { "key1", "value1" },
++      { "key2", "value2" },
++      { "key3", "value3" }
+     ])
+ 
+     # verify the second results
+@@ -65,7 +70,7 @@ defmodule Cachex.Actions.StreamTest do
+     cache = Helper.create_cache()
+ 
+     # create cache stream
+-    result  = Cachex.stream(cache, [ of: { :invalid } ])
++    result  = Cachex.stream(cache, { :invalid })
+ 
+     # verify the stream fails
+     assert(result == { :error, :invalid_match })
+diff --git a/test/cachex/query_test.exs b/test/cachex/query_test.exs
+new file mode 100644
+index 00000000..03b8a156
+--- /dev/null
++++ b/test/cachex/query_test.exs
+@@ -0,0 +1,149 @@
++defmodule Cachex.QueryTest do
++  use CachexCase
++
++  # All queries are run through the basic query generation, so this test
++  # will just validate the passing of query clauses through to the query
++  # creation default, which will attach the checks for expirations.
++  test "creating basic queries" do
++    # create a query with a true filter
++    query1 = Cachex.Query.create_query(true)
++    query2 = Cachex.Query.create_query(true, :key)
++
++    # verify the form of the first query
++    assert [
++      {
++        { :_, :"$1", :"$2", :"$3", :"$4" },
++        [
++          { :andalso,
++            { :orelse,
++              { :==, :"$3", nil },
++              { :>, {:+, :"$2", :"$3" }, _now }
++            },
++            true
++          }
++        ],
++        [ :"$_" ]
++      }
++    ] = query1
++
++    # verify the form of the second query
++    assert [
++      {
++        { :_, :"$1", :"$2", :"$3", :"$4" },
++        [
++          { :andalso,
++            { :orelse,
++              { :==, :"$3", nil },
++              { :>, {:+, :"$2", :"$3" }, _now }
++            },
++            true
++          }
++        ],
++        [ :"$1" ]
++      }
++    ] = query2
++  end
++
++  # The `create_expired_query()` function is just a wrapper to `create_query`
++  # whilst inverting the expiration checks. This test just covers this behaviour.
++  test "creating expired queries" do
++    # create a couple of expired queries
++    query1 = Cachex.Query.create_expired_query()
++    query2 = Cachex.Query.create_expired_query(:key)
++
++    # verify the form of the first query
++    assert [
++      {
++        { :_, :"$1", :"$2", :"$3", :"$4" },
++        [
++          { :not,
++            { :orelse,
++              { :==, :"$3", nil },
++              { :>, {:+, :"$2", :"$3" }, _now }
++            }
++          }
++        ],
++        [ :"$_" ]
++      }
++    ] = query1
++
++    # verify the form of the second query
++    assert [
++      {
++        { :_, :"$1", :"$2", :"$3", :"$4" },
++        [
++          { :not,
++            { :orelse,
++              { :==, :"$3", nil },
++              { :>, {:+, :"$2", :"$3" }, _now }
++            }
++          }
++        ],
++        [ :"$1" ]
++      }
++    ] = query2
++  end
++
++  # The `create_unexpired_query()` function is just a wrapper to `create_query`
++  # whilst without a secondary clause. This test just covers this behaviour.
++  test "creating unexpired queries" do
++    # create a couple of unexpired queries
++    query1 = Cachex.Query.create_unexpired_query()
++    query2 = Cachex.Query.create_unexpired_query(:key)
++
++    # verify the form of the first query
++    assert [
++      {
++        { :_, :"$1", :"$2", :"$3", :"$4" },
++        [
++          { :orelse,
++            { :==, :"$3", nil },
++            { :>, {:+, :"$2", :"$3" }, _now }
++          }
++        ],
++        [ :"$_" ]
++      }
++    ] = query1
++
++    # verify the form of the second query
++    assert [
++      {
++        { :_, :"$1", :"$2", :"$3", :"$4" },
++        [
++          { :orelse,
++            { :==, :"$3", nil },
++            { :>, {:+, :"$2", :"$3" }, _now }
++          }
++        ],
++        [ :"$1" ]
++      }
++    ] = query2
++  end
++
++  # This test just covers the default value checking when creating raw
++  # queries with none of the provided bindings. This does nothing more
++  # than validate structure, as there are no attached conditions added.
++  test "creating raw queries" do
++    # create a query with a true filter
++    query1 = Cachex.Query.create_raw_query(true)
++    query2 = Cachex.Query.create_raw_query(true, :key)
++
++    # verify the form of the first query
++    assert query1 == [
++      {
++        { :_, :"$1", :"$2", :"$3", :"$4" },
++        [ true ],
++        [ :"$_" ]
++      }
++    ]
++
++    # verify the form of the second query
++    assert query2 == [
++      {
++        { :_, :"$1", :"$2", :"$3", :"$4" },
++        [ true ],
++        [ :"$1" ]
++      }
++    ]
++  end
++end
+diff --git a/test/cachex/util_test.exs b/test/cachex/util_test.exs
+deleted file mode 100644
+index eeb12734..00000000
+--- a/test/cachex/util_test.exs
++++ /dev/null
+@@ -1,106 +0,0 @@
+-defmodule Cachex.UtilTest do
+-  use CachexCase
+-
+-  # Match statements are heavily used, so we need to make sure they all compile
+-  # correctly when called in the utilities. There are several cases to cover here,
+-  # including those with and without field aliases (for example using :key instead)
+-  # of $1. We also need to ensure that where clauses get wrapped, but never doubly.
+-  test "creating match statements" do
+-    # create our returns, with and without indexes
+-    return1 = { { :"$1", :"$2" } }
+-    return2 = { { :key, :touched, :ttl, :value } }
+-
+-    # create our returns, with and without indexes, and with and without lists
+-    where1 = [ { :"/=", :"$3", nil } ]
+-    where2 =    { :"/=", :ttl, nil }
+-
+-    # compile our matches
+-    match1 = Cachex.Util.create_match(return1, where1)
+-    match2 = Cachex.Util.create_match(return2, where2)
+-
+-    # compare match1 to hand written
+-    assert(match1 == [
+-      {
+-        { :_, :"$1", :"$2", :"$3", :"$4" },
+-        [ { :"/=", :"$3", nil } ],
+-        [ { { :"$1", :"$2" } } ]
+-      }
+-    ])
+-
+-    # compare match2 to hand written
+-    assert(match2 == [
+-      {
+-        { :_, :"$1", :"$2", :"$3", :"$4" },
+-        [ { :"/=", :"$3", nil } ],
+-        [ { { :"$1", :"$2", :"$3", :"$4" } } ]
+-      }
+-    ])
+-  end
+-
+-  # There are several places we wish to fetch all rows from a cache, so this util
+-  # just generates a spec which takes a return set. All we can do here is check
+-  # that a specification is correctly generated with and without field indexes.
+-  test "selecting all rows in a match spec" do
+-    # generates two return types
+-    return1 = { :"$1", :"$2", :"$3", :"$4" }
+-    return2 = { :key, :touched, :ttl, :value }
+-
+-    # create both specifications
+-    result1 = Cachex.Util.retrieve_all_rows(return1)
+-    result2 = Cachex.Util.retrieve_all_rows(return2)
+-
+-    # both validate the same way
+-    validate = fn(result) ->
+-      # let's break down the result
+-      [ { head, query, return } ] = result
+-
+-      # assert all makes sense
+-      assert(head == { :_, :"$1", :"$2", :"$3", :"$4" })
+-      assert(return == [ { :"$1", :"$2", :"$3", :"$4" } ])
+-
+-      # the query has some dynamic values
+-      [ { :orelse, left, right } ] = query
+-
+-      # validate the query
+-      assert(left == { :==, :"$3", nil })
+-      assert(match?({ :>, { :+, :"$2", :"$3" }, _now }, right))
+-    end
+-
+-    # validate both results (as they should be the same)
+-    validate.(result1)
+-    validate.(result2)
+-  end
+-
+-  # The reasoning for this test is the same as the above, but we need to ensure
+-  # that we only pull back expired rows rather than all of those inside the cache.
+-  test "selecting unexpired rows in a match spec" do
+-    # generates two return types
+-    return1 = { :"$1", :"$2", :"$3", :"$4" }
+-    return2 = { :key, :touched, :ttl, :value }
+-
+-    # create both specifications
+-    result1 = Cachex.Util.retrieve_expired_rows(return1)
+-    result2 = Cachex.Util.retrieve_expired_rows(return2)
+-
+-    # both validate the same way
+-    validate = fn(result) ->
+-      # let's break down the result
+-      [ { head, query, return } ] = result
+-
+-      # assert all makes sense
+-      assert(head == { :_, :"$1", :"$2", :"$3", :"$4" })
+-      assert(return == [ { :"$1", :"$2", :"$3", :"$4" } ])
+-
+-      # the query has some dynamic values
+-      [ { :andalso, left, right } ] = query
+-
+-      # validate the query
+-      assert(left == { :"/=", :"$3", nil })
+-      assert(match?({ :<, { :+, :"$2", :"$3" }, _now }, right))
+-    end
+-
+-    # validate both results (as they should be the same)
+-    validate.(result1)
+-    validate.(result2)
+-  end
+-end
+diff --git a/test/cachex_test.exs b/test/cachex_test.exs
+index 75639d76..84f2c16b 100644
+--- a/test/cachex_test.exs
++++ b/test/cachex_test.exs
+@@ -177,7 +177,7 @@ defmodule CachexTest do
+     assert(is_even(length(definitions)))
+ 
+     # verify the size to cause errors on addition/removal
+-    assert(length(definitions) == 140)
++    assert(length(definitions) == 142)
+ 
+     # validate all definitions
+     for { name, arity } <- definitions do

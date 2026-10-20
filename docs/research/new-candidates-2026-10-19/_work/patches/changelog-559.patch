@@ -1,0 +1,1280 @@
+From fe274ccdce515f80cafe23ba5dccdc7a48ae099f Mon Sep 17 00:00:00 2001
+From: adamstac <adam@stacoviak.com>
+Date: Fri, 4 Sep 2026 01:55:37 -0500
+Subject: [PATCH 1/2] Make episode publish idempotent
+
+---
+ config/test.exs                               |   2 +
+ lib/changelog/schema/episode/episode.ex       |   1 +
+ .../schema/news/episode_news_item.ex          | 136 +++++--
+ lib/changelog/schema/news/news_queue.ex       |  14 +
+ .../controllers/admin/episode_controller.ex   |  93 +++--
+ lib/mix/tasks/news/feed_only.ex               |   6 +-
+ .../changelog/schema/episode/episode_test.exs |  76 +++-
+ .../schema/news/episode_news_item_test.exs    |  55 ++-
+ .../changelog/schema/news/news_queue_test.exs |  27 +-
+ .../admin/episode_controller_test.exs         | 355 +++++++++++++++++-
+ 10 files changed, 692 insertions(+), 73 deletions(-)
+
+diff --git a/config/test.exs b/config/test.exs
+index 2173ef47254..4647052ce22 100644
+--- a/config/test.exs
++++ b/config/test.exs
+@@ -11,6 +11,8 @@ config :logger, level: :warning
+ 
+ config :changelog, Changelog.Mailer, adapter: Swoosh.Adapters.Test
+ 
++config :changelog, :sync_episode_news_item_search, true
++
+ # Configure your database
+ config :changelog, Changelog.Repo,
+   adapter: Ecto.Adapters.Postgres,
+diff --git a/lib/changelog/schema/episode/episode.ex b/lib/changelog/schema/episode/episode.ex
+index a2c5a5c7997..2db8aca7fa6 100644
+--- a/lib/changelog/schema/episode/episode.ex
++++ b/lib/changelog/schema/episode/episode.ex
+@@ -240,6 +240,7 @@ defmodule Changelog.Episode do
+   def get_news_item(episode) do
+     episode
+     |> NewsItem.with_episode()
++    |> from(order_by: [asc: :inserted_at, asc: :id], limit: 1)
+     |> Repo.one()
+   end
+ 
+diff --git a/lib/changelog/schema/news/episode_news_item.ex b/lib/changelog/schema/news/episode_news_item.ex
+index 364ae4531f2..ea5a96919ba 100644
+--- a/lib/changelog/schema/news/episode_news_item.ex
++++ b/lib/changelog/schema/news/episode_news_item.ex
+@@ -7,6 +7,91 @@ defmodule Changelog.EpisodeNewsItem do
+   def insert(episode, logger), do: insert(episode, logger, false)
+ 
+   def insert(episode, logger, feed_only) do
++    result = insert_with_result(episode, logger, feed_only)
++
++    if Repo.in_transaction?() do
++      result.item
++    else
++      refresh_search(result)
++    end
++  end
++
++  def insert_with_result(episode, logger, feed_only) do
++    Repo.transaction(fn ->
++      episode
++      |> lock_episode()
++      |> insert_locked(logger, feed_only)
++    end)
++    |> unwrap_transaction!()
++  end
++
++  def insert_published_feed_only_once(episode, logger) do
++    Repo.transaction(fn ->
++      episode = lock_episode(episode)
++
++      case canonical_item(episode) do
++        nil -> {:created, episode |> create_item(logger, true) |> NewsItem.publish!()}
++        item -> {:existing, item}
++      end
++    end)
++    |> unwrap_transaction!()
++  end
++
++  defp insert_locked(episode, logger, feed_only) do
++    case canonical_item(episode) do
++      nil ->
++        result(create_item(episode, logger, feed_only), false)
++
++      item ->
++        item
++        |> reconcile_changeset(episode, %{
++          feed_only: reconciled_feed_only(item, feed_only),
++          logger_id: logger.id
++        })
++        |> Repo.update!()
++        |> result(true)
++    end
++  end
++
++  def update(episode) do
++    if item = canonical_item(episode) do
++      item
++      |> reconcile_changeset(episode, %{})
++      |> Repo.update!()
++      |> update_search()
++    end
++  end
++
++  def delete(episode) do
++    if item = canonical_item(episode) do
++      Repo.delete!(item)
++    end
++  end
++
++  defp lock_episode(episode) do
++    from(e in Episode,
++      where: e.id == ^episode.id,
++      lock: "FOR UPDATE"
++    )
++    |> Repo.one!()
++  end
++
++  defp canonical_item(episode) do
++    from(item in NewsItem.with_episode(episode),
++      order_by: [asc: item.inserted_at, asc: item.id],
++      limit: 1
++    )
++    |> Repo.one()
++  end
++
++  defp create_item(episode, logger, feed_only) do
++    episode
++    |> build_item(logger, feed_only)
++    |> NewsItem.insert_changeset()
++    |> Repo.insert!()
++  end
++
++  defp build_item(episode, logger, feed_only) do
+     %NewsItem{
+       type: :audio,
+       feed_only: feed_only,
+@@ -18,30 +103,27 @@ defmodule Changelog.EpisodeNewsItem do
+       logger_id: logger.id,
+       news_item_topics: episode_topics(episode)
+     }
+-    |> NewsItem.insert_changeset()
+-    |> Repo.insert!()
+   end
+ 
+-  def update(episode) do
+-    if item = Episode.get_news_item(episode) do
+-      item
+-      |> NewsItem.preload_topics()
+-      |> change(%{
+-        url: EpisodeView.episode_url(episode, :show),
+-        headline: episode.title,
+-        story: episode.summary,
+-        news_item_topics: episode_topics(episode)
+-      })
+-      |> Repo.update!()
+-      |> update_search()
+-    end
++  defp reconcile_changeset(item, episode, attrs) do
++    item
++    |> NewsItem.preload_topics()
++    |> change(
++      Map.merge(
++        %{
++          url: EpisodeView.episode_url(episode, :show),
++          headline: episode.title,
++          story: episode.summary,
++          published_at: episode.published_at,
++          news_item_topics: episode_topics(episode)
++        },
++        attrs
++      )
++    )
+   end
+ 
+-  def delete(episode) do
+-    if item = Episode.get_news_item(episode) do
+-      Repo.delete!(item)
+-    end
+-  end
++  defp reconciled_feed_only(_item, false), do: false
++  defp reconciled_feed_only(item, true), do: item.feed_only
+ 
+   defp episode_topics(episode) do
+     episode
+@@ -51,7 +133,19 @@ defmodule Changelog.EpisodeNewsItem do
+   end
+ 
+   defp update_search(item) do
+-    Task.start_link(fn -> TypesenseSearch.update_item(item) end)
++    if Application.get_env(:changelog, :sync_episode_news_item_search, false) do
++      TypesenseSearch.update_item(item)
++    else
++      Task.start(fn -> TypesenseSearch.update_item(item) end)
++    end
++
+     item
+   end
++
++  def refresh_search(%{item: item, update_search?: true}), do: update_search(item)
++  def refresh_search(%{item: item, update_search?: false}), do: item
++
++  defp result(item, update_search?), do: %{item: item, update_search?: update_search?}
++
++  defp unwrap_transaction!({:ok, result}), do: result
+ end
+diff --git a/lib/changelog/schema/news/news_queue.ex b/lib/changelog/schema/news/news_queue.ex
+index b9dc9e8c33a..84d1b6ddacd 100644
+--- a/lib/changelog/schema/news/news_queue.ex
++++ b/lib/changelog/schema/news/news_queue.ex
+@@ -54,6 +54,20 @@ defmodule Changelog.NewsQueue do
+     NewsItem.queue!(item)
+   end
+ 
++  def append_once(item) do
++    case Repo.get_by(NewsQueue, item_id: item.id) do
++      nil ->
++        append(item)
++
++      _entry ->
++        if NewsItem.is_queued(item) || NewsItem.is_published(item) do
++          item
++        else
++          NewsItem.queue!(item)
++        end
++    end
++  end
++
+   def move(item = %NewsItem{}, to_index) do
+     entry = Repo.get_by(NewsQueue, item_id: item.id)
+     move(entry, to_index)
+diff --git a/lib/changelog_web/controllers/admin/episode_controller.ex b/lib/changelog_web/controllers/admin/episode_controller.ex
+index 127969f7b3e..f5890c69fdc 100644
+--- a/lib/changelog_web/controllers/admin/episode_controller.ex
++++ b/lib/changelog_web/controllers/admin/episode_controller.ex
+@@ -351,26 +351,45 @@ defmodule ChangelogWeb.Admin.EpisodeController do
+   end
+ 
+   def publish(conn, params = %{"id" => slug}, podcast) do
+-    episode =
+-      assoc(podcast, :episodes)
+-      |> Repo.get_by!(slug: slug)
+-
+-    changeset = Ecto.Changeset.change(episode, %{published: true})
+-
+-    case Repo.update(changeset) do
+-      {:ok, episode} ->
++    case Repo.transaction(fn ->
++           episode = lock_episode_for_publish(podcast, slug)
++           newly_published? = !Episode.is_published(episode)
++           changeset = Ecto.Changeset.change(episode, %{published: true})
++
++           case Repo.update(changeset) do
++             {:ok, episode} ->
++               news_item_result = handle_news_item(conn, episode)
++               if newly_published?, do: handle_notes_push_to_github!(episode)
++               %{episode: episode, news_item_result: news_item_result}
++
++             {:error, changeset} ->
++               Repo.rollback(changeset)
++           end
++         end) do
++      {:ok, %{episode: episode, news_item_result: news_item_result}} ->
++        EpisodeNewsItem.refresh_search(news_item_result)
+         handle_guest_thanks(params, episode)
+-        handle_news_item(conn, episode)
+-        handle_notes_push_to_github(episode)
+ 
+         conn
+         |> put_flash(:result, "success")
+         |> redirect(to: ~p"/admin/podcasts/#{podcast.slug}/episodes")
+ 
+-      {:error, changeset} ->
++      {:error, error} ->
++        episode =
++          assoc(podcast, :episodes)
++          |> Repo.get_by!(slug: slug)
++          |> Episode.preload_all()
++
++        changeset = publish_error_changeset(episode, error)
++
+         conn
+         |> put_flash(:result, "failure")
+-        |> render(:edit, episode: episode, changeset: changeset)
++        |> render(:edit,
++          episode: episode,
++          changeset: changeset,
++          last_slug: Podcast.last_published_numbered_slug(podcast),
++          episode_requests: episode_requests(episode)
++        )
+     end
+   end
+ 
+@@ -433,22 +452,14 @@ defmodule ChangelogWeb.Admin.EpisodeController do
+     |> Repo.all()
+   end
+ 
+-  # if the "news" param exists, it's a regular news item.
+-  defp handle_news_item(conn = %{params: %{"news" => _}}, episode) do
+-    logger = conn.assigns.current_user
+-
+-    episode
+-    |> EpisodeNewsItem.insert(logger)
+-    |> NewsQueue.append()
+-  end
+-
+-  # Otherwise we want a feed-only news item
+   defp handle_news_item(conn, episode) do
+     logger = conn.assigns.current_user
++    feed_only = !Map.has_key?(conn.params, "news")
+ 
+-    episode
+-    |> EpisodeNewsItem.insert(logger, true)
+-    |> NewsQueue.append()
++    result = EpisodeNewsItem.insert_with_result(episode, logger, feed_only)
++    item = maybe_queue_news_item(result.item)
++
++    %{result | item: item}
+   end
+ 
+   defp handle_notes_push_to_github(episode) do
+@@ -457,6 +468,22 @@ defmodule ChangelogWeb.Admin.EpisodeController do
+     end
+   end
+ 
++  defp handle_notes_push_to_github!(episode) do
++    case handle_notes_push_to_github(episode) do
++      :ok -> :ok
++      {:ok, _job} -> :ok
++      {:error, reason} -> Repo.rollback({:notes_push_failed, reason})
++    end
++  end
++
++  defp publish_error_changeset(_episode, changeset = %Ecto.Changeset{}), do: changeset
++
++  defp publish_error_changeset(episode, {:notes_push_failed, _reason}) do
++    episode
++    |> Ecto.Changeset.change()
++    |> Ecto.Changeset.add_error(:base, "Unable to queue notes push")
++  end
++
+   defp handle_feed_updates(episode) do
+     if Episode.is_published(episode) do
+       FeedUpdater.queue(episode)
+@@ -487,6 +514,22 @@ defmodule ChangelogWeb.Admin.EpisodeController do
+     end)
+   end
+ 
++  defp lock_episode_for_publish(podcast, slug) do
++    from(e in assoc(podcast, :episodes),
++      where: e.slug == ^slug,
++      lock: "FOR UPDATE"
++    )
++    |> Repo.one!()
++  end
++
++  defp maybe_queue_news_item(item) do
++    if NewsItem.is_published(item) do
++      item
++    else
++      NewsQueue.append_once(item)
++    end
++  end
++
+   defp set_guest_thanks(episode, true), do: set_guest_thanks(episode, &EpisodeGuest.thanks/1)
+   defp set_guest_thanks(episode, false), do: set_guest_thanks(episode, &EpisodeGuest.no_thanks/1)
+ 
+diff --git a/lib/mix/tasks/news/feed_only.ex b/lib/mix/tasks/news/feed_only.ex
+index 21da10bb58d..67c2a2eec19 100644
+--- a/lib/mix/tasks/news/feed_only.ex
++++ b/lib/mix/tasks/news/feed_only.ex
+@@ -1,7 +1,7 @@
+ defmodule Mix.Tasks.Changelog.News.FeedOnly do
+   use Mix.Task
+ 
+-  alias Changelog.{Episode, EpisodeNewsItem, NewsItem, Person, Repo}
++  alias Changelog.{Episode, EpisodeNewsItem, Person, Repo}
+ 
+   @shortdoc "Generates news items for historic feed-only episodes"
+ 
+@@ -20,9 +20,7 @@ defmodule Mix.Tasks.Changelog.News.FeedOnly do
+ 
+     for episode <- episodes do
+       if !Episode.has_news_item(episode) do
+-        episode
+-        |> EpisodeNewsItem.insert(logbot, true)
+-        |> NewsItem.publish!()
++        EpisodeNewsItem.insert_published_feed_only_once(episode, logbot)
+       end
+     end
+   end
+diff --git a/test/changelog/schema/episode/episode_test.exs b/test/changelog/schema/episode/episode_test.exs
+index aa7f4ef999b..665fe10e6ce 100644
+--- a/test/changelog/schema/episode/episode_test.exs
++++ b/test/changelog/schema/episode/episode_test.exs
+@@ -3,7 +3,7 @@ defmodule Changelog.EpisodeTest do
+ 
+   import Mock
+ 
+-  alias Changelog.{Episode}
++  alias Changelog.{Episode, NewsItem}
+ 
+   describe "admin_changeset/2" do
+     test "with valid attributes" do
+@@ -17,33 +17,51 @@ defmodule Changelog.EpisodeTest do
+     end
+ 
+     test "purges audio-related attrs whenever slug changes" do
+-      episode = build(:episode,
+-        audio_file: %{file_name: "test.mp3"},
+-        audio_bytes: 42,
+-        audio_duration: 2600,
+-        plusplus_file: %{file_name: "test++.mp3"},
+-        plusplus_bytes: 43,
+-        plusplus_duration: 600)
++      episode =
++        build(:episode,
++          audio_file: %{file_name: "test.mp3"},
++          audio_bytes: 42,
++          audio_duration: 2600,
++          plusplus_file: %{file_name: "test++.mp3"},
++          plusplus_bytes: 43,
++          plusplus_duration: 600
++        )
+ 
+       changeset = Episode.admin_changeset(episode, %{slug: "newslug"})
+ 
+-      for attr <- [:audio_file, :audio_bytes, :audio_duration, :plusplus_file, :plusplus_bytes, :plusplus_duration] do
++      for attr <- [
++            :audio_file,
++            :audio_bytes,
++            :audio_duration,
++            :plusplus_file,
++            :plusplus_bytes,
++            :plusplus_duration
++          ] do
+         assert Map.has_key?(changeset.changes, attr)
+       end
+     end
+ 
+     test "doesn't purge audio-related attrs whenever slug doesn't change" do
+-      episode = build(:episode,
+-        audio_file: %{file_name: "test.mp3"},
+-        audio_bytes: 42,
+-        audio_duration: 2600,
+-        plusplus_file: %{file_name: "test++.mp3"},
+-        plusplus_bytes: 43,
+-        plusplus_duration: 600)
++      episode =
++        build(:episode,
++          audio_file: %{file_name: "test.mp3"},
++          audio_bytes: 42,
++          audio_duration: 2600,
++          plusplus_file: %{file_name: "test++.mp3"},
++          plusplus_bytes: 43,
++          plusplus_duration: 600
++        )
+ 
+       changeset = Episode.admin_changeset(episode, %{title: "new title"})
+ 
+-      for attr <- [:audio_file, :audio_bytes, :audio_duration, :plusplus_file, :plusplus_bytes, :plusplus_duration] do
++      for attr <- [
++            :audio_file,
++            :audio_bytes,
++            :audio_duration,
++            :plusplus_file,
++            :plusplus_bytes,
++            :plusplus_duration
++          ] do
+         refute Map.has_key?(changeset.changes, attr)
+       end
+     end
+@@ -63,6 +81,30 @@ defmodule Changelog.EpisodeTest do
+     assert found_titles == [yes1.title, yes2.title]
+   end
+ 
++  describe "get_news_item/1" do
++    test "returns the canonical item when duplicate episode news items exist" do
++      episode = insert(:published_episode)
++
++      canonical =
++        insert(:news_item,
++          type: :audio,
++          object_id: Episode.object_id(episode),
++          headline: "Canonical",
++          inserted_at: ~N[2026-01-01 00:00:00]
++        )
++
++      insert(:news_item,
++        type: :audio,
++        object_id: Episode.object_id(episode),
++        headline: "Duplicate",
++        inserted_at: ~N[2026-01-01 00:01:00]
++      )
++
++      assert %NewsItem{id: id} = Episode.get_news_item(episode)
++      assert id == canonical.id
++    end
++  end
++
+   describe "update_stat_counts" do
+     test "it defaults to 0 when episode has no imports or stats" do
+       episode = insert(:episode, import_count: 0.0)
+diff --git a/test/changelog/schema/news/episode_news_item_test.exs b/test/changelog/schema/news/episode_news_item_test.exs
+index fe53849fa63..5c811d46799 100644
+--- a/test/changelog/schema/news/episode_news_item_test.exs
++++ b/test/changelog/schema/news/episode_news_item_test.exs
+@@ -1,7 +1,13 @@
+ defmodule Changelog.EpisodeNewsItemTest do
+   use Changelog.SchemaCase
+ 
+-  alias Changelog.{EpisodeNewsItem, EpisodeTopic, NewsItem, Repo}
++  import Mock
++
++  alias Changelog.{EpisodeNewsItem, EpisodeTopic, NewsItem, Repo, TypesenseSearch}
++
++  setup_with_mocks([{TypesenseSearch, [], [update_item: fn _ -> :ok end]}], _context) do
++    :ok
++  end
+ 
+   test "insert/2 and update/1" do
+     episode = insert(:published_episode)
+@@ -29,4 +35,51 @@ defmodule Changelog.EpisodeNewsItemTest do
+     assert item.story == "obai"
+     assert NewsItem.preload_topics(item).topics == []
+   end
++
++  test "insert/3 reconciles the canonical item instead of creating a duplicate" do
++    episode = insert(:published_episode, title: "Original", summary: "First")
++    logger_1 = insert(:person)
++    logger_2 = insert(:person)
++
++    item = EpisodeNewsItem.insert(episode, logger_1, true)
++
++    updated_episode =
++      episode
++      |> Ecto.Changeset.change(title: "Updated", summary: "Second")
++      |> Repo.update!()
++
++    updated_item = EpisodeNewsItem.insert(updated_episode, logger_2, false)
++
++    assert Repo.aggregate(NewsItem.with_episode(updated_episode), :count) == 1
++    assert updated_item.id == item.id
++    assert updated_item.feed_only == false
++    assert updated_item.logger_id == logger_2.id
++    assert updated_item.headline == "Updated"
++    assert updated_item.story == "Second"
++  end
++
++  test "feed-only retries do not demote an existing non-feed-only canonical item" do
++    episode = insert(:published_episode)
++    logger = insert(:person)
++
++    item = EpisodeNewsItem.insert(episode, logger, false)
++    retried_item = EpisodeNewsItem.insert(episode, logger, true)
++
++    assert Repo.aggregate(NewsItem.with_episode(episode), :count) == 1
++    assert retried_item.id == item.id
++    assert retried_item.feed_only == false
++  end
++
++  test "insert_published_feed_only_once/2 does not mutate an existing canonical item" do
++    episode = insert(:published_episode)
++    logger = insert(:person)
++
++    item = EpisodeNewsItem.insert(episode, logger, false)
++
++    assert {:existing, existing_item} =
++             EpisodeNewsItem.insert_published_feed_only_once(episode, logger)
++
++    assert existing_item.id == item.id
++    assert Repo.get!(NewsItem, item.id).feed_only == false
++  end
+ end
+diff --git a/test/changelog/schema/news/news_queue_test.exs b/test/changelog/schema/news/news_queue_test.exs
+index 1807d109253..23574065aa1 100644
+--- a/test/changelog/schema/news/news_queue_test.exs
++++ b/test/changelog/schema/news/news_queue_test.exs
+@@ -33,6 +33,21 @@ defmodule Changelog.NewsQueueTest do
+     end
+   end
+ 
++  describe "append_once/1" do
++    test "does not create a duplicate queue entry for the same item" do
++      item = insert(:news_item, status: :queued)
++
++      insert(:news_queue, item: item, position: 1.0)
++
++      NewsQueue.append_once(item)
++
++      entries = Repo.all(NewsQueue.queued())
++
++      assert length(entries) == 1
++      assert Enum.map(entries, & &1.item_id) == [item.id]
++    end
++  end
++
+   describe "move/2" do
+     setup do
+       i1 = insert(:news_item)
+@@ -124,7 +139,8 @@ defmodule Changelog.NewsQueueTest do
+ 
+       with_mocks([
+         {Buffer, [], [queue: fn _ -> true end]},
+-        {Typesense.Client, [], [upsert_documents: fn _, _ -> {:ok, %HTTPoison.Response{body: "{}"}} end]},
++        {Typesense.Client, [],
++         [upsert_documents: fn _, _ -> {:ok, %HTTPoison.Response{body: "{}"}} end]},
+         {HN, [], [submit: fn _ -> true end]},
+         {Social, [], [post: fn _ -> true end]}
+       ]) do
+@@ -160,7 +176,8 @@ defmodule Changelog.NewsQueueTest do
+ 
+       with_mocks([
+         {Buffer, [], [queue: fn _ -> true end]},
+-        {Typesense.Client, [], [upsert_documents: fn _, _ -> {:ok, %HTTPoison.Response{body: "{}"}} end]},
++        {Typesense.Client, [],
++         [upsert_documents: fn _, _ -> {:ok, %HTTPoison.Response{body: "{}"}} end]},
+         {HN, [], [submit: fn _ -> true end]},
+         {Social, [], [post: fn _ -> true end]}
+       ]) do
+@@ -186,7 +203,8 @@ defmodule Changelog.NewsQueueTest do
+       with_mocks([
+         {Buffer, [], [queue: fn _ -> true end]},
+         {Notifier, [], [notify: fn _ -> true end]},
+-        {Typesense.Client, [], [upsert_documents: fn _, _ -> {:ok, %HTTPoison.Response{body: "{}"}} end]},
++        {Typesense.Client, [],
++         [upsert_documents: fn _, _ -> {:ok, %HTTPoison.Response{body: "{}"}} end]},
+         {HN, [], [submit: fn _ -> true end]},
+         {Social, [], [post: fn _ -> true end]}
+       ]) do
+@@ -210,7 +228,8 @@ defmodule Changelog.NewsQueueTest do
+ 
+       with_mocks([
+         {Buffer, [], [queue: fn _ -> true end]},
+-        {Typesense.Client, [], [upsert_documents: fn _, _ -> {:ok, %HTTPoison.Response{body: "{}"}} end]},
++        {Typesense.Client, [],
++         [upsert_documents: fn _, _ -> {:ok, %HTTPoison.Response{body: "{}"}} end]},
+         {HN, [], [submit: fn _ -> true end]},
+         {Social, [], [post: fn _ -> true end]}
+       ]) do
+diff --git a/test/changelog_web/controllers/admin/episode_controller_test.exs b/test/changelog_web/controllers/admin/episode_controller_test.exs
+index 16d9724b569..20a9cb83638 100644
+--- a/test/changelog_web/controllers/admin/episode_controller_test.exs
++++ b/test/changelog_web/controllers/admin/episode_controller_test.exs
+@@ -3,7 +3,17 @@ defmodule ChangelogWeb.Admin.EpisodeControllerTest do
+ 
+   import Mock
+ 
+-  alias Changelog.{Episode, EpisodeGuest, Github, NewsItem, ObanWorkers, NewsQueue}
++  alias Changelog.{
++    Episode,
++    EpisodeGuest,
++    EpisodeNewsItem,
++    Github,
++    NewsItem,
++    NewsItemTopic,
++    ObanWorkers,
++    Podcast,
++    NewsQueue
++  }
+ 
+   @valid_attrs %{title: "The one where we win", slug: "181-win"}
+   @invalid_attrs %{title: ""}
+@@ -15,6 +25,7 @@ defmodule ChangelogWeb.Admin.EpisodeControllerTest do
+       {ObanWorkers.AudioUpdater, [], [queue: fn _ -> :ok end]},
+       {ObanWorkers.NotesPusher, [], [queue: fn _ -> :ok end]},
+       {Changelog.Snap, [], [purge: fn _ -> :ok end]},
++      {Changelog.TypesenseSearch, [], [update_item: fn _ -> :ok end]},
+       {Craisin.Client, [], [stats: fn _ -> %{"Delivered" => 0, "Opened" => 0} end]}
+     ],
+     assigns
+@@ -175,6 +186,89 @@ defmodule ChangelogWeb.Admin.EpisodeControllerTest do
+     assert called(ObanWorkers.NotesPusher.queue(:_))
+   end
+ 
++  @tag :as_inserted_admin
++  test "does not publish when first-transition notes push cannot be queued", %{conn: conn} do
++    :meck.expect(ObanWorkers.NotesPusher, :queue, fn _ -> {:error, :boom} end)
++
++    p = insert(:podcast)
++    e = insert(:publishable_episode, podcast: p)
++
++    conn = post(conn, Routes.admin_podcast_episode_path(conn, :publish, p.slug, e.slug))
++
++    assert html_response(conn, 200) =~ "Edit"
++    refute Repo.get!(Episode, e.id).published
++    assert Repo.aggregate(NewsItem.with_episode(e), :count) == 0
++    assert count(NewsQueue) == 0
++
++    :meck.expect(ObanWorkers.NotesPusher, :queue, fn _ -> :ok end)
++
++    user = conn.assigns.current_user
++    conn = conn |> recycle() |> assign(:current_user, user)
++    conn = post(conn, Routes.admin_podcast_episode_path(conn, :publish, p.slug, e.slug))
++
++    assert redirected_to(conn) == Routes.admin_podcast_episode_path(conn, :index, p.slug)
++    assert Repo.get!(Episode, e.id).published
++    assert Repo.aggregate(NewsItem.with_episode(e), :count) == 1
++    assert count(NewsQueue) == 1
++    assert :meck.num_calls(ObanWorkers.NotesPusher, :queue, :_) == 2
++  end
++
++  @tag :as_inserted_admin
++  test "notes push failure rolls back reconciliation before search or guest thanks side effects",
++       %{
++         conn: conn
++       } do
++    :meck.expect(ObanWorkers.NotesPusher, :queue, fn _ -> {:error, :boom} end)
++
++    guest = insert(:person)
++    p = insert(:podcast)
++    e = insert(:publishable_episode, podcast: p)
++    eg = insert(:episode_guest, episode: e, person: guest, thanks: false)
++
++    item =
++      insert(:news_item,
++        type: :audio,
++        status: :published,
++        feed_only: true,
++        object_id: Episode.object_id(e),
++        url: "https://changelog.com/#{p.slug}/#{e.slug}",
++        headline: "Old title",
++        story: "Old summary",
++        published_at: e.published_at
++      )
++
++    conn =
++      post(conn, Routes.admin_podcast_episode_path(conn, :publish, p.slug, e.slug), %{
++        "news" => "1",
++        "thanks" => "true"
++      })
++
++    assert html_response(conn, 200) =~ "Edit"
++    refute Repo.get!(Episode, e.id).published
++    assert Repo.get!(NewsItem, item.id).feed_only == true
++    refute Repo.get!(EpisodeGuest, eg.id).thanks
++    refute called(Changelog.TypesenseSearch.update_item(:_))
++    refute called(Changelog.Merch.create_discount(:_, :_))
++
++    :meck.expect(ObanWorkers.NotesPusher, :queue, fn _ -> :ok end)
++
++    user = conn.assigns.current_user
++    conn = conn |> recycle() |> assign(:current_user, user)
++
++    conn =
++      post(conn, Routes.admin_podcast_episode_path(conn, :publish, p.slug, e.slug), %{
++        "news" => "1",
++        "thanks" => "true"
++      })
++
++    assert redirected_to(conn) == Routes.admin_podcast_episode_path(conn, :index, p.slug)
++    assert Repo.get!(Episode, e.id).published
++    assert Repo.get!(NewsItem, item.id).feed_only == false
++    assert Repo.get!(EpisodeGuest, eg.id).thanks
++    assert called(Changelog.TypesenseSearch.update_item(:_))
++    assert called(Changelog.Merch.create_discount(:_, :_))
++  end
++
+   @tag :as_inserted_admin
+   test "schedules an episode for publishing", %{conn: conn} do
+     p = insert(:podcast)
+@@ -257,6 +351,265 @@ defmodule ChangelogWeb.Admin.EpisodeControllerTest do
+     assert count(NewsQueue) == 1
+   end
+ 
++  @tag :as_inserted_admin
++  test "re-publishing reconciles the canonical news item without duplicating queue entries", %{
++    conn: conn
++  } do
++    p = insert(:podcast)
++    e = insert(:publishable_episode, podcast: p, title: "First title", summary: "First summary")
++
++    conn = post(conn, Routes.admin_podcast_episode_path(conn, :publish, p.slug, e.slug))
++
++    assert redirected_to(conn) == Routes.admin_podcast_episode_path(conn, :index, p.slug)
++    assert Repo.aggregate(NewsItem.with_episode(e), :count) == 1
++    assert count(NewsItem.feed_only()) == 1
++    assert count(NewsQueue) == 1
++
++    e =
++      Repo.get!(Episode, e.id)
++      |> Ecto.Changeset.change(title: "Updated title", summary: "Updated summary")
++      |> Repo.update!()
++
++    user = conn.assigns.current_user
++    conn = conn |> recycle() |> assign(:current_user, user)
++
++    conn =
++      post(conn, Routes.admin_podcast_episode_path(conn, :publish, p.slug, e.slug), %{
++        "news" => "1"
++      })
++
++    assert redirected_to(conn) == Routes.admin_podcast_episode_path(conn, :index, p.slug)
++    assert Repo.aggregate(NewsItem.with_episode(e), :count) == 1
++    assert count(NewsItem.feed_only()) == 0
++    assert count(NewsQueue) == 1
++    assert :meck.num_calls(ObanWorkers.NotesPusher, :queue, :_) == 1
++
++    item = NewsItem |> NewsItem.with_episode(e) |> Repo.one()
++    assert item.headline == "Updated title"
++    assert item.story == "Updated summary"
++    assert item.feed_only == false
++  end
++
++  @tag :as_inserted_admin
++  test "re-publishing an already published episode does not create a second news item or queue entry",
++       %{
++         conn: conn
++       } do
++    p = insert(:podcast)
++    e = insert(:published_episode, podcast: p)
++
++    insert(:news_item,
++      type: :audio,
++      status: :published,
++      feed_only: true,
++      object_id: Episode.object_id(e),
++      url: "https://changelog.com/#{p.slug}/#{e.slug}",
++      headline: e.title,
++      story: e.summary,
++      published_at: e.published_at
++    )
++
++    conn =
++      post(conn, Routes.admin_podcast_episode_path(conn, :publish, p.slug, e.slug), %{
++        "news" => "1"
++      })
++
++    assert redirected_to(conn) == Routes.admin_podcast_episode_path(conn, :index, p.slug)
++    assert Repo.aggregate(NewsItem.with_episode(e), :count) == 1
++    assert count(NewsQueue) == 0
++    refute called(ObanWorkers.NotesPusher.queue(:_))
++
++    item = NewsItem |> NewsItem.with_episode(e) |> Repo.one()
++    assert item.feed_only == false
++  end
++
++  @tag :as_inserted_admin
++  test "unpublish then republish reuses the canonical news item and queue entry", %{conn: conn} do
++    p = insert(:podcast)
++    e = insert(:publishable_episode, podcast: p)
++
++    conn = post(conn, Routes.admin_podcast_episode_path(conn, :publish, p.slug, e.slug))
++
++    assert redirected_to(conn) == Routes.admin_podcast_episode_path(conn, :index, p.slug)
++    item = NewsItem |> NewsItem.with_episode(e) |> Repo.one()
++    assert item.feed_only == true
++    assert count(NewsQueue) == 1
++    assert :meck.num_calls(ObanWorkers.NotesPusher, :queue, :_) == 1
++
++    user = conn.assigns.current_user
++    conn = conn |> recycle() |> assign(:current_user, user)
++    conn = post(conn, Routes.admin_podcast_episode_path(conn, :unpublish, p.slug, e.slug))
++
++    assert redirected_to(conn) == Routes.admin_podcast_episode_path(conn, :index, p.slug)
++    refute Repo.get!(Episode, e.id).published
++    assert Repo.aggregate(NewsItem.with_episode(e), :count) == 1
++    assert count(NewsQueue) == 1
++
++    conn = conn |> recycle() |> assign(:current_user, user)
++
++    conn =
++      post(conn, Routes.admin_podcast_episode_path(conn, :publish, p.slug, e.slug), %{
++        "news" => "1"
++      })
++
++    assert redirected_to(conn) == Routes.admin_podcast_episode_path(conn, :index, p.slug)
++    assert Repo.get!(Episode, e.id).published
++    assert Repo.aggregate(NewsItem.with_episode(e), :count) == 1
++    assert count(NewsQueue) == 1
++    assert :meck.num_calls(ObanWorkers.NotesPusher, :queue, :_) == 2
++
++    republished_item = NewsItem |> NewsItem.with_episode(e) |> Repo.one()
++    assert republished_item.id == item.id
++    assert republished_item.feed_only == false
++  end
++
++  test "concurrent publish requests converge on one news item and queue entry" do
++    Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
++      user = insert(:person, admin: true)
++      podcast = insert(:podcast)
++      episode = insert(:publishable_episode, podcast: podcast)
++
++      expected_path =
++        Routes.admin_podcast_episode_path(ChangelogWeb.Endpoint, :index, podcast.slug)
++
++      publish_path =
++        Routes.admin_podcast_episode_path(
++          ChangelogWeb.Endpoint,
++          :publish,
++          podcast.slug,
++          episode.slug
++        )
++
++      try do
++        redirects =
++          1..2
++          |> Task.async_stream(
++            fn _ ->
++              :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
++
++              try do
++                build_conn()
++                |> assign(:current_user, user)
++                |> post(publish_path)
++                |> redirected_to()
++              after
++                Ecto.Adapters.SQL.Sandbox.checkin(Repo)
++              end
++            end,
++            max_concurrency: 2,
++            timeout: 5_000
++          )
++          |> Enum.map(fn {:ok, redirect} -> redirect end)
++
++        assert Enum.all?(redirects, &(&1 == expected_path))
++        assert Repo.get!(Episode, episode.id).published
++        assert Repo.aggregate(NewsItem.with_episode(episode), :count) == 1
++
++        item = NewsItem |> NewsItem.with_episode(episode) |> Repo.one()
++        assert Repo.aggregate(from(q in NewsQueue, where: q.item_id == ^item.id), :count) == 1
++        assert :meck.num_calls(ObanWorkers.NotesPusher, :queue, :_) == 1
++      after
++        item_ids =
++          episode
++          |> NewsItem.with_episode()
++          |> Repo.all()
++          |> Enum.map(& &1.id)
++
++        Repo.delete_all(from(q in NewsQueue, where: q.item_id in ^item_ids))
++        Repo.delete_all(from(t in NewsItemTopic, where: t.item_id in ^item_ids))
++        Repo.delete_all(from(i in NewsItem, where: i.id in ^item_ids))
++        Repo.delete_all(from(e in Episode, where: e.id == ^episode.id))
++        Repo.delete_all(from(p in Podcast, where: p.id == ^podcast.id))
++        Repo.delete_all(from(p in Changelog.Person, where: p.id == ^user.id))
++      end
++    end)
++  end
++
++  test "feed-only writer racing admin publish converges on the same canonical news item" do
++    Ecto.Adapters.SQL.Sandbox.unboxed_run(Repo, fn ->
++      user = insert(:person, admin: true)
++      logger = insert(:person)
++      podcast = insert(:podcast)
++      episode = insert(:published_episode, podcast: podcast)
++
++      expected_path =
++        Routes.admin_podcast_episode_path(ChangelogWeb.Endpoint, :index, podcast.slug)
++
++      publish_path =
++        Routes.admin_podcast_episode_path(
++          ChangelogWeb.Endpoint,
++          :publish,
++          podcast.slug,
++          episode.slug
++        )
++
++      admin_publish = fn ->
++        :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
++
++        try do
++          redirect =
++            build_conn()
++            |> assign(:current_user, user)
++            |> post(publish_path, %{"news" => "1"})
++            |> redirected_to()
++
++          {:admin, redirect}
++        after
++          Ecto.Adapters.SQL.Sandbox.checkin(Repo)
++        end
++      end
++
++      feed_only_publish = fn ->
++        :ok = Ecto.Adapters.SQL.Sandbox.checkout(Repo, sandbox: false)
++
++        try do
++          result =
++            case EpisodeNewsItem.insert_published_feed_only_once(episode, logger) do
++              {:created, _item} -> :created
++              {:existing, _item} -> :existing
++            end
++
++          {:feed_only, result}
++        after
++          Ecto.Adapters.SQL.Sandbox.checkin(Repo)
++        end
++      end
++
++      try do
++        results =
++          [admin_publish, feed_only_publish]
++          |> Task.async_stream(fn fun -> fun.() end, max_concurrency: 2, timeout: 5_000)
++          |> Enum.map(fn {:ok, result} -> result end)
++
++        assert {:admin, expected_path} in results
++        assert Repo.get!(Episode, episode.id).published
++        assert Repo.aggregate(NewsItem.with_episode(episode), :count) == 1
++
++        item = NewsItem |> NewsItem.with_episode(episode) |> Repo.one()
++        assert item.feed_only == false
++
++        queue_count =
++          Repo.aggregate(from(q in NewsQueue, where: q.item_id == ^item.id), :count)
++
++        assert queue_count in [0, 1]
++        refute called(ObanWorkers.NotesPusher.queue(:_))
++      after
++        item_ids =
++          episode
++          |> NewsItem.with_episode()
++          |> Repo.all()
++          |> Enum.map(& &1.id)
++
++        Repo.delete_all(from(q in NewsQueue, where: q.item_id in ^item_ids))
++        Repo.delete_all(from(t in NewsItemTopic, where: t.item_id in ^item_ids))
++        Repo.delete_all(from(i in NewsItem, where: i.id in ^item_ids))
++        Repo.delete_all(from(e in Episode, where: e.id == ^episode.id))
++        Repo.delete_all(from(p in Podcast, where: p.id == ^podcast.id))
++        Repo.delete_all(from(p in Changelog.Person, where: p.id in ^[user.id, logger.id]))
++      end
++    end)
++  end
++
+   @tag :as_admin
+   test "unpublishes an episode", %{conn: conn} do
+     p = insert(:podcast)
+
+From 9ac86216afc3f876ec3661e15157e5c41ad05927 Mon Sep 17 00:00:00 2001
+From: adamstac <adam@stacoviak.com>
+Date: Fri, 4 Sep 2026 04:21:02 -0500
+Subject: [PATCH 2/2] Address publish review edge cases
+
+---
+ .../schema/news/episode_news_item.ex          | 24 +++++++---
+ .../controllers/admin/episode_controller.ex   | 29 +++++++++++
+ .../templates/admin/episode/_form.html.heex   | 19 ++++++--
+ .../schema/news/episode_news_item_test.exs    | 48 ++++++++++++++++++-
+ .../admin/episode_controller_test.exs         | 25 ++++++++++
+ 5 files changed, 132 insertions(+), 13 deletions(-)
+
+diff --git a/lib/changelog/schema/news/episode_news_item.ex b/lib/changelog/schema/news/episode_news_item.ex
+index ea5a96919ba..87342e63f60 100644
+--- a/lib/changelog/schema/news/episode_news_item.ex
++++ b/lib/changelog/schema/news/episode_news_item.ex
+@@ -110,18 +110,28 @@ defmodule Changelog.EpisodeNewsItem do
+     |> NewsItem.preload_topics()
+     |> change(
+       Map.merge(
+-        %{
+-          url: EpisodeView.episode_url(episode, :show),
+-          headline: episode.title,
+-          story: episode.summary,
+-          published_at: episode.published_at,
+-          news_item_topics: episode_topics(episode)
+-        },
++        reconcile_attrs(item, episode),
+         attrs
+       )
+     )
+   end
+ 
++  defp reconcile_attrs(item, episode) do
++    %{
++      url: EpisodeView.episode_url(episode, :show),
++      headline: episode.title,
++      story: episode.summary,
++      news_item_topics: episode_topics(episode)
++    }
++    |> Map.merge(reconciled_published_at(item, episode))
++  end
++
++  defp reconciled_published_at(%NewsItem{status: :published}, episode) do
++    %{published_at: episode.published_at}
++  end
++
++  defp reconciled_published_at(_item, _episode), do: %{}
++
+   defp reconciled_feed_only(_item, false), do: false
+   defp reconciled_feed_only(item, true), do: item.feed_only
+ 
+diff --git a/lib/changelog_web/controllers/admin/episode_controller.ex b/lib/changelog_web/controllers/admin/episode_controller.ex
+index f5890c69fdc..2ae611ceb3b 100644
+--- a/lib/changelog_web/controllers/admin/episode_controller.ex
++++ b/lib/changelog_web/controllers/admin/episode_controller.ex
+@@ -353,6 +353,7 @@ defmodule ChangelogWeb.Admin.EpisodeController do
+   def publish(conn, params = %{"id" => slug}, podcast) do
+     case Repo.transaction(fn ->
+            episode = lock_episode_for_publish(podcast, slug)
++           validate_guest_thanks!(params, episode)
+            newly_published? = !Episode.is_published(episode)
+            changeset = Ecto.Changeset.change(episode, %{published: true})
+ 
+@@ -482,8 +483,21 @@ defmodule ChangelogWeb.Admin.EpisodeController do
+     episode
+     |> Ecto.Changeset.change()
+     |> Ecto.Changeset.add_error(:base, "Unable to queue notes push")
++    |> publish_error_action()
+   end
+ 
++  defp publish_error_changeset(episode, :guest_thanks_missing_person) do
++    episode
++    |> Ecto.Changeset.change()
++    |> Ecto.Changeset.add_error(
++      :episode_guests,
++      "Every guest needs a person before thanks can be sent"
++    )
++    |> publish_error_action()
++  end
++
++  defp publish_error_action(changeset), do: %{changeset | action: :validate}
++
+   defp handle_feed_updates(episode) do
+     if Episode.is_published(episode) do
+       FeedUpdater.queue(episode)
+@@ -514,6 +528,21 @@ defmodule ChangelogWeb.Admin.EpisodeController do
+     end)
+   end
+ 
++  defp validate_guest_thanks!(%{"thanks" => _}, episode) do
++    if guest_thanks_missing_person?(episode) do
++      Repo.rollback(:guest_thanks_missing_person)
++    end
++  end
++
++  defp validate_guest_thanks!(_params, _episode), do: :ok
++
++  defp guest_thanks_missing_person?(episode) do
++    episode
++    |> assoc(:episode_guests)
++    |> where([episode_guest], is_nil(episode_guest.person_id))
++    |> Repo.exists?()
++  end
++
+   defp lock_episode_for_publish(podcast, slug) do
+     from(e in assoc(podcast, :episodes),
+       where: e.slug == ^slug,
+diff --git a/lib/changelog_web/templates/admin/episode/_form.html.heex b/lib/changelog_web/templates/admin/episode/_form.html.heex
+index 9c29fa2d37d..3086a202f8c 100644
+--- a/lib/changelog_web/templates/admin/episode/_form.html.heex
++++ b/lib/changelog_web/templates/admin/episode/_form.html.heex
+@@ -129,8 +129,9 @@
+     </div>
+   </div>
+ 
+-  <div class="field">
++  <div class={"field #{AdminHelpers.error_class(f, :episode_guests)}"}>
+     <%= label(f, :guests) %>
++    <%= AdminHelpers.error_message(f, :episode_guests) %>
+ 
+     <div class="ui middle aligned selection list js-episode_guests">
+       <%= inputs_for f, :episode_guests, fn i -> %>
+@@ -138,11 +139,19 @@
+         <div class={if AdminHelpers.is_persisted(i.data), do: "item persisted", else: "item"}>
+           <%= hidden_input(i, :person_id) %>
+           <%= hidden_input(i, :position, class: "js-position") %>
+-          <img class="ui avatar image" src={ChangelogWeb.PersonView.avatar_url(guest)}>
+ 
+-          <div class="content">
+-            <div class="header"><%= guest.name %> (@<%= guest.handle %>)</div>
+-          </div>
++          <%= if guest do %>
++            <img class="ui avatar image" src={ChangelogWeb.PersonView.avatar_url(guest)}>
++
++            <div class="content">
++              <div class="header"><%= guest.name %> (@<%= guest.handle %>)</div>
++            </div>
++          <% else %>
++            <div class="content">
++              <div class="header">Missing guest person</div>
++              <div class="description">Remove this guest or select a person before thanking guests.</div>
++            </div>
++          <% end %>
+ 
+           <div class="right floated content">
+             <div class="ui tiny icon button js-remove">
+diff --git a/test/changelog/schema/news/episode_news_item_test.exs b/test/changelog/schema/news/episode_news_item_test.exs
+index 5c811d46799..62129daa6fc 100644
+--- a/test/changelog/schema/news/episode_news_item_test.exs
++++ b/test/changelog/schema/news/episode_news_item_test.exs
+@@ -3,7 +3,7 @@ defmodule Changelog.EpisodeNewsItemTest do
+ 
+   import Mock
+ 
+-  alias Changelog.{EpisodeNewsItem, EpisodeTopic, NewsItem, Repo, TypesenseSearch}
++  alias Changelog.{Episode, EpisodeNewsItem, EpisodeTopic, NewsItem, Repo, TypesenseSearch}
+ 
+   setup_with_mocks([{TypesenseSearch, [], [update_item: fn _ -> :ok end]}], _context) do
+     :ok
+@@ -70,6 +70,52 @@ defmodule Changelog.EpisodeNewsItemTest do
+     assert retried_item.feed_only == false
+   end
+ 
++  test "update/1 preserves nil published_at on queued canonical items" do
++    episode = insert(:published_episode, title: "Updated", summary: "Fresh")
++    logger = insert(:person)
++
++    item =
++      insert(:news_item,
++        type: :audio,
++        status: :queued,
++        object_id: Episode.object_id(episode),
++        url: "https://changelog.com/#{episode.podcast.slug}/#{episode.slug}",
++        headline: "Old",
++        story: "Stale",
++        logger: logger,
++        published_at: nil
++      )
++
++    updated_item = EpisodeNewsItem.update(episode)
++
++    assert updated_item.id == item.id
++    assert updated_item.status == :queued
++    assert updated_item.published_at == nil
++    assert updated_item.headline == "Updated"
++    assert updated_item.story == "Fresh"
++  end
++
++  test "update/1 syncs published_at on published canonical items" do
++    episode = insert(:published_episode)
++    logger = insert(:person)
++    old_published_at = Timex.shift(episode.published_at, days: -1)
++
++    item =
++      insert(:news_item,
++        type: :audio,
++        status: :published,
++        object_id: Episode.object_id(episode),
++        logger: logger,
++        published_at: old_published_at
++      )
++
++    updated_item = EpisodeNewsItem.update(episode)
++
++    assert updated_item.id == item.id
++    assert updated_item.status == :published
++    assert updated_item.published_at == episode.published_at
++  end
++
+   test "insert_published_feed_only_once/2 does not mutate an existing canonical item" do
+     episode = insert(:published_episode)
+     logger = insert(:person)
+diff --git a/test/changelog_web/controllers/admin/episode_controller_test.exs b/test/changelog_web/controllers/admin/episode_controller_test.exs
+index 20a9cb83638..46e5b17410f 100644
+--- a/test/changelog_web/controllers/admin/episode_controller_test.exs
++++ b/test/changelog_web/controllers/admin/episode_controller_test.exs
+@@ -269,6 +269,31 @@ defmodule ChangelogWeb.Admin.EpisodeControllerTest do
+     assert called(Changelog.Merch.create_discount(:_, :_))
+   end
+ 
++  @tag :as_inserted_admin
++  test "does not publish when guest thanks is requested for a guest without a person", %{
++    conn: conn
++  } do
++    p = insert(:podcast)
++    e = insert(:publishable_episode, podcast: p)
++    eg = insert(:episode_guest, episode: e, person: nil, person_id: nil, thanks: false)
++
++    conn =
++      post(conn, Routes.admin_podcast_episode_path(conn, :publish, p.slug, e.slug), %{
++        "thanks" => "true"
++      })
++
++    response = html_response(conn, 200)
++
++    assert response =~ "Every guest needs a person before thanks can be sent"
++    assert response =~ "Missing guest person"
++    refute Repo.get!(Episode, e.id).published
++    refute Repo.get!(EpisodeGuest, eg.id).thanks
++    assert Repo.aggregate(NewsItem.with_episode(e), :count) == 0
++    assert count(NewsQueue) == 0
++    refute called(ObanWorkers.NotesPusher.queue(:_))
++    refute called(Changelog.Merch.create_discount(:_, :_))
++  end
++
+   @tag :as_inserted_admin
+   test "schedules an episode for publishing", %{conn: conn} do
+     p = insert(:podcast)

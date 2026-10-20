@@ -1,0 +1,423 @@
+diff --git a/VERSION b/VERSION
+index 7486fdbc..f38fc539 100644
+--- a/VERSION
++++ b/VERSION
+@@ -1 +1 @@
+-0.7.2
++0.7.3
+diff --git a/lib/craftplan/orders/order.ex b/lib/craftplan/orders/order.ex
+index c6158b19..3e90aeba 100644
+--- a/lib/craftplan/orders/order.ex
++++ b/lib/craftplan/orders/order.ex
+@@ -44,13 +44,20 @@ defmodule Craftplan.Orders.Order do
+   end
+ 
+   actions do
+-    defaults [:read, :destroy]
++    defaults [:read]
++
++    destroy :destroy do
++      primary? true
++      require_atomic? false
++      change cascade_destroy(:items, after_action?: false)
++    end
+ 
+     create :create do
+       primary? true
+ 
+       accept [
+         :status,
++        :payment_status,
+         :customer_id,
+         :delivery_date,
+         :invoice_number,
+@@ -74,6 +81,7 @@ defmodule Craftplan.Orders.Order do
+ 
+       accept [
+         :status,
++        :payment_status,
+         :customer_id,
+         :delivery_date,
+         :invoice_number,
+diff --git a/lib/craftplan_web/live/manage/customer_live/show.ex b/lib/craftplan_web/live/manage/customer_live/show.ex
+index e379193c..338f9bbd 100644
+--- a/lib/craftplan_web/live/manage/customer_live/show.ex
++++ b/lib/craftplan_web/live/manage/customer_live/show.ex
+@@ -72,6 +72,15 @@ defmodule CraftplanWeb.CustomerLive.Show do
+             <:col :let={order} label="Total">
+               {format_money(@settings.currency, order.total_cost)}
+             </:col>
++            <:action :let={order}>
++              <.link
++                id={"edit-customer-order-#{order.id}"}
++                navigate={~p"/manage/orders/#{order.reference}/edit"}
++                class="font-semibold text-stone-900 hover:text-stone-700"
++              >
++                Edit order
++              </.link>
++            </:action>
+           </.table>
+         </div>
+       </.tabs_content>
+diff --git a/lib/craftplan_web/live/manage/order_live/form_component.ex b/lib/craftplan_web/live/manage/order_live/form_component.ex
+index 355b4ac6..c8164c72 100644
+--- a/lib/craftplan_web/live/manage/order_live/form_component.ex
++++ b/lib/craftplan_web/live/manage/order_live/form_component.ex
+@@ -4,6 +4,8 @@ defmodule CraftplanWeb.OrderLive.FormComponent do
+ 
+   alias AshPhoenix.Form
+   alias Craftplan.Orders
++  alias Craftplan.Orders.Order.Types.PaymentStatus
++  alias Craftplan.Orders.Order.Types.Status
+ 
+   @impl true
+   def render(assigns) do
+@@ -31,6 +33,21 @@ defmodule CraftplanWeb.OrderLive.FormComponent do
+             <.timezone />
+           </div>
+ 
++          <div class="mb-8 grid grid-cols-1 gap-4 sm:grid-cols-2">
++            <.input
++              field={@form[:status]}
++              type="select"
++              label="Status"
++              options={Enum.map(Status.values(), &{Phoenix.Naming.humanize(&1), &1})}
++            />
++            <.input
++              field={@form[:payment_status]}
++              type="select"
++              label="Payment status"
++              options={Enum.map(PaymentStatus.values(), &{Phoenix.Naming.humanize(&1), &1})}
++            />
++          </div>
++
+           <.label>Items</.label>
+           <div
+             id="order-items"
+@@ -73,7 +90,7 @@ defmodule CraftplanWeb.OrderLive.FormComponent do
+                       />
+                       <.input
+                         field={items_form[:unit_price]}
+-                        value={@products_map[items_form[:product_id].value].price}
++                        value={items_form[:unit_price].value}
+                         type="hidden"
+                       />
+                     </span>
+@@ -96,7 +113,7 @@ defmodule CraftplanWeb.OrderLive.FormComponent do
+                       {format_money(
+                         @settings.currency,
+                         Decimal.mult(
+-                          @products_map[items_form[:product_id].value].price || 0,
++                          items_form[:unit_price].value || 0,
+                           items_form[:quantity].value || 0
+                         )
+                       )}
+@@ -106,7 +123,8 @@ defmodule CraftplanWeb.OrderLive.FormComponent do
+ 
+                 <div class="relative border-r border-b border-stone-200 p-0 pl-4 last:border-r-0">
+                   <div class="block py-4 pr-6">
+-                    <.link
++                    <button
++                      id={"remove-#{items_form.id}"}
+                       class="font-semibold leading-6 text-stone-900 hover:text-stone-700"
+                       type="button"
+                       phx-click="remove_form"
+@@ -114,7 +132,7 @@ defmodule CraftplanWeb.OrderLive.FormComponent do
+                       phx-value-path={items_form.name}
+                     >
+                       Remove
+-                    </.link>
++                    </button>
+                   </div>
+                 </div>
+               </div>
+@@ -201,16 +219,33 @@ defmodule CraftplanWeb.OrderLive.FormComponent do
+ 
+   @impl true
+   def handle_event("save", %{"order" => order_params, "timezone" => timezone}, socket) do
+-    datetime = extract_and_parse_datetime(order_params["delivery_date"], timezone)
++    order_params =
++      case Map.fetch(order_params, "delivery_date") do
++        {:ok, delivery_date} ->
++          Map.put(
++            order_params,
++            "delivery_date",
++            extract_and_parse_datetime(delivery_date, timezone)
++          )
++
++        :error ->
++          order_params
++      end
+ 
+     order_params =
+-      order_params
+-      |> Map.put("delivery_date", datetime)
+-      |> update_in(["items"], fn items ->
+-        Map.new(items, fn {k, v} ->
+-          {k, Map.put(v, "unit_price", socket.assigns.products_map[v["product_id"]].price)}
+-        end)
+-      end)
++      case Map.fetch(order_params, "items") do
++        {:ok, items} when is_map(items) ->
++          Map.put(
++            order_params,
++            "items",
++            Map.new(items, fn {index, item} ->
++              {index, Map.put(item, "unit_price", item_price(item, socket.assigns))}
++            end)
++          )
++
++        _ ->
++          order_params
++      end
+ 
+     case Form.submit(socket.assigns.form, params: order_params) do
+       {:ok, order} ->
+@@ -234,7 +269,13 @@ defmodule CraftplanWeb.OrderLive.FormComponent do
+   @impl true
+   def handle_event("add_form", %{"path" => path}, socket) do
+     form =
+-      Form.add_form(socket.assigns.form, path, params: %{product_id: socket.assigns.selected_product, quantity: 0})
++      Form.add_form(socket.assigns.form, path,
++        params: %{
++          product_id: socket.assigns.selected_product,
++          quantity: 1,
++          unit_price: socket.assigns.products_map[socket.assigns.selected_product].price
++        }
++      )
+ 
+     {available_products, selected_product} =
+       recompute_availability(form, socket.assigns.products)
+@@ -328,6 +369,16 @@ defmodule CraftplanWeb.OrderLive.FormComponent do
+       (order_item_form.data && order_item_form.data.product_id)
+   end
+ 
++  defp item_price(params, assigns) do
++    existing_item =
++      assigns.order && Enum.find(assigns.order.items, &(&1.id == params["id"]))
++
++    case existing_item do
++      nil -> assigns.products_map[params["product_id"]].price
++      item -> item.unit_price
++    end
++  end
++
+   defp extract_and_parse_datetime(delivery_date, timezone) do
+     <<datetime::binary-size(16), _::binary>> = delivery_date
+ 
+diff --git a/lib/craftplan_web/live/manage/order_live/index.ex b/lib/craftplan_web/live/manage/order_live/index.ex
+index 066f0483..1609d80e 100644
+--- a/lib/craftplan_web/live/manage/order_live/index.ex
++++ b/lib/craftplan_web/live/manage/order_live/index.ex
+@@ -188,6 +188,15 @@ defmodule CraftplanWeb.OrderLive.Index do
+             <:col :let={{_id, order}} label="Payment">
+               <.badge text={"#{emoji_for_payment(order.payment_status)} #{order.payment_status}"} />
+             </:col>
++            <:action :let={{_id, order}}>
++              <.link
++                id={"edit-order-#{order.id}"}
++                navigate={~p"/manage/orders/#{order.reference}/edit"}
++                class="font-semibold text-stone-900 hover:text-stone-700"
++              >
++                Edit order
++              </.link>
++            </:action>
+           </.table>
+           <div class="mt-4 flex items-center justify-between text-sm text-stone-600">
+             <span>{page_label(@page_offset, @page_size, @page_count)}</span>
+diff --git a/lib/craftplan_web/live/manage/order_live/show.ex b/lib/craftplan_web/live/manage/order_live/show.ex
+index 3959abe0..8e9f1b4c 100644
+--- a/lib/craftplan_web/live/manage/order_live/show.ex
++++ b/lib/craftplan_web/live/manage/order_live/show.ex
+@@ -40,12 +40,24 @@ defmodule CraftplanWeb.OrderLive.Show do
+     <.header>
+       {@order.reference}
+       <:actions>
+-        <.link patch={~p"/manage/orders/#{@order.reference}/edit"} phx-click={JS.push_focus()}>
++        <.link
++          id="edit-order"
++          patch={~p"/manage/orders/#{@order.reference}/edit"}
++          phx-click={JS.push_focus()}
++        >
+           <.button variant={:primary}>Edit order</.button>
+         </.link>
+         <.link href={~p"/manage/orders/#{@order.reference}/invoice.pdf"} target="_blank">
+           <.button variant={:outline}>View Invoice</.button>
+         </.link>
++        <.button
++          id="delete-order"
++          variant={:outline}
++          phx-click="delete_order"
++          data-confirm="Delete this order and all its items? This cannot be undone."
++        >
++          Delete order
++        </.button>
+       </:actions>
+     </.header>
+ 
+@@ -329,6 +341,25 @@ defmodule CraftplanWeb.OrderLive.Show do
+     {:noreply, Navigation.assign(socket, :orders, order_trail(order, live_action))}
+   end
+ 
++  @impl true
++  def handle_event("delete_order", _params, socket) do
++    case Orders.destroy_order(socket.assigns.order, actor: socket.assigns.current_user) do
++      :ok ->
++        {:noreply,
++         socket
++         |> put_flash(:info, "Order deleted successfully")
++         |> push_navigate(to: ~p"/manage/orders")}
++
++      {:error, _error} ->
++        {:noreply,
++         put_flash(
++           socket,
++           :error,
++           "Could not delete this order. Orders linked to production must be cancelled instead."
++         )}
++    end
++  end
++
+   @impl true
+   def handle_event("update_item_status", _params, socket), do: {:noreply, socket}
+ 
+diff --git a/test/craftplan_web/manage_orders_details_edit_interactions_live_test.exs b/test/craftplan_web/manage_orders_details_edit_interactions_live_test.exs
+index a79bd361..709313e2 100644
+--- a/test/craftplan_web/manage_orders_details_edit_interactions_live_test.exs
++++ b/test/craftplan_web/manage_orders_details_edit_interactions_live_test.exs
+@@ -48,12 +48,131 @@ defmodule CraftplanWeb.ManageOrdersDetailsEditInteractionsLiveTest do
+ 
+     {:ok, view, _} = live(conn, ~p"/manage/orders/#{o.reference}/edit")
+ 
+-    # No specific field required; submit minimal change (same customer)
+     view
+-    |> element("#order-item-form")
+-    |> render_submit(%{"order" => %{}, "timezone" => "Etc/UTC"})
++    |> form("#order-item-form", order: %{status: "confirmed", payment_status: "paid"})
++    |> render_submit(%{"timezone" => "Etc/UTC"})
+ 
+     assert_patch(view, ~p"/manage/orders/#{o.reference}")
+-    assert render(view) =~ "Order updated successfully"
++    updated = Craftplan.Orders.get_order_by_id!(o.id, actor: Craftplan.DataCase.staff_actor())
++    assert updated.status == :confirmed
++    assert updated.payment_status == :paid
++    assert Decimal.equal?(updated.subtotal, o.subtotal)
++  end
++
++  @tag role: :staff
++  test "orders and customer history expose edit links", %{conn: conn} do
++    customer = create_customer!()
++    order = create_order!(customer, create_product!())
++    path = ~p"/manage/orders/#{order.reference}/edit"
++
++    {:ok, view, _} = live(conn, ~p"/manage/orders")
++    assert has_element?(view, "#edit-order-#{order.id}[href='#{path}']")
++
++    {:ok, view, _} = live(conn, ~p"/manage/customers/#{customer.reference}/orders")
++    assert has_element?(view, "#edit-customer-order-#{order.id}[href='#{path}']")
++  end
++
++  @tag role: :staff
++  test "removing a product persists and retains the remaining item's original price", %{
++    conn: conn
++  } do
++    customer = create_customer!()
++    product = create_product!()
++    other = create_product!()
++
++    order =
++      Order
++      |> Ash.Changeset.for_create(:create, %{
++        customer_id: customer.id,
++        delivery_date: DateTime.utc_now(),
++        items: [
++          %{product_id: product.id, quantity: 1, unit_price: Decimal.new("2.00")},
++          %{product_id: other.id, quantity: 1, unit_price: other.price}
++        ]
++      })
++      |> Ash.create!(actor: Craftplan.DataCase.staff_actor())
++
++    {:ok, view, _} = live(conn, ~p"/manage/orders/#{order.reference}/edit")
++
++    # Find the nested form for the product to remove without assuming database order.
++    [input] =
++      view
++      |> element("#order-item-form")
++      |> render()
++      |> LazyHTML.from_fragment()
++      |> LazyHTML.query("input[name$='[product_id]'][value='#{other.id}']")
++      |> LazyHTML.attribute("name")
++
++    path = String.replace_suffix(input, "[product_id]", "")
++
++    view
++    |> element("button[phx-click='remove_form'][phx-value-path='#{path}']")
++    |> render_click()
++
++    refute has_element?(view, "#order-item-form button[phx-disable-with][disabled]")
++
++    view
++    |> form("#order-item-form")
++    |> render_submit(%{"timezone" => "Etc/UTC"})
++
++    assert_patch(view, ~p"/manage/orders/#{order.reference}")
++
++    updated =
++      Craftplan.Orders.get_order_by_id!(order.id,
++        actor: Craftplan.DataCase.staff_actor(),
++        load: [:items]
++      )
++
++    assert [item] = updated.items
++    assert item.product_id == product.id
++    assert Decimal.equal?(item.unit_price, Decimal.new("2.00"))
++    assert Decimal.equal?(updated.subtotal, Decimal.new("2.00"))
++  end
++
++  @tag role: :staff
++  test "deleting an order removes its items", %{conn: conn} do
++    order = create_order!(create_customer!(), create_product!())
++    {:ok, view, _} = live(conn, ~p"/manage/orders/#{order.reference}")
++    assert has_element?(view, "#delete-order[data-confirm]")
++
++    view |> element("#delete-order") |> render_click()
++
++    assert_redirect(view, ~p"/manage/orders")
++
++    assert {:error, _} =
++             Craftplan.Orders.get_order_by_id(order.id, actor: Craftplan.DataCase.staff_actor())
++
++    assert {:error, _} =
++             Craftplan.Orders.get_order_item_by_id(hd(order.items).id,
++               actor: Craftplan.DataCase.staff_actor()
++             )
++  end
++
++  @tag role: :staff
++  test "production allocations prevent order deletion", %{conn: conn} do
++    product = create_product!()
++    order = create_order!(create_customer!(), product)
++    actor = Craftplan.DataCase.staff_actor()
++
++    batch =
++      Craftplan.Orders.ProductionBatch
++      |> Ash.Changeset.for_create(:open, %{product_id: product.id, planned_qty: Decimal.new(1)})
++      |> Ash.create!(actor: actor)
++
++    Craftplan.Orders.create_order_item_batch_allocation!(
++      %{
++        order_item_id: hd(order.items).id,
++        production_batch_id: batch.id,
++        planned_qty: Decimal.new(1)
++      },
++      actor: actor
++    )
++
++    {:ok, view, _} = live(conn, ~p"/manage/orders/#{order.reference}")
++    view |> element("#delete-order") |> render_click()
++
++    assert has_element?(view, "#flash-error", "Could not delete this order")
++    assert {:ok, _} = Craftplan.Orders.get_order_by_id(order.id, actor: actor)
++    assert {:ok, _} = Craftplan.Orders.get_order_item_by_id(hd(order.items).id, actor: actor)
+   end
+ end

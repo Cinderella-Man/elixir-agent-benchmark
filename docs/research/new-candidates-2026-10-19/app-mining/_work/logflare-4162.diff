@@ -1,0 +1,65 @@
+diff --git a/lib/logflare/sources.ex b/lib/logflare/sources.ex
+index e2aacdd871..b41c078a77 100644
+--- a/lib/logflare/sources.ex
++++ b/lib/logflare/sources.ex
+@@ -371,8 +371,23 @@ defmodule Logflare.Sources do
+     end
+   end
+ 
+-  def delete_source(source) do
+-    Repo.delete(source)
++  @doc """
++  Deletes a source along with its `sources_backends` join rows.
++
++  The `sources_backends.source_id` foreign key has no `ON DELETE` action, so the
++  join rows must go first or the delete raises `Ecto.ConstraintError`.
++  """
++  @spec delete_source(Source.t()) :: {:ok, Source.t()} | {:error, Ecto.Changeset.t()}
++  def delete_source(%Source{} = source) do
++    Repo.transaction(fn ->
++      from(sb in "sources_backends", where: sb.source_id == ^source.id)
++      |> Repo.delete_all()
++
++      case Repo.delete(source) do
++        {:ok, deleted} -> deleted
++        {:error, changeset} -> Repo.rollback(changeset)
++      end
++    end)
+   end
+ 
+   def node_rate_limiter_failsafe(node_metrics, cluster_size) do
+diff --git a/test/logflare/sources_test.exs b/test/logflare/sources_test.exs
+index 9dd03eba2e..b7f8858425 100644
+--- a/test/logflare/sources_test.exs
++++ b/test/logflare/sources_test.exs
+@@ -102,6 +102,30 @@ defmodule Logflare.SourcesTest do
+     end
+   end
+ 
++  describe "delete_source/1" do
++    setup do
++      user = insert(:user)
++      %{user: user}
++    end
++
++    test "deletes a source that has attached backends", %{user: user} do
++      backend = insert(:backend, user: user)
++      source = insert(:source, user: user, backends: [backend])
++
++      assert {:ok, %Source{}} = Sources.delete_source(source)
++      refute Sources.get(source.id)
++      # the backend itself is untouched
++      assert Backends.get_backend(backend.id)
++    end
++
++    test "deletes a source with no backends", %{user: user} do
++      source = insert(:source, user: user)
++
++      assert {:ok, %Source{}} = Sources.delete_source(source)
++      refute Sources.get(source.id)
++    end
++  end
++
+   describe "update_source/2 with different retention_days" do
+     setup do
+       user = insert(:user)

@@ -1,0 +1,2057 @@
+diff --git a/config/test.exs b/config/test.exs
+index a2d816887..060b0d3e4 100644
+--- a/config/test.exs
++++ b/config/test.exs
+@@ -169,6 +169,7 @@ config :vutuv, :daily_report_email, false
+ # The sign-up trap's hourly report tick would touch the sandbox from outside;
+ # tests call Vutuv.SignupTrap.run/2 directly.
+ config :vutuv, :signup_trap_report, false
++config :vutuv, :link_spam_check, false
+ # The 23:59 head-count recorder behind the investor page's growth curve; same
+ # sandbox reason. Vutuv.PeopleHistory.record/1 is called directly in
+ # people_history_test.exs instead.
+diff --git a/docs/ADMINS.md b/docs/ADMINS.md
+index 33c43b9ab..24ad36c8c 100644
+--- a/docs/ADMINS.md
++++ b/docs/ADMINS.md
+@@ -281,6 +281,8 @@ A few rarely-changed switches are compile-time settings in
+ saw 90 days after the last sighting; on by default),
+ `:signup_trap_report` (the weekly report of scripted sign-ups, see
+ [Scripted sign-ups](#scripted-sign-ups); on by default),
++`:link_spam_check` (every 30 minutes, freezes a new account registered to
++plant a link, see [Scripted sign-ups](#scripted-sign-ups); on by default),
+ `:landing_teaser_video` (the silent teaser film in the start page's hero and
+ on `/system/investors`, which also hands out its addresses; German for German
+ readers and English for everybody else; loads only on a click; on by default), `:ai_crawler_policy` (`:permissive` or `:block_training` — drives robots.txt
+@@ -1381,7 +1383,8 @@ deactivations. A spam mark is never shown publicly.
+ 
+ Some sign-ups come from scripts that create accounts in bulk. vutuv
+ recognises the ones it has rules for (today: the same lowercase word as first
+-and last name, four letters or more) and shows them the usual PIN screen, but
++and last name, or a single lowercase name with the other field left empty,
++four letters or more) and shows them the usual PIN screen, but
+ creates no account and sends no mail. What such a form submitted, with the IP
+ address and browser, is kept for 14 days. Every Monday at 07:00 German time
+ `OPERATOR_EMAIL` receives a table of the past week's catches, with the most
+@@ -1390,6 +1393,17 @@ from. A real person caught by mistake never gets a PIN, so look through that
+ mail. Because the IP address is stored, mention this in your privacy policy
+ (`/admin/legal`); vutuv.de's policy has a section on it.
+ 
++What these accounts are after is a link from your domain, and two things
++answer that after the sign-up. Every link that leaves the site from a
++headline or a profile description carries `rel="ugc nofollow"`, so it is worth
++nothing to a search engine. And every 30 minutes vutuv looks at the accounts
++of the last day: one with a single name and such a link in its headline is
++frozen, which hides it from everybody but its owner and you. It shows up in
++the daily report as "Automatisch eingefrorene Konten" and at
++`/admin/accounts/frozen` with the source "automatic check", where you delete
++it or thaw it. A thawed account is never frozen by the check again. Set
++`:link_spam_check` to `false` to switch the check off.
++
+ ### Reports from people who have no account
+ 
+ A rights holder who finds their own photograph on a post here is usually not a
+diff --git a/docs/architecture/authentication.md b/docs/architecture/authentication.md
+index fc7f16622..68ddeb513 100644
+--- a/docs/architecture/authentication.md
++++ b/docs/architecture/authentication.md
+@@ -96,7 +96,8 @@ unread-conversations nudge) is unchanged.
+ Some registrations come from scripts that create accounts in bulk, and they
+ read the PIN mail, so the PIN alone does not stop them. `Vutuv.SignupTrap`
+ recognises them by what they type (today: the same lowercase word as first and
+-last name, four letters or more) and answers with the ordinary PIN screen
++last name, or one lowercase name beside an empty second field, four letters or
++more) and answers with the ordinary PIN screen
+ while creating nothing: `Accounts.register_user/3` returns `{:trapped, email}`
+ and the controller calls `Accounts.pretend_registration/2`, the same pin
+ cookie and screen without any mail. The trap only looks at a form that would
+@@ -115,3 +116,16 @@ A new rule is an entry in `@rules` (its name and the label the report shows),
+ a `rule?/2` clause and a test in `test/vutuv/signup_trap_test.exs`. Run it
+ over the dev database's accounts first and read every one it would have
+ caught: a real person caught by a rule never gets a PIN and is never told why.
++
++The form never sees a headline, and the headline is where these accounts put
++the link they were registered for. Two things answer that after the sign-up.
++`VutuvWeb.Markdown.render/1`, the renderer of profile prose, marks every link
++that leaves the site `ugc nofollow`. And `Vutuv.Moderation.LinkSpam.run/1`,
++ticked every 30 minutes by `Vutuv.Moderation.LinkSpamSweeper`, freezes an
++account of the last day that has exactly one of first and last name and such a
++link in its headline (`Markdown.foreign_link?/1`, asked of the rendered HTML).
++The freeze goes through `Moderation.auto_freeze_user/2`: a ledger row in
++`moderation_admin_actions` without an `actor_id`, which is how the frozen list
++and the daily report tell it from an admin's. Any ledger row exempts an account
++from the check, so a thaw is final. Nothing is kept between ticks; the due list
++is the query.
+diff --git a/lib/vutuv/application.ex b/lib/vutuv/application.ex
+index e8251e50e..f41cf14d7 100644
+--- a/lib/vutuv/application.ex
++++ b/lib/vutuv/application.ex
+@@ -134,6 +134,7 @@ defmodule Vutuv.Application do
+         optional_child(:send_unread_message_emails, Vutuv.Chat.UnreadNotifier) ++
+         optional_child(:send_notification_digest_emails, Vutuv.Activity.DigestNotifier) ++
+         optional_child(:moderation_sweeper, Vutuv.Moderation.Sweeper) ++
++        optional_child(:link_spam_check, Vutuv.Moderation.LinkSpamSweeper) ++
+         optional_child(:webhook_deliverer, Vutuv.Webhooks.Deliverer) ++
+         optional_child(:fediverse_deliverer, Vutuv.Fediverse.Deliverer) ++
+         optional_child(:fediverse_follower_pruning, Vutuv.Fediverse.FollowerPruner) ++
+diff --git a/lib/vutuv/moderation.ex b/lib/vutuv/moderation.ex
+index edb93ec97..3c9d6709c 100644
+--- a/lib/vutuv/moderation.ex
++++ b/lib/vutuv/moderation.ex
+@@ -2419,6 +2419,74 @@ defmodule Vutuv.Moderation do
+     {:ok, :unfrozen}
+   end
+ 
++  @doc """
++  A freeze no person decided: a check of ours recognised the account
++  (`Vutuv.Moderation.LinkSpam`). It hides the profile exactly like
++  `admin_freeze_user/3` and does not block the login either, so a member caught
++  by mistake still signs in and reads the banner.
++
++  The ledger row carries no `actor_id`, which is what tells an automatic
++  freeze from an admin's (`auto_frozen_ids/1`), and the name of the `rule` in
++  `detail`. The member's own activity log gets its entry too.
++
++  Returns `{:ok, :frozen}`, or `{:ok, :noop}` if the account was already frozen.
++  """
++  def auto_freeze_user(%User{frozen_at: %NaiveDateTime{}}, _rule), do: {:ok, :noop}
++
++  def auto_freeze_user(%User{} = user, rule) when is_binary(rule) do
++    Repo.transaction(fn ->
++      set_user_moderation!(user.id, frozen_at: NaiveDateTime.utc_now(:second))
++
++      Repo.insert!(%AdminAction{
++        user_id: user.id,
++        action: "account_frozen",
++        detail: %{"rule" => rule}
++      })
++    end)
++
++    Vutuv.AccountEvents.record(user, "account_frozen")
++    {:ok, :frozen}
++  end
++
++  @doc """
++  Of the given account ids, the set whose latest freeze was automatic: the
++  newest `account_frozen` ledger row has no actor. Drives the frozen list's
++  "Source" column beside `report_frozen_ids/1`.
++  """
++  def auto_frozen_ids(user_ids) when is_list(user_ids) do
++    from(a in AdminAction,
++      where: a.user_id in ^user_ids and a.action == "account_frozen",
++      distinct: a.user_id,
++      order_by: [asc: a.user_id, desc: a.id],
++      select: {a.user_id, a.actor_id}
++    )
++    |> Repo.all()
++    |> Enum.filter(fn {_user_id, actor_id} -> is_nil(actor_id) end)
++    |> MapSet.new(fn {user_id, _actor_id} -> user_id end)
++  end
++
++  @doc "How many accounts a check froze by itself in the UTC window `[from, to)`."
++  def count_auto_freezes(from, to), do: Repo.aggregate(auto_freezes(from, to), :count)
++
++  @doc """
++  Up to `limit` of those freezes, oldest first, as `%{action: row, user: user}`.
++  `user` is nil once the account has been deleted.
++  """
++  def auto_freeze_sample(from, to, limit) do
++    actions = Repo.all(from(a in auto_freezes(from, to), order_by: [asc: a.id], limit: ^limit))
++    ids = Enum.map(actions, & &1.user_id)
++    users = Map.new(Repo.all(from(u in User, where: u.id in ^ids)), &{&1.id, &1})
++
++    Enum.map(actions, &%{action: &1, user: users[&1.user_id]})
++  end
++
++  defp auto_freezes(from, to) do
++    from(a in AdminAction,
++      where: a.action == "account_frozen" and is_nil(a.actor_id),
++      where: a.inserted_at >= ^from and a.inserted_at < ^to
++    )
++  end
++
+   defp log_admin_action(%User{} = user, %User{} = admin, action, reason) do
+     Repo.insert!(%AdminAction{
+       user_id: user.id,
+diff --git a/lib/vutuv/moderation/link_spam.ex b/lib/vutuv/moderation/link_spam.ex
+new file mode 100644
+index 000000000..a7d683944
+--- /dev/null
++++ b/lib/vutuv/moderation/link_spam.ex
+@@ -0,0 +1,78 @@
++defmodule Vutuv.Moderation.LinkSpam do
++  @moduledoc """
++  Freezes a brand-new account that was registered to plant a link.
++
++  The accounts of October 2026 gave one random lowercase word as their only
++  name, confirmed their address and then wrote an address and a line of
++  search-engine copy into the headline. The registration form never sees a
++  headline, so `Vutuv.SignupTrap` cannot catch that; this check looks at the
++  account afterwards. Its rule: registered within the last day, exactly one of
++  first and last name, and a headline with a link that leaves the site
++  (`VutuvWeb.Markdown.foreign_link?/1`, so a pasted address counts like a
++  Markdown link).
++
++  A match is frozen (`Vutuv.Moderation.auto_freeze_user/2`), never deleted:
++  the profile disappears for everybody but its owner and the admins, and the
++  operator reads about it in the next daily report and on
++  `/admin/accounts/frozen`, where thawing or deleting it is one click. An
++  account that already has an entry in the admin ledger is left alone, so
++  thawing one is final.
++
++  `Vutuv.Moderation.LinkSpamSweeper` runs this every 30 minutes. Nothing is
++  remembered between runs: what is due is the query, so a deploy or a crash
++  costs half an hour and no account.
++  """
++
++  import Ecto.Query
++
++  alias Vutuv.Accounts.User
++  alias Vutuv.Moderation
++  alias Vutuv.Moderation.AdminAction
++  alias Vutuv.Repo
++  alias VutuvWeb.Markdown
++
++  @rule "new_account_link"
++  # A day, plus one interval of the sweeper: a headline written in the last
++  # minutes of the day is still inside the window at the check after it.
++  @window_minutes 24 * 60 + 30
++
++  @doc "The rule name an automatic freeze records in the admin ledger."
++  def rule, do: @rule
++
++  @doc "One pass at `now`. Returns how many accounts it froze."
++  def run(now \\ NaiveDateTime.utc_now(:second)) do
++    now
++    |> candidates()
++    |> Enum.filter(&Markdown.foreign_link?(&1.headline))
++    |> Enum.count(&(Moderation.auto_freeze_user(&1, @rule) == {:ok, :frozen}))
++  end
++
++  # Everything the rule can ask of the database. Whether the headline holds a
++  # link is asked of the renderer afterwards, on the handful of rows left.
++  defp candidates(now) do
++    since = NaiveDateTime.add(now, -@window_minutes, :minute)
++
++    Repo.all(
++      from(u in User,
++        where: u.inserted_at > ^since,
++        where: u.email_confirmed? == true and u.admin? != true,
++        where: is_nil(u.frozen_at) and is_nil(u.deactivated_at),
++        where: not is_nil(u.headline) and u.headline != "",
++        where:
++          fragment(
++            "(coalesce(?, '') = '') <> (coalesce(?, '') = '')",
++            u.first_name,
++            u.last_name
++          ),
++        where: u.id not in subquery(judged_ids()),
++        order_by: [asc: u.id]
++      )
++    )
++  end
++
++  # Named, because it feeds a NOT IN: `user_id` is nullable in the ledger, and
++  # one NULL in the list would make the predicate false for every account.
++  defp judged_ids do
++    from(a in AdminAction, where: not is_nil(a.user_id), select: a.user_id)
++  end
++end
+diff --git a/lib/vutuv/moderation/link_spam_sweeper.ex b/lib/vutuv/moderation/link_spam_sweeper.ex
+new file mode 100644
+index 000000000..4d32c3d75
+--- /dev/null
++++ b/lib/vutuv/moderation/link_spam_sweeper.ex
+@@ -0,0 +1,50 @@
++defmodule Vutuv.Moderation.LinkSpamSweeper do
++  @moduledoc """
++  The clock of `Vutuv.Moderation.LinkSpam`: every 30 minutes it runs the check
++  that freezes a new account registered to plant a link.
++
++  The first tick comes five minutes after boot rather than half an hour,
++  because this site deploys several times a day and a full interval after
++  every boot could keep pushing the check back.
++
++  Disabled in tests (`config :vutuv, :link_spam_check, false`): the run would
++  touch the SQL Sandbox from a process that does not own it, so tests call
++  `Vutuv.Moderation.LinkSpam.run/1` directly.
++  """
++
++  use GenServer
++
++  require Logger
++
++  alias Vutuv.Moderation.LinkSpam
++
++  @first_tick :timer.minutes(5)
++  @interval :timer.minutes(30)
++
++  def start_link(opts) do
++    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
++  end
++
++  @impl true
++  def init(_opts) do
++    Process.send_after(self(), :tick, @first_tick)
++    {:ok, nil}
++  end
++
++  @impl true
++  def handle_info(:tick, state) do
++    # Rescued, like the sign-up trap's reporter: a raise would restart the
++    # process, which would then wait out a fresh first tick.
++    try do
++      case LinkSpam.run() do
++        0 -> :ok
++        frozen -> Logger.info("Link spam check froze #{frozen} new account(s)")
++      end
++    rescue
++      error -> Logger.error("Link spam check failed: #{Exception.message(error)}")
++    end
++
++    Process.send_after(self(), :tick, @interval)
++    {:noreply, state}
++  end
++end
+diff --git a/lib/vutuv/reports.ex b/lib/vutuv/reports.ex
+index f1f3b076b..df7f2fff5 100644
+--- a/lib/vutuv/reports.ex
++++ b/lib/vutuv/reports.ex
+@@ -19,6 +19,7 @@ defmodule Vutuv.Reports do
+   alias Vutuv.Deliverability
+   alias Vutuv.Fediverse.Follower
+   alias Vutuv.Fediverse.FollowerPrune
++  alias Vutuv.Moderation
+   alias Vutuv.Notifications.Emailer
+   alias Vutuv.Posts.{Post, PostBookmark, PostLike, PostRepost}
+   alias Vutuv.Repo
+@@ -53,6 +54,7 @@ defmodule Vutuv.Reports do
+       freezes: deliverability.freezes,
+       thaws: deliverability.thaws,
+       spam_removals: count_spam_removals(day_start, day_end),
++      link_spam_freezes: Moderation.count_auto_freezes(day_start, day_end),
+       details: %{
+         registrations: registration_sample(day_start, day_end, limit),
+         # Both author kinds (issue #1334): the day's posts include what
+@@ -75,7 +77,8 @@ defmodule Vutuv.Reports do
+         deactivations: deliverability_details.deactivations,
+         freezes: deliverability_details.freezes,
+         thaws: deliverability_details.thaws,
+-        spam_removals: spam_removal_sample(day_start, day_end, limit)
++        spam_removals: spam_removal_sample(day_start, day_end, limit),
++        link_spam_freezes: Moderation.auto_freeze_sample(day_start, day_end, limit)
+       }
+     }
+   end
+diff --git a/lib/vutuv/reports/daily_report.ex b/lib/vutuv/reports/daily_report.ex
+index 2130869d5..a12aad276 100644
+--- a/lib/vutuv/reports/daily_report.ex
++++ b/lib/vutuv/reports/daily_report.ex
+@@ -4,8 +4,9 @@ defmodule Vutuv.Reports.DailyReport do
+   how many posts, reposts, likes and bookmarks were created, how many new
+   Fediverse followers were gained and how many were dropped again because the
+   remote account is gone, the day's email-deliverability events (hard bounces,
+-  address deactivations, account freezes and thaws) and the accounts an admin
+-  removed as spam from a moderation case, on one German calendar day
++  address deactivations, account freezes and thaws), the accounts an admin
++  removed as spam from a moderation case and the new accounts a check froze by
++  itself (`Vutuv.Moderation.LinkSpam`), on one German calendar day
+   (`Vutuv.BerlinTime`).
+ 
+   Every metric also carries a capped `details` sample (`detail_limit/0` rows,
+@@ -41,6 +42,7 @@ defmodule Vutuv.Reports.DailyReport do
+     freezes: 0,
+     thaws: 0,
+     spam_removals: 0,
++    link_spam_freezes: 0,
+     # Per-metric sample lists keyed by the metric atom (see the moduledoc); the
+     # element shape varies by metric and is normalized in `VutuvWeb.ReportDetails`.
+     details: %{}
+@@ -60,6 +62,7 @@ defmodule Vutuv.Reports.DailyReport do
+           freezes: non_neg_integer(),
+           thaws: non_neg_integer(),
+           spam_removals: non_neg_integer(),
++          link_spam_freezes: non_neg_integer(),
+           details: %{optional(atom()) => list()}
+         }
+ 
+@@ -82,7 +85,8 @@ defmodule Vutuv.Reports.DailyReport do
+     {:deactivations, "deaktivierte Adresse", "deaktivierte Adressen"},
+     {:freezes, "eingefrorenes Konto", "eingefrorene Konten"},
+     {:thaws, "aufgetautes Konto", "aufgetaute Konten"},
+-    {:spam_removals, "als Spam entferntes Konto", "als Spam entfernte Konten"}
++    {:spam_removals, "als Spam entferntes Konto", "als Spam entfernte Konten"},
++    {:link_spam_freezes, "automatisch eingefrorenes Konto", "automatisch eingefrorene Konten"}
+   ]
+ 
+   @doc "Every tallied metric, summed."
+diff --git a/lib/vutuv/signup_trap.ex b/lib/vutuv/signup_trap.ex
+index aa7934d60..6056ca78e 100644
+--- a/lib/vutuv/signup_trap.ex
++++ b/lib/vutuv/signup_trap.ex
+@@ -38,7 +38,10 @@ defmodule Vutuv.SignupTrap do
+ 
+   # Each rule's name (stored with every entry it catches) and the label the
+   # weekly report gives it.
+-  @rules [same_lowercase_name: "Vor- und Nachname gleich, kleiner Anfangsbuchstabe"]
++  @rules [
++    same_lowercase_name: "Vor- und Nachname gleich, kleiner Anfangsbuchstabe",
++    single_lowercase_name: "Nur ein Name, kleiner Anfangsbuchstabe"
++  ]
+   @labels Map.new(@rules, fn {rule, label} -> {Atom.to_string(rule), label} end)
+ 
+   @retention_days 14
+@@ -70,10 +73,26 @@ defmodule Vutuv.SignupTrap do
+   # name are the same word and who types it in lower case is rare enough that
+   # the weekly report is where they would show up.
+   defp rule?(:same_lowercase_name, %{first_name: name, last_name: name}) when is_binary(name),
+-    do: name =~ ~r/\A\p{Ll}\p{L}{3,}\z/u
++    do: lowercase_word?(name)
++
++  # Three weeks later the same scripts left the second field empty
++  # ("vbsvinwz"). Measured over the 401 sign-ups since July 2026: one member
++  # gave a single name and five typed their first name in lower case, nobody
++  # did both.
++  defp rule?(:single_lowercase_name, %{first_name: first, last_name: last}) do
++    case {blank?(first), blank?(last)} do
++      {false, true} -> lowercase_word?(first)
++      {true, false} -> lowercase_word?(last)
++      _both_or_neither -> false
++    end
++  end
+ 
+   defp rule?(_rule, _fields), do: false
+ 
++  defp lowercase_word?(name), do: is_binary(name) and name =~ ~r/\A\p{Ll}\p{L}{3,}\z/u
++
++  defp blank?(value), do: value in [nil, ""]
++
+   @doc """
+   How the weekly report names a stored rule. A rule removed from `@rules` keeps
+   its bare name for the two weeks its entries outlive it.
+diff --git a/lib/vutuv_web/controllers/admin/account_controller.ex b/lib/vutuv_web/controllers/admin/account_controller.ex
+index 8fa3903e7..7affeb0b8 100644
+--- a/lib/vutuv_web/controllers/admin/account_controller.ex
++++ b/lib/vutuv_web/controllers/admin/account_controller.ex
+@@ -46,12 +46,14 @@ defmodule VutuvWeb.Admin.AccountController do
+   def frozen(conn, params) do
+     total = Moderation.frozen_accounts_count()
+     accounts = Moderation.list_frozen_accounts(params, total: total)
+-    report_frozen = Moderation.report_frozen_ids(Enum.map(accounts, & &1.id))
++    ids = Enum.map(accounts, & &1.id)
++    report_frozen = Moderation.report_frozen_ids(ids)
+ 
+     render(conn, "frozen.html",
+       page_title: gettext("Frozen accounts"),
+       accounts: accounts,
+       report_frozen: report_frozen,
++      auto_frozen: Moderation.auto_frozen_ids(ids),
+       row_count: total,
+       params: params
+     )
+diff --git a/lib/vutuv_web/markdown.ex b/lib/vutuv_web/markdown.ex
+index a75fccd8a..0693c4873 100644
+--- a/lib/vutuv_web/markdown.ex
++++ b/lib/vutuv_web/markdown.ex
+@@ -84,18 +84,39 @@ defmodule VutuvWeb.Markdown do
+   # A bare email address in rendered text, see `linkify_emails/1`.
+   @email ~r/(?<![\w.%+@-])[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}(?![\w-]|\.[A-Za-z0-9])/
+ 
+-  @doc "Render untrusted Markdown to safe HTML (`Phoenix.HTML.safe()`)."
++  # What `mark_foreign_links/1` leaves on every link that leaves the site.
++  @foreign_rel ~s(rel="ugc nofollow noopener noreferrer")
++
++  @doc """
++  Render untrusted Markdown to safe HTML (`Phoenix.HTML.safe()`).
++
++  This is the renderer of a member's profile prose (the headline, the
++  descriptions of a job or a degree), so every link that leaves the site is
++  marked `ugc nofollow` (`mark_foreign_links/1`): a followed link in a headline
++  is what a throwaway account is registered for.
++  """
+   def render(text) when is_binary(text) do
+     text
+     |> render_pipeline()
+     |> open_links_in_new_tab()
+     |> linkify_entities()
+     |> linkify_emails()
++    |> mark_foreign_links()
+     |> Phoenix.HTML.raw()
+   end
+ 
+   def render(_), do: Phoenix.HTML.raw("")
+ 
++  @doc """
++  Whether Markdown `text` renders a link that leaves the site, a pasted
++  address included. Asked of the rendered HTML, so it agrees with what a
++  reader can click.
++  """
++  def foreign_link?(text) when is_binary(text),
++    do: text |> render() |> Phoenix.HTML.safe_to_string() |> String.contains?(@foreign_rel)
++
++  def foreign_link?(_), do: false
++
+   @doc """
+   `render/1` as an HTML string for a reader on another server or in an app,
+   with its root-relative links (`/handle`, `/tags/…`) absolutized against
+@@ -264,11 +285,7 @@ defmodule VutuvWeb.Markdown do
+   linking they exist for.
+   """
+   def mark_foreign_links(html) when is_binary(html) do
+-    String.replace(
+-      html,
+-      ~s(rel="noopener noreferrer"),
+-      ~s(rel="ugc nofollow noopener noreferrer")
+-    )
++    String.replace(html, ~s(rel="noopener noreferrer"), @foreign_rel)
+   end
+ 
+   ## The author's own, proven webpages (issue #1246)
+diff --git a/lib/vutuv_web/report_details.ex b/lib/vutuv_web/report_details.ex
+index 5021682ee..c730bf08e 100644
+--- a/lib/vutuv_web/report_details.ex
++++ b/lib/vutuv_web/report_details.ex
+@@ -47,7 +47,8 @@ defmodule VutuvWeb.ReportDetails do
+     {:deactivations, "Deaktivierte Adressen"},
+     {:freezes, "Eingefrorene Konten"},
+     {:thaws, "Aufgetaute Konten"},
+-    {:spam_removals, "Als Spam entfernte Konten"}
++    {:spam_removals, "Als Spam entfernte Konten"},
++    {:link_spam_freezes, "Automatisch eingefrorene Konten"}
+   ]
+ 
+   @doc """
+@@ -99,6 +100,13 @@ defmodule VutuvWeb.ReportDetails do
+   defp entry(:registrations, user), do: person_entry(user)
+   defp entry(:spam_removals, event), do: person_entry(event.case.owner)
+ 
++  # The account may have been deleted since; the line then keeps the count
++  # honest without a link.
++  defp entry(:link_spam_freezes, %{user: %User{} = user}), do: person_entry(user)
++
++  defp entry(:link_spam_freezes, %{user: nil}),
++    do: %{primary: "Gelöschtes Konto", secondary: nil, path: nil}
++
+   defp entry(:posts, post), do: post_entry(post, Vutuv.Posts.author(post))
+ 
+   # Through `Posts.actor/1`, not `row.user`: a page likes, reposts and bookmarks
+diff --git a/lib/vutuv_web/templates/admin/account/frozen.html.heex b/lib/vutuv_web/templates/admin/account/frozen.html.heex
+index 0aeca2133..ff38b58b6 100644
+--- a/lib/vutuv_web/templates/admin/account/frozen.html.heex
++++ b/lib/vutuv_web/templates/admin/account/frozen.html.heex
+@@ -53,7 +53,7 @@
+               <.local_time at={user.frozen_at} id={"frozen-since-#{user.id}"} format="%Y-%m-%d" />
+             </td>
+             <td class="text-slate-600 dark:text-slate-400">
+-              {freeze_source_label(MapSet.member?(@report_frozen, user.id))}
++              {freeze_source_label(freeze_source(user.id, @report_frozen, @auto_frozen))}
+             </td>
+             <td class="text-right">
+               <.freeze_toggle
+diff --git a/lib/vutuv_web/templates/email/daily_report_de.text.eex b/lib/vutuv_web/templates/email/daily_report_de.text.eex
+index 4954efeea..e000be6aa 100644
+--- a/lib/vutuv_web/templates/email/daily_report_de.text.eex
++++ b/lib/vutuv_web/templates/email/daily_report_de.text.eex
+@@ -19,6 +19,7 @@ Aufgetaute Konten:                          <%= @report.thaws %>
+ Moderation
+ ----------
+ Als Spam entfernte Konten:                  <%= @report.spam_removals %>
++Automatisch eingefrorene Konten:            <%= @report.link_spam_freezes %>
+ 
+ <%= VutuvWeb.ReportDetails.text_block(@report, @url) %>
+ Vollständiger Bericht (mit Zeitreise zu anderen Tagen):
+diff --git a/lib/vutuv_web/templates/email_body/daily_report_de.html.heex b/lib/vutuv_web/templates/email_body/daily_report_de.html.heex
+index 4eeaf37a3..53998e62c 100644
+--- a/lib/vutuv_web/templates/email_body/daily_report_de.html.heex
++++ b/lib/vutuv_web/templates/email_body/daily_report_de.html.heex
+@@ -21,6 +21,9 @@
+   <.email_p><strong>Moderation</strong></.email_p>
+   <.email_panel>
+     <.email_row label="Als Spam entfernte Konten">{@report.spam_removals}</.email_row>
++    <.email_row label="Automatisch eingefrorene Konten">
++      {@report.link_spam_freezes}
++    </.email_row>
+   </.email_panel>
+ 
+   <%= for section <- VutuvWeb.ReportDetails.sections(@report) do %>
+diff --git a/lib/vutuv_web/views/admin/account_html.ex b/lib/vutuv_web/views/admin/account_html.ex
+index a1b503aa6..d673eb319 100644
+--- a/lib/vutuv_web/views/admin/account_html.ex
++++ b/lib/vutuv_web/views/admin/account_html.ex
+@@ -92,9 +92,21 @@ defmodule VutuvWeb.Admin.AccountHTML do
+     do: "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-200"
+ 
+   @doc """
+-  The frozen list's "Source" label: an account currently frozen by an open
+-  report shows "report", one frozen by an admin shows "admin".
++  The frozen list's "Source" label for what `freeze_source/3` answered.
+   """
+-  def freeze_source_label(true), do: gettext("report")
+-  def freeze_source_label(false), do: gettext("admin")
++  def freeze_source_label(:report), do: gettext("report")
++  def freeze_source_label(:automatic), do: gettext("automatic check")
++  def freeze_source_label(:admin), do: gettext("admin")
++
++  @doc """
++  What froze the account: an open report wins (the case is what holds it), then
++  an automatic check (`Vutuv.Moderation.LinkSpam`), else an admin.
++  """
++  def freeze_source(user_id, report_frozen, auto_frozen) do
++    cond do
++      MapSet.member?(report_frozen, user_id) -> :report
++      MapSet.member?(auto_frozen, user_id) -> :automatic
++      true -> :admin
++    end
++  end
+ end
+diff --git a/lib/vutuv_web/views/admin/report_html.ex b/lib/vutuv_web/views/admin/report_html.ex
+index 06872db42..5e4025109 100644
+--- a/lib/vutuv_web/views/admin/report_html.ex
++++ b/lib/vutuv_web/views/admin/report_html.ex
+@@ -18,7 +18,8 @@ defmodule VutuvWeb.Admin.ReportHTML do
+     :deactivations,
+     :freezes,
+     :thaws,
+-    :spam_removals
++    :spam_removals,
++    :link_spam_freezes
+   ]
+ 
+   @doc """
+@@ -46,4 +47,5 @@ defmodule VutuvWeb.Admin.ReportHTML do
+   def metric_label(:freezes), do: gettext("Frozen accounts")
+   def metric_label(:thaws), do: gettext("Thawed accounts")
+   def metric_label(:spam_removals), do: gettext("Accounts removed as spam")
++  def metric_label(:link_spam_freezes), do: gettext("Accounts frozen automatically")
+ end
+diff --git a/priv/gettext/de/LC_MESSAGES/default.po b/priv/gettext/de/LC_MESSAGES/default.po
+index a9f83e30b..33dc1f31d 100644
+--- a/priv/gettext/de/LC_MESSAGES/default.po
++++ b/priv/gettext/de/LC_MESSAGES/default.po
+@@ -2218,7 +2218,7 @@ msgstr "Beitrag erfolgreich gelöscht."
+ #: lib/vutuv_web/live/search_live.ex:546
+ #: lib/vutuv_web/live/search_live.ex:1198
+ #: lib/vutuv_web/templates/settings/preferences.html.heex:250
+-#: lib/vutuv_web/views/admin/report_html.ex:35
++#: lib/vutuv_web/views/admin/report_html.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "Posts"
+ msgstr "Beiträge"
+@@ -2416,7 +2416,7 @@ msgstr "Lesezeichen setzen"
+ #: lib/vutuv_web/live/shell_live.ex:1554
+ #: lib/vutuv_web/live/shell_live.ex:1642
+ #: lib/vutuv_web/templates/settings/auto_post_deletion.html.heex:172
+-#: lib/vutuv_web/views/admin/report_html.ex:38
++#: lib/vutuv_web/views/admin/report_html.ex:39
+ #, elixir-autogen, elixir-format
+ msgid "Bookmarks"
+ msgstr "Lesezeichen"
+@@ -2439,7 +2439,7 @@ msgstr "Gefällt mir"
+ #: lib/vutuv_web/templates/settings/auto_post_deletion.html.heex:159
+ #: lib/vutuv_web/templates/settings/notifications.html.heex:108
+ #: lib/vutuv_web/templates/settings/privacy.html.heex:91
+-#: lib/vutuv_web/views/admin/report_html.ex:37
++#: lib/vutuv_web/views/admin/report_html.ex:38
+ #, elixir-autogen, elixir-format
+ msgid "Likes"
+ msgstr "Likes"
+@@ -5020,7 +5020,7 @@ msgstr ""
+ "Eine pro Zeile. Exakte https://-URLs (http://localhost ist für die "
+ "Entwicklung erlaubt). Die Autorisierung leitet nur an diese Adressen weiter."
+ 
+-#: lib/vutuv_web/controllers/oauth_controller.ex:70
++#: lib/vutuv_web/controllers/oauth_controller.ex:73
+ #, elixir-autogen, elixir-format
+ msgid "Please log in to connect %{app} with your account."
+ msgstr "Bitte melden Sie sich an, um %{app} mit Ihrem Konto zu verbinden."
+@@ -6211,7 +6211,7 @@ msgstr "Telefon verwalten"
+ msgid "Metric"
+ msgstr "Kennzahl"
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:34
++#: lib/vutuv_web/views/admin/report_html.ex:35
+ #, elixir-autogen, elixir-format
+ msgid "New confirmed registrations (by PIN)"
+ msgstr "Neue bestätigte Registrierungen (per PIN)"
+@@ -6240,7 +6240,7 @@ msgstr "Vorheriger Tag"
+ #: lib/vutuv_web/components/post_components.ex:458
+ #: lib/vutuv_web/templates/post/analytics.html.heex:112
+ #: lib/vutuv_web/templates/settings/auto_post_deletion.html.heex:185
+-#: lib/vutuv_web/views/admin/report_html.ex:36
++#: lib/vutuv_web/views/admin/report_html.ex:37
+ #, elixir-autogen, elixir-format
+ msgid "Reposts"
+ msgstr "Reposts"
+@@ -6428,17 +6428,17 @@ msgstr ""
+ "auf."
+ 
+ #: lib/vutuv_web/live/admin/deliverability_live.ex:153
+-#: lib/vutuv_web/views/admin/report_html.ex:45
++#: lib/vutuv_web/views/admin/report_html.ex:46
+ #, elixir-autogen, elixir-format
+ msgid "Deactivated addresses"
+ msgstr "Deaktivierte Adressen"
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:39
++#: lib/vutuv_web/views/admin/report_html.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "New Fediverse followers"
+ msgstr "Neue Fediverse-Follower"
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:42
++#: lib/vutuv_web/views/admin/report_html.ex:43
+ #, elixir-autogen, elixir-format
+ msgid "Removed Fediverse followers (account deleted)"
+ msgstr "Entfernte Fediverse-Follower (Konto gelöscht)"
+@@ -6468,12 +6468,12 @@ msgstr ""
+ "Jede Deaktivierung, Wiederherstellung, Einfrierung und Auftauung, neueste "
+ "zuerst."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:52
++#: lib/vutuv_web/controllers/admin/account_controller.ex:53
+ #: lib/vutuv_web/live/admin/deliverability_live.ex:102
+ #: lib/vutuv_web/templates/admin/account/frozen.html.heex:2
+ #: lib/vutuv_web/templates/admin/account/frozen.html.heex:3
+ #: lib/vutuv_web/templates/admin/account/frozen.html.heex:8
+-#: lib/vutuv_web/views/admin/report_html.ex:46
++#: lib/vutuv_web/views/admin/report_html.ex:47
+ #, elixir-autogen, elixir-format
+ msgid "Frozen accounts"
+ msgstr "Eingefrorene Konten"
+@@ -6598,12 +6598,12 @@ msgstr "wiederholte harte Bounces"
+ msgid "system"
+ msgstr "System"
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:44
++#: lib/vutuv_web/views/admin/report_html.ex:45
+ #, elixir-autogen, elixir-format
+ msgid "Bounces"
+ msgstr "Bounces"
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:47
++#: lib/vutuv_web/views/admin/report_html.ex:48
+ #, elixir-autogen, elixir-format
+ msgid "Thawed accounts"
+ msgstr "Aufgetaute Konten"
+@@ -7680,7 +7680,7 @@ msgstr ""
+ "nicht gesperrt; ein Name, der eine globale Sperre verdient, gehört in die "
+ "Moderationswerkzeuge."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:69
++#: lib/vutuv_web/controllers/admin/account_controller.ex:71
+ #: lib/vutuv_web/live/admin/deliverability_live.ex:34
+ #: lib/vutuv_web/live/admin/user_delete_live.ex:69
+ #, elixir-autogen, elixir-format
+@@ -10059,7 +10059,7 @@ msgstr "Konto entfernt"
+ msgid "Account restored. The member can sign in again."
+ msgstr "Konto wiederhergestellt. Das Mitglied kann sich wieder anmelden."
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:48
++#: lib/vutuv_web/views/admin/report_html.ex:49
+ #, elixir-autogen, elixir-format
+ msgid "Accounts removed as spam"
+ msgstr "Als Spam entfernte Konten"
+@@ -14371,22 +14371,22 @@ msgid_plural "%{formatted} accounts are in the moderation freezer."
+ msgstr[0] "%{formatted} Konto ist von der Moderation eingefroren."
+ msgstr[1] "%{formatted} Konten sind von der Moderation eingefroren."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:105
++#: lib/vutuv_web/controllers/admin/account_controller.ex:107
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was already frozen."
+ msgstr "@%{username} war bereits eingefroren."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:102
++#: lib/vutuv_web/controllers/admin/account_controller.ex:104
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was frozen."
+ msgstr "@%{username} wurde eingefroren."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:111
++#: lib/vutuv_web/controllers/admin/account_controller.ex:113
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was not frozen."
+ msgstr "@%{username} war nicht eingefroren."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:108
++#: lib/vutuv_web/controllers/admin/account_controller.ex:110
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was unfrozen."
+ msgstr "@%{username} wurde wieder freigegeben."
+@@ -14489,7 +14489,7 @@ msgstr "Admin"
+ msgid "frozen"
+ msgstr "Eingefroren"
+ 
+-#: lib/vutuv_web/views/admin/account_html.ex:98
++#: lib/vutuv_web/views/admin/account_html.ex:97
+ #, elixir-autogen, elixir-format
+ msgid "report"
+ msgstr "Meldung"
+@@ -18067,7 +18067,7 @@ msgstr "%{address} (nur diese Seite)"
+ msgid "%{address} (whole website)"
+ msgstr "%{address} (ganze Website)"
+ 
+-#: lib/vutuv_web/markdown.ex:396
++#: lib/vutuv_web/markdown.ex:413
+ #, elixir-autogen, elixir-format
+ msgid "Verified webpage of the author (%{address})"
+ msgstr "Verifizierte Webseite der Autorin oder des Autors (%{address})"
+@@ -21121,19 +21121,19 @@ msgstr "Bestätigen Sie das Folgen auf Ihrem eigenen Server."
+ 
+ #: lib/vutuv_web/components/welcome_components.ex:360
+ #: lib/vutuv_web/live/registration_live.ex:508
+-#: lib/vutuv_web/views/outbound_html.ex:68
+-#: lib/vutuv_web/views/outbound_html.ex:81
++#: lib/vutuv_web/views/outbound_html.ex:71
++#: lib/vutuv_web/views/outbound_html.ex:84
+ #, elixir-autogen, elixir-format
+ msgid "Continue"
+ msgstr "Weiter"
+ 
+-#: lib/vutuv_web/views/outbound_html.ex:67
+-#: lib/vutuv_web/views/outbound_html.ex:80
++#: lib/vutuv_web/views/outbound_html.ex:70
++#: lib/vutuv_web/views/outbound_html.ex:83
+ #, elixir-autogen, elixir-format
+ msgid "Continue to %{server}"
+ msgstr "Weiter zu %{server}"
+ 
+-#: lib/vutuv_web/views/outbound_html.ex:60
++#: lib/vutuv_web/views/outbound_html.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "E-mail to %{address}"
+ msgstr "E-Mail an %{address}"
+@@ -21143,7 +21143,7 @@ msgstr "E-Mail an %{address}"
+ msgid "The employer takes applications on their own website."
+ msgstr "Das Unternehmen nimmt Bewerbungen auf der eigenen Webseite entgegen."
+ 
+-#: lib/vutuv_web/views/outbound_html.ex:61
++#: lib/vutuv_web/views/outbound_html.ex:64
+ #, elixir-autogen, elixir-format
+ msgid "Write e-mail"
+ msgstr "E-Mail schreiben"
+@@ -27549,7 +27549,17 @@ msgstr "Neue Funktionen können Sie erreichen, bevor alle anderen sie bekommen.
+ msgid "Use beta features"
+ msgstr "Beta-Funktionen nutzen"
+ 
+-#: lib/vutuv_web/controllers/oauth_controller.ex:222
++#: lib/vutuv_web/controllers/oauth_controller.ex:223
+ #, elixir-autogen, elixir-format
+ msgid "Taking you back to %{app}."
+ msgstr "Sie werden zu %{app} zurückgeleitet."
++
++#: lib/vutuv_web/views/admin/report_html.ex:50
++#, elixir-autogen, elixir-format
++msgid "Accounts frozen automatically"
++msgstr "Automatisch eingefrorene Konten"
++
++#: lib/vutuv_web/views/admin/account_html.ex:98
++#, elixir-autogen, elixir-format
++msgid "automatic check"
++msgstr "Automatik"
+diff --git a/priv/gettext/default.pot b/priv/gettext/default.pot
+index fb5f93864..9ae0be430 100644
+--- a/priv/gettext/default.pot
++++ b/priv/gettext/default.pot
+@@ -2180,7 +2180,7 @@ msgstr ""
+ #: lib/vutuv_web/live/search_live.ex:546
+ #: lib/vutuv_web/live/search_live.ex:1198
+ #: lib/vutuv_web/templates/settings/preferences.html.heex:250
+-#: lib/vutuv_web/views/admin/report_html.ex:35
++#: lib/vutuv_web/views/admin/report_html.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "Posts"
+ msgstr ""
+@@ -2376,7 +2376,7 @@ msgstr ""
+ #: lib/vutuv_web/live/shell_live.ex:1554
+ #: lib/vutuv_web/live/shell_live.ex:1642
+ #: lib/vutuv_web/templates/settings/auto_post_deletion.html.heex:172
+-#: lib/vutuv_web/views/admin/report_html.ex:38
++#: lib/vutuv_web/views/admin/report_html.ex:39
+ #, elixir-autogen, elixir-format
+ msgid "Bookmarks"
+ msgstr ""
+@@ -2399,7 +2399,7 @@ msgstr ""
+ #: lib/vutuv_web/templates/settings/auto_post_deletion.html.heex:159
+ #: lib/vutuv_web/templates/settings/notifications.html.heex:108
+ #: lib/vutuv_web/templates/settings/privacy.html.heex:91
+-#: lib/vutuv_web/views/admin/report_html.ex:37
++#: lib/vutuv_web/views/admin/report_html.ex:38
+ #, elixir-autogen, elixir-format
+ msgid "Likes"
+ msgstr ""
+@@ -4857,7 +4857,7 @@ msgstr ""
+ msgid "One per line. Exact https:// URLs (http://localhost is allowed for development). The authorization flow only ever redirects to these."
+ msgstr ""
+ 
+-#: lib/vutuv_web/controllers/oauth_controller.ex:70
++#: lib/vutuv_web/controllers/oauth_controller.ex:73
+ #, elixir-autogen, elixir-format
+ msgid "Please log in to connect %{app} with your account."
+ msgstr ""
+@@ -6000,7 +6000,7 @@ msgstr ""
+ msgid "Metric"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:34
++#: lib/vutuv_web/views/admin/report_html.ex:35
+ #, elixir-autogen, elixir-format
+ msgid "New confirmed registrations (by PIN)"
+ msgstr ""
+@@ -6029,7 +6029,7 @@ msgstr ""
+ #: lib/vutuv_web/components/post_components.ex:458
+ #: lib/vutuv_web/templates/post/analytics.html.heex:112
+ #: lib/vutuv_web/templates/settings/auto_post_deletion.html.heex:185
+-#: lib/vutuv_web/views/admin/report_html.ex:36
++#: lib/vutuv_web/views/admin/report_html.ex:37
+ #, elixir-autogen, elixir-format
+ msgid "Reposts"
+ msgstr ""
+@@ -6204,17 +6204,17 @@ msgid "Confirmed members whose every email address bounced, so they can no longe
+ msgstr ""
+ 
+ #: lib/vutuv_web/live/admin/deliverability_live.ex:153
+-#: lib/vutuv_web/views/admin/report_html.ex:45
++#: lib/vutuv_web/views/admin/report_html.ex:46
+ #, elixir-autogen, elixir-format
+ msgid "Deactivated addresses"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:39
++#: lib/vutuv_web/views/admin/report_html.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "New Fediverse followers"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:42
++#: lib/vutuv_web/views/admin/report_html.ex:43
+ #, elixir-autogen, elixir-format
+ msgid "Removed Fediverse followers (account deleted)"
+ msgstr ""
+@@ -6242,12 +6242,12 @@ msgstr ""
+ msgid "Every deactivation, recovery, freeze and thaw, newest first."
+ msgstr ""
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:52
++#: lib/vutuv_web/controllers/admin/account_controller.ex:53
+ #: lib/vutuv_web/live/admin/deliverability_live.ex:102
+ #: lib/vutuv_web/templates/admin/account/frozen.html.heex:2
+ #: lib/vutuv_web/templates/admin/account/frozen.html.heex:3
+ #: lib/vutuv_web/templates/admin/account/frozen.html.heex:8
+-#: lib/vutuv_web/views/admin/report_html.ex:46
++#: lib/vutuv_web/views/admin/report_html.ex:47
+ #, elixir-autogen, elixir-format
+ msgid "Frozen accounts"
+ msgstr ""
+@@ -6370,12 +6370,12 @@ msgstr ""
+ msgid "system"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:44
++#: lib/vutuv_web/views/admin/report_html.ex:45
+ #, elixir-autogen, elixir-format
+ msgid "Bounces"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:47
++#: lib/vutuv_web/views/admin/report_html.ex:48
+ #, elixir-autogen, elixir-format
+ msgid "Thawed accounts"
+ msgstr ""
+@@ -7393,7 +7393,7 @@ msgstr ""
+ msgid "Take an unwanted username away from a member: the account is force-renamed to a generated handle. The old name is not blocked afterwards - a name bad enough to ban globally belongs in the moderation tooling."
+ msgstr ""
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:69
++#: lib/vutuv_web/controllers/admin/account_controller.ex:71
+ #: lib/vutuv_web/live/admin/deliverability_live.ex:34
+ #: lib/vutuv_web/live/admin/user_delete_live.ex:69
+ #, elixir-autogen, elixir-format
+@@ -9629,7 +9629,7 @@ msgstr ""
+ msgid "Account restored. The member can sign in again."
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:48
++#: lib/vutuv_web/views/admin/report_html.ex:49
+ #, elixir-autogen, elixir-format
+ msgid "Accounts removed as spam"
+ msgstr ""
+@@ -13740,22 +13740,22 @@ msgid_plural "%{formatted} accounts are in the moderation freezer."
+ msgstr[0] ""
+ msgstr[1] ""
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:105
++#: lib/vutuv_web/controllers/admin/account_controller.ex:107
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was already frozen."
+ msgstr ""
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:102
++#: lib/vutuv_web/controllers/admin/account_controller.ex:104
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was frozen."
+ msgstr ""
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:111
++#: lib/vutuv_web/controllers/admin/account_controller.ex:113
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was not frozen."
+ msgstr ""
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:108
++#: lib/vutuv_web/controllers/admin/account_controller.ex:110
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was unfrozen."
+ msgstr ""
+@@ -13858,7 +13858,7 @@ msgstr ""
+ msgid "frozen"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/admin/account_html.ex:98
++#: lib/vutuv_web/views/admin/account_html.ex:97
+ #, elixir-autogen, elixir-format
+ msgid "report"
+ msgstr ""
+@@ -17385,7 +17385,7 @@ msgstr ""
+ msgid "%{address} (whole website)"
+ msgstr ""
+ 
+-#: lib/vutuv_web/markdown.ex:396
++#: lib/vutuv_web/markdown.ex:413
+ #, elixir-autogen, elixir-format
+ msgid "Verified webpage of the author (%{address})"
+ msgstr ""
+@@ -20407,19 +20407,19 @@ msgstr ""
+ 
+ #: lib/vutuv_web/components/welcome_components.ex:360
+ #: lib/vutuv_web/live/registration_live.ex:508
+-#: lib/vutuv_web/views/outbound_html.ex:68
+-#: lib/vutuv_web/views/outbound_html.ex:81
++#: lib/vutuv_web/views/outbound_html.ex:71
++#: lib/vutuv_web/views/outbound_html.ex:84
+ #, elixir-autogen, elixir-format
+ msgid "Continue"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/outbound_html.ex:67
+-#: lib/vutuv_web/views/outbound_html.ex:80
++#: lib/vutuv_web/views/outbound_html.ex:70
++#: lib/vutuv_web/views/outbound_html.ex:83
+ #, elixir-autogen, elixir-format
+ msgid "Continue to %{server}"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/outbound_html.ex:60
++#: lib/vutuv_web/views/outbound_html.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "E-mail to %{address}"
+ msgstr ""
+@@ -20429,7 +20429,7 @@ msgstr ""
+ msgid "The employer takes applications on their own website."
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/outbound_html.ex:61
++#: lib/vutuv_web/views/outbound_html.ex:64
+ #, elixir-autogen, elixir-format
+ msgid "Write e-mail"
+ msgstr ""
+@@ -26792,7 +26792,17 @@ msgstr ""
+ msgid "Use beta features"
+ msgstr ""
+ 
+-#: lib/vutuv_web/controllers/oauth_controller.ex:222
++#: lib/vutuv_web/controllers/oauth_controller.ex:223
+ #, elixir-autogen, elixir-format
+ msgid "Taking you back to %{app}."
+ msgstr ""
++
++#: lib/vutuv_web/views/admin/report_html.ex:50
++#, elixir-autogen, elixir-format
++msgid "Accounts frozen automatically"
++msgstr ""
++
++#: lib/vutuv_web/views/admin/account_html.ex:98
++#, elixir-autogen, elixir-format
++msgid "automatic check"
++msgstr ""
+diff --git a/priv/gettext/en/LC_MESSAGES/default.po b/priv/gettext/en/LC_MESSAGES/default.po
+index 93a04e49f..8e47d52b4 100644
+--- a/priv/gettext/en/LC_MESSAGES/default.po
++++ b/priv/gettext/en/LC_MESSAGES/default.po
+@@ -2178,7 +2178,7 @@ msgstr ""
+ #: lib/vutuv_web/live/search_live.ex:546
+ #: lib/vutuv_web/live/search_live.ex:1198
+ #: lib/vutuv_web/templates/settings/preferences.html.heex:250
+-#: lib/vutuv_web/views/admin/report_html.ex:35
++#: lib/vutuv_web/views/admin/report_html.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "Posts"
+ msgstr ""
+@@ -2374,7 +2374,7 @@ msgstr ""
+ #: lib/vutuv_web/live/shell_live.ex:1554
+ #: lib/vutuv_web/live/shell_live.ex:1642
+ #: lib/vutuv_web/templates/settings/auto_post_deletion.html.heex:172
+-#: lib/vutuv_web/views/admin/report_html.ex:38
++#: lib/vutuv_web/views/admin/report_html.ex:39
+ #, elixir-autogen, elixir-format
+ msgid "Bookmarks"
+ msgstr ""
+@@ -2397,7 +2397,7 @@ msgstr ""
+ #: lib/vutuv_web/templates/settings/auto_post_deletion.html.heex:159
+ #: lib/vutuv_web/templates/settings/notifications.html.heex:108
+ #: lib/vutuv_web/templates/settings/privacy.html.heex:91
+-#: lib/vutuv_web/views/admin/report_html.ex:37
++#: lib/vutuv_web/views/admin/report_html.ex:38
+ #, elixir-autogen, elixir-format
+ msgid "Likes"
+ msgstr ""
+@@ -4855,7 +4855,7 @@ msgstr ""
+ msgid "One per line. Exact https:// URLs (http://localhost is allowed for development). The authorization flow only ever redirects to these."
+ msgstr ""
+ 
+-#: lib/vutuv_web/controllers/oauth_controller.ex:70
++#: lib/vutuv_web/controllers/oauth_controller.ex:73
+ #, elixir-autogen, elixir-format
+ msgid "Please log in to connect %{app} with your account."
+ msgstr ""
+@@ -5998,7 +5998,7 @@ msgstr ""
+ msgid "Metric"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:34
++#: lib/vutuv_web/views/admin/report_html.ex:35
+ #, elixir-autogen, elixir-format
+ msgid "New confirmed registrations (by PIN)"
+ msgstr ""
+@@ -6027,7 +6027,7 @@ msgstr ""
+ #: lib/vutuv_web/components/post_components.ex:458
+ #: lib/vutuv_web/templates/post/analytics.html.heex:112
+ #: lib/vutuv_web/templates/settings/auto_post_deletion.html.heex:185
+-#: lib/vutuv_web/views/admin/report_html.ex:36
++#: lib/vutuv_web/views/admin/report_html.ex:37
+ #, elixir-autogen, elixir-format
+ msgid "Reposts"
+ msgstr ""
+@@ -6202,17 +6202,17 @@ msgid "Confirmed members whose every email address bounced, so they can no longe
+ msgstr ""
+ 
+ #: lib/vutuv_web/live/admin/deliverability_live.ex:153
+-#: lib/vutuv_web/views/admin/report_html.ex:45
++#: lib/vutuv_web/views/admin/report_html.ex:46
+ #, elixir-autogen, elixir-format
+ msgid "Deactivated addresses"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:39
++#: lib/vutuv_web/views/admin/report_html.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "New Fediverse followers"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:42
++#: lib/vutuv_web/views/admin/report_html.ex:43
+ #, elixir-autogen, elixir-format
+ msgid "Removed Fediverse followers (account deleted)"
+ msgstr ""
+@@ -6240,12 +6240,12 @@ msgstr ""
+ msgid "Every deactivation, recovery, freeze and thaw, newest first."
+ msgstr ""
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:52
++#: lib/vutuv_web/controllers/admin/account_controller.ex:53
+ #: lib/vutuv_web/live/admin/deliverability_live.ex:102
+ #: lib/vutuv_web/templates/admin/account/frozen.html.heex:2
+ #: lib/vutuv_web/templates/admin/account/frozen.html.heex:3
+ #: lib/vutuv_web/templates/admin/account/frozen.html.heex:8
+-#: lib/vutuv_web/views/admin/report_html.ex:46
++#: lib/vutuv_web/views/admin/report_html.ex:47
+ #, elixir-autogen, elixir-format
+ msgid "Frozen accounts"
+ msgstr ""
+@@ -6368,12 +6368,12 @@ msgstr ""
+ msgid "system"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:44
++#: lib/vutuv_web/views/admin/report_html.ex:45
+ #, elixir-autogen, elixir-format
+ msgid "Bounces"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:47
++#: lib/vutuv_web/views/admin/report_html.ex:48
+ #, elixir-autogen, elixir-format
+ msgid "Thawed accounts"
+ msgstr ""
+@@ -7391,7 +7391,7 @@ msgstr ""
+ msgid "Take an unwanted username away from a member: the account is force-renamed to a generated handle. The old name is not blocked afterwards - a name bad enough to ban globally belongs in the moderation tooling."
+ msgstr ""
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:69
++#: lib/vutuv_web/controllers/admin/account_controller.ex:71
+ #: lib/vutuv_web/live/admin/deliverability_live.ex:34
+ #: lib/vutuv_web/live/admin/user_delete_live.ex:69
+ #, elixir-autogen, elixir-format
+@@ -9627,7 +9627,7 @@ msgstr ""
+ msgid "Account restored. The member can sign in again."
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:48
++#: lib/vutuv_web/views/admin/report_html.ex:49
+ #, elixir-autogen, elixir-format
+ msgid "Accounts removed as spam"
+ msgstr ""
+@@ -13738,22 +13738,22 @@ msgid_plural "%{formatted} accounts are in the moderation freezer."
+ msgstr[0] ""
+ msgstr[1] ""
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:105
++#: lib/vutuv_web/controllers/admin/account_controller.ex:107
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was already frozen."
+ msgstr ""
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:102
++#: lib/vutuv_web/controllers/admin/account_controller.ex:104
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was frozen."
+ msgstr ""
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:111
++#: lib/vutuv_web/controllers/admin/account_controller.ex:113
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was not frozen."
+ msgstr ""
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:108
++#: lib/vutuv_web/controllers/admin/account_controller.ex:110
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was unfrozen."
+ msgstr ""
+@@ -13856,7 +13856,7 @@ msgstr ""
+ msgid "frozen"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/admin/account_html.ex:98
++#: lib/vutuv_web/views/admin/account_html.ex:97
+ #, elixir-autogen, elixir-format
+ msgid "report"
+ msgstr ""
+@@ -17383,7 +17383,7 @@ msgstr ""
+ msgid "%{address} (whole website)"
+ msgstr ""
+ 
+-#: lib/vutuv_web/markdown.ex:396
++#: lib/vutuv_web/markdown.ex:413
+ #, elixir-autogen, elixir-format
+ msgid "Verified webpage of the author (%{address})"
+ msgstr ""
+@@ -20405,19 +20405,19 @@ msgstr ""
+ 
+ #: lib/vutuv_web/components/welcome_components.ex:360
+ #: lib/vutuv_web/live/registration_live.ex:508
+-#: lib/vutuv_web/views/outbound_html.ex:68
+-#: lib/vutuv_web/views/outbound_html.ex:81
++#: lib/vutuv_web/views/outbound_html.ex:71
++#: lib/vutuv_web/views/outbound_html.ex:84
+ #, elixir-autogen, elixir-format, fuzzy
+ msgid "Continue"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/outbound_html.ex:67
+-#: lib/vutuv_web/views/outbound_html.ex:80
++#: lib/vutuv_web/views/outbound_html.ex:70
++#: lib/vutuv_web/views/outbound_html.ex:83
+ #, elixir-autogen, elixir-format
+ msgid "Continue to %{server}"
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/outbound_html.ex:60
++#: lib/vutuv_web/views/outbound_html.ex:63
+ #, elixir-autogen, elixir-format, fuzzy
+ msgid "E-mail to %{address}"
+ msgstr ""
+@@ -20427,7 +20427,7 @@ msgstr ""
+ msgid "The employer takes applications on their own website."
+ msgstr ""
+ 
+-#: lib/vutuv_web/views/outbound_html.ex:61
++#: lib/vutuv_web/views/outbound_html.ex:64
+ #, elixir-autogen, elixir-format
+ msgid "Write e-mail"
+ msgstr ""
+@@ -26790,7 +26790,17 @@ msgstr ""
+ msgid "Use beta features"
+ msgstr ""
+ 
+-#: lib/vutuv_web/controllers/oauth_controller.ex:222
++#: lib/vutuv_web/controllers/oauth_controller.ex:223
+ #, elixir-autogen, elixir-format
+ msgid "Taking you back to %{app}."
+ msgstr ""
++
++#: lib/vutuv_web/views/admin/report_html.ex:50
++#, elixir-autogen, elixir-format, fuzzy
++msgid "Accounts frozen automatically"
++msgstr ""
++
++#: lib/vutuv_web/views/admin/account_html.ex:98
++#, elixir-autogen, elixir-format
++msgid "automatic check"
++msgstr ""
+diff --git a/priv/gettext/fr/LC_MESSAGES/default.po b/priv/gettext/fr/LC_MESSAGES/default.po
+index 3fdb42039..c7b675e39 100644
+--- a/priv/gettext/fr/LC_MESSAGES/default.po
++++ b/priv/gettext/fr/LC_MESSAGES/default.po
+@@ -2180,7 +2180,7 @@ msgstr "La publication a été supprimée."
+ #: lib/vutuv_web/live/search_live.ex:546
+ #: lib/vutuv_web/live/search_live.ex:1198
+ #: lib/vutuv_web/templates/settings/preferences.html.heex:250
+-#: lib/vutuv_web/views/admin/report_html.ex:35
++#: lib/vutuv_web/views/admin/report_html.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "Posts"
+ msgstr "Publications"
+@@ -2376,7 +2376,7 @@ msgstr "Marque-page"
+ #: lib/vutuv_web/live/shell_live.ex:1554
+ #: lib/vutuv_web/live/shell_live.ex:1642
+ #: lib/vutuv_web/templates/settings/auto_post_deletion.html.heex:172
+-#: lib/vutuv_web/views/admin/report_html.ex:38
++#: lib/vutuv_web/views/admin/report_html.ex:39
+ #, elixir-autogen, elixir-format
+ msgid "Bookmarks"
+ msgstr "Marque-pages"
+@@ -2399,7 +2399,7 @@ msgstr "J'aime"
+ #: lib/vutuv_web/templates/settings/auto_post_deletion.html.heex:159
+ #: lib/vutuv_web/templates/settings/notifications.html.heex:108
+ #: lib/vutuv_web/templates/settings/privacy.html.heex:91
+-#: lib/vutuv_web/views/admin/report_html.ex:37
++#: lib/vutuv_web/views/admin/report_html.ex:38
+ #, elixir-autogen, elixir-format
+ msgid "Likes"
+ msgstr "J'aime"
+@@ -4857,7 +4857,7 @@ msgstr "Les applications OAuth permettent à d'autres membres de connecter votre
+ msgid "One per line. Exact https:// URLs (http://localhost is allowed for development). The authorization flow only ever redirects to these."
+ msgstr "Une par ligne. URL https:// exactes (http://localhost est autorisé pour le développement). L'autorisation ne redirige que vers ces adresses."
+ 
+-#: lib/vutuv_web/controllers/oauth_controller.ex:70
++#: lib/vutuv_web/controllers/oauth_controller.ex:73
+ #, elixir-autogen, elixir-format
+ msgid "Please log in to connect %{app} with your account."
+ msgstr "Veuillez vous connecter pour connecter %{app} à votre compte."
+@@ -6000,7 +6000,7 @@ msgstr "Gérer les téléphones"
+ msgid "Metric"
+ msgstr "Indicateur"
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:34
++#: lib/vutuv_web/views/admin/report_html.ex:35
+ #, elixir-autogen, elixir-format
+ msgid "New confirmed registrations (by PIN)"
+ msgstr "Nouvelles inscriptions confirmées (par PIN)"
+@@ -6029,7 +6029,7 @@ msgstr "Jour précédent"
+ #: lib/vutuv_web/components/post_components.ex:458
+ #: lib/vutuv_web/templates/post/analytics.html.heex:112
+ #: lib/vutuv_web/templates/settings/auto_post_deletion.html.heex:185
+-#: lib/vutuv_web/views/admin/report_html.ex:36
++#: lib/vutuv_web/views/admin/report_html.ex:37
+ #, elixir-autogen, elixir-format
+ msgid "Reposts"
+ msgstr "Republications"
+@@ -6204,17 +6204,17 @@ msgid "Confirmed members whose every email address bounced, so they can no longe
+ msgstr "Membres confirmés dont toutes les adresses e-mail sont non distribuables et qui ne peuvent donc plus recevoir de code PIN de connexion. Masqués aux autres membres jusqu'à ce qu'une adresse fonctionne de nouveau. Dégeler lève le blocage."
+ 
+ #: lib/vutuv_web/live/admin/deliverability_live.ex:153
+-#: lib/vutuv_web/views/admin/report_html.ex:45
++#: lib/vutuv_web/views/admin/report_html.ex:46
+ #, elixir-autogen, elixir-format
+ msgid "Deactivated addresses"
+ msgstr "Adresses désactivées"
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:39
++#: lib/vutuv_web/views/admin/report_html.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "New Fediverse followers"
+ msgstr "Nouveaux abonnés du Fédiverse"
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:42
++#: lib/vutuv_web/views/admin/report_html.ex:43
+ #, elixir-autogen, elixir-format
+ msgid "Removed Fediverse followers (account deleted)"
+ msgstr "Abonnés du Fédiverse retirés (compte supprimé)"
+@@ -6242,12 +6242,12 @@ msgstr "Délivrabilité"
+ msgid "Every deactivation, recovery, freeze and thaw, newest first."
+ msgstr "Chaque désactivation, restauration, gel et dégel, les plus récents d'abord."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:52
++#: lib/vutuv_web/controllers/admin/account_controller.ex:53
+ #: lib/vutuv_web/live/admin/deliverability_live.ex:102
+ #: lib/vutuv_web/templates/admin/account/frozen.html.heex:2
+ #: lib/vutuv_web/templates/admin/account/frozen.html.heex:3
+ #: lib/vutuv_web/templates/admin/account/frozen.html.heex:8
+-#: lib/vutuv_web/views/admin/report_html.ex:46
++#: lib/vutuv_web/views/admin/report_html.ex:47
+ #, elixir-autogen, elixir-format
+ msgid "Frozen accounts"
+ msgstr "Comptes gelés"
+@@ -6370,12 +6370,12 @@ msgstr "rejets définitifs répétés"
+ msgid "system"
+ msgstr "système"
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:44
++#: lib/vutuv_web/views/admin/report_html.ex:45
+ #, elixir-autogen, elixir-format
+ msgid "Bounces"
+ msgstr "Rejets"
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:47
++#: lib/vutuv_web/views/admin/report_html.ex:48
+ #, elixir-autogen, elixir-format
+ msgid "Thawed accounts"
+ msgstr "Comptes dégelés"
+@@ -7393,7 +7393,7 @@ msgstr "Construire des groupes de destinataires fixes à partir de filtres (lang
+ msgid "Take an unwanted username away from a member: the account is force-renamed to a generated handle. The old name is not blocked afterwards - a name bad enough to ban globally belongs in the moderation tooling."
+ msgstr "Retirer à un membre un nom d'utilisateur indésirable : le compte est renommé de force avec un handle généré. L'ancien nom n'est pas bloqué ensuite - un nom assez mauvais pour être banni globalement relève des outils de modération."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:69
++#: lib/vutuv_web/controllers/admin/account_controller.ex:71
+ #: lib/vutuv_web/live/admin/deliverability_live.ex:34
+ #: lib/vutuv_web/live/admin/user_delete_live.ex:69
+ #, elixir-autogen, elixir-format
+@@ -9629,7 +9629,7 @@ msgstr "Compte retiré"
+ msgid "Account restored. The member can sign in again."
+ msgstr "Compte restauré. Le membre peut se reconnecter."
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:48
++#: lib/vutuv_web/views/admin/report_html.ex:49
+ #, elixir-autogen, elixir-format
+ msgid "Accounts removed as spam"
+ msgstr "Comptes retirés comme spam"
+@@ -13740,22 +13740,22 @@ msgid_plural "%{formatted} accounts are in the moderation freezer."
+ msgstr[0] "%{formatted} compte est gelé par la modération."
+ msgstr[1] "%{formatted} comptes sont gelés par la modération."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:105
++#: lib/vutuv_web/controllers/admin/account_controller.ex:107
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was already frozen."
+ msgstr "@%{username} était déjà gelé."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:102
++#: lib/vutuv_web/controllers/admin/account_controller.ex:104
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was frozen."
+ msgstr "@%{username} a été gelé."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:111
++#: lib/vutuv_web/controllers/admin/account_controller.ex:113
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was not frozen."
+ msgstr "@%{username} n'était pas gelé."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:108
++#: lib/vutuv_web/controllers/admin/account_controller.ex:110
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was unfrozen."
+ msgstr "@%{username} a été dégelé."
+@@ -13858,7 +13858,7 @@ msgstr "Admin"
+ msgid "frozen"
+ msgstr "Gelé"
+ 
+-#: lib/vutuv_web/views/admin/account_html.ex:98
++#: lib/vutuv_web/views/admin/account_html.ex:97
+ #, elixir-autogen, elixir-format
+ msgid "report"
+ msgstr "Signalement"
+@@ -17385,7 +17385,7 @@ msgstr "%{address} (cette page uniquement)"
+ msgid "%{address} (whole website)"
+ msgstr "%{address} (site entier)"
+ 
+-#: lib/vutuv_web/markdown.ex:396
++#: lib/vutuv_web/markdown.ex:413
+ #, elixir-autogen, elixir-format
+ msgid "Verified webpage of the author (%{address})"
+ msgstr "Page web vérifiée de l'auteur (%{address})"
+@@ -20407,19 +20407,19 @@ msgstr "Confirmez l'abonnement sur votre propre serveur."
+ 
+ #: lib/vutuv_web/components/welcome_components.ex:360
+ #: lib/vutuv_web/live/registration_live.ex:508
+-#: lib/vutuv_web/views/outbound_html.ex:68
+-#: lib/vutuv_web/views/outbound_html.ex:81
++#: lib/vutuv_web/views/outbound_html.ex:71
++#: lib/vutuv_web/views/outbound_html.ex:84
+ #, elixir-autogen, elixir-format
+ msgid "Continue"
+ msgstr "Continuer"
+ 
+-#: lib/vutuv_web/views/outbound_html.ex:67
+-#: lib/vutuv_web/views/outbound_html.ex:80
++#: lib/vutuv_web/views/outbound_html.ex:70
++#: lib/vutuv_web/views/outbound_html.ex:83
+ #, elixir-autogen, elixir-format
+ msgid "Continue to %{server}"
+ msgstr "Continuer vers %{server}"
+ 
+-#: lib/vutuv_web/views/outbound_html.ex:60
++#: lib/vutuv_web/views/outbound_html.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "E-mail to %{address}"
+ msgstr "E-mail à %{address}"
+@@ -20429,7 +20429,7 @@ msgstr "E-mail à %{address}"
+ msgid "The employer takes applications on their own website."
+ msgstr "L'entreprise reçoit les candidatures sur son propre site web."
+ 
+-#: lib/vutuv_web/views/outbound_html.ex:61
++#: lib/vutuv_web/views/outbound_html.ex:64
+ #, elixir-autogen, elixir-format
+ msgid "Write e-mail"
+ msgstr "Écrire un e-mail"
+@@ -26792,7 +26792,17 @@ msgstr "Les nouvelles fonctionnalités peuvent vous parvenir avant tout le monde
+ msgid "Use beta features"
+ msgstr "Utiliser les fonctionnalités bêta"
+ 
+-#: lib/vutuv_web/controllers/oauth_controller.ex:222
++#: lib/vutuv_web/controllers/oauth_controller.ex:223
+ #, elixir-autogen, elixir-format
+ msgid "Taking you back to %{app}."
+ msgstr "Vous êtes redirigé vers %{app}."
++
++#: lib/vutuv_web/views/admin/report_html.ex:50
++#, elixir-autogen, elixir-format
++msgid "Accounts frozen automatically"
++msgstr "Comptes gelés automatiquement"
++
++#: lib/vutuv_web/views/admin/account_html.ex:98
++#, elixir-autogen, elixir-format
++msgid "automatic check"
++msgstr "Contrôle automatique"
+diff --git a/priv/gettext/it/LC_MESSAGES/default.po b/priv/gettext/it/LC_MESSAGES/default.po
+index 95635d619..bec858cd2 100644
+--- a/priv/gettext/it/LC_MESSAGES/default.po
++++ b/priv/gettext/it/LC_MESSAGES/default.po
+@@ -2220,7 +2220,7 @@ msgstr "Post eliminato."
+ #: lib/vutuv_web/live/search_live.ex:546
+ #: lib/vutuv_web/live/search_live.ex:1198
+ #: lib/vutuv_web/templates/settings/preferences.html.heex:250
+-#: lib/vutuv_web/views/admin/report_html.ex:35
++#: lib/vutuv_web/views/admin/report_html.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "Posts"
+ msgstr "Post"
+@@ -2418,7 +2418,7 @@ msgstr "Salva"
+ #: lib/vutuv_web/live/shell_live.ex:1554
+ #: lib/vutuv_web/live/shell_live.ex:1642
+ #: lib/vutuv_web/templates/settings/auto_post_deletion.html.heex:172
+-#: lib/vutuv_web/views/admin/report_html.ex:38
++#: lib/vutuv_web/views/admin/report_html.ex:39
+ #, elixir-autogen, elixir-format
+ msgid "Bookmarks"
+ msgstr "Salvati"
+@@ -2441,7 +2441,7 @@ msgstr "Mi piace"
+ #: lib/vutuv_web/templates/settings/auto_post_deletion.html.heex:159
+ #: lib/vutuv_web/templates/settings/notifications.html.heex:108
+ #: lib/vutuv_web/templates/settings/privacy.html.heex:91
+-#: lib/vutuv_web/views/admin/report_html.ex:37
++#: lib/vutuv_web/views/admin/report_html.ex:38
+ #, elixir-autogen, elixir-format
+ msgid "Likes"
+ msgstr "Mi piace"
+@@ -5015,7 +5015,7 @@ msgstr ""
+ "Uno per riga. URL https:// esatti (http://localhost è ammesso in fase di "
+ "sviluppo). Il flusso di autorizzazione reindirizza solo a questi."
+ 
+-#: lib/vutuv_web/controllers/oauth_controller.ex:70
++#: lib/vutuv_web/controllers/oauth_controller.ex:73
+ #, elixir-autogen, elixir-format
+ msgid "Please log in to connect %{app} with your account."
+ msgstr "Accedi per collegare %{app} al tuo account."
+@@ -6196,7 +6196,7 @@ msgstr "Gestisci i numeri di telefono"
+ msgid "Metric"
+ msgstr "Indicatore"
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:34
++#: lib/vutuv_web/views/admin/report_html.ex:35
+ #, elixir-autogen, elixir-format
+ msgid "New confirmed registrations (by PIN)"
+ msgstr "Nuove registrazioni confermate (con PIN)"
+@@ -6225,7 +6225,7 @@ msgstr "Giorno precedente"
+ #: lib/vutuv_web/components/post_components.ex:458
+ #: lib/vutuv_web/templates/post/analytics.html.heex:112
+ #: lib/vutuv_web/templates/settings/auto_post_deletion.html.heex:185
+-#: lib/vutuv_web/views/admin/report_html.ex:36
++#: lib/vutuv_web/views/admin/report_html.ex:37
+ #, elixir-autogen, elixir-format
+ msgid "Reposts"
+ msgstr "Ripubblicazioni"
+@@ -6415,17 +6415,17 @@ msgstr ""
+ "togliere il blocco."
+ 
+ #: lib/vutuv_web/live/admin/deliverability_live.ex:153
+-#: lib/vutuv_web/views/admin/report_html.ex:45
++#: lib/vutuv_web/views/admin/report_html.ex:46
+ #, elixir-autogen, elixir-format
+ msgid "Deactivated addresses"
+ msgstr "Indirizzi disattivati"
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:39
++#: lib/vutuv_web/views/admin/report_html.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "New Fediverse followers"
+ msgstr "Nuovi follower dal Fediverso"
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:42
++#: lib/vutuv_web/views/admin/report_html.ex:43
+ #, elixir-autogen, elixir-format
+ msgid "Removed Fediverse followers (account deleted)"
+ msgstr "Follower del Fediverso rimossi (account eliminato)"
+@@ -6453,12 +6453,12 @@ msgstr "Recapitabilità"
+ msgid "Every deactivation, recovery, freeze and thaw, newest first."
+ msgstr "Ogni disattivazione, recupero, blocco e sblocco, dal più recente."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:52
++#: lib/vutuv_web/controllers/admin/account_controller.ex:53
+ #: lib/vutuv_web/live/admin/deliverability_live.ex:102
+ #: lib/vutuv_web/templates/admin/account/frozen.html.heex:2
+ #: lib/vutuv_web/templates/admin/account/frozen.html.heex:3
+ #: lib/vutuv_web/templates/admin/account/frozen.html.heex:8
+-#: lib/vutuv_web/views/admin/report_html.ex:46
++#: lib/vutuv_web/views/admin/report_html.ex:47
+ #, elixir-autogen, elixir-format
+ msgid "Frozen accounts"
+ msgstr "Account bloccati"
+@@ -6585,12 +6585,12 @@ msgstr "rifiuti definitivi ripetuti"
+ msgid "system"
+ msgstr "sistema"
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:44
++#: lib/vutuv_web/views/admin/report_html.ex:45
+ #, elixir-autogen, elixir-format
+ msgid "Bounces"
+ msgstr "Rifiuti"
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:47
++#: lib/vutuv_web/views/admin/report_html.ex:48
+ #, elixir-autogen, elixir-format
+ msgid "Thawed accounts"
+ msgstr "Account sbloccati"
+@@ -7660,7 +7660,7 @@ msgstr ""
+ "nome tanto grave da vietare ovunque va gestito con gli strumenti di "
+ "moderazione."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:69
++#: lib/vutuv_web/controllers/admin/account_controller.ex:71
+ #: lib/vutuv_web/live/admin/deliverability_live.ex:34
+ #: lib/vutuv_web/live/admin/user_delete_live.ex:69
+ #, elixir-autogen, elixir-format
+@@ -10020,7 +10020,7 @@ msgstr "Account rimosso"
+ msgid "Account restored. The member can sign in again."
+ msgstr "Account ripristinato. Il membro può accedere di nuovo."
+ 
+-#: lib/vutuv_web/views/admin/report_html.ex:48
++#: lib/vutuv_web/views/admin/report_html.ex:49
+ #, elixir-autogen, elixir-format
+ msgid "Accounts removed as spam"
+ msgstr "Account rimossi come spam"
+@@ -14447,22 +14447,22 @@ msgid_plural "%{formatted} accounts are in the moderation freezer."
+ msgstr[0] "%{formatted} account è bloccato dalla moderazione."
+ msgstr[1] "%{formatted} account sono bloccati dalla moderazione."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:105
++#: lib/vutuv_web/controllers/admin/account_controller.ex:107
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was already frozen."
+ msgstr "@%{username} era già bloccato."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:102
++#: lib/vutuv_web/controllers/admin/account_controller.ex:104
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was frozen."
+ msgstr "@%{username} è stato bloccato."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:111
++#: lib/vutuv_web/controllers/admin/account_controller.ex:113
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was not frozen."
+ msgstr "@%{username} non era bloccato."
+ 
+-#: lib/vutuv_web/controllers/admin/account_controller.ex:108
++#: lib/vutuv_web/controllers/admin/account_controller.ex:110
+ #, elixir-autogen, elixir-format
+ msgid "@%{username} was unfrozen."
+ msgstr "@%{username} è stato sbloccato."
+@@ -14574,7 +14574,7 @@ msgstr "amministratore"
+ msgid "frozen"
+ msgstr "bloccato"
+ 
+-#: lib/vutuv_web/views/admin/account_html.ex:98
++#: lib/vutuv_web/views/admin/account_html.ex:97
+ #, elixir-autogen, elixir-format
+ msgid "report"
+ msgstr "segnalazione"
+@@ -18437,7 +18437,7 @@ msgstr "%{address} (solo questa pagina)"
+ msgid "%{address} (whole website)"
+ msgstr "%{address} (intero sito web)"
+ 
+-#: lib/vutuv_web/markdown.ex:396
++#: lib/vutuv_web/markdown.ex:413
+ #, elixir-autogen, elixir-format
+ msgid "Verified webpage of the author (%{address})"
+ msgstr "Pagina web verificata dell'autore (%{address})"
+@@ -21767,19 +21767,19 @@ msgstr "Conferma il follow sul tuo server."
+ 
+ #: lib/vutuv_web/components/welcome_components.ex:360
+ #: lib/vutuv_web/live/registration_live.ex:508
+-#: lib/vutuv_web/views/outbound_html.ex:68
+-#: lib/vutuv_web/views/outbound_html.ex:81
++#: lib/vutuv_web/views/outbound_html.ex:71
++#: lib/vutuv_web/views/outbound_html.ex:84
+ #, elixir-autogen, elixir-format
+ msgid "Continue"
+ msgstr "Continua"
+ 
+-#: lib/vutuv_web/views/outbound_html.ex:67
+-#: lib/vutuv_web/views/outbound_html.ex:80
++#: lib/vutuv_web/views/outbound_html.ex:70
++#: lib/vutuv_web/views/outbound_html.ex:83
+ #, elixir-autogen, elixir-format
+ msgid "Continue to %{server}"
+ msgstr "Prosegui verso %{server}"
+ 
+-#: lib/vutuv_web/views/outbound_html.ex:60
++#: lib/vutuv_web/views/outbound_html.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "E-mail to %{address}"
+ msgstr "E-mail a %{address}"
+@@ -21789,7 +21789,7 @@ msgstr "E-mail a %{address}"
+ msgid "The employer takes applications on their own website."
+ msgstr "Il datore di lavoro raccoglie le candidature sul proprio sito web."
+ 
+-#: lib/vutuv_web/views/outbound_html.ex:61
++#: lib/vutuv_web/views/outbound_html.ex:64
+ #, elixir-autogen, elixir-format
+ msgid "Write e-mail"
+ msgstr "Scrivi un'e-mail"
+@@ -28377,7 +28377,17 @@ msgstr "Le nuove funzioni possono arrivarti prima che le abbiano tutti. Possono
+ msgid "Use beta features"
+ msgstr "Usa le funzioni beta"
+ 
+-#: lib/vutuv_web/controllers/oauth_controller.ex:222
++#: lib/vutuv_web/controllers/oauth_controller.ex:223
+ #, elixir-autogen, elixir-format
+ msgid "Taking you back to %{app}."
+ msgstr "Ti riportiamo a %{app}."
++
++#: lib/vutuv_web/views/admin/report_html.ex:50
++#, elixir-autogen, elixir-format
++msgid "Accounts frozen automatically"
++msgstr "Account bloccati automaticamente"
++
++#: lib/vutuv_web/views/admin/account_html.ex:98
++#, elixir-autogen, elixir-format
++msgid "automatic check"
++msgstr "controllo automatico"
+diff --git a/test/vutuv/moderation/link_spam_test.exs b/test/vutuv/moderation/link_spam_test.exs
+new file mode 100644
+index 000000000..3bb61e380
+--- /dev/null
++++ b/test/vutuv/moderation/link_spam_test.exs
+@@ -0,0 +1,106 @@
++defmodule Vutuv.Moderation.LinkSpamTest do
++  @moduledoc """
++  The check that freezes a brand-new account registered to plant a link:
++  one name, and a link that leaves the site in the headline.
++  """
++  use Vutuv.DataCase, async: true
++
++  import Ecto.Query
++
++  alias Vutuv.Accounts.User
++  alias Vutuv.Moderation
++  alias Vutuv.Moderation.AdminAction
++  alias Vutuv.Moderation.LinkSpam
++  alias Vutuv.Reports
++
++  @headline "https://sexualitytest.example Sexuality Test: Explore"
++
++  defp planted(attrs \\ []) do
++    insert(
++      :activated_user,
++      Keyword.merge([first_name: "vbsvinwz", last_name: nil, headline: @headline], attrs)
++    )
++  end
++
++  defp hours_ago(hours), do: NaiveDateTime.add(NaiveDateTime.utc_now(:second), -hours * 3600)
++
++  defp frozen?(%User{id: id}), do: Repo.get!(User, id).frozen_at != nil
++
++  defp actions_for(%User{id: id}), do: Repo.all(from(a in AdminAction, where: a.user_id == ^id))
++
++  test "freezes a new single-name account with a link in its headline and says why" do
++    user = planted()
++
++    assert LinkSpam.run() == 1
++
++    assert frozen?(user)
++
++    assert [%AdminAction{action: "account_frozen", actor_id: nil, detail: detail}] =
++             actions_for(user)
++
++    assert detail == %{"rule" => "new_account_link"}
++  end
++
++  test "a Markdown link and a last name alone are caught the same way" do
++    user = planted(first_name: nil, last_name: "tqmnkhne", headline: "[ACE](https://ace.example)")
++
++    assert LinkSpam.run() == 1
++    assert frozen?(user)
++  end
++
++  test "leaves alone what the rule does not describe" do
++    spared = [
++      planted(last_name: "Hubert"),
++      planted(headline: "Softwarearchäologe aus dem Sauerland"),
++      planted(headline: nil),
++      planted(inserted_at: hours_ago(26)),
++      planted(admin?: true),
++      planted(email_confirmed?: false)
++    ]
++
++    assert LinkSpam.run() == 0
++    refute Enum.any?(spared, &frozen?/1)
++  end
++
++  test "an account an admin has thawed is not frozen a second time" do
++    user = planted()
++    assert LinkSpam.run() == 1
++
++    admin = insert(:activated_user, admin?: true)
++    {:ok, :unfrozen} = Moderation.admin_unfreeze_user(Repo.get!(User, user.id), admin, "real")
++
++    assert LinkSpam.run() == 0
++    refute frozen?(user)
++  end
++
++  test "the frozen list can tell an automatic freeze from an admin's" do
++    automatic = planted()
++    LinkSpam.run()
++
++    by_hand = insert(:activated_user)
++    {:ok, :frozen} = Moderation.admin_freeze_user(by_hand, insert(:activated_user, admin?: true))
++
++    set = Moderation.auto_frozen_ids([automatic.id, by_hand.id])
++
++    assert MapSet.member?(set, automatic.id)
++    refute MapSet.member?(set, by_hand.id)
++  end
++
++  test "the daily report counts and names the account" do
++    user = planted()
++    LinkSpam.run()
++
++    report = Reports.daily(Vutuv.BerlinTime.today())
++
++    assert report.link_spam_freezes == 1
++    assert [%{user: %User{id: id}}] = report.details.link_spam_freezes
++    assert id == user.id
++
++    assert [%{label: "Automatisch eingefrorene Konten", entries: [entry]}] =
++             report
++             |> VutuvWeb.ReportDetails.sections()
++             |> Enum.filter(&(&1.key == :link_spam_freezes))
++
++    assert entry.path == "/" <> user.username
++  end
++end
+diff --git a/test/vutuv/signup_trap_test.exs b/test/vutuv/signup_trap_test.exs
+index 30173edb7..d3134da0e 100644
+--- a/test/vutuv/signup_trap_test.exs
++++ b/test/vutuv/signup_trap_test.exs
+@@ -51,12 +51,27 @@ defmodule Vutuv.SignupTrapTest do
+             {"anna", "müller"},
+             {"anna", "Anna"},
+             {"jo-jo", "jo-jo"},
+-            {"anna", nil},
++            {"Tobias", nil},
++            {nil, "Müller"},
++            {"abc", nil},
++            {"jo-jo", ""},
+             {nil, nil}
+           ] do
+         refute SignupTrap.match(%{first_name: first, last_name: last}), "#{first} #{last}"
+       end
+     end
++
++    test "catches a single lowercase name with nothing in the other field" do
++      for {first, last} <- [
++            {"vbsvinwz", nil},
++            {"tqmnkhne", ""},
++            {nil, "tqmnkhne"},
++            {"", "müller"}
++          ] do
++        assert SignupTrap.match(%{first_name: first, last_name: last}) == :single_lowercase_name,
++               "#{first} #{last}"
++      end
++    end
+   end
+ 
+   describe "record/4" do
+diff --git a/test/vutuv_web/controllers/admin/account_controller_test.exs b/test/vutuv_web/controllers/admin/account_controller_test.exs
+index 3e269a513..dfae06726 100644
+--- a/test/vutuv_web/controllers/admin/account_controller_test.exs
++++ b/test/vutuv_web/controllers/admin/account_controller_test.exs
+@@ -103,6 +103,25 @@ defmodule VutuvWeb.Admin.AccountControllerTest do
+       assert get(build_conn(), "/hideme").status == 403
+     end
+ 
++    test "the frozen list names the automatic check as the source, in German too",
++         %{conn: conn} do
++      user = insert(:activated_user, username: "planted")
++      {:ok, :frozen} = Vutuv.Moderation.auto_freeze_user(user, "new_account_link")
++
++      row = fn conn ->
++        conn
++        |> get(~p"/admin/accounts/frozen")
++        |> html_response(200)
++        |> LazyHTML.from_fragment()
++        |> LazyHTML.query("#frozen-#{user.id}")
++        |> LazyHTML.text()
++      end
++
++      assert row.(conn) =~ "automatic check"
++      german = conn |> recycle() |> put_req_header("accept-language", "de-DE,de")
++      assert row.(german) =~ "Automatik"
++    end
++
+     test "unfreezes a frozen account through a CSRF-protected POST", %{conn: conn} do
+       user =
+         insert(:activated_user,
+diff --git a/test/vutuv_web/controllers/dev_webhook_controller_test.exs b/test/vutuv_web/controllers/dev_webhook_controller_test.exs
+index 4c395e73c..94f5066df 100644
+--- a/test/vutuv_web/controllers/dev_webhook_controller_test.exs
++++ b/test/vutuv_web/controllers/dev_webhook_controller_test.exs
+@@ -67,7 +67,7 @@ defmodule VutuvWeb.DevWebhookControllerTest do
+     {other_conn, _other} =
+       create_and_login_user(other_conn, %{
+         "emails" => %{"0" => %{"value" => "intruder@example.com"}},
+-        "first_name" => "intruder",
++        "first_name" => "Intruder",
+         "tag_list" => @registration_tags
+       })
+ 
+diff --git a/test/vutuv_web/controllers/moderation_case_controller_test.exs b/test/vutuv_web/controllers/moderation_case_controller_test.exs
+index 2b93a574e..79918aaf6 100644
+--- a/test/vutuv_web/controllers/moderation_case_controller_test.exs
++++ b/test/vutuv_web/controllers/moderation_case_controller_test.exs
+@@ -198,7 +198,7 @@ defmodule VutuvWeb.ModerationCaseControllerTest do
+       {other_conn, _other} =
+         create_and_login_user(build_conn() |> Plug.Test.init_test_session(%{}), %{
+           "emails" => %{"0" => %{"value" => "other@example.com"}},
+-          "first_name" => "other",
++          "first_name" => "Other",
+           "tag_list" => @registration_tags
+         })
+ 
+diff --git a/test/vutuv_web/controllers/post_controller_test.exs b/test/vutuv_web/controllers/post_controller_test.exs
+index c4ae3f453..f01580f5d 100644
+--- a/test/vutuv_web/controllers/post_controller_test.exs
++++ b/test/vutuv_web/controllers/post_controller_test.exs
+@@ -15,7 +15,7 @@ defmodule VutuvWeb.PostControllerTest do
+ 
+   @other_login_attrs %{
+     "emails" => %{"0" => %{"value" => "other@example.com"}},
+-    "first_name" => "other",
++    "first_name" => "Other",
+     "tag_list" => @registration_tags
+   }
+ 
+diff --git a/test/vutuv_web/controllers/post_image_controller_test.exs b/test/vutuv_web/controllers/post_image_controller_test.exs
+index a76e29126..e4342e123 100644
+--- a/test/vutuv_web/controllers/post_image_controller_test.exs
++++ b/test/vutuv_web/controllers/post_image_controller_test.exs
+@@ -15,7 +15,7 @@ defmodule VutuvWeb.PostImageControllerTest do
+ 
+   @other_login_attrs %{
+     "emails" => %{"0" => %{"value" => "other@example.com"}},
+-    "first_name" => "other",
++    "first_name" => "Other",
+     "tag_list" => @registration_tags
+   }
+ 
+diff --git a/test/vutuv_web/controllers/signup_trap_registration_test.exs b/test/vutuv_web/controllers/signup_trap_registration_test.exs
+index cede2ab36..3a8388c82 100644
+--- a/test/vutuv_web/controllers/signup_trap_registration_test.exs
++++ b/test/vutuv_web/controllers/signup_trap_registration_test.exs
+@@ -52,6 +52,16 @@ defmodule VutuvWeb.SignupTrapRegistrationTest do
+     assert entry.params["gender"] == "male"
+   end
+ 
++  test "a single lowercase name with no last name is trapped too", %{conn: conn} do
++    params = trapped_params(%{"first_name" => "vbsvinwz", "last_name" => ""})
++
++    conn |> post(~p"/new_registration", user: params) |> html_response(200)
++
++    assert accounts_with(address(params)) == 0
++    assert [entry] = Repo.all(where(Entry, email: ^address(params)))
++    assert entry.rule == "single_lowercase_name"
++  end
++
+   test "a real sign-up still gets its account and its PIN", %{conn: conn} do
+     params = registration_attrs("real")
+ 
+diff --git a/test/vutuv_web/markdown_bluesky_test.exs b/test/vutuv_web/markdown_bluesky_test.exs
+index 26a482bfc..02b5c7c9d 100644
+--- a/test/vutuv_web/markdown_bluesky_test.exs
++++ b/test/vutuv_web/markdown_bluesky_test.exs
+@@ -29,7 +29,7 @@ defmodule VutuvWeb.MarkdownBlueskyTest do
+ 
+       assert html =~ ~s(href="#{@profile}")
+       assert html =~ ~s(target="_blank")
+-      assert html =~ ~s(rel="noopener noreferrer")
++      assert html =~ ~s(rel="ugc nofollow noopener noreferrer")
+       assert html =~ ">#{@handle}</a>"
+     end
+ 
+diff --git a/test/vutuv_web/markdown_test.exs b/test/vutuv_web/markdown_test.exs
+index 69012b6c5..3dcbb5bdf 100644
+--- a/test/vutuv_web/markdown_test.exs
++++ b/test/vutuv_web/markdown_test.exs
+@@ -30,7 +30,7 @@ defmodule VutuvWeb.MarkdownTest do
+     html = render("see [the docs](https://hexdocs.pm/phoenix)")
+     assert html =~ ~s(href="https://hexdocs.pm/phoenix")
+     assert html =~ ~s(target="_blank")
+-    assert html =~ ~s(rel="noopener noreferrer")
++    assert html =~ ~s(rel="ugc nofollow noopener noreferrer")
+     assert html =~ ">the docs</a>"
+   end
+ 
+@@ -465,7 +465,7 @@ defmodule VutuvWeb.MarkdownTest do
+ 
+       assert html =~ ~s(href="https://geno.social/@hostsharing")
+       assert html =~ ~s(target="_blank")
+-      assert html =~ ~s(rel="noopener noreferrer")
++      assert html =~ ~s(rel="ugc nofollow noopener noreferrer")
+       assert html =~ ">@hostsharing@geno.social</a>"
+     end
+ 
+@@ -629,4 +629,22 @@ defmodule VutuvWeb.MarkdownTest do
+       assert html == "<blockquote><p>zitiert</p></blockquote><p>danach</p>"
+     end
+   end
++
++  describe "links that leave the site in profile prose" do
++    test "render/1 marks them ugc nofollow, a pasted address included" do
++      for source <- ["https://sexualitytest.example Test", "[test](https://acetest.example/a)"] do
++        html = source |> Markdown.render() |> Phoenix.HTML.safe_to_string()
++        assert html =~ ~s(rel="ugc nofollow noopener noreferrer"), source
++        assert Markdown.foreign_link?(source), source
++      end
++    end
++
++    test "text, a hashtag and a mail address are not foreign links" do
++      for source <- ["Softwarearchäologe aus dem Sauerland", "#elixir und mehr", "a@b.example"] do
++        refute Markdown.foreign_link?(source), source
++      end
++
++      refute Markdown.foreign_link?(nil)
++    end
++  end
+ end

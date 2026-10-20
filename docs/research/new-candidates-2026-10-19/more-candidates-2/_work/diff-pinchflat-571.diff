@@ -1,0 +1,180 @@
+diff --git a/lib/pinchflat/downloading/media_download_worker.ex b/lib/pinchflat/downloading/media_download_worker.ex
+index 9a9d906f4..e442344db 100644
+--- a/lib/pinchflat/downloading/media_download_worker.ex
++++ b/lib/pinchflat/downloading/media_download_worker.ex
+@@ -49,8 +49,7 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+ 
+     media_item = fetch_and_run_prevent_download_user_script(media_item_id)
+ 
+-    # If the source or media item is set to not download media, perform a no-op unless forced
+-    if (media_item.source.download_media && !media_item.prevent_download) || should_force do
++    if should_download_media?(media_item, should_force, is_quality_upgrade) do
+       download_media_and_schedule_jobs(media_item, is_quality_upgrade, should_force)
+     else
+       :ok
+@@ -60,6 +59,20 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+     Ecto.StaleEntryError -> Logger.info("#{__MODULE__} discarded: media item #{media_item_id} stale")
+   end
+ 
++  # If this is a quality upgrade, only check if the source is set to download media
++  # or that the media item's download hasn't been prevented
++  defp should_download_media?(media_item, should_force, true = _is_quality_upgrade) do
++    (media_item.source.download_media && !media_item.prevent_download) || should_force
++  end
++
++  # If it's not a quality upgrade, additionally check if the media item is pending download
++  defp should_download_media?(media_item, should_force, _is_quality_upgrade) do
++    source = media_item.source
++    is_pending = Media.pending_download?(media_item)
++
++    (is_pending && source.download_media && !media_item.prevent_download) || should_force
++  end
++
+   # If a user script exists and, when run, returns a non-zero exit code, prevent this and all future downloads
+   # of the media item.
+   defp fetch_and_run_prevent_download_user_script(media_item_id) do
+diff --git a/test/pinchflat/downloading/media_download_worker_test.exs b/test/pinchflat/downloading/media_download_worker_test.exs
+index 3f3bf4f6b..e104f273f 100644
+--- a/test/pinchflat/downloading/media_download_worker_test.exs
++++ b/test/pinchflat/downloading/media_download_worker_test.exs
+@@ -67,7 +67,7 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+       :ok
+     end
+ 
+-    test "it saves attributes to the media_item", %{media_item: media_item} do
++    test "saves attributes to the media_item", %{media_item: media_item} do
+       assert media_item.media_filepath == nil
+       perform_job(MediaDownloadWorker, %{id: media_item.id})
+       media_item = Repo.reload(media_item)
+@@ -75,20 +75,20 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+       assert media_item.media_filepath != nil
+     end
+ 
+-    test "it saves the metadata to the media_item", %{media_item: media_item} do
++    test "saves the metadata to the media_item", %{media_item: media_item} do
+       assert media_item.metadata == nil
+       perform_job(MediaDownloadWorker, %{id: media_item.id})
+       assert Repo.reload(media_item).metadata != nil
+     end
+ 
+-    test "it won't double-schedule downloading jobs", %{media_item: media_item} do
++    test "won't double-schedule downloading jobs", %{media_item: media_item} do
+       Oban.insert(MediaDownloadWorker.new(%{id: media_item.id}))
+       Oban.insert(MediaDownloadWorker.new(%{id: media_item.id}))
+ 
+       assert [_] = all_enqueued(worker: MediaDownloadWorker)
+     end
+ 
+-    test "it sets the job to retryable if the download fails", %{media_item: media_item} do
++    test "sets the job to retryable if the download fails", %{media_item: media_item} do
+       expect(YtDlpRunnerMock, :run, 2, fn
+         _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
+         _url, :download, _opts, _ot, _addl -> {:error, "error"}
+@@ -140,7 +140,7 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+       end)
+     end
+ 
+-    test "it ensures error are returned in a 2-item tuple", %{media_item: media_item} do
++    test "ensures error are returned in a 2-item tuple", %{media_item: media_item} do
+       expect(YtDlpRunnerMock, :run, 2, fn
+         _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
+         _url, :download, _opts, _ot, _addl -> {:error, "error", 1}
+@@ -149,7 +149,7 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+       assert {:error, :download_failed} = perform_job(MediaDownloadWorker, %{id: media_item.id})
+     end
+ 
+-    test "it does not download if the source is set to not download", %{media_item: media_item} do
++    test "does not download if the source is set to not download", %{media_item: media_item} do
+       expect(YtDlpRunnerMock, :run, 0, fn _url, :download, _opts, _ot, _addl -> :ok end)
+ 
+       Sources.update_source(media_item.source, %{download_media: false})
+@@ -165,7 +165,7 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+       perform_job(MediaDownloadWorker, %{id: media_item.id})
+     end
+ 
+-    test "it saves the file's size to the database", %{media_item: media_item} do
++    test "saves the file's size to the database", %{media_item: media_item} do
+       expect(YtDlpRunnerMock, :run, 3, fn
+         _url, :get_downloadable_status, _opts, _ot, _addl ->
+           {:ok, "{}"}
+@@ -214,6 +214,14 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+ 
+       perform_job(MediaDownloadWorker, %{id: media_item.id})
+     end
++
++    test "does not download if the media item isn't pending download", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, 0, fn _url, :download, _opts, _ot, _addl -> :ok end)
++
++      Media.update_media_item(media_item, %{media_filepath: "foo.mp4"})
++
++      perform_job(MediaDownloadWorker, %{id: media_item.id})
++    end
+   end
+ 
+   describe "perform/1 when testing non-downloadable media" do
+@@ -232,12 +240,30 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+ 
+   describe "perform/1 when testing forced downloads" do
+     test "ignores 'prevent_download' if forced", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:ok, render_metadata(:media_metadata)}
++        _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""}
++      end)
++
+       Sources.update_source(media_item.source, %{download_media: false})
+       Media.update_media_item(media_item, %{prevent_download: true})
+ 
+       perform_job(MediaDownloadWorker, %{id: media_item.id, force: true})
+     end
+ 
++    test "ignores whether the media item is pending when forced", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:ok, render_metadata(:media_metadata)}
++        _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""}
++      end)
++
++      Media.update_media_item(media_item, %{media_filepath: "foo.mp4"})
++
++      perform_job(MediaDownloadWorker, %{id: media_item.id, force: true})
++    end
++
+     test "sets force_overwrites runner option", %{media_item: media_item} do
+       expect(YtDlpRunnerMock, :run, 3, fn
+         _url, :get_downloadable_status, _opts, _ot, _addl ->
+@@ -265,6 +291,34 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+       assert media_item.media_redownloaded_at != nil
+     end
+ 
++    test "ignores whether the media item is pending when re-downloaded", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:ok, render_metadata(:media_metadata)}
++        _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""}
++      end)
++
++      Media.update_media_item(media_item, %{media_filepath: "foo.mp4"})
++
++      perform_job(MediaDownloadWorker, %{id: media_item.id, quality_upgrade?: true})
++    end
++
++    test "doesn't redownload if the source is set to not download", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, 0, fn _url, :download, _opts, _ot, _addl -> :ok end)
++
++      Sources.update_source(media_item.source, %{download_media: false})
++
++      perform_job(MediaDownloadWorker, %{id: media_item.id, quality_upgrade?: true})
++    end
++
++    test "doesn't redownload if the media item is set to not download", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, 0, fn _url, :download, _opts, _ot, _addl -> :ok end)
++
++      Media.update_media_item(media_item, %{prevent_download: true})
++
++      perform_job(MediaDownloadWorker, %{id: media_item.id, quality_upgrade?: true})
++    end
++
+     test "sets force_overwrites runner option", %{media_item: media_item} do
+       expect(YtDlpRunnerMock, :run, 3, fn
+         _url, :get_downloadable_status, _opts, _ot, _addl ->

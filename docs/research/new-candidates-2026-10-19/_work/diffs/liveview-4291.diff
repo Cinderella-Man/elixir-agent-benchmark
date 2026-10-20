@@ -1,0 +1,340 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 262bfb6c62..8faeeea94c 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -176,7 +176,7 @@ jobs:
+ 
+     runs-on: ubuntu-latest
+     container:
+-      image: mcr.microsoft.com/playwright:v1.59.1-noble
++      image: mcr.microsoft.com/playwright:v1.60.0-noble
+     env:
+       ImageOS: ubuntu22
+       HOME: /root
+diff --git a/assets/js/phoenix_live_view/dom.ts b/assets/js/phoenix_live_view/dom.ts
+index e053052d0a..5fa8dfa80f 100644
+--- a/assets/js/phoenix_live_view/dom.ts
++++ b/assets/js/phoenix_live_view/dom.ts
+@@ -411,7 +411,9 @@ const DOM = {
+             // we also clear the throttle timeout to prevent the callback
+             // from being called again after the timeout fires
+             clearTimeout(this.private(el, THROTTLED));
+-            this.triggerCycle(el, DEBOUNCE_TRIGGER);
++            if (asyncFilter()) {
++              this.triggerCycle(el, DEBOUNCE_TRIGGER);
++            }
+           });
+         }
+     }
+diff --git a/assets/js/phoenix_live_view/dom_patch.ts b/assets/js/phoenix_live_view/dom_patch.ts
+index 71563a3d82..c52e44a585 100644
+--- a/assets/js/phoenix_live_view/dom_patch.ts
++++ b/assets/js/phoenix_live_view/dom_patch.ts
+@@ -792,7 +792,7 @@ export default class DOMPatch {
+   private transitionPendingRemoves() {
+     const { pendingRemoves, liveSocket } = this;
+     if (pendingRemoves.length > 0) {
+-      liveSocket.transitionRemoves(pendingRemoves, () => {
++      liveSocket.transitionRemoves(pendingRemoves, this.view, () => {
+         pendingRemoves.forEach((el) => {
+           const child = DOM.firstPhxChild(el);
+           if (child) {
+diff --git a/assets/js/phoenix_live_view/live_socket.ts b/assets/js/phoenix_live_view/live_socket.ts
+index 8e2cdfea76..46fcb3f632 100644
+--- a/assets/js/phoenix_live_view/live_socket.ts
++++ b/assets/js/phoenix_live_view/live_socket.ts
+@@ -823,12 +823,15 @@ export default class LiveSocket {
+     ).filter((el) => !DOM.isChildOfAny(el, stickies));
+ 
+     const newMainEl = DOM.cloneNode(this.outgoingMainEl, "");
+-    this.main.showLoader(this.loaderTimeout);
+-    this.main.destroy();
++    const oldMainView = this.main;
++    oldMainView.showLoader(this.loaderTimeout);
++    oldMainView.destroy();
+ 
+     this.main = this.newRootView(newMainEl, flash, liveReferer);
+     this.main.setRedirect(href);
+-    this.transitionRemoves(removeEls);
++    // the old view is destroyed at this point; pass it explicitly so the
++    // phx-remove commands execute in the context of the outgoing view
++    this.transitionRemoves(removeEls, oldMainView);
+     this.main.join((joinCount, onDone) => {
+       if (joinCount === 1 && this.commitPendingLink(linkRef)) {
+         this.requestDOMUpdate(() => {
+@@ -845,7 +848,7 @@ export default class LiveSocket {
+   }
+ 
+   /** @internal */
+-  transitionRemoves(elements, callback?) {
++  transitionRemoves(elements, view: View, callback?) {
+     const removeAttr = this.binding("remove");
+     const silenceEvents = (e) => {
+       e.preventDefault();
+@@ -857,7 +860,8 @@ export default class LiveSocket {
+       for (const event of this.boundEventNames) {
+         el.addEventListener(event, silenceEvents, true);
+       }
+-      this.execJS(el, el.getAttribute(removeAttr), "remove");
++      const e = new CustomEvent("phx:exec", { detail: { sourceElement: el } });
++      JS.exec(e, "remove", el.getAttribute(removeAttr), view, el);
+     });
+     // remove the silenced listeners when transitions are done in case the element is re-used
+     // and call caller's callback as soon as we are done with transitions
+@@ -885,12 +889,15 @@ export default class LiveSocket {
+ 
+   /** @internal */
+   owner(childEl: Element, callback?: (view: View) => any) {
+-    let view: View;
++    let view: View | undefined;
+     const viewEl = DOM.closestViewEl(childEl);
+     if (viewEl) {
+-      // it can happen that we find a view that is already destroyed;
+-      // in that case we DO NOT want to fallback to the main element
+-      view = this.getViewByEl(viewEl);
++      // resolve the view by element identity instead of id; during live
++      // navigation the new view is registered under the same id while the
++      // old DOM is still attached, and events from the old DOM must not be
++      // routed to the new view. A destroyed view removes its element binding,
++      // in which case we DO NOT want to fallback to the main element
++      view = DOM.private(viewEl, "view");
+     } else {
+       if (!childEl.isConnected) {
+         // if the element is not part of the DOM any more
+diff --git a/assets/js/phoenix_live_view/view.ts b/assets/js/phoenix_live_view/view.ts
+index 36b6a1f1d2..77fa0f10c1 100644
+--- a/assets/js/phoenix_live_view/view.ts
++++ b/assets/js/phoenix_live_view/view.ts
+@@ -408,6 +408,7 @@ export default class View {
+     if (container) {
+       const [tag, attrs] = container;
+       this.el = DOM.replaceRootContainer(this.el, tag, attrs);
++      DOM.putPrivate(this.el, "view", this);
+     }
+     this.childJoins = 0;
+     this.joinPending = true;
+@@ -516,7 +517,10 @@ export default class View {
+     if (!el) {
+       throw new Error("unable to find root element for view");
+     }
++    // child views are initially bound to an element inside the join HTML
++    // fragment (see onJoinComplete), so the binding must move to the real el
+     this.el = el;
++    DOM.putPrivate(this.el, "view", this);
+     this.el.setAttribute(PHX_ROOT_ID, this.root.id);
+   }
+ 
+@@ -746,6 +750,7 @@ export default class View {
+     });
+ 
+     // because we work with a template element, we must manually copy the attributes
++    // and bind the template root to this view,
+     // otherwise the owner / target helpers don't work properly
+     const rootEl = template.content.firstElementChild!;
+     rootEl.id = this.id;
+@@ -753,6 +758,7 @@ export default class View {
+     rootEl.setAttribute(PHX_SESSION, this.getSession());
+     rootEl.setAttribute(PHX_STATIC, this.getStatic() ?? "");
+     this.parent && rootEl.setAttribute(PHX_PARENT_ID, this.parent.id);
++    DOM.putPrivate(rootEl, "view", this);
+ 
+     // we go over all form elements in the new HTML for the LV
+     // and look for old forms in the `formsForRecovery` object;
+diff --git a/assets/test/event_test.ts b/assets/test/event_test.ts
+index 53a45b801a..8c975907d8 100644
+--- a/assets/test/event_test.ts
++++ b/assets/test/event_test.ts
+@@ -334,11 +334,9 @@ describe("pushEvent replies", () => {
+       {
+         s: [
+           `
+-      <div id="${view.id}" data-phx-session="abc123" data-phx-root-id="${view.id}">
+-        <div id="gateway" phx-hook="Gateway">
+-          <div data-foo="bar"></div>
+-          <div data-foo="baz"></div>
+-        </div>
++      <div id="gateway" phx-hook="Gateway">
++        <div data-foo="bar"></div>
++        <div data-foo="baz"></div>
+       </div>
+     `,
+         ],
+diff --git a/package-lock.json b/package-lock.json
+index 06469de953..fa0a804e48 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -17,7 +17,7 @@
+         "@babel/preset-env": "7.27.2",
+         "@babel/preset-typescript": "^7.27.1",
+         "@eslint/js": "^9.29.0",
+-        "@playwright/test": "^1.59.1",
++        "@playwright/test": "^1.60.0",
+         "@types/jest": "^30.0.0",
+         "@types/phoenix": "^1.6.6",
+         "css.escape": "^1.5.1",
+@@ -2984,13 +2984,13 @@
+       }
+     },
+     "node_modules/@playwright/test": {
+-      "version": "1.59.1",
+-      "resolved": "https://registry.npmjs.org/@playwright/test/-/test-1.59.1.tgz",
+-      "integrity": "sha512-PG6q63nQg5c9rIi4/Z5lR5IVF7yU5MqmKaPOe0HSc0O2cX1fPi96sUQu5j7eo4gKCkB2AnNGoWt7y4/Xx3Kcqg==",
++      "version": "1.60.0",
++      "resolved": "https://registry.npmjs.org/@playwright/test/-/test-1.60.0.tgz",
++      "integrity": "sha512-O71yZIbAh/PxDMNGns37GHBIfrVkEVyn+AXyIa5dOTfb4/xNvRWV+Vv/NMbNCtODB/pO7vLlF2OTmMVLhmr7Ag==",
+       "dev": true,
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "playwright": "1.59.1"
++        "playwright": "1.60.0"
+       },
+       "bin": {
+         "playwright": "cli.js"
+@@ -7356,13 +7356,13 @@
+       }
+     },
+     "node_modules/playwright": {
+-      "version": "1.59.1",
+-      "resolved": "https://registry.npmjs.org/playwright/-/playwright-1.59.1.tgz",
+-      "integrity": "sha512-C8oWjPR3F81yljW9o5OxcWzfh6avkVwDD2VYdwIGqTkl+OGFISgypqzfu7dOe4QNLL2aqcWBmI3PMtLIK233lw==",
++      "version": "1.60.0",
++      "resolved": "https://registry.npmjs.org/playwright/-/playwright-1.60.0.tgz",
++      "integrity": "sha512-hheHdokM8cdqCb0lcE3s+zT4t4W+vvjpGxsZlDnikarzx8tSzMebh3UiFtgqwFwnTnjYQcsyMF8ei2mCO/tpeA==",
+       "dev": true,
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "playwright-core": "1.59.1"
++        "playwright-core": "1.60.0"
+       },
+       "bin": {
+         "playwright": "cli.js"
+@@ -7375,9 +7375,9 @@
+       }
+     },
+     "node_modules/playwright-core": {
+-      "version": "1.59.1",
+-      "resolved": "https://registry.npmjs.org/playwright-core/-/playwright-core-1.59.1.tgz",
+-      "integrity": "sha512-HBV/RJg81z5BiiZ9yPzIiClYV/QMsDCKUyogwH9p3MCP6IYjUFu/MActgYAvK0oWyV9NlwM3GLBjADyWgydVyg==",
++      "version": "1.60.0",
++      "resolved": "https://registry.npmjs.org/playwright-core/-/playwright-core-1.60.0.tgz",
++      "integrity": "sha512-9bW6zvX/m0lEbgTKJ6YppOKx8H3VOPBMOCFh2irXFOT4BbHgrx5hPjwJYLT40Lu+4qtD36qKc/Hn56StUW57IA==",
+       "dev": true,
+       "license": "Apache-2.0",
+       "bin": {
+diff --git a/package.json b/package.json
+index da9ed4973c..92f8ad624a 100644
+--- a/package.json
++++ b/package.json
+@@ -37,7 +37,7 @@
+     "@babel/preset-env": "7.27.2",
+     "@babel/preset-typescript": "^7.27.1",
+     "@eslint/js": "^9.29.0",
+-    "@playwright/test": "^1.59.1",
++    "@playwright/test": "^1.60.0",
+     "@types/jest": "^30.0.0",
+     "@types/phoenix": "^1.6.6",
+     "css.escape": "^1.5.1",
+diff --git a/test/e2e/support/issues/issue_4290.ex b/test/e2e/support/issues/issue_4290.ex
+new file mode 100644
+index 0000000000..b8b9cf7000
+--- /dev/null
++++ b/test/e2e/support/issues/issue_4290.ex
+@@ -0,0 +1,52 @@
++defmodule Phoenix.LiveViewTest.E2E.Issue4290 do
++  # https://github.com/phoenixframework/phoenix_live_view/issues/4290
++
++  defmodule ALive do
++    use Phoenix.LiveView
++
++    alias Phoenix.LiveView.JS
++
++    def render(assigns) do
++      ~H"""
++      <h1>A</h1>
++      <%!-- the phx-remove transition delays the swap of the main element until well
++            after the new LiveView joined, keeping the old DOM visible and interactive --%>
++      <div id="slow-remove" phx-remove={JS.transition("fade-out", time: 1500)}>
++        removed with transition
++      </div>
++      <form id="form" phx-change="validate">
++        <input type="text" name="name" />
++      </form>
++      <button phx-click="navigate">Navigate</button>
++      """
++    end
++
++    def handle_event("navigate", _params, socket) do
++      {:noreply, push_navigate(socket, to: "/issues/4290/b")}
++    end
++
++    def handle_event("validate", _params, socket) do
++      {:noreply, socket}
++    end
++  end
++
++  defmodule BLive do
++    use Phoenix.LiveView
++
++    def mount(_params, _session, socket) do
++      {:ok, assign(socket, events: [])}
++    end
++
++    def render(assigns) do
++      ~H"""
++      <h1>B</h1>
++      <span id="event-count">{length(@events)}</span>
++      <div :for={{event, idx} <- Enum.with_index(@events)} id={"event-#{idx}"}>{event}</div>
++      """
++    end
++
++    def handle_event(event, _params, socket) do
++      {:noreply, update(socket, :events, &(&1 ++ [event]))}
++    end
++  end
++end
+diff --git a/test/e2e/test_helper.exs b/test/e2e/test_helper.exs
+index fc2a8cd74c..b2aa377f32 100644
+--- a/test/e2e/test_helper.exs
++++ b/test/e2e/test_helper.exs
+@@ -216,6 +216,8 @@ defmodule Phoenix.LiveViewTest.E2E.Router do
+       live "/4147", Issue4147Live
+       live "/4209", Issue4209Live
+       live "/4212", Issue4212Live
++      live "/4290/a", Issue4290.ALive
++      live "/4290/b", Issue4290.BLive
+     end
+   end
+ 
+diff --git a/test/e2e/tests/issues/4290.spec.js b/test/e2e/tests/issues/4290.spec.js
+new file mode 100644
+index 0000000000..90beb25f45
+--- /dev/null
++++ b/test/e2e/tests/issues/4290.spec.js
+@@ -0,0 +1,27 @@
++import { test, expect } from "../../test-fixtures";
++import { syncLV } from "../../utils";
++
++// https://github.com/phoenixframework/phoenix_live_view/issues/4290
++test("events from the old view are not routed to the new view during live navigation", async ({
++  page,
++}) => {
++  await page.goto("/issues/4290/a");
++  await syncLV(page);
++
++  await page.getByRole("button", { name: "Navigate" }).click();
++
++  // The new LiveView is registered and joins immediately, but the DOM swap
++  // is delayed by the phx-remove transition. The old page stays visible and
++  // interactive during that window.
++  await page.waitForTimeout(500);
++  await expect(page.locator("h1")).toHaveText("A");
++
++  // interact with the old form while the navigation is still in progress;
++  // the resulting change event must not be pushed to the new LiveView
++  await page.locator("input[name=name]").fill("hello");
++
++  await expect(page.locator("h1")).toHaveText("B");
++  await syncLV(page);
++
++  await expect(page.locator("#event-count")).toHaveText("0");
++});

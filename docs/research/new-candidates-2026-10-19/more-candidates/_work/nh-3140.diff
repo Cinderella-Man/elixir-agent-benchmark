@@ -1,0 +1,185 @@
+diff --git a/lib/nerves_hub/fwup.ex b/lib/nerves_hub/fwup.ex
+index a2bda1184..7e79eca17 100644
+--- a/lib/nerves_hub/fwup.ex
++++ b/lib/nerves_hub/fwup.ex
+@@ -36,7 +36,7 @@ defmodule NervesHub.Fwup do
+   defp parse_metadata(metadata) do
+     known = Map.new(Metadata.keys(), &{Atom.to_string(&1), &1})
+ 
+-    Regex.scan(~r/meta-(?<key>[^\n]+)=\"?(?<value>[^\"\n]+)/, metadata)
++    Regex.scan(~r/meta-(?<key>[^=\n]+)=\"?(?<value>[^\"\n]+)/, metadata)
+     |> Enum.reduce(%{}, fn [_, key, value], acc ->
+       case Map.fetch(known, String.replace(key, "-", "_")) do
+         {:ok, key} -> Map.put(acc, key, value)
+diff --git a/lib/nerves_hub_web/controllers/api/firmware_json.ex b/lib/nerves_hub_web/controllers/api/firmware_json.ex
+index 042accf47..a498dcade 100644
+--- a/lib/nerves_hub_web/controllers/api/firmware_json.ex
++++ b/lib/nerves_hub_web/controllers/api/firmware_json.ex
+@@ -17,7 +17,12 @@ defmodule NervesHubWeb.API.FirmwareJSON do
+       platform: firmware.platform,
+       version: firmware.version,
+       product: firmware.product.name,
+-      tool: firmware.tool
++      tool: firmware.tool,
++      description: firmware.description,
++      misc: firmware.misc,
++      vcs_identifier: firmware.vcs_identifier,
++      size: firmware.size,
++      inserted_at: firmware.inserted_at
+     }
+   end
+ end
+diff --git a/lib/nerves_hub_web/controllers/api/schemas/firmware_schemas.ex b/lib/nerves_hub_web/controllers/api/schemas/firmware_schemas.ex
+index 535e6c14e..acbee0412 100644
+--- a/lib/nerves_hub_web/controllers/api/schemas/firmware_schemas.ex
++++ b/lib/nerves_hub_web/controllers/api/schemas/firmware_schemas.ex
+@@ -19,7 +19,12 @@ defmodule NervesHubWeb.API.Schemas.FirmwareSchemas do
+           type: :string,
+           description: "The update tool that handles this firmware, determined from the uploaded file",
+           enum: ["fwup", "esp-idf"]
+-        }
++        },
++        description: %Schema{type: :string, nullable: true},
++        misc: %Schema{type: :string, nullable: true},
++        vcs_identifier: %Schema{type: :string, nullable: true},
++        size: %Schema{type: :integer, description: "Size in bytes"},
++        inserted_at: %Schema{type: :string, format: :"date-time"}
+       },
+       example: %{
+         "uuid" => "d9f8c63a-1234-5678-abcd-ef0123456789",
+@@ -28,7 +33,12 @@ defmodule NervesHubWeb.API.Schemas.FirmwareSchemas do
+         "platform" => "rpi0",
+         "author" => "NervesHub",
+         "product" => "MyProduct",
+-        "tool" => "fwup"
++        "tool" => "fwup",
++        "description" => "Main firmware",
++        "misc" => nil,
++        "vcs_identifier" => "a1b2c3d",
++        "size" => 104_857_600,
++        "inserted_at" => "2026-01-15T09:34:27"
+       }
+     })
+   end
+@@ -48,7 +58,12 @@ defmodule NervesHubWeb.API.Schemas.FirmwareSchemas do
+           "platform" => "rpi0",
+           "author" => "NervesHub",
+           "product" => "MyProduct",
+-          "tool" => "fwup"
++          "tool" => "fwup",
++          "description" => "Main firmware",
++          "misc" => nil,
++          "vcs_identifier" => "a1b2c3d",
++          "size" => 104_857_600,
++          "inserted_at" => "2026-01-15T09:34:27"
+         }
+       }
+     })
+diff --git a/test/nerves_hub/fwup_test.exs b/test/nerves_hub/fwup_test.exs
+index 2bb0f003f..3c13574c5 100644
+--- a/test/nerves_hub/fwup_test.exs
++++ b/test/nerves_hub/fwup_test.exs
+@@ -25,6 +25,24 @@ defmodule NervesHub.FwupTest do
+     assert nil == metadata.misc
+   end
+ 
++  test "keeps metadata values that contain an equals sign", %{tmp_dir: tmp_dir} do
++    user = Fixtures.user_fixture()
++    org = Fixtures.org_fixture(user)
++    product = Fixtures.product_fixture(user, org)
++    org_key = Fixtures.org_key_fixture(org, user, tmp_dir)
++
++    filepath =
++      Fixtures.firmware_file_fixture(org_key, product, %{
++        dir: tmp_dir,
++        misc: "e=mc^2",
++        vcs_identifier: "4f104e8"
++      })
++
++    assert {:ok, metadata} = Fwup.metadata(filepath)
++    assert "e=mc^2" == metadata.misc
++    assert "4f104e8" == metadata.vcs_identifier
++  end
++
+   test "returns :invalid_metadata", %{tmp_dir: tmp_dir} do
+     user = Fixtures.user_fixture()
+     org = Fixtures.org_fixture(user)
+diff --git a/test/nerves_hub_web/controllers/api/firmware_controller_test.exs b/test/nerves_hub_web/controllers/api/firmware_controller_test.exs
+index aae7f0abd..90a7f1bfe 100644
+--- a/test/nerves_hub_web/controllers/api/firmware_controller_test.exs
++++ b/test/nerves_hub_web/controllers/api/firmware_controller_test.exs
+@@ -59,6 +59,35 @@ defmodule NervesHubWeb.API.FirmwareControllerTest do
+       assert json_response(conn, 200)["data"]["uuid"] == uuid
+     end
+ 
++    test "returns the firmware's metadata", %{conn: conn, user: user, org: org, product: product} do
++      org_key = Fixtures.org_key_fixture(org, user)
++
++      {:ok, signed_firmware_path} =
++        Fwup.create_signed_firmware(org_key.name, "unsigned", "signed", %{
++          product: product.name,
++          misc: "e=mc^2",
++          vcs_identifier: "4f104e8"
++        })
++
++      {boundary, body} = multipart_file(File.read!(signed_firmware_path))
++
++      conn =
++        conn
++        |> put_req_header("content-type", "multipart/form-data; boundary=#{boundary}")
++        |> post(Routes.api_firmware_path(conn, :create, org.name, product.name), body)
++
++      uuid = json_response(conn, 201)["data"]["uuid"]
++
++      conn = get(conn, Routes.api_firmware_path(conn, :show, org.name, product.name, uuid))
++      data = json_response(conn, 200)["data"]
++
++      assert data["misc"] == "e=mc^2"
++      assert data["vcs_identifier"] == "4f104e8"
++      assert data["size"] == File.stat!(signed_firmware_path).size
++      assert data["description"]
++      assert data["inserted_at"]
++    end
++
+     test "prevents too large of firmware", context do
+       prev_size = Application.get_env(:nerves_hub, Upload)[:max_size]
+       Application.put_env(:nerves_hub, Upload, max_size: 10)
+diff --git a/test/support/fwup.ex b/test/support/fwup.ex
+index b537427d5..344b8a972 100644
+--- a/test/support/fwup.ex
++++ b/test/support/fwup.ex
+@@ -19,11 +19,13 @@ defmodule NervesHub.Support.Fwup do
+               author: "me",
+               block_cache_size_mb: nil,
+               description: "D",
++              misc: nil,
+               platform: "platform",
+               product: "nerves-hub",
+               resource_contents: "Hello, world!",
+               resource_contents_path: nil,
+               resource_name: nil,
++              vcs_identifier: nil,
+               version: "1.0.0"
+   end
+ 
+@@ -201,6 +203,12 @@ defmodule NervesHub.Support.Fwup do
+         do: "block-cache-size-mb = #{meta_params.block_cache_size_mb}\n",
+         else: ""
+ 
++    optional_meta_lines =
++      Enum.map_join([misc: meta_params.misc, "vcs-identifier": meta_params.vcs_identifier], fn
++        {_key, nil} -> ""
++        {key, value} -> "meta-#{key} = \"#{value}\"\n"
++      end)
++
+     """
+     meta-product = "#{meta_params.product}"
+     meta-description = "#{meta_params.description} "
+@@ -208,6 +216,7 @@ defmodule NervesHub.Support.Fwup do
+     meta-platform = "#{meta_params.platform}"
+     meta-architecture = "#{meta_params.architecture}"
+     meta-author = "#{meta_params.author}"
++    #{optional_meta_lines}
+     #{block_cache_line}
+     file-resource #{uuid}.txt {
+       host-path = "#{data_file_path}"

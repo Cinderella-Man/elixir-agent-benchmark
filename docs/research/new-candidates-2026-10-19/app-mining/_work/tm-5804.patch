@@ -1,0 +1,456 @@
+From 2d376c1eb5ed183d5f21c882d2008be8b0dad877 Mon Sep 17 00:00:00 2001
+From: Matthias Wirtz <matthias.wirtz@hotmail.de>
+Date: Tue, 29 Sep 2026 17:59:57 +0200
+Subject: [PATCH 1/4] fix: read TeslaMate's version from one module
+
+Mix does not rebuild a module whose source is unchanged, so each copy of
+Mix.Project.config()[:version] kept the version from the last time that
+file was compiled. After VERSION moved to 4.4.0-dev, a cached build still
+published 4.3.0-dev while the discovery replay masked 4.4.0-dev.
+
+TeslaMate.Version is the only module that reads VERSION, and it declares
+the file as an external resource so a bump recompiles it. Callers read
+version/0 at runtime.
+---
+ CHANGELOG.md                                  |  2 ++
+ elixir/lib/tesla_api.ex                       |  3 +--
+ elixir/lib/tesla_api/auth.ex                  | 16 ++++++++-------
+ elixir/lib/teslamate/locations/geocoder.ex    |  4 +---
+ .../teslamate/mqtt/pubsub/home_assistant.ex   |  4 +---
+ elixir/lib/teslamate/updater.ex               |  5 ++---
+ elixir/lib/teslamate/version.ex               | 17 ++++++++++++++++
+ elixir/test/support/characterization.ex       | 20 ++++++++++++-------
+ 8 files changed, 46 insertions(+), 25 deletions(-)
+ create mode 100644 elixir/lib/teslamate/version.ex
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f3319767b1..43e1b30bfb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,8 @@
+ 
+ #### Build, CI, internal
+ 
++- fix: read TeslaMate's version from one module so a VERSION bump cannot leave a stale copy
++
+ #### Dashboards
+ 
+ #### Translations
+diff --git a/elixir/lib/tesla_api.ex b/elixir/lib/tesla_api.ex
+index 26655297dd..1a9d658e1b 100644
+--- a/elixir/lib/tesla_api.ex
++++ b/elixir/lib/tesla_api.ex
+@@ -1,12 +1,11 @@
+ defmodule TeslaApi do
+-  @version Mix.Project.config()[:version]
+   @sensitive_headers ~w(Authorization authorization)
+ 
+   def client do
+     Tesla.client(
+       [
+         {Tesla.Middleware.BaseUrl, "https://owner-api.teslamotors.com"},
+-        {Tesla.Middleware.Headers, [{"user-agent", "TeslaMate/#{@version}"}]},
++        {Tesla.Middleware.Headers, [{"user-agent", "TeslaMate/#{TeslaMate.Version.version()}"}]},
+         Tesla.Middleware.JSON,
+         TeslaApi.Middleware.TokenAuth,
+         TeslaApi.Middleware.FleetAuth,
+diff --git a/elixir/lib/tesla_api/auth.ex b/elixir/lib/tesla_api/auth.ex
+index 7f1646bc6d..e5cd74ce57 100644
+--- a/elixir/lib/tesla_api/auth.ex
++++ b/elixir/lib/tesla_api/auth.ex
+@@ -5,17 +5,11 @@ defmodule TeslaApi.Auth do
+ 
+   def web_client_id, do: @web_client_id
+ 
+-  @default_headers [
+-    {"user-agent", "TeslaMate/#{Mix.Project.config()[:version]}"},
+-    {"Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"},
+-    {"Accept-Language", "en-US,de-DE;q=0.5"}
+-  ]
+-
+   def client do
+     Tesla.client(
+       [
+         {Tesla.Middleware.BaseUrl, System.get_env("TESLA_AUTH_HOST", "https://auth.tesla.com")},
+-        {Tesla.Middleware.Headers, @default_headers},
++        {Tesla.Middleware.Headers, default_headers()},
+         Tesla.Middleware.JSON,
+         TeslaApi.Middleware.FleetAuth,
+         # No request and response details, not even on the debug level: the
+@@ -27,6 +21,14 @@ defmodule TeslaApi.Auth do
+     )
+   end
+ 
++  defp default_headers do
++    [
++      {"user-agent", "TeslaMate/#{TeslaMate.Version.version()}"},
++      {"Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"},
++      {"Accept-Language", "en-US,de-DE;q=0.5"}
++    ]
++  end
++
+   def post(url, body) do
+     Tesla.post(client(), url, body)
+   end
+diff --git a/elixir/lib/teslamate/locations/geocoder.ex b/elixir/lib/teslamate/locations/geocoder.ex
+index 324d87d956..6a95c8f55f 100644
+--- a/elixir/lib/teslamate/locations/geocoder.ex
++++ b/elixir/lib/teslamate/locations/geocoder.ex
+@@ -1,13 +1,11 @@
+ defmodule TeslaMate.Locations.Geocoder do
+-  @version Mix.Project.config()[:version]
+-
+   alias TeslaMate.Locations.Address
+ 
+   defp client do
+     Tesla.client(
+       [
+         {Tesla.Middleware.BaseUrl, "https://nominatim.openstreetmap.org"},
+-        {Tesla.Middleware.Headers, [{"user-agent", "TeslaMate/#{@version}"}]},
++        {Tesla.Middleware.Headers, [{"user-agent", "TeslaMate/#{TeslaMate.Version.version()}"}]},
+         Tesla.Middleware.JSON,
+         {Tesla.Middleware.Logger, debug: true, level: &log_level/1}
+       ],
+diff --git a/elixir/lib/teslamate/mqtt/pubsub/home_assistant.ex b/elixir/lib/teslamate/mqtt/pubsub/home_assistant.ex
+index 6029a6cf63..cd240e060f 100644
+--- a/elixir/lib/teslamate/mqtt/pubsub/home_assistant.ex
++++ b/elixir/lib/teslamate/mqtt/pubsub/home_assistant.ex
+@@ -82,8 +82,6 @@ defmodule TeslaMate.Mqtt.PubSub.HomeAssistant do
+     {"sensor", "tpms_pressure_rl_psi"},
+     {"sensor", "tpms_pressure_rr_psi"}
+   ]
+-  @version Mix.Project.config()[:version]
+-
+   @type publish_opts :: [
+           car_id: pos_integer(),
+           namespace: String.t() | nil,
+@@ -240,7 +238,7 @@ defmodule TeslaMate.Mqtt.PubSub.HomeAssistant do
+   defp origin do
+     %{
+       name: "TeslaMate",
+-      sw_version: @version,
++      sw_version: TeslaMate.Version.version(),
+       support_url: "https://docs.teslamate.org/"
+     }
+   end
+diff --git a/elixir/lib/teslamate/updater.ex b/elixir/lib/teslamate/updater.ex
+index 88320543fd..6e3e8d956e 100644
+--- a/elixir/lib/teslamate/updater.ex
++++ b/elixir/lib/teslamate/updater.ex
+@@ -3,14 +3,13 @@ defmodule TeslaMate.Updater do
+ 
+   require Logger
+ 
+-  @version Mix.Project.config()[:version]
+   @name __MODULE__
+ 
+   defp client do
+     Tesla.client(
+       [
+         {Tesla.Middleware.BaseUrl, "https://api.github.com"},
+-        {Tesla.Middleware.Headers, [{"user-agent", "TeslaMate/#{@version}"}]},
++        {Tesla.Middleware.Headers, [{"user-agent", "TeslaMate/#{TeslaMate.Version.version()}"}]},
+         Tesla.Middleware.JSON,
+         {Tesla.Middleware.Logger, debug: true, level: &log_level/1}
+       ],
+@@ -38,7 +37,7 @@ defmodule TeslaMate.Updater do
+   def init(opts) do
+     check_after = opts[:check_after] || :timer.minutes(5)
+     interval = opts[:interval] || :timer.hours(72)
+-    version = opts[:version] || @version
++    version = opts[:version] || TeslaMate.Version.version()
+ 
+     {:ok, _} = :timer.send_interval(interval, :check_for_updates)
+ 
+diff --git a/elixir/lib/teslamate/version.ex b/elixir/lib/teslamate/version.ex
+new file mode 100644
+index 0000000000..52bea40e5f
+--- /dev/null
++++ b/elixir/lib/teslamate/version.ex
+@@ -0,0 +1,17 @@
++defmodule TeslaMate.Version do
++  @moduledoc """
++  The version this build was compiled with, from the repository `VERSION` file.
++
++  Read it through `version/0`. A module that copies
++  `Mix.Project.config()[:version]` into its own attribute keeps that string
++  until its source changes, so a `VERSION` bump leaves the old one in place.
++  """
++
++  # VERSION lives outside this file. Without this, Mix will not rebuild the
++  # module when the version changes.
++  @external_resource Path.expand("../../../VERSION", __DIR__)
++  @version Mix.Project.config()[:version]
++
++  @spec version() :: String.t()
++  def version, do: @version
++end
+diff --git a/elixir/test/support/characterization.ex b/elixir/test/support/characterization.ex
+index d01a19e2a6..06fe37a840 100644
+--- a/elixir/test/support/characterization.ex
++++ b/elixir/test/support/characterization.ex
+@@ -185,8 +185,9 @@ defmodule TeslaMate.Characterization do
+   the entity block. The car id is masked in payloads as in topics
+   (`mask_car_id/2`): state topics, unique ids, the device identifier and the
+   fallback device name carry it. The origin's `sw_version`, TeslaMate's own
+-  version, is pinned as `"$teslamate_version"` (`mask_version/1`), since
+-  every release changes it.
++  version, is pinned as `"$teslamate_version"` (`mask_version/1`). The
++  comparison uses `TeslaMate.Version.version/0` at replay time, since every
++  release changes it.
+ 
+   `seed.positions` (optional) inserts position rows for the car before the
+   vehicle starts, through the production `Log.insert_position/2` — the
+@@ -401,7 +402,6 @@ defmodule TeslaMate.Characterization do
+ 
+   @fixtures_dir Path.expand("../fixtures/characterization", __DIR__)
+   @volatile "<volatile>"
+-  @version Mix.Project.config()[:version]
+ 
+   @db_tables ~w(cars car_settings states positions drives charging_processes charges updates
+                 addresses geofences)
+@@ -1440,10 +1440,16 @@ defmodule TeslaMate.Characterization do
+   end
+ 
+   # The discovery origin carries TeslaMate's own version, which every release
+-  # changes. Only that exact version is masked, so a different one still
+-  # diverges.
+-  defp mask_version(%{"origin" => %{"sw_version" => @version} = origin} = payload),
+-    do: %{payload | "origin" => %{origin | "sw_version" => "$teslamate_version"}}
++  # changes. Only the version this build was compiled with is masked, so a
++  # different one still diverges. Read it at replay time: a copy compiled into
++  # this module goes stale when VERSION changes and this file does not.
++  defp mask_version(%{"origin" => %{"sw_version" => version} = origin} = payload) do
++    if version == TeslaMate.Version.version() do
++      %{payload | "origin" => %{origin | "sw_version" => "$teslamate_version"}}
++    else
++      payload
++    end
++  end
+ 
+   defp mask_version(payload), do: payload
+ 
+
+From 02ff900e999ac6556e48083ab790d3b52b0b7ba2 Mon Sep 17 00:00:00 2001
+From: Matthias Wirtz <matthias.wirtz@hotmail.de>
+Date: Tue, 29 Sep 2026 18:00:45 +0200
+Subject: [PATCH 2/4] docs: add changelog PR number for the version module
+
+---
+ CHANGELOG.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 43e1b30bfb..42df7e5536 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,7 +8,7 @@
+ 
+ #### Build, CI, internal
+ 
+-- fix: read TeslaMate's version from one module so a VERSION bump cannot leave a stale copy
++- fix: read TeslaMate's version from one module so a VERSION bump cannot leave a stale copy (#5804 - @swiffer)
+ 
+ #### Dashboards
+ 
+
+From a949e2d619149bdd8aa0cb4bc8af2e7449291adc Mon Sep 17 00:00:00 2001
+From: Jakob Lichterfeld <jakob-lichterfeld@gmx.de>
+Date: Wed, 30 Sep 2026 09:19:31 +0200
+Subject: [PATCH 3/4] fix: read the version from TeslaMate.Version everywhere
+
+Move the startup log and the settings page off Application.spec/2. Its vsn is only refreshed because TeslaMate.Version recompiles on a VERSION bump.
+
+Add a test that fails on a stale build and when a module other than TeslaMate.Version uses Mix.Project. Anchor mix.exs's VERSION read at __DIR__, the same file @external_resource watches.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md                                  |  2 +-
+ elixir/lib/tesla_api/auth.ex                  | 16 ++++++------
+ elixir/lib/teslamate/application.ex           |  2 +-
+ .../live/settings_live/index.html.heex        |  2 +-
+ elixir/mix.exs                                |  2 +-
+ elixir/test/support/characterization.ex       |  6 ++---
+ elixir/test/teslamate/version_test.exs        | 25 +++++++++++++++++++
+ .../test/teslamate_web/live/settings_test.exs |  2 +-
+ 8 files changed, 40 insertions(+), 17 deletions(-)
+ create mode 100644 elixir/test/teslamate/version_test.exs
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 42df7e5536..071f4c4a63 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,7 +8,7 @@
+ 
+ #### Build, CI, internal
+ 
+-- fix: read TeslaMate's version from one module so a VERSION bump cannot leave a stale copy (#5804 - @swiffer)
++- fix: read TeslaMate's version from one module so a VERSION bump cannot leave a stale copy (#5804 - @swiffer, @JakobLichterfeld)
+ 
+ #### Dashboards
+ 
+diff --git a/elixir/lib/tesla_api/auth.ex b/elixir/lib/tesla_api/auth.ex
+index e5cd74ce57..8bdafb58ba 100644
+--- a/elixir/lib/tesla_api/auth.ex
++++ b/elixir/lib/tesla_api/auth.ex
+@@ -5,11 +5,17 @@ defmodule TeslaApi.Auth do
+ 
+   def web_client_id, do: @web_client_id
+ 
++  @default_headers [
++    {"Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"},
++    {"Accept-Language", "en-US,de-DE;q=0.5"}
++  ]
++
+   def client do
+     Tesla.client(
+       [
+         {Tesla.Middleware.BaseUrl, System.get_env("TESLA_AUTH_HOST", "https://auth.tesla.com")},
+-        {Tesla.Middleware.Headers, default_headers()},
++        {Tesla.Middleware.Headers,
++         [{"user-agent", "TeslaMate/#{TeslaMate.Version.version()}"} | @default_headers]},
+         Tesla.Middleware.JSON,
+         TeslaApi.Middleware.FleetAuth,
+         # No request and response details, not even on the debug level: the
+@@ -21,14 +27,6 @@ defmodule TeslaApi.Auth do
+     )
+   end
+ 
+-  defp default_headers do
+-    [
+-      {"user-agent", "TeslaMate/#{TeslaMate.Version.version()}"},
+-      {"Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"},
+-      {"Accept-Language", "en-US,de-DE;q=0.5"}
+-    ]
+-  end
+-
+   def post(url, body) do
+     Tesla.post(client(), url, body)
+   end
+diff --git a/elixir/lib/teslamate/application.ex b/elixir/lib/teslamate/application.ex
+index 2ae8df24a8..cb1719b333 100644
+--- a/elixir/lib/teslamate/application.ex
++++ b/elixir/lib/teslamate/application.ex
+@@ -5,7 +5,7 @@ defmodule TeslaMate.Application do
+ 
+   def start(_type, _args) do
+     Logger.info("System Info: Erlang/OTP #{otp_release()} (#{emu_flavor()})")
+-    Logger.info("Version: #{Application.spec(:teslamate, :vsn) || "???"}")
++    Logger.info("Version: #{TeslaMate.Version.version()}")
+ 
+     # Disable log entries
+     :ok = :telemetry.detach({Phoenix.Logger, [:phoenix, :socket_connected]})
+diff --git a/elixir/lib/teslamate_web/live/settings_live/index.html.heex b/elixir/lib/teslamate_web/live/settings_live/index.html.heex
+index b67c719110..fcbfdf3500 100644
+--- a/elixir/lib/teslamate_web/live/settings_live/index.html.heex
++++ b/elixir/lib/teslamate_web/live/settings_live/index.html.heex
+@@ -458,7 +458,7 @@
+         <tr>
+           <th align="right">{gettext("Version")}</th>
+           <td>
+-            {Application.spec(:teslamate, :vsn)}<strong>{if @update do
++            {TeslaMate.Version.version()}<strong>{if @update do
+               vsn =
+                 link(@update,
+                   to: "https://github.com/teslamate-org/teslamate/releases",
+diff --git a/elixir/mix.exs b/elixir/mix.exs
+index 5e54ea1f6e..56a5f9ca00 100644
+--- a/elixir/mix.exs
++++ b/elixir/mix.exs
+@@ -121,7 +121,7 @@ defmodule TeslaMate.MixProject do
+   end
+ 
+   defp version do
+-    case File.read("../VERSION") do
++    case File.read(Path.expand("../VERSION", __DIR__)) do
+       {:ok, version} -> String.trim(version)
+       {:error, _reason} -> "0.0.0"
+     end
+diff --git a/elixir/test/support/characterization.ex b/elixir/test/support/characterization.ex
+index 06fe37a840..7fc195b2f9 100644
+--- a/elixir/test/support/characterization.ex
++++ b/elixir/test/support/characterization.ex
+@@ -185,9 +185,9 @@ defmodule TeslaMate.Characterization do
+   the entity block. The car id is masked in payloads as in topics
+   (`mask_car_id/2`): state topics, unique ids, the device identifier and the
+   fallback device name carry it. The origin's `sw_version`, TeslaMate's own
+-  version, is pinned as `"$teslamate_version"` (`mask_version/1`). The
+-  comparison uses `TeslaMate.Version.version/0` at replay time, since every
+-  release changes it.
++  version, is pinned as `"$teslamate_version"` (`mask_version/1`), since
++  every release changes it. The version to mask is read from
++  `TeslaMate.Version.version/0` at replay time, so it cannot go stale.
+ 
+   `seed.positions` (optional) inserts position rows for the car before the
+   vehicle starts, through the production `Log.insert_position/2` — the
+diff --git a/elixir/test/teslamate/version_test.exs b/elixir/test/teslamate/version_test.exs
+new file mode 100644
+index 0000000000..967748ee6b
+--- /dev/null
++++ b/elixir/test/teslamate/version_test.exs
+@@ -0,0 +1,25 @@
++defmodule TeslaMate.VersionTest do
++  use ExUnit.Case, async: true
++
++  alias TeslaMate.Version
++
++  # Fails on a build that compiled an older VERSION: the project config is
++  # read from VERSION when the test run starts.
++  test "is the version of the project and of the loaded application" do
++    assert Version.version() == Mix.Project.config()[:version]
++    assert Version.version() == to_string(Application.spec(:teslamate, :vsn))
++  end
++
++  # Any other module that compiles the project version in keeps a stale copy
++  # after a VERSION bump.
++  test "is the only module in lib that reads the project config" do
++    lib = Path.expand("../../lib", __DIR__)
++
++    readers =
++      for path <- Path.wildcard(Path.join(lib, "**/*.{ex,heex}")),
++          File.read!(path) =~ "Mix.Project",
++          do: Path.relative_to(path, lib)
++
++    assert readers == ["teslamate/version.ex"]
++  end
++end
+diff --git a/elixir/test/teslamate_web/live/settings_test.exs b/elixir/test/teslamate_web/live/settings_test.exs
+index 88c324cf5e..fd7ce5ab6c 100644
+--- a/elixir/test/teslamate_web/live/settings_test.exs
++++ b/elixir/test/teslamate_web/live/settings_test.exs
+@@ -598,7 +598,7 @@ defmodule TeslaMateWeb.SettingsLiveTest do
+         assert {:ok, _view, html} = live(conn, "/settings")
+         html = Floki.parse_document!(html)
+ 
+-        assert "#{Application.spec(:teslamate, :vsn)} (Update available: 1.1.3)" ==
++        assert "#{TeslaMate.Version.version()} (Update available: 1.1.3)" ==
+                  html
+                  |> Floki.find(".about tr:first-child td")
+                  |> Floki.text()
+
+From 4123bec3a4c022c78617dcd6752f9e5d43583b15 Mon Sep 17 00:00:00 2001
+From: Jakob Lichterfeld <jakob-lichterfeld@gmx.de>
+Date: Wed, 30 Sep 2026 09:25:09 +0200
+Subject: [PATCH 4/4] chore(config): drop the unread endpoint version
+
+prod.exs set the endpoint's :version from Application.spec/2. Phoenix has no such option and nothing in lib reads it. The config is evaluated before the app is loaded, so the value was always nil.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ elixir/config/prod.exs | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/elixir/config/prod.exs b/elixir/config/prod.exs
+index 065672dc49..84681d5904 100644
+--- a/elixir/config/prod.exs
++++ b/elixir/config/prod.exs
+@@ -3,8 +3,7 @@ import Config
+ config :teslamate, TeslaMateWeb.Endpoint,
+   cache_static_manifest: "priv/static/cache_manifest.json",
+   root: ".",
+-  server: true,
+-  version: Application.spec(:teslamate, :vsn)
++  server: true
+ 
+ config :logger,
+   level: :info

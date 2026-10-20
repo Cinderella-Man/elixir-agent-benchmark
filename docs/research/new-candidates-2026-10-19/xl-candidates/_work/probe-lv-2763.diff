@@ -1,0 +1,1686 @@
+diff --git a/lib/phoenix_component.ex b/lib/phoenix_component.ex
+index d1e330f2c6..bc79d81577 100644
+--- a/lib/phoenix_component.ex
++++ b/lib/phoenix_component.ex
+@@ -511,7 +511,7 @@ defmodule Phoenix.Component do
+ 
+   ## Functions
+ 
+-  alias Phoenix.LiveView.{Static, Socket}
++  alias Phoenix.LiveView.{Static, Socket, AsyncResult}
+   @reserved_assigns Phoenix.Component.Declarative.__reserved__()
+   # Note we allow live_action as it may be passed down to a component, so it is not listed
+   @non_assignables [:uploads, :streams, :socket, :myself]
+@@ -2868,4 +2868,51 @@ defmodule Phoenix.Component do
+     %><% end %>
+     """
+   end
++
++  @doc """
++  Renders an async assign with slots for the different loading states.
++
++  *Note*: The inner block receives the result of the async assign as a :let.
++  The let is only accessible to the inner block and is not in scope to the
++  other slots.
++
++  ## Examples
++
++  ```heex
++  <.async_result :let={org} assign={@org}>
++    <:loading>Loading organization...</:loading>
++    <:failed :let={reason}>there was an error loading the organization</:failed>
++    <%= if org do %>
++      <%= org.name %>
++    <% else %>
++      You don't have an organization yet.
++    <% end %>
++  <.async_result>
++  ```
++  """
++  attr.(:assign, AsyncResult, required: true)
++  slot.(:loading, doc: "rendered while the assign is loading")
++
++  slot.(:failed,
++    doc:
++      "rendered when an error or exit is caught or assign_async returns `{:error, reason}`. Receives the error as a :let."
++  )
++
++  slot.(:inner_block,
++    doc:
++      "rendered when the assign is loaded successfully via AsyncResult.ok/2. Receives the result as a :let"
++  )
++
++  def async_result(%{assign: async_assign} = assigns) do
++    cond do
++      async_assign.ok? ->
++        ~H|<%= render_slot(@inner_block, @assign.result) %>|
++
++      async_assign.loading ->
++        ~H|<%= render_slot(@loading, @assign.loading) %>|
++
++      async_assign.failed ->
++        ~H|<%= render_slot(@failed, @assign.failed) %>|
++    end
++  end
+ end
+diff --git a/lib/phoenix_live_view.ex b/lib/phoenix_live_view.ex
+index 4ef2fe5223..f1cb363216 100644
+--- a/lib/phoenix_live_view.ex
++++ b/lib/phoenix_live_view.ex
+@@ -306,9 +306,98 @@ defmodule Phoenix.LiveView do
+     * [DOM patching and temporary assigns](dom-patching.md)
+     * [JavaScript interoperability](js-interop.md)
+     * [Uploads (External)](uploads-external.md)
++
++  ## Async Operations
++
++  Performing asynchronous work is common in LiveViews and LiveComponents.
++  It allows the user to get a working UI quicky while the system fetches some
++  data in the background or talks to an external service, without blocking the
++  render or event handling. For async work, you also typically need to handle
++  the different states of the async operation, such as loading, error, and the
++  successful result. You also want to catch any errors or exits and translate it
++  to a meaningful update in the UI rather than crashing the user experience.
++
++  ### Async assigns
++
++  The `assign_async/3` function takes a name, a list of keys which will be assigned
++  asynchronously, and a function that returns the result of the async operation.
++  For example, let's say we want to async fetch a user's organization from the database,
++  as well as their profile and rank:
++
++      def mount(%{"slug" => slug}, _, socket) do
++        {:ok,
++         socket
++         |> assign(:foo, "bar")
++         |> assign_async(:org, fn -> {:ok, %{org: fetch_org!(slug)} end)
++         |> assign_async([:profile, :rank], fn -> {:ok, %{profile: ..., rank: ...}} end)}
++      end
++
++  Here we are assigning `:org` and `[:profile, :rank]` asynchronously. The async function
++  must return a `{:ok, assigns}` or `{:error, reason}` tuple, where `assigns` is a map of
++  the keys passed to `assign_async`. If the function returns other keys or a different
++  set of keys, an error is raised.
++
++  The state of the async operation is stored in the socket assigns within an
++  `%AsyncResult{}`. It carries the loading and failed states, as well as the result.
++  For example, if we wanted to show the loading states in the UI for the `:org`,
++  our template could conditionally render the states:
++
++  ```heex
++  <div :if={@org.loading}>Loading organization...</div>
++  <div :if={org = @org.ok? && @org.result}}><%= org.name %> loaded!</div>
++  ```
++
++  The `Phoenix.Component.async_result/1` function component can also be used to
++  declaratively render the different states using slots:
++
++  ```heex
++  <.async_result :let={org} assign={@org}>
++    <:loading>Loading organization...</:loading>
++    <:failed :let={_reason}>there was an error loading the organization</:failed>
++    <%= org.name %>
++  <.async_result>
++  ```
++
++  Additionally, for async assigns which result in a collection of items, you
++  can enumerate the assign directly. It will only enumerate
++  the results once the results are loaded. For example:
++
++  ```heex
++  <div :for={orgs <- @orgs}><%= org.name %></div>
++  ```
++
++  ### Arbitrary async operations
++
++  Sometimes you need lower level control of asynchronous operations, while
++  still receiving process isolation and error handling. For this, you can use
++  `start_async/3` and the `AsyncResult` module directly:
++
++      def mount(%{"id" => id}, _, socket) do
++        {:ok,
++         socket
++         |> assign(:org, AsyncResult.loading())
++         |> start_async(:my_task, fn -> fetch_org!(id) end)}
++      end
++
++      def handle_async(:my_task, {:ok, fetched_org}, socket) do
++        %{org: org} = socket.assigns
++        {:noreply, assign(socket, :org, AsyncResult.ok(org, fetched_org))}
++      end
++
++      def handle_async(:my_task, {:exit, reason}, socket) do
++        %{org: org} = socket.assigns
++        {:noreply, assign(socket, :org, AsyncResult.failed(org, {:exit, reason}))}
++      end
++
++  `start_async/3` is used to fetch the organization asynchronously. The
++  `handle_async/3` callback is called when the task completes or exits,
++  with the results wrapped in either `{:ok, result}` or `{:exit, reason}`.
++  The `AsyncResult` module is used to direclty to update the state of the
++  async operation, but you can also assign any value directly to the socket
++  if you want to handle the state yourself.
+   '''
+ 
+-  alias Phoenix.LiveView.{Socket, LiveStream}
++  alias Phoenix.LiveView.{Socket, LiveStream, Async}
+ 
+   @type unsigned_params :: map
+ 
+@@ -666,6 +755,40 @@ defmodule Phoenix.LiveView do
+   """
+   def connected?(%Socket{transport_pid: transport_pid}), do: transport_pid != nil
+ 
++  @doc """
++  Puts a new private key and value in the socket.
++
++  Privates are *not change tracked*. This storage is meant to be used by
++  users and libraries to hold state that doesn't require
++  change tracking. The keys should be prefixed with the app/library name.
++
++  ## Examples
++
++  Key values can be placed in private:
++
++      put_private(socket, :myapp_meta, %{foo: "bar"})
++
++  And then retrieved:
++
++      socket.private[:myapp_meta]
++  """
++  @reserved_privates ~w(
++    connect_params
++    connect_info
++    assign_new
++    live_layout
++    lifecycle
++    root_view
++    __temp__
++  )a
++  def put_private(%Socket{} = socket, key, value) when key not in @reserved_privates do
++    %Socket{socket | private: Map.put(socket.private, key, value)}
++  end
++
++  def put_private(%Socket{}, bad_key, _value) do
++    raise ArgumentError, "cannot set reserved private key #{inspect(bad_key)}"
++  end
++
+   @doc """
+   Adds a flash message to the socket to be displayed.
+ 
+@@ -690,6 +813,7 @@ defmodule Phoenix.LiveView do
+       iex> put_flash(socket, :info, "It worked!")
+       iex> put_flash(socket, :error, "You can't access that page")
+   """
++
+   defdelegate put_flash(socket, kind, msg), to: Phoenix.LiveView.Utils
+ 
+   @doc """
+@@ -1842,4 +1966,87 @@ defmodule Phoenix.LiveView do
+       |> Map.update!(:__changed__, &MapSet.put(&1, name))
+     end)
+   end
++
++  @doc """
++  Assigns keys asynchronously.
++
++  The task is linked to the caller and errors are wrapped.
++  Each key passed to `assign_async/3` will be assigned to
++  an `%AsyncResult{}` struct holding the status of the operation
++  and the result when completed.
++
++  ## Examples
++
++      def mount(%{"slug" => slug}, _, socket) do
++        {:ok,
++         socket
++         |> assign(:foo, "bar")
++         |> assign_async(:org, fn -> {:ok, %{org: fetch_org!(slug)} end)
++         |> assign_async([:profile, :rank], fn -> {:ok, %{profile: ..., rank: ...}} end)}
++      end
++
++  See the moduledoc for more information.
++  """
++  def assign_async(%Socket{} = socket, key_or_keys, func)
++      when (is_atom(key_or_keys) or is_list(key_or_keys)) and
++             is_function(func, 0) do
++    Async.assign_async(socket, key_or_keys, func)
++  end
++
++  @doc """
++  Starts an ansynchronous task and invokes callback to handle the result.
++
++  The task is linked to the caller and errors/exits are wrapped.
++  The result of the task is sent to the `handle_async/3` callback
++  of the caller LiveView or LiveComponent.
++
++  ## Examples
++
++      def mount(%{"id" => id}, _, socket) do
++        {:ok,
++         socket
++         |> assign(:org, AsyncResult.loading())
++         |> start_async(:my_task, fn -> fetch_org!(id) end)
++      end
++
++      def handle_async(:my_task, {:ok, fetched_org}, socket) do
++        %{org: org} = socket.assigns
++        {:noreply, assign(socket, :org, AsyncResult.ok(org, fetched_org))}
++      end
++
++      def handle_async(:my_task, {:exit, reason}, socket) do
++        %{org: org} = socket.assigns
++        {:noreply, assign(socket, :org, AsyncResult.failed(org, {:exit, reason}))}
++      end
++
++  See the moduledoc for more information.
++  """
++  def start_async(%Socket{} = socket, name, func)
++      when is_atom(name) and is_function(func, 0) do
++    Async.start_async(socket, name, func)
++  end
++
++  @doc """
++  Cancels an async operation if one exists.
++
++  Accepts either the `%AsyncResult{}` when using `assign_async/3` or
++  the key passed to `start_async/3`.
++
++  The underlying process will be killed with the provided reason, or
++  {:shutdown, :cancel}`. if no reason is passed. For `assign_async/3`
++  operations, the `:failed` field will be set to `{:exit, reason}`.
++  For `start_async/3`, the `handle_async/3` callback will receive
++  `{:exit, reason}` as the result.
++
++  Returns the `%Phoenix.LiveView.Socket{}`.
++
++  ## Examples
++
++      cancel_async(socket, :preview)
++      cancel_async(socket, :preview, :my_reason)
++      cancel_async(socket, socket.assigns.preview)
++  """
++  def cancel_async(socket, async_or_keys, reason \\ {:shutdown, :cancel}) do
++    Async.cancel_async(socket, async_or_keys, reason)
++  end
+ end
+diff --git a/lib/phoenix_live_view/async.ex b/lib/phoenix_live_view/async.ex
+new file mode 100644
+index 0000000000..d5d1aa35e0
+--- /dev/null
++++ b/lib/phoenix_live_view/async.ex
+@@ -0,0 +1,207 @@
++defmodule Phoenix.LiveView.Async do
++  @moduledoc false
++
++  alias Phoenix.LiveView.{AsyncResult, Socket, Channel}
++
++  def start_async(%Socket{} = socket, key, func)
++      when is_atom(key) and is_function(func, 0) do
++    run_async_task(socket, key, func, :start)
++  end
++
++  def assign_async(%Socket{} = socket, key_or_keys, func)
++      when (is_atom(key_or_keys) or is_list(key_or_keys)) and
++             is_function(func, 0) do
++    keys = List.wrap(key_or_keys)
++
++    # verifies result inside task
++    wrapped_func = fn ->
++      case func.() do
++        {:ok, %{} = assigns} ->
++          if Enum.find(keys, &(not is_map_key(assigns, &1))) do
++            raise ArgumentError, """
++            expected assign_async to return map of assigns for all keys
++            in #{inspect(keys)}, but got: #{inspect(assigns)}
++            """
++          else
++            {:ok, assigns}
++          end
++
++        {:error, reason} ->
++          {:error, reason}
++
++        other ->
++          raise ArgumentError, """
++          expected assign_async to return {:ok, map} of
++          assigns for #{inspect(keys)} or {:error, reason}, got: #{inspect(other)}
++          """
++      end
++    end
++
++    new_assigns =
++      Enum.map(keys, fn key ->
++        case socket.assigns do
++          %{^key => %AsyncResult{ok?: true} = existing} ->
++            {key, AsyncResult.loading(existing, keys)}
++
++          %{} ->
++            {key, AsyncResult.loading(keys)}
++        end
++      end)
++
++    socket
++    |> Phoenix.Component.assign(new_assigns)
++    |> run_async_task(keys, wrapped_func, :assign)
++  end
++
++  defp run_async_task(%Socket{} = socket, key, func, kind) do
++    if Phoenix.LiveView.connected?(socket) do
++      lv_pid = self()
++      cid = cid(socket)
++      {:ok, pid} = Task.start_link(fn -> do_async(lv_pid, cid, key, func, kind) end)
++
++      ref =
++        :erlang.monitor(:process, pid, alias: :reply_demonitor, tag: {__MODULE__, key, cid, kind})
++
++      send(pid, {:context, ref})
++
++      update_private_async(socket, &Map.put(&1, key, {ref, pid, kind}))
++    else
++      socket
++    end
++  end
++
++  defp do_async(lv_pid, cid, key, func, async_kind) do
++    receive do
++      {:context, ref} ->
++        try do
++          result = func.()
++          Channel.report_async_result(ref, async_kind, ref, cid, key, {:ok, result})
++        catch
++          catch_kind, reason ->
++            Process.unlink(lv_pid)
++            caught_result = to_exit(catch_kind, reason, __STACKTRACE__)
++            Channel.report_async_result(ref, async_kind, ref, cid, key, caught_result)
++            :erlang.raise(catch_kind, reason, __STACKTRACE__)
++        end
++    end
++  end
++
++  def cancel_async(%Socket{} = socket, %AsyncResult{} = result, reason) do
++    case result do
++      %AsyncResult{loading: keys} when is_list(keys) ->
++        new_assigns = for key <- keys, do: {key, AsyncResult.failed(result, {:exit, reason})}
++
++        socket
++        |> Phoenix.Component.assign(new_assigns)
++        |> cancel_async(keys, reason)
++
++      %AsyncResult{} ->
++        socket
++    end
++  end
++
++  def cancel_async(%Socket{} = socket, key, reason) do
++    case get_private_async(socket, key) do
++      {_ref, pid, _kind} when is_pid(pid) ->
++        Process.unlink(pid)
++        Process.exit(pid, reason)
++        update_private_async(socket, &Map.delete(&1, key))
++
++      nil ->
++        socket
++    end
++  end
++
++  def handle_async(socket, maybe_component, kind, key, ref, result) do
++    case prune_current_async(socket, key, ref) do
++      {:ok, pruned_socket} ->
++        handle_kind(pruned_socket, maybe_component, kind, key, result)
++
++      :error ->
++        socket
++    end
++  end
++
++  def handle_trap_exit(socket, maybe_component, kind, key, ref, reason) do
++    handle_async(socket, maybe_component, kind, key, ref, {:exit, reason})
++  end
++
++  defp handle_kind(socket, maybe_component, :start, key, result) do
++    callback_mod = maybe_component || socket.view
++
++    case callback_mod.handle_async(key, result, socket) do
++      {:noreply, %Socket{} = new_socket} ->
++        new_socket
++
++      other ->
++        raise ArgumentError, """
++        expected #{inspect(callback_mod)}.handle_async/3 to return {:noreply, socket}, got:
++
++            #{inspect(other)}
++        """
++    end
++  end
++
++  defp handle_kind(socket, _maybe_component, :assign, keys, result) do
++    case result do
++      {:ok, {:ok, %{} = assigns}} ->
++        new_assigns =
++          for {key, val} <- assigns do
++            {key, AsyncResult.ok(get_current_async!(socket, key), val)}
++          end
++
++        Phoenix.Component.assign(socket, new_assigns)
++
++      {:ok, {:error, reason}} ->
++        new_assigns =
++          for key <- keys do
++            {key, AsyncResult.failed(get_current_async!(socket, key), {:error, reason})}
++          end
++
++        Phoenix.Component.assign(socket, new_assigns)
++
++      {:exit, _reason} = normalized_exit ->
++        new_assigns =
++          for key <- keys do
++            {key, AsyncResult.failed(get_current_async!(socket, key), normalized_exit)}
++          end
++
++        Phoenix.Component.assign(socket, new_assigns)
++    end
++  end
++
++  # handle race of async being canceled and then reassigned
++  defp prune_current_async(socket, key, ref) do
++    case get_private_async(socket, key) do
++      {^ref, _pid, _kind} -> {:ok, update_private_async(socket, &Map.delete(&1, key))}
++      {_ref, _pid, _kind} -> :error
++      nil -> :error
++    end
++  end
++
++  defp update_private_async(socket, func) do
++    existing = socket.private[:phoenix_async] || %{}
++    Phoenix.LiveView.put_private(socket, :phoenix_async, func.(existing))
++  end
++
++  defp get_private_async(%Socket{} = socket, key) do
++    socket.private[:phoenix_async][key]
++  end
++
++  defp get_current_async!(socket, key) do
++    # handle case where assign is temporary and needs to be rebuilt
++    case socket.assigns do
++      %{^key => %AsyncResult{} = current_async} -> current_async
++      %{^key => _other} -> AsyncResult.loading(key)
++      %{} -> raise ArgumentError, "missing async assign #{inspect(key)}"
++    end
++  end
++
++  defp to_exit(:throw, reason, stack), do: {:exit, {{:nocatch, reason}, stack}}
++  defp to_exit(:error, reason, stack), do: {:exit, {reason, stack}}
++  defp to_exit(:exit, reason, _stack), do: {:exit, reason}
++
++  defp cid(%Socket{} = socket) do
++    if myself = socket.assigns[:myself], do: myself.cid
++  end
++end
+diff --git a/lib/phoenix_live_view/async_result.ex b/lib/phoenix_live_view/async_result.ex
+new file mode 100644
+index 0000000000..26bc31fa5f
+--- /dev/null
++++ b/lib/phoenix_live_view/async_result.ex
+@@ -0,0 +1,112 @@
++defmodule Phoenix.LiveView.AsyncResult do
++  @moduledoc ~S'''
++  Provides a datastructure for tracking the state of an async assign.
++
++  See the `Async Operations` section of the `Phoenix.LiveView` docs for more information.
++
++  ## Fields
++
++    * `:ok?` - When true, indicates the `:result` has been set successfully at least once.
++    * `:loading` - The current loading state
++    * `:failed` - The current failed state
++    * `:result` - The successful result of the async task
++  '''
++
++  defstruct ok?: false,
++            loading: nil,
++            failed: nil,
++            result: nil
++
++  alias Phoenix.LiveView.AsyncResult
++
++  @doc """
++  Updates the loading state.
++
++  When loading, the failed state will be reset to `nil`.
++
++  ## Examples
++
++      AsyncResult.loading()
++      AsyncResult.loading(my_async)
++      AsyncResult.loading(my_async, %{my: :loading_state})
++  """
++  def loading do
++    %AsyncResult{loading: true}
++  end
++
++  def loading(%AsyncResult{} = result) do
++    %AsyncResult{result | loading: true, failed: nil}
++  end
++
++  def loading(loading_state) do
++    %AsyncResult{loading: loading_state, failed: nil}
++  end
++
++  def loading(%AsyncResult{} = result, loading_state) do
++    %AsyncResult{result | loading: loading_state, failed: nil}
++  end
++
++
++  @doc """
++  Updates the failed state.
++
++  When failed, the loading state will be reset to `nil`.
++
++  ## Examples
++
++      AsyncResult.failed(my_async, {:exit, :boom})
++      AsyncResult.failed(my_async, {:error, reason})
++  """
++  def failed(%AsyncResult{} = result, reason) do
++    %AsyncResult{result | failed: reason, loading: nil}
++  end
++
++  @doc """
++  Updates the successful result.
++
++  The `:ok?` field will also be set to `true` to indicate this result has
++  completed successfully at least once, regardless of future state changes.
++
++  When ok'd, the loading and failed state will be reset to `nil`.
++
++  ## Examples
++
++      AsyncResult.ok(my_async, my_result)
++  """
++  def ok(%AsyncResult{} = result, value) do
++    %AsyncResult{result | failed: nil, loading: nil, ok?: true, result: value}
++  end
++
++  defimpl Enumerable, for: Phoenix.LiveView.AsyncResult do
++    alias Phoenix.LiveView.AsyncResult
++
++    def count(%AsyncResult{result: result, ok?: true}),
++      do: Enumerable.count(result)
++
++    def count(%AsyncResult{}), do: 0
++
++    def member?(%AsyncResult{result: result, ok?: true}, item) do
++      Enumerable.member?(result, item)
++    end
++
++    def member?(%AsyncResult{}, _item), do: false
++
++    def reduce(
++          %AsyncResult{result: result, ok?: true},
++          acc,
++          fun
++        ) do
++      Enumerable.reduce(result, acc, fun)
++    end
++
++    def reduce(%AsyncResult{}, {_, acc}, _fun), do: {:done, acc}
++
++    def slice(%AsyncResult{result: result, ok?: true}) do
++      Enumerable.slice(result)
++    end
++
++    def slice(%AsyncResult{}) do
++      fn _start, _length, _step -> [] end
++    end
++  end
++end
+diff --git a/lib/phoenix_live_view/channel.ex b/lib/phoenix_live_view/channel.ex
+index 33cbb2c260..8f6cd165df 100644
+--- a/lib/phoenix_live_view/channel.ex
++++ b/lib/phoenix_live_view/channel.ex
+@@ -4,7 +4,18 @@ defmodule Phoenix.LiveView.Channel do
+ 
+   require Logger
+ 
+-  alias Phoenix.LiveView.{Socket, Utils, Diff, Upload, UploadConfig, Route, Session, Lifecycle}
++  alias Phoenix.LiveView.{
++    Socket,
++    Utils,
++    Diff,
++    Upload,
++    UploadConfig,
++    Route,
++    Session,
++    Lifecycle,
++    Async
++  }
++
+   alias Phoenix.Socket.{Broadcast, Message}
+ 
+   @prefix :phoenix
+@@ -30,6 +41,15 @@ defmodule Phoenix.LiveView.Channel do
+     )
+   end
+ 
++  def report_async_result(monitor_ref, kind, ref, cid, keys, result)
++      when is_reference(monitor_ref) and kind in [:assign, :start] and is_reference(ref) do
++    send(monitor_ref, {@prefix, :async_result, {kind, {ref, cid, keys, result}}})
++  end
++
++  def async_pids(lv_pid) do
++    GenServer.call(lv_pid, {@prefix, :async_pids})
++  end
++
+   def ping(pid) do
+     GenServer.call(pid, {@prefix, :ping}, :infinity)
+   end
+@@ -223,6 +243,18 @@ defmodule Phoenix.LiveView.Channel do
+     end
+   end
+ 
++  def handle_info({@prefix, :async_result, {kind, info}}, state) do
++    {ref, cid, keys, result} = info
++
++    new_state =
++      write_socket(state, cid, nil, fn socket, maybe_component ->
++        new_socket = Async.handle_async(socket, maybe_component, kind, keys, ref, result)
++        {new_socket, {:ok, nil, state}}
++      end)
++
++    {:noreply, new_state}
++  end
++
+   def handle_info({@prefix, :drop_upload_entries, info}, state) do
+     %{ref: ref, cid: cid, entry_refs: entry_refs} = info
+ 
+@@ -260,6 +292,16 @@ defmodule Phoenix.LiveView.Channel do
+     handle_redirect(state, command, flash, nil)
+   end
+ 
++  def handle_info({{Phoenix.LiveView.Async, keys, cid, kind}, ref, :process, _pid, reason}, state) do
++    new_state =
++      write_socket(state, cid, nil, fn socket, component ->
++        new_socket = Async.handle_trap_exit(socket, component, kind, keys, ref, reason)
++        {new_socket, {:ok, nil, state}}
++      end)
++
++    {:noreply, new_state}
++  end
++
+   def handle_info({:phoenix_live_reload, _topic, _changed_file}, %{socket: socket} = state) do
+     Phoenix.CodeReloader.reload(socket.endpoint)
+ 
+@@ -282,6 +324,11 @@ defmodule Phoenix.LiveView.Channel do
+     {:reply, :ok, state}
+   end
+ 
++  def handle_call({@prefix, :async_pids}, _from, state) do
++    pids = state |> all_asyncs() |> Map.keys()
++    {:reply, {:ok, pids}, state}
++  end
++
+   def handle_call({@prefix, :fetch_upload_config, name, cid}, _from, state) do
+     read_socket(state, cid, fn socket, _ ->
+       result =
+@@ -1391,4 +1438,30 @@ defmodule Phoenix.LiveView.Channel do
+   end
+ 
+   defp maybe_subscribe_to_live_reload(response), do: response
++
++  defp component_asyncs(state) do
++    %{components: {components, _ids, _}} = state
++
++    Enum.reduce(components, %{}, fn {cid, {_mod, _id, _assigns, private, _prints}}, acc ->
++      Map.merge(acc, socket_asyncs(private, cid))
++    end)
++  end
++
++  defp all_asyncs(state) do
++    %{socket: socket} = state
++
++    socket.private
++    |> socket_asyncs(nil)
++    |> Map.merge(component_asyncs(state))
++  end
++
++  defp socket_asyncs(private, cid) do
++    case private do
++      %{phoenix_async: ref_pids} ->
++        Enum.into(ref_pids, %{}, fn {key, {ref, pid, kind}} -> {pid, {key, ref, cid, kind}} end)
++
++      %{} ->
++        %{}
++    end
++  end
+ end
+diff --git a/lib/phoenix_live_view/test/client_proxy.ex b/lib/phoenix_live_view/test/client_proxy.ex
+index 08a2db78a4..c6325e1bb2 100644
+--- a/lib/phoenix_live_view/test/client_proxy.ex
++++ b/lib/phoenix_live_view/test/client_proxy.ex
+@@ -526,6 +526,12 @@ defmodule Phoenix.LiveViewTest.ClientProxy do
+     {:noreply, state}
+   end
+ 
++  def handle_call({:async_pids, topic_or_element}, _from, state) do
++    topic = proxy_topic(topic_or_element)
++    %{pid: pid} = fetch_view_by_topic!(state, topic)
++    {:reply, Phoenix.LiveView.Channel.async_pids(pid), state}
++  end
++
+   def handle_call({:render_event, topic_or_element, type, value}, from, state) do
+     topic = proxy_topic(topic_or_element)
+     %{pid: pid} = fetch_view_by_topic!(state, topic)
+diff --git a/lib/phoenix_live_view/test/live_view_test.ex b/lib/phoenix_live_view/test/live_view_test.ex
+index df415bfd24..793c91e68c 100644
+--- a/lib/phoenix_live_view/test/live_view_test.ex
++++ b/lib/phoenix_live_view/test/live_view_test.ex
+@@ -468,8 +468,7 @@ defmodule Phoenix.LiveViewTest do
+   def __render_component__(endpoint, %{module: component}, assigns, opts) do
+     socket = %Socket{endpoint: endpoint, router: opts[:router]}
+ 
+-    assigns =
+-      Map.new(assigns)
++    assigns = Map.new(assigns)
+ 
+     # TODO: Make the ID required once we support only stateful module components as live_component
+     mount_assigns = if assigns[:id], do: %{myself: %Phoenix.LiveComponent.CID{cid: -1}}, else: %{}
+@@ -922,6 +921,54 @@ defmodule Phoenix.LiveViewTest do
+     call(view, {:render_event, {proxy_topic(view), to_string(event), view.target}, type, value})
+   end
+ 
++  @doc """
++  Awaits all current `assign_async` and `start_async` for a given LiveView or element.
++
++  It renders the LiveView or Element once complete and returns the result.
++  By default, the timeout is 100ms, but a custom time may be passed to override.
++
++  ## Examples
++
++      {:ok, lv, html} = live(conn, "/path")
++      assert html =~ "loading data..."
++      assert render_async(lv) =~ "data loaded!"
++  """
++  def render_async(
++        view_or_element,
++        timeout \\ Application.fetch_env!(:ex_unit, :assert_receive_timeout)
++      ) do
++    pids =
++      case view_or_element do
++        %View{} = view -> call(view, {:async_pids, {proxy_topic(view), nil, nil}})
++        %Element{} = element -> call(element, {:async_pids, element})
++      end
++
++    timeout_ref = make_ref()
++    Process.send_after(self(), {timeout_ref, :timeout}, timeout)
++
++    pids
++    |> Enum.map(&Process.monitor(&1))
++    |> Enum.each(fn ref ->
++      receive do
++        {^timeout_ref, :timeout} ->
++          raise RuntimeError, "expected async processes to finish within #{timeout}ms"
++
++        {:DOWN, ^ref, :process, _pid, _reason} ->
++          :ok
++      end
++    end)
++
++    unless Process.cancel_timer(timeout_ref) do
++      receive do
++        {^timeout_ref, :timeout} -> :noop
++      after
++        0 -> :noop
++      end
++    end
++
++    render(view_or_element)
++  end
++
+   @doc """
+   Simulates a `live_patch` to the given `path` and returns the rendered result.
+   """
+diff --git a/test/phoenix_live_view/async_result_test.exs b/test/phoenix_live_view/async_result_test.exs
+new file mode 100644
+index 0000000000..e53a0f4c9c
+--- /dev/null
++++ b/test/phoenix_live_view/async_result_test.exs
+@@ -0,0 +1,25 @@
++defmodule Phoenix.LiveView.AsyncResultTest do
++  use ExUnit.Case, async: true
++
++  alias Phoenix.LiveView.AsyncResult
++
++  test "ok" do
++    async = AsyncResult.loading()
++    assert Enum.sum(AsyncResult.ok(async, [1, 1, 1])) == 3
++    assert Enum.count(AsyncResult.ok(async, [1, 2, 3])) == 3
++    assert Enum.map(AsyncResult.ok(async, [1, 2, 3]), &(&1 * 2)) == [2, 4, 6]
++  end
++
++  test "not ok" do
++    async = AsyncResult.loading()
++
++    # loading
++    assert Enum.sum(async) == 0
++    assert Enum.map(async, & &1) == []
++
++    # failed
++    failed = AsyncResult.failed(async, {:exit, :boom})
++    assert Enum.sum(failed) == 0
++    assert Enum.map(failed, & &1) == []
++  end
++end
+diff --git a/test/phoenix_live_view/integrations/assign_async_test.exs b/test/phoenix_live_view/integrations/assign_async_test.exs
+new file mode 100644
+index 0000000000..c7c8e12d28
+--- /dev/null
++++ b/test/phoenix_live_view/integrations/assign_async_test.exs
+@@ -0,0 +1,177 @@
++defmodule Phoenix.LiveView.AssignAsyncTest do
++  use ExUnit.Case, async: true
++  import Phoenix.ConnTest
++
++  import Phoenix.LiveViewTest
++  alias Phoenix.LiveViewTest.Endpoint
++
++  @endpoint Endpoint
++
++  setup do
++    {:ok, conn: Plug.Test.init_test_session(Phoenix.ConnTest.build_conn(), %{})}
++  end
++
++  describe "LiveView assign_async" do
++    test "bad return", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=bad_return")
++
++      assert render_async(lv) =~
++               "{:exit, {%ArgumentError{message: &quot;expected assign_async to return {:ok, map} of\\nassigns for [:data] or {:error, reason}, got: 123\\n&quot;}"
++
++      assert render(lv)
++    end
++
++    test "missing known key", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=bad_ok")
++
++      assert render_async(lv) =~
++               "expected assign_async to return map of assigns for all keys\\nin [:data]"
++
++      assert render(lv)
++    end
++
++    test "valid return", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=ok")
++      assert render_async(lv) =~ "data: 123"
++    end
++
++    test "raise during execution", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=raise")
++
++      assert render_async(lv) =~ "{:exit, {%RuntimeError{message: &quot;boom&quot;}"
++      assert render(lv)
++    end
++
++    test "exit during execution", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=exit")
++
++      assert render_async(lv) =~ "{:exit, :boom}"
++      assert render(lv)
++    end
++
++    test "lv exit brings down asyncs", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=lv_exit")
++      Process.unlink(lv.pid)
++      lv_ref = Process.monitor(lv.pid)
++      async_ref = Process.monitor(Process.whereis(:lv_exit))
++      send(lv.pid, :boom)
++
++      assert_receive {:DOWN, ^lv_ref, :process, _pid, :boom}, 1000
++      assert_receive {:DOWN, ^async_ref, :process, _pid, :boom}, 1000
++    end
++
++    test "cancel_async", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=cancel")
++      Process.unlink(lv.pid)
++      async_ref = Process.monitor(Process.whereis(:cancel))
++      send(lv.pid, :cancel)
++
++      assert_receive {:DOWN, ^async_ref, :process, _pid, {:shutdown, :cancel}}, 1000
++
++      assert render(lv) =~ ":cancel"
++
++      send(lv.pid, :renew_canceled)
++
++      assert render(lv) =~ "data loading..."
++      assert render_async(lv, 200) =~ "data: 123"
++    end
++
++    test "enum", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=enum")
++
++      html = render_async(lv, 200)
++      assert html =~ "data: [1, 2, 3]"
++      assert html =~ "<div>1</div><div>2</div><div>3</div>"
++    end
++
++    test "trapping exits", %{conn: conn} do
++      Process.register(self(), :trap_exit_test)
++      {:ok, lv, _html} = live(conn, "/assign_async?test=trap_exit")
++
++      assert render_async(lv, 200) =~ "{:exit, :boom}"
++      assert render(lv)
++      assert_receive {:exit, _pid, :boom}, 1000
++    end
++  end
++
++  describe "LiveComponent assign_async" do
++    test "bad return", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=lc_bad_return")
++
++      assert render_async(lv) =~
++               "exit: {%ArgumentError{message: &quot;expected assign_async to return {:ok, map} of\\nassigns for [:lc_data] or {:error, reason}, got: 123\\n&quot;}"
++
++      assert render(lv)
++    end
++
++    test "missing known key", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=lc_bad_ok")
++
++      assert render_async(lv) =~
++               "expected assign_async to return map of assigns for all keys\\nin [:lc_data]"
++
++      assert render(lv)
++    end
++
++    test "valid return", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=lc_ok")
++      assert render_async(lv) =~ "lc_data: 123"
++    end
++
++    test "raise during execution", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=lc_raise")
++
++      assert render_async(lv) =~ "exit: {%RuntimeError{message: &quot;boom&quot;}"
++      assert render(lv)
++    end
++
++    test "exit during execution", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=lc_exit")
++
++      assert render_async(lv) =~ "exit: :boom"
++      assert render(lv)
++    end
++
++    test "lv exit brings down asyncs", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=lc_lv_exit")
++      Process.unlink(lv.pid)
++      lv_ref = Process.monitor(lv.pid)
++      async_ref = Process.monitor(Process.whereis(:lc_exit))
++      send(lv.pid, :boom)
++
++      assert_receive {:DOWN, ^lv_ref, :process, _pid, :boom}, 1000
++      assert_receive {:DOWN, ^async_ref, :process, _pid, :boom}, 1000
++    end
++
++    test "cancel_async", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=lc_cancel")
++      Process.unlink(lv.pid)
++      async_ref = Process.monitor(Process.whereis(:lc_cancel))
++
++      Phoenix.LiveView.send_update(lv.pid, Phoenix.LiveViewTest.AssignAsyncLive.LC,
++        id: "lc",
++        action: :cancel
++      )
++
++      assert_receive {:DOWN, ^async_ref, :process, _pid, {:shutdown, :cancel}}, 1000
++
++      assert render(lv) =~ "exit: {:shutdown, :cancel}"
++
++      Phoenix.LiveView.send_update(lv.pid, Phoenix.LiveViewTest.AssignAsyncLive.LC,
++        id: "lc",
++        action: :renew_canceled
++      )
++
++      assert render(lv) =~ "lc_data loading..."
++      assert render_async(lv, 200) =~ "lc_data: 123"
++    end
++
++    test "enum", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/assign_async?test=lc_enum")
++
++      html = render_async(lv, 200)
++      assert html =~ "lc_data: [4, 5, 6]"
++      assert html =~ "<div>4</div><div>5</div><div>6</div>"
++    end
++  end
++end
+diff --git a/test/phoenix_live_view/integrations/hooks_test.exs b/test/phoenix_live_view/integrations/hooks_test.exs
+index f77a87b3e7..55859ab5a4 100644
+--- a/test/phoenix_live_view/integrations/hooks_test.exs
++++ b/test/phoenix_live_view/integrations/hooks_test.exs
+@@ -123,6 +123,9 @@ defmodule Phoenix.LiveView.HooksTest do
+       {:halt, %{}, socket}
+     end)
+ 
++    %{proxy: {_ref, _topic, proxy_pid}} = lv
++    Process.unlink(proxy_pid)
++
+     assert ExUnit.CaptureLog.capture_log(fn ->
+              send(lv.pid, :boom)
+              ref = Process.monitor(lv.pid)
+diff --git a/test/phoenix_live_view/integrations/start_async_test.exs b/test/phoenix_live_view/integrations/start_async_test.exs
+new file mode 100644
+index 0000000000..90fb7ee744
+--- /dev/null
++++ b/test/phoenix_live_view/integrations/start_async_test.exs
+@@ -0,0 +1,127 @@
++defmodule Phoenix.LiveView.StartAsyncTest do
++  use ExUnit.Case, async: true
++  import Phoenix.ConnTest
++
++  import Phoenix.LiveViewTest
++  alias Phoenix.LiveViewTest.Endpoint
++
++  @endpoint Endpoint
++
++  setup do
++    {:ok, conn: Plug.Test.init_test_session(Phoenix.ConnTest.build_conn(), %{})}
++  end
++
++  describe "LiveView start_async" do
++    test "ok task", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/start_async?test=ok")
++
++      assert render_async(lv) =~ "result: :good"
++    end
++
++    test "raise during execution", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/start_async?test=raise")
++
++      assert render_async(lv) =~ "result: {:exit, %RuntimeError{message: &quot;boom&quot;}}"
++      assert render(lv)
++    end
++
++    test "exit during execution", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/start_async?test=exit")
++
++      assert render_async(lv) =~ "result: {:exit, :boom}"
++      assert render(lv)
++    end
++
++    test "lv exit brings down asyncs", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/start_async?test=lv_exit")
++      Process.unlink(lv.pid)
++      lv_ref = Process.monitor(lv.pid)
++      async_ref = Process.monitor(Process.whereis(:start_async_exit))
++      send(lv.pid, :boom)
++
++      assert_receive {:DOWN, ^lv_ref, :process, _pid, :boom}, 1000
++      assert_receive {:DOWN, ^async_ref, :process, _pid, :boom}, 1000
++    end
++
++    test "cancel_async", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/start_async?test=cancel")
++      Process.unlink(lv.pid)
++      async_ref = Process.monitor(Process.whereis(:start_async_cancel))
++      send(lv.pid, :cancel)
++
++      assert_receive {:DOWN, ^async_ref, :process, _pid, {:shutdown, :cancel}}, 1000
++
++      assert render(lv) =~ "result: :loading"
++
++      send(lv.pid, :renew_canceled)
++
++      assert render(lv) =~ "result: :loading"
++      assert render_async(lv, 200) =~ "result: :renewed"
++    end
++
++    test "trapping exits", %{conn: conn} do
++      Process.register(self(), :start_async_trap_exit_test)
++      {:ok, lv, _html} = live(conn, "/start_async?test=trap_exit")
++
++      assert render_async(lv, 200) =~ "result: :loading"
++      assert render(lv)
++      assert_receive {:exit, _pid, :boom}, 1000
++    end
++  end
++
++  describe "LiveComponent start_async" do
++    test "ok task", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/start_async?test=lc_ok")
++
++      assert render_async(lv) =~ "lc: :good"
++    end
++
++    test "raise during execution", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/start_async?test=lc_raise")
++
++      assert render_async(lv) =~ "lc: {:exit, %RuntimeError{message: &quot;boom&quot;}}"
++      assert render(lv)
++    end
++
++    test "exit during execution", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/start_async?test=lc_exit")
++
++      assert render_async(lv) =~ "lc: {:exit, :boom}"
++      assert render(lv)
++    end
++
++    test "lv exit brings down asyncs", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/start_async?test=lc_lv_exit")
++      Process.unlink(lv.pid)
++      lv_ref = Process.monitor(lv.pid)
++      async_ref = Process.monitor(Process.whereis(:start_async_exit))
++      send(lv.pid, :boom)
++
++      assert_receive {:DOWN, ^lv_ref, :process, _pid, :boom}, 1000
++      assert_receive {:DOWN, ^async_ref, :process, _pid, :boom}, 1000
++    end
++
++    test "cancel_async", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/start_async?test=lc_cancel")
++      Process.unlink(lv.pid)
++      async_ref = Process.monitor(Process.whereis(:start_async_cancel))
++
++      Phoenix.LiveView.send_update(lv.pid, Phoenix.LiveViewTest.StartAsyncLive.LC,
++        id: "lc",
++        action: :cancel
++      )
++
++      assert_receive {:DOWN, ^async_ref, :process, _pid, {:shutdown, :cancel}}
++
++      assert render(lv) =~ "lc: :loading"
++
++      Phoenix.LiveView.send_update(lv.pid, Phoenix.LiveViewTest.StartAsyncLive.LC,
++        id: "lc",
++        action: :renew_canceled
++      )
++
++      assert render(lv) =~ "lc: :loading"
++      assert render_async(lv, 200) =~ "lc: :renewed"
++    end
++  end
++end
+diff --git a/test/phoenix_live_view/upload/channel_test.exs b/test/phoenix_live_view/upload/channel_test.exs
+index 73788ec6db..ad5bd9da17 100644
+--- a/test/phoenix_live_view/upload/channel_test.exs
++++ b/test/phoenix_live_view/upload/channel_test.exs
+@@ -221,7 +221,7 @@ defmodule Phoenix.LiveView.UploadChannelTest do
+                ) ==
+                  {:error, %{limit: 100, reason: :file_size_limit_exceeded}}
+ 
+-        assert_receive {:DOWN, _ref, :process, ^channel_pid, {:shutdown, :closed}}
++        assert_receive {:DOWN, _ref, :process, ^channel_pid, {:shutdown, :closed}}, 1000
+       end
+ 
+       @tag allow: [accept: :any, max_file_size: 100, chunk_timeout: 500]
+@@ -394,8 +394,8 @@ defmodule Phoenix.LiveView.UploadChannelTest do
+         end)
+ 
+         # Wait for the UploadClient and UploadChannel to shutdown
+-        assert_receive {:DOWN, _ref, :process, ^avatar_pid, {:shutdown, :closed}}
+-        assert_receive {:DOWN, _ref, :process, ^channel_pid, {:shutdown, :closed}}
++        assert_receive {:DOWN, _ref, :process, ^avatar_pid, {:shutdown, :closed}}, 1000
++        assert_receive {:DOWN, _ref, :process, ^channel_pid, {:shutdown, :closed}}, 1000
+         assert_receive {:file, tmp_path, "foo.jpeg", "123"}
+         # synchronize with LV and Plug.Upload to ensure they have processed DOWN
+         assert render(lv)
+@@ -423,7 +423,7 @@ defmodule Phoenix.LiveView.UploadChannelTest do
+           {:reply, :ok, socket}
+         end)
+ 
+-        assert_receive {:DOWN, _ref, :process, ^avatar_pid, {:shutdown, :closed}}
++        assert_receive {:DOWN, _ref, :process, ^avatar_pid, {:shutdown, :closed}}, 1000
+         assert_receive {:file, tmp_path, "foo.jpeg", "123"}
+         # synchronize with LV to ensure it has processed DOWN
+         assert render(lv)
+@@ -535,8 +535,8 @@ defmodule Phoenix.LiveView.UploadChannelTest do
+ 
+         assert_receive {:results, [{:consumed, tmp_path}]}
+         assert_receive {:file, ^tmp_path, "foo.jpeg", "123"}
+-        assert_receive {:DOWN, _ref, :process, ^avatar_pid, {:shutdown, :closed}}
+-        assert_receive {:DOWN, _ref, :process, ^channel_pid, {:shutdown, :closed}}
++        assert_receive {:DOWN, _ref, :process, ^avatar_pid, {:shutdown, :closed}}, 1000
++        assert_receive {:DOWN, _ref, :process, ^channel_pid, {:shutdown, :closed}}, 1000
+         # synchronize with LV to ensure it has processed DOWN
+         assert render(lv)
+         # synchronize with Plug.Upload to ensure it has processed DOWN
+@@ -590,8 +590,8 @@ defmodule Phoenix.LiveView.UploadChannelTest do
+ 
+         assert_receive {:result, {:consumed, tmp_path}}
+         assert_receive {:file, ^tmp_path, "foo.jpeg", "123"}
+-        assert_receive {:DOWN, _ref, :process, ^avatar_pid, {:shutdown, :closed}}
+-        assert_receive {:DOWN, _ref, :process, ^channel_pid, {:shutdown, :closed}}
++        assert_receive {:DOWN, _ref, :process, ^avatar_pid, {:shutdown, :closed}}, 1000
++        assert_receive {:DOWN, _ref, :process, ^channel_pid, {:shutdown, :closed}}, 1000
+         # synchronize with LV to ensure it has processed DOWN
+         assert render(lv)
+         # synchronize with Plug.Upload to ensure it has processed DOWN
+@@ -631,7 +631,7 @@ defmodule Phoenix.LiveView.UploadChannelTest do
+           {:reply, :ok, Phoenix.LiveView.cancel_upload(socket, :avatar, ref)}
+         end)
+ 
+-        assert_receive {:DOWN, _ref, :process, ^channel_pid, {:shutdown, :closed}}
++        assert_receive {:DOWN, _ref, :process, ^channel_pid, {:shutdown, :closed}}, 1000
+ 
+         assert UploadLive.run(lv, fn socket ->
+                  {:reply, Phoenix.LiveView.uploaded_entries(socket, :avatar), socket}
+@@ -803,7 +803,7 @@ defmodule Phoenix.LiveView.UploadChannelTest do
+ 
+       refute render(lv) =~ "myfile1.jpeg"
+ 
+-      assert_receive {:DOWN, _ref, :process, ^channel_pid, {:shutdown, :closed}}
++      assert_receive {:DOWN, _ref, :process, ^channel_pid, {:shutdown, :closed}}, 1000
+ 
+       # retry with new component
+       GenServer.call(lv.pid, {:uploads, 1})
+diff --git a/test/phoenix_live_view_test.exs b/test/phoenix_live_view_test.exs
+index 38a772eea9..e22ab776c5 100644
+--- a/test/phoenix_live_view_test.exs
++++ b/test/phoenix_live_view_test.exs
+@@ -288,4 +288,17 @@ defmodule Phoenix.LiveViewUnitTest do
+                {:live, :patch, %{kind: :push, to: "/counter/123"}}
+     end
+   end
++
++  describe "put_private" do
++    test "assigns private keys" do
++      assert @socket.private[:hello] == nil
++      assert put_private(@socket, :hello, "world").private[:hello] == "world"
++    end
++
++    test "disallows reserved keys" do
++      assert_raise ArgumentError, ~r/reserved/, fn ->
++        put_private(@socket, :assign_new, "boom")
++      end
++    end
++  end
+ end
+diff --git a/test/support/live_views/general.ex b/test/support/live_views/general.ex
+index 172c78122a..6029eebb5a 100644
+--- a/test/support/live_views/general.ex
++++ b/test/support/live_views/general.ex
+@@ -336,3 +336,370 @@ defmodule Phoenix.LiveViewTest.ClassListLive do
+ 
+   def render(assigns), do: ~H|Some content|
+ end
++
++defmodule Phoenix.LiveViewTest.AssignAsyncLive do
++  use Phoenix.LiveView
++
++  on_mount({__MODULE__, :defaults})
++
++  def on_mount(:defaults, _params, _session, socket) do
++    {:cont, assign(socket, enum: false, lc: false)}
++  end
++
++  def render(assigns) do
++    ~H"""
++    <.live_component :if={@lc} module={Phoenix.LiveViewTest.AssignAsyncLive.LC} test={@lc} id="lc" />
++
++    <div :if={@data.loading}>data loading...</div>
++    <div :if={@data.ok? && @data.result == nil}>no data found</div>
++    <div :if={@data.ok? && @data.result}>data: <%= inspect(@data.result) %></div>
++    <div :if={@data.failed}><%= inspect(@data.failed) %></div>
++
++    <%= if @enum do %>
++      <div :for={i <- @data}><%= i %></div>
++    <% end %>
++    """
++  end
++
++  def mount(%{"test" => "lc_" <> lc_test}, _session, socket) do
++    {:ok,
++     socket
++     |> assign(lc: lc_test)
++     |> assign_async(:data, fn -> {:ok, %{data: :live_component}} end)}
++  end
++
++  def mount(%{"test" => "bad_return"}, _session, socket) do
++    {:ok, assign_async(socket, :data, fn -> 123 end)}
++  end
++
++  def mount(%{"test" => "bad_ok"}, _session, socket) do
++    {:ok, assign_async(socket, :data, fn -> {:ok, %{bad: 123}} end)}
++  end
++
++  def mount(%{"test" => "ok"}, _session, socket) do
++    {:ok, assign_async(socket, :data, fn -> {:ok, %{data: 123}} end)}
++  end
++
++  def mount(%{"test" => "raise"}, _session, socket) do
++    {:ok, assign_async(socket, :data, fn -> raise("boom") end)}
++  end
++
++  def mount(%{"test" => "exit"}, _session, socket) do
++    {:ok, assign_async(socket, :data, fn -> exit(:boom) end)}
++  end
++
++  def mount(%{"test" => "lv_exit"}, _session, socket) do
++    {:ok,
++     assign_async(socket, :data, fn ->
++       Process.register(self(), :lv_exit)
++       Process.sleep(:infinity)
++     end)}
++  end
++
++  def mount(%{"test" => "cancel"}, _session, socket) do
++    {:ok,
++     assign_async(socket, :data, fn ->
++       Process.register(self(), :cancel)
++       Process.sleep(:infinity)
++     end)}
++  end
++
++  def mount(%{"test" => "trap_exit"}, _session, socket) do
++    Process.flag(:trap_exit, true)
++
++    {:ok,
++     assign_async(socket, :data, fn ->
++       spawn_link(fn -> exit(:boom) end)
++       Process.sleep(100)
++       {:ok, %{data: 0}}
++     end)}
++  end
++
++  def mount(%{"test" => "enum"}, _session, socket) do
++    {:ok,
++     socket |> assign(enum: true) |> assign_async(:data, fn -> {:ok, %{data: [1, 2, 3]}} end)}
++  end
++
++  def handle_info(:boom, _socket), do: exit(:boom)
++
++  def handle_info(:cancel, socket) do
++    {:noreply, cancel_async(socket, socket.assigns.data)}
++  end
++
++  def handle_info({:EXIT, pid, reason}, socket) do
++    send(:trap_exit_test, {:exit, pid, reason})
++    {:noreply, socket}
++  end
++
++  def handle_info(:renew_canceled, socket) do
++    {:noreply,
++     assign_async(socket, :data, fn ->
++       Process.sleep(100)
++       {:ok, %{data: 123}}
++     end)}
++  end
++end
++
++defmodule Phoenix.LiveViewTest.AssignAsyncLive.LC do
++  use Phoenix.LiveComponent
++
++  def render(assigns) do
++    ~H"""
++    <div>
++      <%= if @enum do %>
++        <div :for={i <- @lc_data}><%= i %></div>
++      <% end %>
++      <.async_result :let={data} assign={@lc_data}>
++        <:loading>lc_data loading...</:loading>
++        <:failed :let={{kind, reason}}><%= kind %>: <%= inspect(reason) %></:failed>
++
++        lc_data: <%= inspect(data) %>
++      </.async_result>
++    </div>
++    """
++  end
++
++  def mount(socket) do
++    {:ok, assign(socket, enum: false)}
++  end
++
++  def update(%{test: "bad_return"}, socket) do
++    {:ok, assign_async(socket, :lc_data, fn -> 123 end)}
++  end
++
++  def update(%{test: "bad_ok"}, socket) do
++    {:ok, assign_async(socket, :lc_data, fn -> {:ok, %{bad: 123}} end)}
++  end
++
++  def update(%{test: "ok"}, socket) do
++    {:ok, assign_async(socket, :lc_data, fn -> {:ok, %{lc_data: 123}} end)}
++  end
++
++  def update(%{test: "raise"}, socket) do
++    {:ok, assign_async(socket, :lc_data, fn -> raise("boom") end)}
++  end
++
++  def update(%{test: "exit"}, socket) do
++    {:ok, assign_async(socket, :lc_data, fn -> exit(:boom) end)}
++  end
++
++  def update(%{test: "lv_exit"}, socket) do
++    {:ok,
++     assign_async(socket, :lc_data, fn ->
++       Process.register(self(), :lc_exit)
++       Process.sleep(:infinity)
++     end)}
++  end
++
++  def update(%{test: "cancel"}, socket) do
++    {:ok,
++     assign_async(socket, :lc_data, fn ->
++       Process.register(self(), :lc_cancel)
++       Process.sleep(:infinity)
++     end)}
++  end
++
++  def update(%{test: "enum"}, socket) do
++    {:ok,
++     socket
++     |> assign(enum: true)
++     |> assign_async(:lc_data, fn -> {:ok, %{lc_data: [4, 5, 6]}} end)}
++  end
++
++  def update(%{action: :boom}, _socket), do: exit(:boom)
++
++  def update(%{action: :cancel}, socket) do
++    {:ok, cancel_async(socket, socket.assigns.lc_data)}
++  end
++
++  def update(%{action: :renew_canceled}, socket) do
++    {:ok,
++     assign_async(socket, :lc_data, fn ->
++       Process.sleep(100)
++       {:ok, %{lc_data: 123}}
++     end)}
++  end
++end
++
++defmodule Phoenix.LiveViewTest.StartAsyncLive do
++  use Phoenix.LiveView
++
++  on_mount({__MODULE__, :defaults})
++
++  def on_mount(:defaults, _params, _session, socket) do
++    {:cont, assign(socket, lc: false)}
++  end
++
++  def render(assigns) do
++    ~H"""
++    <.live_component :if={@lc} module={Phoenix.LiveViewTest.StartAsyncLive.LC} test={@lc} id="lc" />
++    result: <%= inspect(@result) %>
++    """
++  end
++
++  def mount(%{"test" => "lc_" <> lc_test}, _session, socket) do
++    {:ok, assign(socket, lc: lc_test, result: :loading)}
++  end
++
++  def mount(%{"test" => "ok"}, _session, socket) do
++    {:ok,
++     socket
++     |> assign(result: :loading)
++     |> start_async(:result_task, fn -> :good end)}
++  end
++
++  def mount(%{"test" => "raise"}, _session, socket) do
++    {:ok,
++     socket
++     |> assign(result: :loading)
++     |> start_async(:result_task, fn -> raise("boom") end)}
++  end
++
++  def mount(%{"test" => "exit"}, _session, socket) do
++    {:ok,
++     socket
++     |> assign(result: :loading)
++     |> start_async(:result_task, fn -> exit(:boom) end)}
++  end
++
++  def mount(%{"test" => "lv_exit"}, _session, socket) do
++    {:ok,
++     socket
++     |> assign(result: :loading)
++     |> start_async(:result_task, fn ->
++       Process.register(self(), :start_async_exit)
++       Process.sleep(:infinity)
++     end)}
++  end
++
++  def mount(%{"test" => "cancel"}, _session, socket) do
++    {:ok,
++     socket
++     |> assign(result: :loading)
++     |> start_async(:result_task, fn ->
++       Process.register(self(), :start_async_cancel)
++       Process.sleep(:infinity)
++     end)}
++  end
++
++  def mount(%{"test" => "trap_exit"}, _session, socket) do
++    Process.flag(:trap_exit, true)
++
++    {:ok,
++     socket
++     |> assign(result: :loading)
++     |> assign_async(:result_task, fn ->
++       spawn_link(fn -> exit(:boom) end)
++       Process.sleep(100)
++       :good
++     end)}
++  end
++
++  def handle_async(:result_task, {:ok, result}, socket) do
++    {:noreply, assign(socket, result: result)}
++  end
++
++  def handle_async(:result_task, {:exit, {error, [_ | _] = _stack}}, socket) do
++    {:noreply, assign(socket, result: {:exit, error})}
++  end
++
++  def handle_async(:result_task, {:exit, reason}, socket) do
++    {:noreply, assign(socket, result: {:exit, reason})}
++  end
++
++  def handle_info(:boom, _socket), do: exit(:boom)
++
++  def handle_info(:cancel, socket) do
++    {:noreply, cancel_async(socket, :result_task)}
++  end
++
++  def handle_info(:renew_canceled, socket) do
++    {:noreply,
++     start_async(socket, :result_task, fn ->
++       Process.sleep(100)
++       :renewed
++     end)}
++  end
++
++  def handle_info({:EXIT, pid, reason}, socket) do
++    send(:start_async_trap_exit_test, {:exit, pid, reason})
++    {:noreply, socket}
++  end
++end
++
++defmodule Phoenix.LiveViewTest.StartAsyncLive.LC do
++  use Phoenix.LiveComponent
++
++  def render(assigns) do
++    ~H"""
++    <div>
++      lc: <%= inspect(@result) %>
++    </div>
++    """
++  end
++
++  def update(%{test: "ok"}, socket) do
++    {:ok,
++     socket
++     |> assign(result: :loading)
++     |> start_async(:result_task, fn -> :good end)}
++  end
++
++  def update(%{test: "raise"}, socket) do
++    {:ok,
++     socket
++     |> assign(result: :loading)
++     |> start_async(:result_task, fn -> raise("boom") end)}
++  end
++
++  def update(%{test: "exit"}, socket) do
++    {:ok,
++     socket
++     |> assign(result: :loading)
++     |> start_async(:result_task, fn -> exit(:boom) end)}
++  end
++
++  def update(%{test: "lv_exit"}, socket) do
++    {:ok,
++     socket
++     |> assign(result: :loading)
++     |> start_async(:result_task, fn ->
++       Process.register(self(), :start_async_exit)
++       Process.sleep(:infinity)
++     end)}
++  end
++
++  def update(%{test: "cancel"}, socket) do
++    {:ok,
++     socket
++     |> assign(result: :loading)
++     |> start_async(:result_task, fn ->
++       Process.register(self(), :start_async_cancel)
++       Process.sleep(:infinity)
++     end)}
++  end
++
++  def update(%{action: :cancel}, socket) do
++    {:ok, cancel_async(socket, :result_task)}
++  end
++
++  def update(%{action: :renew_canceled}, socket) do
++    {:ok,
++     start_async(socket, :result_task, fn ->
++       Process.sleep(100)
++       :renewed
++     end)}
++  end
++
++  def handle_async(:result_task, {:ok, result}, socket) do
++    {:noreply, assign(socket, result: result)}
++  end
++
++  def handle_async(:result_task, {:exit, {error, [_ | _] = _stack}}, socket) do
++    {:noreply, assign(socket, result: {:exit, error})}
++  end
++
++  def handle_async(:result_task, {:exit, reason}, socket) do
++    {:noreply, assign(socket, result: {:exit, reason})}
++  end
++end
+diff --git a/test/support/router.ex b/test/support/router.ex
+index 895254013c..3c8babfa25 100644
+--- a/test/support/router.ex
++++ b/test/support/router.ex
+@@ -45,6 +45,8 @@ defmodule Phoenix.LiveViewTest.Router do
+     live "/log-disabled", WithLogDisabled
+     live "/errors", ErrorsLive
+     live "/live-reload", ReloadLive
++    live "/assign_async", AssignAsyncLive
++    live "/start_async", StartAsyncLive
+ 
+     # controller test
+     get "/controller/:type", Controller, :incoming

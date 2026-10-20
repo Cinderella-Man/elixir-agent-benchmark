@@ -1,0 +1,942 @@
+diff --git a/assets/js/phoenix_live_view/entry_uploader.js b/assets/js/phoenix_live_view/entry_uploader.js
+index 6cc82f9411..30a78f2336 100644
+--- a/assets/js/phoenix_live_view/entry_uploader.js
++++ b/assets/js/phoenix_live_view/entry_uploader.js
+@@ -19,7 +19,10 @@ export default class EntryUploader {
+     }
+     // A scheduled submit locks the upload input, so cancel it directly instead
+     // of waiting for the input hook to observe the error diff.
+-    this.entry.view.cancelSubmit(this.entry.fileEl.form);
++    this.entry.view.cancelSubmit(this.entry.fileEl.form, {
++      reason: "upload-failed",
++      inputs: [this.entry.fileEl],
++    });
+     this.uploadChannel.leave();
+     this.errored = true;
+     this.chunkTimer != null && clearTimeout(this.chunkTimer);
+diff --git a/assets/js/phoenix_live_view/hooks.ts b/assets/js/phoenix_live_view/hooks.ts
+index 50da671a46..00fc0da606 100644
+--- a/assets/js/phoenix_live_view/hooks.ts
++++ b/assets/js/phoenix_live_view/hooks.ts
+@@ -310,14 +310,20 @@ const LiveFileUpload: Hook<object, HTMLInputElement> = {
+     if (this.errorRefsWas !== newErrorRefs) {
+       this.errorRefsWas = newErrorRefs;
+       if (newErrorRefs !== "") {
+-        this.__view().cancelSubmit(this.el.form);
++        this.__view().cancelSubmit(this.el.form, {
++          reason: "entry-errors",
++          inputs: [this.el],
++        });
+       }
+     }
+ 
+     if (this.preflightedWas !== newPreflights) {
+       this.preflightedWas = newPreflights;
+       if (newPreflights === "") {
+-        this.__view().cancelSubmit(this.el.form);
++        this.__view().cancelSubmit(this.el.form, {
++          reason: "entries-removed",
++          inputs: [this.el],
++        });
+       }
+     }
+ 
+diff --git a/assets/js/phoenix_live_view/live_uploader.js b/assets/js/phoenix_live_view/live_uploader.js
+index 193462332e..4396edc3b4 100644
+--- a/assets/js/phoenix_live_view/live_uploader.js
++++ b/assets/js/phoenix_live_view/live_uploader.js
+@@ -12,6 +12,19 @@ import UploadEntry from "./upload_entry";
+ 
+ let liveUploaderFileRef = 0;
+ 
++/**
++ * Why a form submit was dropped because of its uploads:
++ *
++ * - `entry-errors`: upload inputs carry entries with errors
++ * - `preflight-rejected`: the server rejected the entries in the preflight
++ * - `preflight-failed`: the preflight push failed (error reply or timeout)
++ * - `upload-failed`: an upload failed after the preflight
++ * - `awaiting-preflight`: entries still need a preflight after the uploads
++ * - `entries-removed`: the entries a scheduled submit waited for are gone
++ *
++ * @typedef {"entry-errors" | "preflight-rejected" | "preflight-failed" | "upload-failed" | "awaiting-preflight" | "entries-removed"} BlockedSubmitReason
++ */
++
+ export default class LiveUploader {
+   static genFileRef(file) {
+     const ref = file._phxRef;
+@@ -44,8 +57,8 @@ export default class LiveUploader {
+     return active > 0;
+   }
+ 
+-  static hasUploadErrors(formEl) {
+-    return DOM.findUploadInputs(formEl).some(
++  static inputsWithUploadErrors(formEl) {
++    return DOM.findUploadInputs(formEl).filter(
+       (input) => (input.getAttribute(PHX_ERROR_REFS) || "") !== "",
+     );
+   }
+diff --git a/assets/js/phoenix_live_view/view.ts b/assets/js/phoenix_live_view/view.ts
+index 0cf03b2c07..8a366e03ae 100644
+--- a/assets/js/phoenix_live_view/view.ts
++++ b/assets/js/phoenix_live_view/view.ts
+@@ -66,6 +66,7 @@ import DOM, { FormInputLike, QueryableNode } from "./dom";
+ import ElementRef from "./element_ref";
+ import DOMPatch from "./dom_patch";
+ import LiveUploader from "./live_uploader";
++import type { BlockedSubmitReason } from "./live_uploader";
+ import Rendered from "./rendered";
+ import { ViewHook } from "./view_hook";
+ import JS from "./js";
+@@ -2134,13 +2135,14 @@ export default class View {
+                 inputEl.form,
+                 phxEvent,
+                 targetCtx,
+-                ref,
+-                cid,
+                 (_uploads) => {
+                   callback && callback(result.resp);
+-                  this.triggerAwaitingSubmit(inputEl.form, phxEvent);
++                  this.triggerAwaitingSubmit(inputEl.form);
+                   this.undoRefs(ref, phxEvent);
+                 },
++                // the change event itself was delivered, so there is no
++                // submit to report; only release the form
++                () => this.undoRefs(ref, phxEvent),
+               );
+             }
+           });
+@@ -2162,11 +2164,11 @@ export default class View {
+     });
+   }
+ 
+-  triggerAwaitingSubmit(formEl, phxEvent) {
++  triggerAwaitingSubmit(formEl) {
+     const awaitingSubmit = this.getScheduledSubmit(formEl);
+     if (awaitingSubmit) {
+       const [_el, _ref, _opts, callback] = awaitingSubmit;
+-      this.cancelSubmit(formEl, phxEvent);
++      this.cancelSubmit(formEl);
+       callback();
+     }
+   }
+@@ -2177,17 +2179,64 @@ export default class View {
+     );
+   }
+ 
+-  scheduleSubmit(formEl, ref, opts, callback) {
++  scheduleSubmit(formEl, ref, opts, callback, phxEvent) {
+     if (this.getScheduledSubmit(formEl)) {
+       return true;
+     }
+-    this.formSubmits.push([formEl, ref, opts, callback]);
++    this.formSubmits.push([formEl, ref, opts, callback, phxEvent]);
+   }
+ 
+-  cancelSubmit(formEl, phxEvent) {
++  // a submit is intentionally dropped when its uploads cannot complete, but
++  // without a signal the click looks like a no-op to the developer, so we
++  // emit a debug diagnostic naming the uploads and why the submit was not sent
++  logBlockedSubmit(
++    formEl,
++    phxEvent,
++    reason: BlockedSubmitReason,
++    inputs,
++    scheduled = false,
++  ) {
++    const uploads = inputs.map((input) => input.name);
++    const what = scheduled ? `scheduled ${phxEvent}` : phxEvent;
++    this.log(
++      "upload",
++      () => [
++        `${what} not sent (${reason}): ${uploads.join(", ")}`,
++        { reason, uploads },
++      ],
++      {
++        code: "upload.submit-blocked",
++        metadata: () => ({
++          event: phxEvent,
++          reason,
++          uploads,
++          scheduled,
++          formEl,
++        }),
++      },
++    );
++  }
++
++  // cancels the submit scheduled while uploads were in progress, if any, and
++  // undoes its refs. `blocked` says why the submit is dropped for good; it is
++  // omitted when the scheduled submit is dequeued to be sent (see
++  // triggerAwaitingSubmit)
++  cancelSubmit(
++    formEl,
++    blocked?: { reason: BlockedSubmitReason; inputs: HTMLInputElement[] },
++  ) {
+     this.formSubmits = this.formSubmits.filter(
+-      ([el, ref, _opts, _callback]) => {
++      ([el, ref, _opts, _callback, phxEvent]) => {
+         if (el.isSameNode(formEl)) {
++          if (blocked) {
++            this.logBlockedSubmit(
++              formEl,
++              phxEvent,
++              blocked.reason,
++              blocked.inputs,
++              true,
++            );
++          }
+           this.undoRefs(ref, phxEvent);
+           return false;
+         } else {
+@@ -2262,8 +2311,11 @@ export default class View {
+     // for phx-trigger-action
+     DOM.putPrivate(formEl, "submitter", submitter);
+     const cid = this.targetComponentID(formEl, targetCtx);
+-    if (LiveUploader.hasUploadErrors(formEl)) {
+-      return this.cancelSubmit(formEl, phxEvent);
++    const inputsWithErrors = LiveUploader.inputsWithUploadErrors(formEl);
++    if (inputsWithErrors.length > 0) {
++      this.logBlockedSubmit(formEl, phxEvent, "entry-errors", inputsWithErrors);
++      // a submit scheduled earlier is dropped for the same reason
++      return this.cancelSubmit(formEl);
+     } else if (LiveUploader.hasUploadsInProgress(formEl)) {
+       const [ref, _els] = refGenerator();
+       const push = () =>
+@@ -2275,41 +2327,53 @@ export default class View {
+           opts,
+           onReply,
+         );
+-      return this.scheduleSubmit(formEl, ref, opts, push);
++      return this.scheduleSubmit(formEl, ref, opts, push, phxEvent);
+     } else if (LiveUploader.inputsAwaitingPreflight(formEl).length > 0) {
+       const [ref, els] = refGenerator();
+       const proxyRefGen = () => [ref, els, opts];
+-      this.uploadFiles(formEl, phxEvent, targetCtx, ref, cid, (_uploads) => {
+-        // if we still having pending preflights it means we have invalid entries
+-        // and the phx-submit cannot be completed
+-        if (LiveUploader.inputsAwaitingPreflight(formEl).length > 0) {
+-          return this.undoRefs(ref, phxEvent);
+-        }
+-        const meta = this.extractMeta(formEl, {}, opts.value);
+-        const formData = this.serializeForm(formEl, { submitter });
+-        this.pushWithReply(proxyRefGen, "event", {
+-          type: "form",
+-          event: phxEvent,
+-          value: formData,
+-          meta: meta,
+-          cid: cid,
+-        }).then((result) => {
+-          if (result.type === "ok") {
+-            onReply(result.resp);
+-          } else {
+-            this.logError(
+-              "event.submit-push-failed",
+-              "Failed to push form submit",
+-              {
+-                error: result.error,
+-                phxEvent,
+-                formEl,
+-              },
+-              result.context,
+-            );
++      const onBlocked = (reason: BlockedSubmitReason, inputs) => {
++        this.logBlockedSubmit(formEl, phxEvent, reason, inputs);
++        this.undoRefs(ref, phxEvent);
++      };
++      this.uploadFiles(
++        formEl,
++        phxEvent,
++        targetCtx,
++        (_uploads) => {
++          // entries can still be awaiting a preflight once the uploads are done,
++          // in which case the phx-submit cannot be completed
++          const awaitingPreflight =
++            LiveUploader.inputsAwaitingPreflight(formEl);
++          if (awaitingPreflight.length > 0) {
++            return onBlocked("awaiting-preflight", awaitingPreflight);
+           }
+-        });
+-      });
++          const meta = this.extractMeta(formEl, {}, opts.value);
++          const formData = this.serializeForm(formEl, { submitter });
++          this.pushWithReply(proxyRefGen, "event", {
++            type: "form",
++            event: phxEvent,
++            value: formData,
++            meta: meta,
++            cid: cid,
++          }).then((result) => {
++            if (result.type === "ok") {
++              onReply(result.resp);
++            } else {
++              this.logError(
++                "event.submit-push-failed",
++                "Failed to push form submit",
++                {
++                  error: result.error,
++                  phxEvent,
++                  formEl,
++                },
++                result.context,
++              );
++            }
++          });
++        },
++        onBlocked,
++      );
+     } else if (!(
+       formEl.hasAttribute(PHX_REF_SRC) &&
+       formEl.classList.contains("phx-submit-loading")
+@@ -2341,26 +2405,59 @@ export default class View {
+     }
+   }
+ 
+-  uploadFiles(formEl, phxEvent, targetCtx, ref, cid, onComplete) {
++  // onComplete is called once the uploads of every input are done; onBlocked
++  // is called instead when a preflight was rejected or failed, or an upload
++  // failed, with the reason and the inputs involved. The caller is responsible
++  // for releasing the form. When inputs are blocked for different reasons, the
++  // first reason seen is reported with its inputs; the others have their own
++  // logs.
++  uploadFiles(
++    formEl,
++    phxEvent,
++    targetCtx,
++    onComplete,
++    onBlocked: (
++      reason: BlockedSubmitReason,
++      inputs: HTMLInputElement[],
++    ) => void,
++  ) {
+     const joinCountAtUpload = this.joinCount;
+     const inputEls = LiveUploader.activeFileInputs(formEl);
+     let numFileInputsInProgress = inputEls.length;
+-    let uploadFailed = false;
++    const blocked: {
++      reason: BlockedSubmitReason;
++      inputs: HTMLInputElement[];
++    }[] = [];
++    const inputBlocked = (reason: BlockedSubmitReason, inputEl) => {
++      const group = blocked.find((b) => b.reason === reason);
++      if (group) {
++        group.inputs.push(inputEl);
++      } else {
++        blocked.push({ reason, inputs: [inputEl] });
++      }
++    };
++    // called once per input, when its uploads are done or could not start
++    const inputDone = () => {
++      numFileInputsInProgress--;
++      if (numFileInputsInProgress > 0) {
++        return;
++      }
++      if (blocked.length > 0) {
++        this.cancelSubmit(formEl, blocked[0]);
++        onBlocked(blocked[0].reason, blocked[0].inputs);
++      } else {
++        onComplete();
++      }
++    };
+ 
+     // get each file input
+     inputEls.forEach((inputEl) => {
+       const uploader = new LiveUploader(inputEl, this, () => {
+         this.activeUploaders.delete(uploader);
+-        uploadFailed ||= uploader.entries().some((entry) => entry.isErrored());
+-        numFileInputsInProgress--;
+-        if (numFileInputsInProgress === 0) {
+-          if (uploadFailed) {
+-            this.cancelSubmit(formEl, phxEvent);
+-            this.undoRefs(ref, phxEvent);
+-          } else {
+-            onComplete();
+-          }
++        if (uploader.entries().some((entry) => entry.isErrored())) {
++          inputBlocked("upload-failed", inputEl);
+         }
++        inputDone();
+       });
+       this.activeUploaders.add(uploader);
+ 
+@@ -2370,7 +2467,7 @@ export default class View {
+ 
+       if (entries.length === 0) {
+         this.activeUploaders.delete(uploader);
+-        numFileInputsInProgress--;
++        inputDone();
+         return;
+       }
+ 
+@@ -2408,12 +2505,13 @@ export default class View {
+             result.resp.error ||
+             Object.keys(result.resp.entries).length === 0
+           ) {
+-            this.undoRefs(ref, phxEvent);
+             const errors = result.resp.error || [];
+             errors.map(([entry_ref, reason]) => {
+               this.handleFailedEntryPreflight(entry_ref, reason, uploader);
+             });
+             this.activeUploaders.delete(uploader);
++            inputBlocked("preflight-rejected", inputEl);
++            inputDone();
+           } else {
+             const onError = (callback) => {
+               this.channel.onError(() => {
+@@ -2425,6 +2523,9 @@ export default class View {
+             uploader.initAdapterUpload(result.resp, onError, this.liveSocket);
+           }
+         } else {
++          // the entries are cancelled so that they are preflighted again on
++          // the next attempt instead of staying marked as in progress
++          uploader.cancel();
+           this.activeUploaders.delete(uploader);
+           this.logError(
+             "upload.push-failed",
+@@ -2436,6 +2537,8 @@ export default class View {
+             },
+             result.context,
+           );
++          inputBlocked("preflight-failed", inputEl);
++          inputDone();
+         }
+       });
+     });
+diff --git a/assets/test/entry_uploader_test.ts b/assets/test/entry_uploader_test.ts
+index 9f600d71c4..f6586b56fe 100644
+--- a/assets/test/entry_uploader_test.ts
++++ b/assets/test/entry_uploader_test.ts
+@@ -32,7 +32,10 @@ describe("EntryUploader", () => {
+     // Reply payload arrives as {reason: "..."}, not as a string.
+     errorCb({ reason: "join crashed" });
+ 
+-    expect(cancelSubmit).toHaveBeenCalledWith(form);
++    expect(cancelSubmit).toHaveBeenCalledWith(form, {
++      reason: "upload-failed",
++      inputs: [entry.fileEl],
++    });
+     expect(entry.error).toHaveBeenCalledWith("join crashed");
+   });
+ 
+@@ -69,7 +72,10 @@ describe("EntryUploader", () => {
+     channelErrorCb("closed");
+ 
+     expect(cancelSubmit).toHaveBeenCalledTimes(1);
+-    expect(cancelSubmit).toHaveBeenCalledWith(form);
++    expect(cancelSubmit).toHaveBeenCalledWith(form, {
++      reason: "upload-failed",
++      inputs: [entry.fileEl],
++    });
+     expect(fakeChannel.leave).toHaveBeenCalledTimes(1);
+     expect(entry.cancel).not.toHaveBeenCalled();
+     expect(entry.error).not.toHaveBeenCalled();
+@@ -112,7 +118,10 @@ describe("EntryUploader", () => {
+     );
+     receives.get("timeout")!();
+ 
+-    expect(entry.view.cancelSubmit).toHaveBeenCalledWith(form);
++    expect(entry.view.cancelSubmit).toHaveBeenCalledWith(form, {
++      reason: "upload-failed",
++      inputs: [entry.fileEl],
++    });
+     expect(fakeChannel.leave).toHaveBeenCalledTimes(1);
+     expect(entry.error).toHaveBeenCalledWith("timeout");
+     expect(entry.progress).not.toHaveBeenCalled();
+@@ -161,7 +170,10 @@ describe("EntryUploader", () => {
+       expect.stringContaining(message),
+       { entry, offset: 0 },
+     );
+-    expect(entry.view.cancelSubmit).toHaveBeenCalledWith(form);
++    expect(entry.view.cancelSubmit).toHaveBeenCalledWith(form, {
++      reason: "upload-failed",
++      inputs: [entry.fileEl],
++    });
+     expect(fakeChannel.leave).toHaveBeenCalledTimes(1);
+     expect(entry.error).toHaveBeenCalledWith("failed");
+   });
+diff --git a/assets/test/hooks_test.ts b/assets/test/hooks_test.ts
+index 454c0bd563..4a72e29214 100644
+--- a/assets/test/hooks_test.ts
++++ b/assets/test/hooks_test.ts
+@@ -31,10 +31,45 @@ describe("LiveFileUpload", () => {
+     input.setAttribute("data-phx-error-refs", "0");
+     Hooks.LiveFileUpload.updated!.call(ctx as any);
+ 
+-    expect(cancelSubmit).toHaveBeenCalledWith(input.form);
++    expect(cancelSubmit).toHaveBeenCalledWith(input.form, {
++      reason: "entry-errors",
++      inputs: [input],
++    });
+     expect(input.required).toBe(false);
+   });
+ 
++  test("cancels a scheduled submit when the preflighted entries are gone", () => {
++    document.body.innerHTML = `
++      <form>
++        <input
++          type="file"
++          data-phx-active-refs="0"
++          data-phx-preflighted-refs="0"
++        >
++      </form>
++    `;
++
++    const input = document.querySelector("input")!;
++    const cancelSubmit = jest.fn();
++    const ctx = {
++      ...Hooks.LiveFileUpload,
++      el: input,
++      js: () => ({ ignoreAttributes: jest.fn() }),
++      __view: () => ({ cancelSubmit }),
++    };
++
++    Hooks.LiveFileUpload.mounted!.call(ctx as any);
++    input.setAttribute("data-phx-active-refs", "");
++    input.setAttribute("data-phx-preflighted-refs", "");
++    Hooks.LiveFileUpload.updated!.call(ctx as any);
++
++    expect(cancelSubmit).toHaveBeenCalledTimes(1);
++    expect(cancelSubmit).toHaveBeenCalledWith(input.form, {
++      reason: "entries-removed",
++      inputs: [input],
++    });
++  });
++
+   test("removes required while the upload has selected files", () => {
+     document.body.innerHTML = `
+       <form>
+diff --git a/assets/test/view_test.ts b/assets/test/view_test.ts
+index 04dd9988d4..fa8e2ae704 100644
+--- a/assets/test/view_test.ts
++++ b/assets/test/view_test.ts
+@@ -14,6 +14,7 @@ import {
+   PHX_ERROR_CLASS,
+   PHX_SERVER_ERROR_CLASS,
+   PHX_HAS_FOCUSED,
++  PHX_LV_DEBUG,
+   MAX_CHILD_JOIN_ATTEMPTS,
+ } from "phoenix_live_view/constants";
+ 
+@@ -32,6 +33,22 @@ const simulateUsedInput = (input) => {
+   DOM.putPrivate(input, PHX_HAS_FOCUSED, true);
+ };
+ 
++// debug-level diagnostics are only emitted while debugging is enabled, so
++// enable it and capture everything dispatched until stop() is called
++const captureDebugDiagnostics = () => {
++  const consoleLog = jest.spyOn(console, "log").mockImplementation(() => {});
++  window.sessionStorage.setItem(PHX_LV_DEBUG, "true");
++  const { diagnostics, stop } = captureDiagnostics();
++  return {
++    diagnostics,
++    stop: () => {
++      stop();
++      window.sessionStorage.removeItem(PHX_LV_DEBUG);
++      consoleLog.mockRestore();
++    },
++  };
++};
++
+ describe("View + DOM", function () {
+   let liveSocket;
+ 
+@@ -847,6 +864,347 @@ describe("View + DOM", function () {
+       view.pushEvent("click", button, el, "inc", {});
+       expect(button.disabled).toEqual(true);
+     });
++
++    test("logs a diagnostic when invalid entries block a submit", () => {
++      const liveSocket = new LiveSocket("/live", Socket);
++      const el = liveViewDOM(`
++      <form id="upload-form" phx-submit="save">
++        <input type="file" name="avatar" id="uploads0" data-phx-upload-ref="0"
++          data-phx-active-refs="0" data-phx-done-refs="" data-phx-error-refs="0"
++          data-phx-preflighted-refs="" data-phx-update="ignore">
++      </form>
++      `);
++      const view = simulateJoinedView(el, liveSocket);
++      const form = view.el.querySelector("form")!;
++      const push = jest.spyOn(view, "pushWithReply");
++      const { diagnostics, stop } = captureDebugDiagnostics();
++      try {
++        view.pushFormSubmit(form, null, "save", null, {}, () => {});
++      } finally {
++        stop();
++      }
++      expect(push).not.toHaveBeenCalled();
++      expect(diagnostics).toContainEqual(
++        expect.objectContaining({
++          level: "debug",
++          code: "upload.submit-blocked",
++          message: "save not sent (entry-errors): avatar",
++          viewId: view.id,
++          metadata: expect.objectContaining({
++            event: "save",
++            reason: "entry-errors",
++            uploads: ["avatar"],
++            scheduled: false,
++          }),
++        }),
++      );
++    });
++
++    test("logs a diagnostic when the preflight rejects the entries of a submit", async () => {
++      const liveSocket = new LiveSocket("/live", Socket);
++      const el = liveViewDOM(`
++      <form id="upload-form" phx-submit="save">
++        <input type="file" name="avatar" id="uploads0" data-phx-upload-ref="0"
++          data-phx-active-refs="" data-phx-done-refs="" data-phx-preflighted-refs="">
++        <button id="submit" type="submit">Save</button>
++      </form>
++      `);
++      const view = simulateJoinedView(el, liveSocket);
++      const form = view.el.querySelector("form")!;
++      const button = form.querySelector("button")!;
++      const input = form.querySelector("input")!;
++      LiveUploader.trackFiles(input, [new File(["first"], "first.txt")]);
++      input.setAttribute(
++        "data-phx-active-refs",
++        LiveUploader.activeFiles(input)
++          .map((file) => LiveUploader.genFileRef(file))
++          .join(","),
++      );
++      // this is how an :external presign failure is reported by the server
++      const push = jest
++        .spyOn(view, "pushWithReply")
++        .mockImplementation((_ref, event, payload) => {
++          expect(event).toBe("allow_upload");
++          return Promise.resolve({
++            type: "ok",
++            resp: {
++              ref: "0",
++              error: [[payload.entries[0].ref, { reason: "presign failed" }]],
++            },
++          } as any);
++        });
++      const onReply = jest.fn();
++      const { diagnostics, stop } = captureDebugDiagnostics();
++      try {
++        view.pushFormSubmit(form, form, "save", button, {}, onReply);
++        expect(form.classList.contains("phx-submit-loading")).toBe(true);
++        await Promise.resolve();
++      } finally {
++        stop();
++      }
++      expect(push).toHaveBeenCalledTimes(1);
++      expect(onReply).not.toHaveBeenCalled();
++      expect(form.classList.contains("phx-submit-loading")).toBe(false);
++      expect(button.disabled).toBe(false);
++      expect(diagnostics).toContainEqual(
++        expect.objectContaining({
++          code: "upload.submit-blocked",
++          message: "save not sent (preflight-rejected): avatar",
++          metadata: expect.objectContaining({
++            reason: "preflight-rejected",
++            uploads: ["avatar"],
++          }),
++        }),
++      );
++    });
++
++    test("does not log a blocked submit when a change-triggered auto upload fails its preflight", async () => {
++      const liveSocket = new LiveSocket("/live", Socket);
++      const el = liveViewDOM(`
++      <form id="upload-form" phx-change="validate" phx-submit="save">
++        <input type="file" name="avatar" id="uploads0" data-phx-upload-ref="0"
++          data-phx-active-refs="" data-phx-done-refs="" data-phx-preflighted-refs=""
++          data-phx-auto-upload="">
++      </form>
++      `);
++      const view = simulateJoinedView(el, liveSocket);
++      const form = view.el.querySelector("form")!;
++      const input = form.querySelector("input")!;
++      LiveUploader.trackFiles(input, [new File(["first"], "first.txt")]);
++      input.setAttribute(
++        "data-phx-active-refs",
++        LiveUploader.activeFiles(input)
++          .map((file) => LiveUploader.genFileRef(file))
++          .join(","),
++      );
++      const pushes: string[] = [];
++      jest
++        .spyOn(view, "pushWithReply")
++        .mockImplementation((_ref, event, payload) => {
++          pushes.push(event);
++          if (event === "event") {
++            return Promise.resolve({ type: "ok", resp: {} } as any);
++          }
++          return Promise.resolve({
++            type: "ok",
++            resp: {
++              ref: "0",
++              error: [[payload.entries[0].ref, { reason: "presign failed" }]],
++            },
++          } as any);
++        });
++      const { diagnostics, stop } = captureDebugDiagnostics();
++      try {
++        view.pushInput(input, form, null, "validate", { _target: input.name });
++        await Promise.resolve();
++        await Promise.resolve();
++      } finally {
++        stop();
++      }
++      expect(pushes).toEqual(["event", "allow_upload"]);
++      expect(diagnostics).toContainEqual(
++        expect.objectContaining({ code: "upload.preflight-rejected" }),
++      );
++      expect(diagnostics).not.toContainEqual(
++        expect.objectContaining({ code: "upload.submit-blocked" }),
++      );
++    });
++
++    test("logs a diagnostic when a failed upload cancels a scheduled submit", () => {
++      const liveSocket = new LiveSocket("/live", Socket);
++      const el = liveViewDOM(`
++      <form id="upload-form" phx-submit="save">
++        <input type="file" name="avatar" id="uploads0" data-phx-upload-ref="0"
++          data-phx-active-refs="0" data-phx-done-refs="" data-phx-preflighted-refs="0">
++        <button id="submit" type="submit">Save</button>
++      </form>
++      `);
++      const view = simulateJoinedView(el, liveSocket);
++      const form = view.el.querySelector("form")!;
++      const button = form.querySelector("button")!;
++      const input = form.querySelector("input")!;
++      const push = jest.spyOn(view, "pushWithReply");
++      const { diagnostics, stop } = captureDebugDiagnostics();
++      const blocked = () =>
++        diagnostics.filter((d) => d.code === "upload.submit-blocked");
++      try {
++        // the upload is still in progress, so the submit is scheduled
++        view.pushFormSubmit(form, form, "save", button, {}, () => {});
++        expect(view.getScheduledSubmit(form)).toBeTruthy();
++        expect(button.disabled).toBe(true);
++        // dequeuing the scheduled submit to send it is not a block
++        view.triggerAwaitingSubmit(form);
++        expect(blocked()).toEqual([]);
++        expect(view.getScheduledSubmit(form)).toBeTruthy();
++        // the upload fails, as reported by EntryUploader.error
++        view.cancelSubmit(form, {
++          reason: "upload-failed",
++          inputs: [input],
++        });
++      } finally {
++        stop();
++      }
++      expect(view.getScheduledSubmit(form)).toBeUndefined();
++      expect(push).not.toHaveBeenCalled();
++      expect(form.classList.contains("phx-submit-loading")).toBe(false);
++      expect(button.disabled).toBe(false);
++      expect(blocked()).toEqual([
++        expect.objectContaining({
++          code: "upload.submit-blocked",
++          message: "scheduled save not sent (upload-failed): avatar",
++          metadata: expect.objectContaining({
++            event: "save",
++            reason: "upload-failed",
++            uploads: ["avatar"],
++            scheduled: true,
++          }),
++        }),
++      ]);
++    });
++
++    test("reports a rejected preflight once the uploads of the other inputs are done", async () => {
++      const entries: UploadEntry[] = [];
++      const liveSocket = new LiveSocket("/live", Socket, {
++        uploaders: { Test: (uploads) => entries.push(...uploads) },
++      });
++      const el = liveViewDOM(`
++      <form id="upload-form" phx-submit="save">
++        <input id="upload-0" type="file" name="files-0" data-phx-upload-ref="upload-ref-0"
++          data-phx-active-refs="" data-phx-preflighted-refs="" data-phx-done-refs="">
++        <input id="upload-1" type="file" name="files-1" data-phx-upload-ref="upload-ref-1"
++          data-phx-active-refs="" data-phx-preflighted-refs="" data-phx-done-refs="">
++        <button id="submit" type="submit">Save</button>
++      </form>
++      `);
++      const view = simulateJoinedView(el, liveSocket);
++      const form = view.el.querySelector("form")!;
++      const button = form.querySelector("button")!;
++      form.querySelectorAll("input").forEach((input, i) => {
++        LiveUploader.trackFiles(input, [
++          new File([`file ${i}`], `file-${i}.txt`),
++        ]);
++        input.setAttribute(
++          "data-phx-active-refs",
++          LiveUploader.activeFiles(input)
++            .map((file) => LiveUploader.genFileRef(file))
++            .join(","),
++        );
++      });
++      // the first input's preflight is rejected, the second one is accepted
++      jest
++        .spyOn(view, "pushWithReply")
++        .mockImplementation((_ref, _event, payload) => {
++          if (payload.ref === "upload-ref-0") {
++            return Promise.resolve({
++              type: "ok",
++              resp: {
++                ref: payload.ref,
++                error: [[payload.entries[0].ref, "too_large"]],
++              },
++            } as any);
++          }
++          return Promise.resolve({
++            type: "ok",
++            resp: {
++              entries: Object.fromEntries(
++                payload.entries.map((entry) => [
++                  entry.ref,
++                  { uploader: "Test" },
++                ]),
++              ),
++            },
++          } as any);
++        });
++      // reply to the progress push right away so the entry can complete
++      jest
++        .spyOn(view, "pushFileProgress")
++        .mockImplementation((_el, _ref, _progress, onReply) => {
++          onReply?.();
++        });
++      const onReply = jest.fn();
++      const { diagnostics, stop } = captureDebugDiagnostics();
++      try {
++        view.pushFormSubmit(form, form, "save", button, {}, onReply);
++        await Promise.resolve();
++        expect(entries).toHaveLength(1);
++        // the form stays locked while the accepted upload is still running
++        expect(form.classList.contains("phx-submit-loading")).toBe(true);
++        entries[0].progress(100);
++      } finally {
++        stop();
++      }
++      expect(view["activeUploaders"].size).toBe(0);
++      expect(onReply).not.toHaveBeenCalled();
++      expect(form.classList.contains("phx-submit-loading")).toBe(false);
++      expect(button.disabled).toBe(false);
++      expect(
++        diagnostics.filter((d) => d.code === "upload.submit-blocked"),
++      ).toEqual([
++        expect.objectContaining({
++          message: "save not sent (preflight-rejected): files-0",
++          metadata: expect.objectContaining({
++            reason: "preflight-rejected",
++            uploads: ["files-0"],
++          }),
++        }),
++      ]);
++    });
++
++    test("logs a diagnostic and releases the form when the preflight push fails", async () => {
++      const liveSocket = new LiveSocket("/live", Socket);
++      const el = liveViewDOM(`
++      <form id="upload-form" phx-submit="save">
++        <input type="file" name="avatar" id="uploads0" data-phx-upload-ref="0"
++          data-phx-active-refs="" data-phx-done-refs="" data-phx-preflighted-refs="">
++        <button id="submit" type="submit">Save</button>
++      </form>
++      `);
++      const view = simulateJoinedView(el, liveSocket);
++      const form = view.el.querySelector("form")!;
++      const button = form.querySelector("button")!;
++      const input = form.querySelector("input")!;
++      LiveUploader.trackFiles(input, [new File(["first"], "first.txt")]);
++      input.setAttribute(
++        "data-phx-active-refs",
++        LiveUploader.activeFiles(input)
++          .map((file) => LiveUploader.genFileRef(file))
++          .join(","),
++      );
++      jest.spyOn(view, "pushWithReply").mockImplementation(() =>
++        Promise.resolve({
++          type: "error",
++          error: "push timeout",
++          context: { attribution: "network" },
++        } as any),
++      );
++      const consoleError = jest
++        .spyOn(console, "error")
++        .mockImplementation(() => {});
++      const onReply = jest.fn();
++      const { diagnostics, stop } = captureDebugDiagnostics();
++      try {
++        view.pushFormSubmit(form, form, "save", button, {}, onReply);
++        expect(LiveUploader.inputsAwaitingPreflight(form)).toEqual([]);
++        await Promise.resolve();
++      } finally {
++        stop();
++        consoleError.mockRestore();
++      }
++      expect(onReply).not.toHaveBeenCalled();
++      expect(form.classList.contains("phx-submit-loading")).toBe(false);
++      expect(button.disabled).toBe(false);
++      // the entries are preflighted again on the next submit
++      expect(LiveUploader.inputsAwaitingPreflight(form)).toEqual([input]);
++      expect(diagnostics).toContainEqual(
++        expect.objectContaining({ level: "error", code: "upload.push-failed" }),
++      );
++      expect(diagnostics).toContainEqual(
++        expect.objectContaining({
++          code: "upload.submit-blocked",
++          message: "save not sent (preflight-failed): avatar",
++        }),
++      );
++    });
+   });
+ 
+   describe("phx-trigger-action", () => {
+@@ -2045,23 +2403,40 @@ describe("View Hooks", function () {
+       // No server progress reply is needed to release a failed upload.
+       jest.spyOn(view, "pushFileProgress").mockImplementation(() => {});
+       const onReply = jest.fn();
+-      view.pushFormSubmit(form, form, "save", button, {}, onReply);
+-      await Promise.resolve();
+-      expect(form.classList.contains("phx-submit-loading")).toBe(true);
+-      expect(button.disabled).toBe(true);
+-      expect(entries).toHaveLength(2);
+-
+-      entries[0].error("timeout");
+-      entries[0].error("closed");
+-      entries[0].cancel();
+-      expect(view["activeUploaders"].size).toBe(1);
+-      entries[1].cancel();
++      const { diagnostics, stop } = captureDebugDiagnostics();
++      try {
++        view.pushFormSubmit(form, form, "save", button, {}, onReply);
++        await Promise.resolve();
++        expect(form.classList.contains("phx-submit-loading")).toBe(true);
++        expect(button.disabled).toBe(true);
++        expect(entries).toHaveLength(2);
++
++        entries[0].error("timeout");
++        entries[0].error("closed");
++        entries[0].cancel();
++        expect(view["activeUploaders"].size).toBe(1);
++        entries[1].cancel();
++      } finally {
++        stop();
++      }
+ 
+       expect(view["activeUploaders"].size).toBe(0);
+       expect(form.classList.contains("phx-submit-loading")).toBe(false);
+       expect(button.disabled).toBe(false);
+       expect(push).toHaveBeenCalledTimes(Number(numInputs));
+       expect(onReply).not.toHaveBeenCalled();
++      // only the input whose upload failed is named
++      expect(diagnostics).toContainEqual(
++        expect.objectContaining({
++          code: "upload.submit-blocked",
++          message: "save not sent (upload-failed): files-0",
++          metadata: expect.objectContaining({
++            reason: "upload-failed",
++            uploads: ["files-0"],
++            scheduled: false,
++          }),
++        }),
++      );
+     },
+   );
+ 

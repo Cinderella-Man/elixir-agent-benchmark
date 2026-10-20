@@ -1,0 +1,168 @@
+diff --git a/lib/oban/peers/global.ex b/lib/oban/peers/global.ex
+index 3cabf9e7..252d2c5c 100644
+--- a/lib/oban/peers/global.ex
++++ b/lib/oban/peers/global.ex
+@@ -69,7 +69,14 @@ defmodule Oban.Peers.Global do
+ 
+   @impl GenServer
+   def handle_info(:election, %State{} = state) do
+-    locked? = :global.set_lock(key(state), nodes(), 0)
++    meta = %{conf: state.conf, leader: state.leader?, peer: __MODULE__}
++
++    locked? =
++      :telemetry.span([:oban, :peer, :election], meta, fn ->
++        locked? = :global.set_lock(key(state), nodes(), 0)
++
++        {locked?, %{meta | leader: locked?}}
++      end)
+ 
+     {:noreply, schedule_election(%{state | leader?: locked?})}
+   end
+diff --git a/lib/oban/peers/postgres.ex b/lib/oban/peers/postgres.ex
+index 1d74a98d..1feae3f6 100644
+--- a/lib/oban/peers/postgres.ex
++++ b/lib/oban/peers/postgres.ex
+@@ -86,11 +86,18 @@ defmodule Oban.Peers.Postgres do
+ 
+   @impl GenServer
+   def handle_info(:election, %State{} = state) do
+-    {:ok, state} =
+-      Repo.transaction(state.conf, fn ->
+-        state
+-        |> delete_expired_peers()
+-        |> upsert_peer()
++    meta = %{conf: state.conf, leader: state.leader?, peer: __MODULE__}
++
++    state =
++      :telemetry.span([:oban, :peer, :election], meta, fn ->
++        {:ok, state} =
++          Repo.transaction(state.conf, fn ->
++            state
++            |> delete_expired_peers()
++            |> upsert_peer()
++          end)
++
++        {state, %{meta | leader: state.leader?}}
+       end)
+ 
+     {:noreply, schedule_election(state)}
+diff --git a/lib/oban/telemetry.ex b/lib/oban/telemetry.ex
+index 5e3fc374..896d8249 100644
+--- a/lib/oban/telemetry.ex
++++ b/lib/oban/telemetry.ex
+@@ -95,7 +95,7 @@ defmodule Oban.Telemetry do
+ 
+   ### Notifier Events
+ 
+-  Oban emits telemetry a span event each time the Notifier is triggered:
++  Oban emits a telemetry span event each time the Notifier is triggered:
+ 
+   * `[:oban, :notifier, :notify, :start | :stop | :exception]`
+ 
+@@ -139,6 +139,25 @@ defmodule Oban.Telemetry do
+   | `:stop`      | `:duration`     | `:conf`, `:plugin`                                    |
+   | `:exception` | `:duration`     | `:conf`, `:plugin`, `:kind`, `:reason`, `:stacktrace` |
+ 
++  ### Peer Events
++
++  Oban emits a telemetry span event each time an Oban Peer election occurs:
++
++  * `[:oban, :peer, :election, :start | :stop | :exception]`
++
++  | event        | measures       | metadata                                                       |
++  | ------------ | -------------- | -------------------------------------------------------        |
++  | `:start`     | `:system_time` | `:conf`, `:leader`, `:peer`,                        |
++  | `:stop`      | `:duration`    | `:conf`, `:leader`, `:peer`,                        |
++  | `:exception` | `:duration`    | `:conf`, `:leader`, `:peer`, `:kind`, `:reason`, `:stacktrace` |
++
++  #### Metadata
++
++  * `:conf`, `:kind`, `:reason`, `:stacktrace` — see the explanation in notifier metadata above
++  * `:leader` — whether the peer is the current leader
++  * `:peer` — the module used for peering
++
++
+   ## Default Logger
+ 
+   A default log handler that emits structured JSON is provided, see `attach_default_logger/0` for
+diff --git a/test/oban/peers/global_test.exs b/test/oban/peers/global_test.exs
+index c33d392d..fb2a10a6 100644
+--- a/test/oban/peers/global_test.exs
++++ b/test/oban/peers/global_test.exs
+@@ -3,8 +3,11 @@ defmodule Oban.Peers.GlobalTest do
+ 
+   alias Oban.Peer
+   alias Oban.Peers.Global
++  alias Oban.TelemetryHandler
+ 
+   test "only a single peer is leader" do
++    TelemetryHandler.attach_events()
++
+     name_1 = start_supervised_oban!(peer: Global, node: "worker.1", plugins: false)
+     name_2 = start_supervised_oban!(peer: Global, node: "worker.2", plugins: false)
+ 
+@@ -15,5 +18,8 @@ defmodule Oban.Peers.GlobalTest do
+     peer_2 = start_supervised!({Peer, conf: conf_2, name: B})
+ 
+     assert [_leader] = Enum.filter([peer_1, peer_2], &Global.leader?/1)
++
++    assert_receive {:event, [:election, :start], _measure, %{leader: _, peer: Oban.Peers.Global}}
++    assert_receive {:event, [:election, :stop], _measure, %{leader: _, peer: Oban.Peers.Global}}
+   end
+ end
+diff --git a/test/oban/peers/postgres_test.exs b/test/oban/peers/postgres_test.exs
+index 1bd3c394..34f89e4d 100644
+--- a/test/oban/peers/postgres_test.exs
++++ b/test/oban/peers/postgres_test.exs
+@@ -5,8 +5,11 @@ defmodule Oban.Peers.PostgresTest do
+ 
+   alias Oban.Peer
+   alias Oban.Peers.Postgres
++  alias Oban.TelemetryHandler
+ 
+   test "only a single peer is leader" do
++    TelemetryHandler.attach_events()
++
+     name = start_supervised_oban!(peer: false)
+     conf = %{Oban.config(name) | peer: Postgres}
+ 
+@@ -14,6 +17,9 @@ defmodule Oban.Peers.PostgresTest do
+              [A, B, C]
+              |> Enum.map(&start_supervised!({Peer, conf: conf, name: &1}))
+              |> Enum.filter(&Postgres.leader?/1)
++
++    assert_received {:event, [:election, :start], _measure, %{leader: _, peer: Postgres}}
++    assert_received {:event, [:election, :stop], _measure, %{leader: _, peer: Postgres}}
+   end
+ 
+   test "gacefully handling a missing oban_peers table" do
+diff --git a/test/support/telemetry_handler.ex b/test/support/telemetry_handler.ex
+index 33457073..2600dd39 100644
+--- a/test/support/telemetry_handler.ex
++++ b/test/support/telemetry_handler.ex
+@@ -7,7 +7,13 @@ defmodule Oban.TelemetryHandler do
+   import ExUnit.Callbacks, only: [on_exit: 1]
+ 
+   @span_tail [:start, :stop, :exception]
+-  @span_type [:job, :plugin, [:engine, :insert_job], [:engine, :insert_all_jobs]]
++  @span_type [
++    :job,
++    :plugin,
++    [:engine, :insert_job],
++    [:engine, :insert_all_jobs],
++    [:peer, :election]
++  ]
+ 
+   def attach_events(opts \\ []) do
+     span_tail = Keyword.get(opts, :span_tail, @span_tail)
+@@ -47,6 +53,10 @@ defmodule Oban.TelemetryHandler do
+     send(pid, {:event, event, measure, meta})
+   end
+ 
++  def handle([:oban, :peer | event], measure, meta, pid) do
++    send(pid, {:event, event, measure, meta})
++  end
++
+   def handle(event, measure, meta, pid) do
+     send(pid, {:event, event, measure, meta})
+   end

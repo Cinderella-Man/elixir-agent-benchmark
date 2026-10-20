@@ -1,0 +1,376 @@
+diff --git a/docs/features/cache-warming/reactive-warming.md b/docs/features/cache-warming/reactive-warming.md
+index 2137380c..e07eb0db 100644
+--- a/docs/features/cache-warming/reactive-warming.md
++++ b/docs/features/cache-warming/reactive-warming.md
+@@ -56,7 +56,15 @@ The new `Courier` service in Cachex v3 will actually queue the second and third
+ 
+ ## Expirations
+ 
+-If you wish to set an expiration on a value retrieved via a fallback execution, you can use the return value of your cache call to determine when it's appropriate. In the case your value was retrieved via a fallback, the first value in the returned Tuple will be the `:commit` (or `:ignore`) atom to signify that the value was loaded via a fallback. You can use this to conditionally set an expiration if you need to, but note that if your cache has a defined default TTL, it will be applied to fallback values automatically.
++Sometimes you might want to set an expiration based on a value retrieved via a fallback execution. For this case, as of Cachex v3.6.0, you can (finally) provide expiration options in your returned `:commit` tuple.
++
++```elixir
++Cachex.fetch(:my_cache, "key", fn ->
++  { :commit, do_something(), ttl: :timer.seconds(60) }
++end)
++```
++
++This inlining is faster than previous solutions, while maintaining correctness and being easy to use. If you are using an older version of Cachex, you can conditionally assign an expiration based on the return value of your cache call in the case of a cache `:commit`:
+ 
+ ```elixir
+ # retrieve the value from the cache, match if loaded
+@@ -66,9 +74,11 @@ with { :commit, value } = res <- Cachex.fetch(:my_cache, "key") do
+ end
+ ```
+ 
++Also note that if your cache has a defined default TTL, it will be applied to fallback values automatically.
++
+ ## Use Cases
+ 
+-Fallbacks allow you to build very simple bindings using a cache in order to reduce overhead on your backing systems. A very common use case is to use a cachex instance with fallbacks to a remote system to lower the jumps across network. With effective use of expirations and fallbacks, you can ensure that your application doesn't receive stale data and yet minimizes network overhead and the number of remote operations.
++Fallbacks allow you to build very simple bindings using a cache in order to reduce overhead on your backing systems. A very common use case is to use a `Cachex` instance with fallbacks to a remote system to lower the jumps across network. With effective use of expirations and fallbacks, you can ensure that your application doesn't receive stale data and yet minimizes network overhead and the number of remote operations.
+ 
+ The snippet below demonstrates an application using a cache to read from a remote database **at most** every 5 minutes, and retrieves the cached value from local memory in the meantime:
+ 
+diff --git a/lib/cachex.ex b/lib/cachex.ex
+index eca4c5b5..ae496ba1 100644
+--- a/lib/cachex.ex
++++ b/lib/cachex.ex
+@@ -643,6 +643,12 @@ defmodule Cachex do
+   cache. If you return a value which does not fit this structure, it
+   will be assumed that you are committing the value.
+ 
++  As of Cachex v3.6, you can also provide a third element in a `:commit`
++  Tuple, to allow passthrough of options from within your fallback. The
++  options supported in this list match the options you can provide to a
++  call of `put/4`. An example is the `:ttl` option to set an expiration
++  from directly inside your fallback.
++
+   If a fallback function has an arity of 1, the requested entry key
+   will be passed through to allow for contextual computation. If a
+   function has an arity of 2, the `:provide` option from the global
+@@ -672,9 +678,14 @@ defmodule Cachex do
+       ...> end)
+       { :commit, "yek_gnissim" }
+ 
++      iex> Cachex.fetch(:my_cache, "missing_key_ttl", fn(key) ->
++      ...>   { :commit, String.reverse(key), ttl: :timer.seconds(60) }
++      ...> end)
++      { :commit, "ltt_yek_gnissim", [ttl: 60000] }
++
+   """
+   @spec fetch(cache, any, function | nil, Keyword.t()) ::
+-          {status | :commit | :ignore, any}
++          {status | :commit | :ignore, any} | {:commit, any, any}
+   def fetch(cache, key, fallback \\ nil, options \\ []) when is_list(options) do
+     Overseer.enforce cache do
+       case fallback || fallback(cache(cache, :fallback), :default) do
+@@ -713,7 +724,9 @@ defmodule Cachex do
+   This function accepts the same return syntax as fallback functions, in that if
+   you return a Tuple of the form `{ :ignore, value }`, the value is returned from
+   the call but is not written to the cache. You can use this to abandon writes
+-  which began eagerly (for example if a key is actually missing).
++  which began eagerly (for example if a key is actually missing)
++
++  See the `fetch/4` documentation for more information on return formats.
+ 
+   ## Examples
+ 
+diff --git a/lib/cachex/actions.ex b/lib/cachex/actions.ex
+index 70a3b6d8..0d52063e 100644
+--- a/lib/cachex/actions.ex
++++ b/lib/cachex/actions.ex
+@@ -16,6 +16,44 @@ defmodule Cachex.Actions do
+   # Public API #
+   ##############
+ 
++  @doc """
++  Formats a fetched value into a Courier compatible tuple.
++
++  If the value is tagged with `:commit`, `:ignore` or `:error`,
++  it will be left alone; otherwise it will be wrapped and treated
++  as a `:commit` Tuple.
++  """
++  def format_fetch_value(value) do
++    case value do
++      {:error, _value} ->
++        value
++
++      {:commit, _value} ->
++        value
++
++      {:commit, _value, _options} ->
++        value
++
++      {:ignore, _value} ->
++        value
++
++      raw_value ->
++        {:commit, raw_value}
++    end
++  end
++
++  @doc """
++  Normalizes a commit formatted fetch value.
++
++  This is simply compatibility for the options addition in v3.5, without
++  breaking the previous versions of this library.
++  """
++  def normalize_commit({:commit, value}),
++    do: {:commit, value, []}
++
++  def normalize_commit(value),
++    do: value
++
+   @doc """
+   Retrieves an entry from a cache.
+ 
+@@ -73,33 +111,4 @@ defmodule Cachex.Actions do
+ 
+   def write_op(_tag),
+     do: :update
+-
+-  ##########
+-  # Macros #
+-  ##########
+-
+-  @doc """
+-  Normalizes a value into a Courier-friendly tagged Tuple.
+-
+-  If the value is tagged with `:commit`, `:ignore` or `:error`,
+-  it will be left alone; otherwise it will be wrapped and treated
+-  as a `:commit` Tuple.
+-  """
+-  defmacro normalize_commit(value) do
+-    quote bind_quoted: [value: value] do
+-      case value do
+-        {:error, _value} ->
+-          value
+-
+-        {:commit, _value} ->
+-          value
+-
+-        {:ignore, _value} ->
+-          value
+-
+-        raw_value ->
+-          {:commit, raw_value}
+-      end
+-    end
+-  end
+ end
+diff --git a/lib/cachex/actions/get_and_update.ex b/lib/cachex/actions/get_and_update.ex
+index c4843670..295646de 100644
+--- a/lib/cachex/actions/get_and_update.ex
++++ b/lib/cachex/actions/get_and_update.ex
+@@ -5,10 +5,10 @@ defmodule Cachex.Actions.GetAndUpdate do
+   # This command is simply sugar, but is common enough that it deserved an explicit
+   # implementation inside the API. It does take care of the transactional context
+   # of the get/update semantics though, so it's potentially non-obvious.
++  alias Cachex.Actions
+   alias Cachex.Services.Locksmith
+ 
+   # add needed imports
+-  import Cachex.Actions
+   import Cachex.Spec
+ 
+   ##############
+@@ -31,16 +31,19 @@ defmodule Cachex.Actions.GetAndUpdate do
+     Locksmith.transaction(cache, [key], fn ->
+       {_label, value} = Cachex.get(cache, key, [])
+ 
+-      normalized =
++      formatted =
+         value
+         |> update_fun.()
+-        |> normalize_commit
++        |> Actions.format_fetch_value()
+ 
+-      with {:commit, new_value} <- normalized do
+-        apply(Cachex, write_op(value), [cache, key, new_value, []])
++      operation = Actions.write_op(value)
++      normalized = Actions.normalize_commit(formatted)
++
++      with {:commit, new_value, options} <- normalized do
++        apply(Cachex, operation, [cache, key, new_value, options])
+       end
+ 
+-      normalized
++      formatted
+     end)
+   end
+ end
+diff --git a/lib/cachex/services/courier.ex b/lib/cachex/services/courier.ex
+index 64496c4f..36630fc7 100644
+--- a/lib/cachex/services/courier.ex
++++ b/lib/cachex/services/courier.ex
+@@ -14,10 +14,10 @@ defmodule Cachex.Services.Courier do
+   use GenServer
+ 
+   # import spec macros
+-  import Cachex.Actions
+   import Cachex.Spec
+ 
+   # add some aliases
++  alias Cachex.Actions
+   alias Cachex.Actions.Put
+   alias Cachex.ExecutionError
+ 
+@@ -86,13 +86,14 @@ defmodule Cachex.Services.Courier do
+                   }
+               end
+ 
+-            normalized = normalize_commit(result)
++            formatted = Actions.format_fetch_value(result)
++            normalized = Actions.normalize_commit(formatted)
+ 
+-            with {:commit, val} <- normalized do
+-              Put.execute(cache, key, val, const(:notify_false))
++            with {:commit, val, options} <- normalized do
++              Put.execute(cache, key, val, [const(:notify_false) | options])
+             end
+ 
+-            send(parent, {:notify, key, normalized})
++            send(parent, {:notify, key, formatted})
+           end)
+ 
+           [caller]
+@@ -123,10 +124,15 @@ defmodule Cachex.Services.Courier do
+       GenServer.reply(owner, result)
+ 
+       result =
+-        if elem(result, 0) == :commit do
+-          put_elem(result, 0, :ok)
+-        else
+-          result
++        case result do
++          {:commit, value, _} ->
++            {:ok, value}
++
++          {:commit, value} ->
++            {:ok, value}
++
++          value ->
++            value
+         end
+ 
+       for caller <- listeners do
+diff --git a/test/cachex/actions/fetch_test.exs b/test/cachex/actions/fetch_test.exs
+index 76644538..c655ef95 100644
+--- a/test/cachex/actions/fetch_test.exs
++++ b/test/cachex/actions/fetch_test.exs
+@@ -138,6 +138,27 @@ defmodule Cachex.Actions.FetchTest do
+     end
+   end
+ 
++  test "fetching and setting an expiration on a key from a fallback" do
++    # create a test cache
++    cache = Helper.create_cache()
++
++    # create a fallback with an expiration
++    purged = [ttl: 60000]
++    fb_opt = &{:commit, String.reverse(&1), purged}
++
++    # fetch our key using our fallback
++    result = Cachex.fetch(cache, "key", fb_opt)
++
++    # verify fetching an existing key
++    assert(result == {:commit, "yek", purged})
++
++    # fetch back the expiration of the key
++    expiration = Cachex.ttl!(cache, "key")
++
++    # check we have a set expiration
++    assert_in_delta(expiration, 60000, 250)
++  end
++
+   # This test verifies that this action is correctly distributed across
+   # a cache cluster, instead of just the local node. We're not concerned
+   # about the actual behaviour here, only the routing of the action.
+diff --git a/test/cachex/actions_test.exs b/test/cachex/actions_test.exs
+index 9332f2c2..6a9f74c7 100644
+--- a/test/cachex/actions_test.exs
++++ b/test/cachex/actions_test.exs
+@@ -115,28 +115,47 @@ defmodule Cachex.ActionsTest do
+   # This test just ensures that we correctly convert return values to either a
+   # :commit Tuple or an :ignore Tuple. We also make sure to verify that the default
+   # behaviour is a :commit Tuple for backwards compatibility.
+-  test "normalizing commit/ignore return values" do
++  test "formatting commit/ignore return values" do
+     # define our base Tuples to test against
+     tuple1 = {:commit, true}
+     tuple2 = {:ignore, true}
+     tuple3 = {:error, true}
++    tuple4 = {:commit, true, []}
+ 
+     # define our base value
+     value1 = true
+ 
+-    # normalize all values
+-    result1 = Cachex.Actions.normalize_commit(tuple1)
+-    result2 = Cachex.Actions.normalize_commit(tuple2)
+-    result3 = Cachex.Actions.normalize_commit(tuple3)
+-    result4 = Cachex.Actions.normalize_commit(value1)
++    # format all values
++    result1 = Cachex.Actions.format_fetch_value(tuple1)
++    result2 = Cachex.Actions.format_fetch_value(tuple2)
++    result3 = Cachex.Actions.format_fetch_value(tuple3)
++    result4 = Cachex.Actions.format_fetch_value(tuple4)
++    result5 = Cachex.Actions.format_fetch_value(value1)
+ 
+     # the first three should persist
+     assert(result1 == tuple1)
+     assert(result2 == tuple2)
+     assert(result3 == tuple3)
++    assert(result4 == tuple4)
+ 
+     # the value should be converted to the first
+-    assert(result4 == tuple1)
++    assert(result5 == tuple1)
++  end
++
++  # Simple test to ensure that commit normalization correctly assigns
++  # options to a commit tuple without, and maintains those with.
++  test "normalizing formatted :commit values" do
++    # define our base Tuples to test against
++    tuple1 = {:commit, true}
++    tuple2 = {:commit, true, []}
++
++    # normalize all values
++    result1 = Cachex.Actions.normalize_commit(tuple1)
++    result2 = Cachex.Actions.normalize_commit(tuple2)
++
++    # both should have options
++    assert(result1 == tuple2)
++    assert(result2 == tuple2)
+   end
+ 
+   # This test just provides basic coverage of the write_op function, by using
+diff --git a/test/cachex/services/courier_test.exs b/test/cachex/services/courier_test.exs
+index d7fb0736..3cb8f406 100644
+--- a/test/cachex/services/courier_test.exs
++++ b/test/cachex/services/courier_test.exs
+@@ -28,7 +28,8 @@ defmodule Cachex.Services.CourierTest do
+ 
+     # define our task function
+     task = fn ->
+-      :timer.sleep(250) && "my_value"
++      :timer.sleep(250)
++      {:commit, "my_value", ttl: :timer.seconds(60)}
+     end
+ 
+     # start a new cache
+@@ -44,10 +45,10 @@ defmodule Cachex.Services.CourierTest do
+     # dispatch an arbitrary task from the current process
+     result = Services.Courier.dispatch(cache, "my_key", task)
+ 
+-    # check the returned value
+-    assert result == {:commit, "my_value"}
++    # check the returned value with the options set
++    assert result == {:commit, "my_value", [ttl: 60000]}
+ 
+-    # check the forwarded task completed
++    # check the forwarded task completed (no options)
+     assert_receive({:ok, "my_value"})
+ 
+     # check the key was placed in the table

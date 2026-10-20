@@ -1,0 +1,444 @@
+diff --git a/lib/phoenix/controller.ex b/lib/phoenix/controller.ex
+index 9b56e6fc05..1fdb96339f 100644
+--- a/lib/phoenix/controller.ex
++++ b/lib/phoenix/controller.ex
+@@ -504,22 +504,17 @@ defmodule Phoenix.Controller do
+     end
+   end
+ 
+-  @invalid_local_url_chars ["\\", "/%09", "/\t"]
+-  defp validate_local_url("//" <> _ = to), do: raise_invalid_url(to)
++  defp validate_local_url(to) do
++    case Phoenix.URL.classify_local_path(to) do
++      :ok ->
++        to
+ 
+-  defp validate_local_url("/" <> _ = to) do
+-    if String.contains?(to, @invalid_local_url_chars) do
+-      raise ArgumentError, "unsafe characters detected for local redirect in URL #{inspect(to)}"
+-    else
+-      to
+-    end
+-  end
++      {:error, :invalid} ->
++        raise ArgumentError, "the :to option in redirect expects a path but was #{inspect(to)}"
+ 
+-  defp validate_local_url(to), do: raise_invalid_url(to)
+-
+-  @spec raise_invalid_url(term()) :: no_return()
+-  defp raise_invalid_url(url) do
+-    raise ArgumentError, "the :to option in redirect expects a path but was #{inspect(url)}"
++      {:error, :unsafe} ->
++        raise ArgumentError, "unsafe characters detected for local redirect in URL #{inspect(to)}"
++    end
+   end
+ 
+   @doc """
+diff --git a/lib/phoenix/endpoint/supervisor.ex b/lib/phoenix/endpoint/supervisor.ex
+index 9c5f1909fd..2d8cbfe76d 100644
+--- a/lib/phoenix/endpoint/supervisor.ex
++++ b/lib/phoenix/endpoint/supervisor.ex
+@@ -283,26 +283,8 @@ defmodule Phoenix.Endpoint.Supervisor do
+   The result is wrapped in a `{:cache | :nocache, value}` tuple so
+   the `Phoenix.Config` layer knows how to cache it.
+   """
+-  @invalid_local_url_chars ["\\"]
+-
+-  def static_lookup(_endpoint, "//" <> _ = path) do
+-    raise_invalid_path(path)
+-  end
+-
+-  def static_lookup(_endpoint, "/" <> _ = path) do
+-    if String.contains?(path, @invalid_local_url_chars) do
+-      raise ArgumentError, "unsafe characters detected for path #{inspect(path)}"
+-    else
+-      {:nocache, {path, nil}}
+-    end
+-  end
+-
+-  def static_lookup(_endpoint, path) when is_binary(path) do
+-    raise_invalid_path(path)
+-  end
+-
+-  defp raise_invalid_path(path) do
+-    raise ArgumentError, "expected a path starting with a single / but got #{inspect(path)}"
++  def static_lookup(_endpoint, path) do
++    {:nocache, {Phoenix.URL.validate_local_path!(path), nil}}
+   end
+ 
+   # TODO: Remove the first function clause once {:system, env_var} tuples are removed
+diff --git a/lib/phoenix/url.ex b/lib/phoenix/url.ex
+new file mode 100644
+index 0000000000..9cddab631b
+--- /dev/null
++++ b/lib/phoenix/url.ex
+@@ -0,0 +1,47 @@
++defmodule Phoenix.URL do
++  @moduledoc false
++
++  # Characters a browser's URL parser removes or reinterprets, which would let
++  # a path that looks local here resolve to another origin once parsed.
++  #
++  # `\n` and `\r` are matched anywhere on purpose: with those rejected outright,
++  # the only remaining parser-stripped character is the tab, so a leading `/`
++  # can only reach a second `/` through tabs and `"/\t"` is enough to catch it.
++  # Listing them positionally would allow `"/\n\t/example.com"`.
++  @invalid_local_url_chars ["\\", "/%09", "/\t", "\n", "\r"]
++
++  @doc """
++  Classifies `path` as a local path that is safe to hand to a browser.
++
++  Returns `:ok`, `{:error, :invalid}` when it is not a path at all or is
++  already scheme-relative, or `{:error, :unsafe}` when it carries characters
++  that would change the origin once parsed.
++  """
++  def classify_local_path("//" <> _), do: {:error, :invalid}
++
++  def classify_local_path("/" <> _ = path) do
++    if String.contains?(path, @invalid_local_url_chars) do
++      {:error, :unsafe}
++    else
++      :ok
++    end
++  end
++
++  def classify_local_path(_path), do: {:error, :invalid}
++
++  @doc """
++  Returns `path` if it is a safe local path, raises otherwise.
++  """
++  def validate_local_path!(path) do
++    case classify_local_path(path) do
++      :ok ->
++        path
++
++      {:error, :invalid} ->
++        raise ArgumentError, "expected a path starting with a single / but got #{inspect(path)}"
++
++      {:error, :unsafe} ->
++        raise ArgumentError, "unsafe characters detected for path #{inspect(path)}"
++    end
++  end
++end
+diff --git a/lib/phoenix/verified_routes.ex b/lib/phoenix/verified_routes.ex
+index becc69ac9f..1c02d19ec2 100644
+--- a/lib/phoenix/verified_routes.ex
++++ b/lib/phoenix/verified_routes.ex
+@@ -232,7 +232,7 @@ defmodule Phoenix.VerifiedRoutes do
+ 
+             k == :router ->
+               raise ArgumentError,
+-                ":router option in VerifiedRoutes must be a literal module, got: #{Macro.to_string(v)}"
++                    ":router option in VerifiedRoutes must be a literal module, got: #{Macro.to_string(v)}"
+ 
+             true ->
+               {k, v}
+@@ -595,8 +595,11 @@ defmodule Phoenix.VerifiedRoutes do
+ 
+   def static_url(%Plug.Conn{private: private}, path) do
+     case private do
+-      %{phoenix_static_url: static_url} -> concat_url(static_url, path)
+-      %{phoenix_endpoint: endpoint} -> static_url(endpoint, path)
++      %{phoenix_static_url: static_url} ->
++        concat_url(static_url, Phoenix.URL.validate_local_path!(path))
++
++      %{phoenix_endpoint: endpoint} ->
++        static_url(endpoint, path)
+     end
+   end
+ 
+@@ -627,7 +630,11 @@ defmodule Phoenix.VerifiedRoutes do
+   """
+   def unverified_url(conn_or_socket_or_endpoint_or_uri, path, params \\ %{})
+       when (is_map(params) or is_list(params)) and is_binary(path) do
+-    guarded_unverified_url(conn_or_socket_or_endpoint_or_uri, path, params)
++    guarded_unverified_url(
++      conn_or_socket_or_endpoint_or_uri,
++      validate_unverified_path!(path),
++      params
++    )
+   end
+ 
+   defp guarded_unverified_url(%Plug.Conn{private: private}, path, params) do
+@@ -655,6 +662,12 @@ defmodule Phoenix.VerifiedRoutes do
+             "or a Phoenix.Endpoint when building url at #{path}, got: #{inspect(other)}"
+   end
+ 
++  # Unlike the other path helpers, "" is meaningful here: it is how the router
++  # helpers ask for the endpoint URL itself. Every other value is validated as
++  # we do in other places.
++  defp validate_unverified_path!(""), do: ""
++  defp validate_unverified_path!(path), do: Phoenix.URL.validate_local_path!(path)
++
+   defp concat_url(url, path) when is_binary(path), do: url <> path
+ 
+   defp concat_url(url, path, params) when is_binary(path) do
+@@ -684,13 +697,13 @@ defmodule Phoenix.VerifiedRoutes do
+ 
+   def static_path(%Plug.Conn{private: private}, path) do
+     case private do
+-      %{phoenix_static_url: _} -> path
++      %{phoenix_static_url: _} -> Phoenix.URL.validate_local_path!(path)
+       %{phoenix_endpoint: endpoint} -> endpoint.static_path(path)
+     end
+   end
+ 
+   def static_path(%URI{} = uri, path) do
+-    (uri.path || "") <> path
++    (uri.path || "") <> Phoenix.URL.validate_local_path!(path)
+   end
+ 
+   def static_path(%_{endpoint: endpoint}, path) do
+@@ -713,8 +726,16 @@ defmodule Phoenix.VerifiedRoutes do
+       "/posts?page=1"
+   """
+   def unverified_path(conn_or_socket_or_endpoint_or_uri, router, path, params \\ %{})
++      when (is_map(params) or is_list(params)) and is_binary(path) do
++    guarded_unverified_path(
++      conn_or_socket_or_endpoint_or_uri,
++      router,
++      validate_unverified_path!(path),
++      params
++    )
++  end
+ 
+-  def unverified_path(%Plug.Conn{} = conn, router, path, params) do
++  defp guarded_unverified_path(%Plug.Conn{} = conn, router, path, params) do
+     conn
+     |> build_own_forward_path(router, path)
+     |> Kernel.||(build_conn_forward_path(conn, router, path))
+@@ -722,19 +743,19 @@ defmodule Phoenix.VerifiedRoutes do
+     |> append_params(params)
+   end
+ 
+-  def unverified_path(%URI{} = uri, _router, path, params) do
++  defp guarded_unverified_path(%URI{} = uri, _router, path, params) do
+     append_params((uri.path || "") <> path, params)
+   end
+ 
+-  def unverified_path(%_{endpoint: endpoint}, router, path, params) do
+-    unverified_path(endpoint, router, path, params)
++  defp guarded_unverified_path(%_{endpoint: endpoint}, router, path, params) do
++    guarded_unverified_path(endpoint, router, path, params)
+   end
+ 
+-  def unverified_path(endpoint, _router, path, params) when is_atom(endpoint) do
++  defp guarded_unverified_path(endpoint, _router, path, params) when is_atom(endpoint) do
+     append_params(endpoint.path(path), params)
+   end
+ 
+-  def unverified_path(other, router, path, _params) do
++  defp guarded_unverified_path(other, router, path, _params) do
+     raise ArgumentError,
+           "expected a %Plug.Conn{}, a %Phoenix.Socket{}, a %URI{}, a struct with an :endpoint key, " <>
+             "or a Phoenix.Endpoint when building path for #{inspect(router)} at #{path}, got: #{inspect(other)}"
+diff --git a/test/phoenix/controller/controller_test.exs b/test/phoenix/controller/controller_test.exs
+index 8e0259956f..feb8442e2b 100644
+--- a/test/phoenix/controller/controller_test.exs
++++ b/test/phoenix/controller/controller_test.exs
+@@ -433,6 +433,18 @@ defmodule Phoenix.Controller.ControllerTest do
+       assert_raise ArgumentError, ~r/unsafe/, fn ->
+         redirect(conn(:get, "/"), to: "/\t/example.com")
+       end
++
++      assert_raise ArgumentError, ~r/unsafe/, fn ->
++        redirect(conn(:get, "/"), to: "/\n/example.com")
++      end
++
++      assert_raise ArgumentError, ~r/unsafe/, fn ->
++        redirect(conn(:get, "/"), to: "/\r/example.com")
++      end
++
++      assert_raise ArgumentError, ~r/unsafe/, fn ->
++        redirect(conn(:get, "/"), to: "/\n\t/example.com")
++      end
+     end
+ 
+     test "with :external" do
+diff --git a/test/phoenix/endpoint/endpoint_test.exs b/test/phoenix/endpoint/endpoint_test.exs
+index 5a31718b3a..4340151af4 100644
+--- a/test/phoenix/endpoint/endpoint_test.exs
++++ b/test/phoenix/endpoint/endpoint_test.exs
+@@ -356,6 +356,19 @@ defmodule Phoenix.Endpoint.EndpointTest do
+     assert_raise ArgumentError, ~r/expected a path starting with a single/, fn ->
+       Endpoint.static_path("//invalid_path")
+     end
++
++    # characters a browser's URL parser strips, turning the path scheme-relative
++    for unsafe <- [
++          "/\t/example.com",
++          "/%09/example.com",
++          "/\n/example.com",
++          "/\r/example.com",
++          "/\n\t/example.com"
++        ] do
++      assert_raise ArgumentError, ~r/unsafe characters/, fn ->
++        Endpoint.static_path(unsafe)
++      end
++    end
+   end
+ 
+   test "static_integrity/1 validates paths are local/safe" do
+@@ -369,6 +382,19 @@ defmodule Phoenix.Endpoint.EndpointTest do
+     assert_raise ArgumentError, ~r/expected a path starting with a single/, fn ->
+       Endpoint.static_integrity("//invalid_path")
+     end
++
++    # characters a browser's URL parser strips, turning the path scheme-relative
++    for unsafe <- [
++          "/\t/example.com",
++          "/%09/example.com",
++          "/\n/example.com",
++          "/\r/example.com",
++          "/\n\t/example.com"
++        ] do
++      assert_raise ArgumentError, ~r/unsafe characters/, fn ->
++        Endpoint.static_integrity(unsafe)
++      end
++    end
+   end
+ 
+   test "validates websocket and longpoll socket options" do
+diff --git a/test/phoenix/verified_routes_test.exs b/test/phoenix/verified_routes_test.exs
+index bb74f05de1..8d5ddd68e6 100644
+--- a/test/phoenix/verified_routes_test.exs
++++ b/test/phoenix/verified_routes_test.exs
+@@ -262,6 +262,22 @@ defmodule Phoenix.VerifiedRoutesTest do
+     assert unverified_path(@endpoint, @router, "/posts", a: "b") == "/posts?a=b"
+   end
+ 
++  test "unverified_path validates the path" do
++    assert unverified_path(@endpoint, @router, "") == ""
++
++    for path <- ["//invalid/x", "@invalid/x", "invalid/x"] do
++      assert_raise ArgumentError, ~r/expected a path starting with a single/, fn ->
++        unverified_path(@endpoint, @router, path)
++      end
++    end
++
++    for path <- ["/\t/invalid/x", "/\n/invalid/x", "/\\invalid/x"] do
++      assert_raise ArgumentError, ~r/unsafe characters/, fn ->
++        unverified_path(@endpoint, @router, path)
++      end
++    end
++  end
++
+   test "unverified_url" do
+     assert unverified_url(conn_with_script_name(), "/posts") == "https://example.com/posts"
+     assert unverified_url(@endpoint, "/posts") == "https://example.com/posts"
+@@ -269,6 +285,27 @@ defmodule Phoenix.VerifiedRoutesTest do
+     assert unverified_url(@endpoint, "/posts", a: "b") == "https://example.com/posts?a=b"
+   end
+ 
++  test "unverified_url validates the path" do
++    # "" is how the router helpers ask for the endpoint url itself
++    assert unverified_url(@endpoint, "") == "https://example.com"
++    assert unverified_url(@endpoint, "", a: "b") == "https://example.com?a=b"
++
++    # a path that does not start with / lands in the authority instead
++    for path <- ["@invalid/landing", ".invalid/x", "invalid/x"] do
++      assert_raise ArgumentError, ~r/expected a path starting with a single/, fn ->
++        unverified_url(@endpoint, path)
++      end
++    end
++
++    assert_raise ArgumentError, ~r/expected a path starting with a single/, fn ->
++      unverified_url(%URI{scheme: "https", host: "example.com"}, "@invalid/landing")
++    end
++
++    assert_raise ArgumentError, ~r/unsafe characters/, fn ->
++      unverified_url(@endpoint, "/\n/invalid/x")
++    end
++  end
++
+   test "~p raises on leftover sigil" do
+     assert_raise ArgumentError, "~p does not support modifiers after closing, got: foo", fn ->
+       defmodule LeftOver do
+@@ -459,6 +496,66 @@ defmodule Phoenix.VerifiedRoutesTest do
+     assert ~p"/ø" == "/%C3%B8"
+   end
+ 
++  describe "static path validation" do
++    @unsafe_static_paths [
++      "/\t/attacker.example/p.js",
++      "/\n/attacker.example/p.js",
++      "/\r/attacker.example/p.js",
++      "/\n\t/attacker.example/p.js",
++      "/%09/attacker.example/p.js",
++      "/\\attacker.example/p.js"
++    ]
++
++    test "static_path/2 validates the path when phoenix_static_url is set" do
++      conn = Phoenix.Controller.put_static_url(conn_with_endpoint(), "https://cdn.example")
++
++      assert Phoenix.VerifiedRoutes.static_path(conn, "/images/foo.png") == "/images/foo.png"
++
++      assert_raise ArgumentError, ~r/expected a path starting with a single/, fn ->
++        Phoenix.VerifiedRoutes.static_path(conn, "//attacker.example/p.js")
++      end
++
++      for path <- @unsafe_static_paths do
++        assert_raise ArgumentError, ~r/unsafe characters/, fn ->
++          Phoenix.VerifiedRoutes.static_path(conn, path)
++        end
++      end
++    end
++
++    test "static_url/2 validates the path when phoenix_static_url is set" do
++      conn = Phoenix.Controller.put_static_url(conn_with_endpoint(), "https://cdn.example")
++
++      assert Phoenix.VerifiedRoutes.static_url(conn, "/images/foo.png") ==
++               "https://cdn.example/images/foo.png"
++
++      assert_raise ArgumentError, ~r/expected a path starting with a single/, fn ->
++        Phoenix.VerifiedRoutes.static_url(conn, "//attacker.example/p.js")
++      end
++
++      for path <- @unsafe_static_paths do
++        assert_raise ArgumentError, ~r/unsafe characters/, fn ->
++          Phoenix.VerifiedRoutes.static_url(conn, path)
++        end
++      end
++    end
++
++    test "static_path/2 validates the path for a %URI{} context" do
++      uri = uri_with_script_name()
++
++      assert Phoenix.VerifiedRoutes.static_path(uri, "/images/foo.png") == "/api/images/foo.png"
++
++      assert_raise ArgumentError, ~r/expected a path starting with a single/, fn ->
++        Phoenix.VerifiedRoutes.static_path(uri, "//attacker.example/p.js")
++      end
++
++      for path <- @unsafe_static_paths do
++        assert_raise ArgumentError, ~r/unsafe characters/, fn ->
++          Phoenix.VerifiedRoutes.static_path(uri, path)
++        end
++      end
++    end
++  end
++
+   describe "with static path" do
+     @endpoint StaticPath
+     @router Router
+@@ -697,12 +794,14 @@ defmodule Phoenix.VerifiedRoutesTest do
+     end
+ 
+     test "raises when :router is not a literal module" do
+-      assert_raise ArgumentError, ~r/:router option in VerifiedRoutes must be a literal module/, fn ->
+-        defmodule DynamicRouter do
+-          use Phoenix.VerifiedRoutes,
+-            router: Module.concat(["My", "Router"])
+-        end
+-      end
++      assert_raise ArgumentError,
++                   ~r/:router option in VerifiedRoutes must be a literal module/,
++                   fn ->
++                     defmodule DynamicRouter do
++                       use Phoenix.VerifiedRoutes,
++                         router: Module.concat(["My", "Router"])
++                     end
++                   end
+     after
+       :code.purge(__MODULE__.DynamicRouter)
+       :code.delete(__MODULE__.DynamicRouter)

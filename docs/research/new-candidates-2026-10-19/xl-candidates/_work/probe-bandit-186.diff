@@ -1,0 +1,477 @@
+diff --git a/README.md b/README.md
+index 242cbaa9..f3c0bd7b 100644
+--- a/README.md
++++ b/README.md
+@@ -58,7 +58,8 @@ foundational work that is approachable & understandable by users above it in the
+   9113](https://datatracker.ietf.org/doc/html/rfc9113) & [RFC
+   9110](https://datatracker.ietf.org/doc/html/rfc9110), comprehensively covered
+   by automated [h2spec](https://github.com/summerwind/h2spec) conformance
+-  testing
++  testing. Though deprecated, Bandit also supports h2c upgrades as
++  specified in [RFC7540](https://datatracker.ietf.org/doc/html/rfc7540)
+ * Support for HTTP content encoding compression on both HTTP/1.x and HTTP/2.
+   gzip and deflate methods are supported per
+   [RFC9110§8.4.1.{2,3}](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.4.1.2)
+diff --git a/lib/bandit/headers.ex b/lib/bandit/headers.ex
+index 0305e7cb..d554ef6b 100644
+--- a/lib/bandit/headers.ex
++++ b/lib/bandit/headers.ex
+@@ -55,6 +55,23 @@ defmodule Bandit.Headers do
+     end
+   end
+ 
++  @spec get_connection_header_keys(Plug.Conn.headers()) ::
++          {:ok, [String.t()]} | {:error, String.t()}
++  def get_connection_header_keys(headers) do
++    case Bandit.Headers.get_header(headers, "connection") do
++      nil ->
++        {:error, "Expected connection header"}
++
++      value ->
++        header_keys =
++          value
++          |> String.downcase()
++          |> Plug.Conn.Utils.list()
++
++        {:ok, header_keys}
++    end
++  end
++
+   @spec parse_content_length(binary()) :: {:ok, non_neg_integer()} | {:error, String.t()}
+   defp parse_content_length(value) do
+     case parse_integer(value) do
+diff --git a/lib/bandit/http1/handler.ex b/lib/bandit/http1/handler.ex
+index 8ab132e4..c291b5fc 100644
+--- a/lib/bandit/http1/handler.ex
++++ b/lib/bandit/http1/handler.ex
+@@ -25,6 +25,8 @@ defmodule Bandit.HTTP1.Handler do
+            req <- %{req | transport_info: transport_info},
+            {:ok, headers, method, request_target, req} <-
+              Bandit.HTTP1.Adapter.read_headers(req),
++           {:ok, :no_upgrade} <-
++             maybe_upgrade_h2c(state, req, transport_info, method, request_target, headers),
+            {:ok, %Plug.Conn{adapter: {Bandit.HTTP1.Adapter, req}} = conn} <-
+              Bandit.Pipeline.run(
+                {Bandit.HTTP1.Adapter, req},
+@@ -54,6 +56,16 @@ defmodule Bandit.HTTP1.Handler do
+             )
+ 
+           {:switch, Bandit.WebSocket.Handler, state}
++
++        {:ok, :h2c, req, remote_settings, initial_request} ->
++          Bandit.Telemetry.stop_span(span, req.metrics)
++
++          state =
++            state
++            |> Map.put(:remote_settings, remote_settings)
++            |> Map.put(:initial_request, initial_request)
++
++          {:switch, Bandit.HTTP2.Handler, state}
+       end
+     rescue
+       exception ->
+@@ -88,6 +100,57 @@ defmodule Bandit.HTTP1.Handler do
+     end
+   end
+ 
++  defp maybe_upgrade_h2c(state, req, transport_info, method, request_target, headers) do
++    with {:http_2_enabled, true} <- {:http_2_enabled, state.http_2_enabled},
++         {:upgrade, "h2c"} <- {:upgrade, Bandit.Headers.get_header(headers, "upgrade")},
++         %Bandit.TransportInfo{secure?: false} <- transport_info,
++         {:ok, connection_headers} <- Bandit.Headers.get_connection_header_keys(headers),
++         {:ok, remote_settings} <- get_h2c_remote_settings(headers),
++         {:ok, data, req} <- do_read_req_body(req),
++         resp_headers = [{"connection", "Upgrade"}, {"upgrade", "h2c"}],
++         {:ok, _sent_body, req} <- Bandit.HTTP1.Adapter.send_resp(req, 101, resp_headers, <<>>) do
++      headers =
++        Enum.reject(headers, fn {key, _value} ->
++          key == "connection" || key in connection_headers
++        end)
++
++      initial_request = {method, request_target, headers, data}
++
++      {:ok, :h2c, req, remote_settings, initial_request}
++    else
++      {:http_2_enabled, false} -> {:ok, :no_upgrade}
++      {:upgrade, _} -> {:ok, :no_upgrade}
++      %Bandit.TransportInfo{secure?: true} -> {:error, "h2c must use http (RFC7540§3.2)"}
++      {:error, error} -> {:error, error}
++    end
++  end
++
++  # This function is only used during h2c upgrades
++  defp do_read_req_body(req, acc \\ <<>>)
++
++  defp do_read_req_body(_req, acc) when byte_size(acc) >= 8_000_000, do: {:error, :body_too_large}
++
++  defp do_read_req_body(req, acc) do
++    case Bandit.HTTP1.Adapter.read_req_body(req, []) do
++      {:ok, chunk, req} -> {:ok, acc <> chunk, req}
++      {:more, chunk, req} -> do_read_req_body(req, acc <> chunk)
++      {:error, error} -> {:error, error}
++    end
++  end
++
++  defp get_h2c_remote_settings(headers) do
++    with {:settings, [{"http2-settings", settings_payload}]} <-
++           {:settings, Enum.filter(headers, fn {key, _value} -> key == "http2-settings" end)},
++         {:ok, remote_settings} <- Base.url_decode64(settings_payload, padding: false),
++         {:ok, %{settings: remote_settings}} <-
++           Bandit.HTTP2.Frame.Settings.deserialize(0, 0, remote_settings) do
++      {:ok, remote_settings}
++    else
++      {:settings, _} -> {:error, "Expected exactly 1 http2-settings header (RFC7540§3.2.1)"}
++      _error -> {:error, "Invalid http2-settings value (RFC7540§3.2.1)"}
++    end
++  end
++
+   def handle_info({:plug_conn, :sent}, {socket, state}),
+     do: {:noreply, {socket, state}, socket.read_timeout}
+ 
+diff --git a/lib/bandit/http2/connection.ex b/lib/bandit/http2/connection.ex
+index 817edf58..ec828662 100644
+--- a/lib/bandit/http2/connection.ex
++++ b/lib/bandit/http2/connection.ex
+@@ -33,6 +33,9 @@ defmodule Bandit.HTTP2.Connection do
+   @typedoc "A description of a connection error"
+   @type error :: {:connection, Errors.error_code(), String.t()}
+ 
++  @type initial_request ::
++          {Plug.Conn.method(), Bandit.Pipeline.request_target(), Plug.Conn.headers(), binary()}
++
+   @typedoc "Encapsulates the state of an HTTP/2 connection"
+   @type t :: %__MODULE__{
+           local_settings: Settings.t(),
+@@ -50,8 +53,15 @@ defmodule Bandit.HTTP2.Connection do
+           opts: keyword()
+         }
+ 
+-  @spec init(Socket.t(), Bandit.Pipeline.plug_def(), keyword()) :: {:ok, t()} | no_return()
+-  def init(socket, plug, opts) do
++  @spec init(
++          Socket.t(),
++          Bandit.Pipeline.plug_def(),
++          keyword(),
++          initial_request() | nil,
++          Settings.t() | nil
++        ) ::
++          {:ok, t()} | {:close, term()} | {:error, term(), term()} | no_return()
++  def init(socket, plug, opts, initial_request \\ nil, remote_settings \\ nil) do
+     transport_info =
+       case Bandit.TransportInfo.init(socket) do
+         {:ok, transport_info} -> transport_info
+@@ -60,6 +70,7 @@ defmodule Bandit.HTTP2.Connection do
+ 
+     connection = %__MODULE__{
+       local_settings: struct!(Settings, Keyword.get(opts, :default_local_settings, [])),
++      remote_settings: remote_settings || %Settings{},
+       transport_info: transport_info,
+       telemetry_span: ThousandIsland.Socket.telemetry_span(socket),
+       plug: plug,
+@@ -71,7 +82,11 @@ defmodule Bandit.HTTP2.Connection do
+       %Frame.Settings{ack: false, settings: connection.local_settings}
+       |> send_frame(socket, connection)
+ 
+-    {:ok, connection}
++    if is_nil(initial_request) do
++      {:ok, connection}
++    else
++      handle_initial_request(initial_request, socket, connection)
++    end
+   end
+ 
+   #
+@@ -199,18 +214,7 @@ defmodule Bandit.HTTP2.Connection do
+          {:hpack, {:ok, headers, recv_hpack_state}} <-
+            {:hpack, HPAX.decode(block, connection.recv_hpack_state)},
+          {:ok, stream} <- StreamCollection.get_stream(connection.streams, frame.stream_id),
+-         true <- accept_stream?(connection),
+-         true <- accept_headers?(headers, connection.opts, stream),
+-         {:ok, stream} <-
+-           Stream.recv_headers(
+-             stream,
+-             connection.transport_info,
+-             connection.telemetry_span,
+-             headers,
+-             end_stream,
+-             connection.plug,
+-             connection.opts
+-           ),
++         {:ok, stream} <- handle_headers(headers, stream, end_stream, connection),
+          {:ok, stream} <- Stream.recv_end_of_stream(stream, end_stream),
+          {:ok, streams} <- StreamCollection.put_stream(connection.streams, stream) do
+       {:continue, %{connection | recv_hpack_state: recv_hpack_state, streams: streams}}
+@@ -322,6 +326,21 @@ defmodule Bandit.HTTP2.Connection do
+     {:continue, connection}
+   end
+ 
++  defp handle_headers(headers, stream, end_stream, connection) do
++    with true <- accept_stream?(connection),
++         true <- accept_headers?(headers, connection.opts, stream) do
++      Stream.recv_headers(
++        stream,
++        connection.transport_info,
++        connection.telemetry_span,
++        headers,
++        end_stream,
++        connection.plug,
++        connection.opts
++      )
++    end
++  end
++
+   defp accept_stream?(connection) do
+     max_requests = Keyword.get(connection.opts, :max_requests, 0)
+ 
+@@ -513,4 +532,29 @@ defmodule Bandit.HTTP2.Connection do
+   defp send_frame(frame, socket, connection) do
+     Socket.send(socket, Frame.serialize(frame, connection.remote_settings.max_frame_size))
+   end
++
++  defp handle_initial_request({method, request_target, headers, data}, socket, connection) do
++    {_, _, _, path} = request_target
++    headers = [{":scheme", "http"}, {":method", method}, {":path", path} | headers]
++
++    with {:ok, stream} <- StreamCollection.get_stream(connection.streams, 1),
++         {:ok, stream} <- handle_headers(headers, stream, true, connection),
++         {:ok, stream, _stream_window_increment} <- Stream.recv_data(stream, data),
++         {:ok, stream} <- Stream.recv_end_of_stream(stream, true),
++         {:ok, streams} <- StreamCollection.put_stream(connection.streams, stream) do
++      {:ok, %{connection | streams: streams}}
++    else
++      {:error, {:connection, error_code, error_message}} ->
++        shutdown_connection(error_code, error_message, socket, connection)
++
++      {:error, {:stream, stream_id, error_code, error_message}} ->
++        {:continue, connection} =
++          handle_stream_error(stream_id, error_code, error_message, socket, connection)
++
++        {:ok, connection}
++
++      {:error, error} ->
++        shutdown_connection(Errors.internal_error(), error, socket, connection)
++    end
++  end
+ end
+diff --git a/lib/bandit/http2/handler.ex b/lib/bandit/http2/handler.ex
+index 414a7779..6aaedb9e 100644
+--- a/lib/bandit/http2/handler.ex
++++ b/lib/bandit/http2/handler.ex
+@@ -12,9 +12,16 @@ defmodule Bandit.HTTP2.Handler do
+ 
+   @impl ThousandIsland.Handler
+   def handle_connection(socket, state) do
+-    {:ok, connection} = Connection.init(socket, state.plug, state.opts.http_2)
+-
+-    {:continue, state |> Map.merge(%{buffer: <<>>, connection: connection})}
++    with {:ok, connection} <-
++           Connection.init(
++             socket,
++             state.plug,
++             state.opts.http_2,
++             Map.get(state, :initial_request),
++             Map.get(state, :remote_settings)
++           ) do
++      {:continue, state |> Map.merge(%{buffer: <<>>, connection: connection})}
++    end
+   end
+ 
+   @impl ThousandIsland.Handler
+diff --git a/test/bandit/http2/h2c_test.exs b/test/bandit/http2/h2c_test.exs
+new file mode 100644
+index 00000000..84e77b87
+--- /dev/null
++++ b/test/bandit/http2/h2c_test.exs
+@@ -0,0 +1,192 @@
++defmodule H2CTest do
++  use ExUnit.Case, async: false
++  use ServerHelpers
++
++  import ExUnit.CaptureLog
++
++  def echo_protocol(conn) do
++    conn
++    |> send_resp(200, to_string(get_http_protocol(conn)))
++  end
++
++  def echo_components(conn) do
++    send_resp(
++      conn,
++      200,
++      conn |> Map.take([:scheme, :host, :port, :path_info, :query_string]) |> Jason.encode!()
++    )
++  end
++
++  def echo_body(conn) do
++    {:ok, body, conn} = read_body(conn)
++    send_resp(conn, 200, body)
++  end
++
++  describe "h2c handling over TCP" do
++    setup :http_server
++
++    test "upgrade to HTTP/2 over TCP using h2c header", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      SimpleHTTP1Client.send(client, "GET", "/echo_protocol", [
++        "Connection: Upgrade, HTTP2-Settings",
++        "Host: banana",
++        "Upgrade: h2c",
++        "HTTP2-Settings: "
++      ])
++
++      {:ok, upgrade_response} = Transport.recv(client, 108)
++
++      assert {:ok, "101 Switching Protocols", headers, <<>>} =
++               SimpleHTTP1Client.parse_response(client, upgrade_response)
++
++      assert Enum.any?(headers, fn {key, value} -> key == :connection && value == "Upgrade" end)
++      assert Enum.any?(headers, fn {key, value} -> key == :upgrade && value == "h2c" end)
++
++      assert {:ok, <<0, 0, 0, 4, 0, 0, 0, 0, 0>>} = Transport.recv(client, 9)
++
++      Transport.send(client, <<0, 0, 0, 4, 1, 0, 0, 0, 0>>)
++
++      assert {:ok, 1, false, _headers, recv_ctx} = SimpleH2Client.recv_headers(client)
++      assert SimpleH2Client.recv_body(client) == {:ok, 1, true, "HTTP/2"}
++
++      {:ok, _send_ctx} =
++        SimpleH2Client.send_simple_headers(client, 3, :get, "/echo_components", context.port)
++
++      assert {:ok, 3, false, _headers, _recv_ctx} = SimpleH2Client.recv_headers(client, recv_ctx)
++      {:ok, 3, true, body} = SimpleH2Client.recv_body(client)
++
++      assert Jason.decode!(body)["path_info"] == ["echo_components"]
++      assert Jason.decode!(body)["query_string"] == ""
++    end
++
++    test "initial upgrade request body is handled", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      SimpleHTTP1Client.send(client, "GET", "/echo_body", [
++        "Connection: Upgrade, HTTP2-Settings",
++        "Host: banana",
++        "Upgrade: h2c",
++        "HTTP2-Settings: ",
++        "Content-Length: 8"
++      ])
++
++      Transport.send(client, "req_body")
++
++      {:ok, upgrade_response} = Transport.recv(client, 108)
++
++      assert {:ok, "101 Switching Protocols", headers, <<>>} =
++               SimpleHTTP1Client.parse_response(client, upgrade_response)
++
++      assert Enum.any?(headers, fn {key, value} -> key == :connection && value == "Upgrade" end)
++      assert Enum.any?(headers, fn {key, value} -> key == :upgrade && value == "h2c" end)
++
++      assert {:ok, <<0, 0, 0, 4, 0, 0, 0, 0, 0>>} = Transport.recv(client, 9)
++
++      Transport.send(client, <<0, 0, 0, 4, 1, 0, 0, 0, 0>>)
++
++      assert {:ok, 1, false, _headers, _recv_ctx} = SimpleH2Client.recv_headers(client)
++      assert SimpleH2Client.recv_body(client) == {:ok, 1, true, "req_body"}
++    end
++
++    test "fails when initial upgrade request body too large", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      errors =
++        capture_log(fn ->
++          SimpleHTTP1Client.send(client, "GET", "/echo_body", [
++            "Connection: Upgrade, HTTP2-Settings",
++            "Host: banana",
++            "Upgrade: h2c",
++            "HTTP2-Settings: ",
++            "Content-Length: 9000000"
++          ])
++
++          Transport.send(client, String.duplicate("a", 9_000_000))
++          Process.sleep(100)
++        end)
++
++      assert {:ok, "400 Bad Request", _headers, <<>>} = SimpleHTTP1Client.recv_reply(client)
++
++      assert errors =~ "body_too_large"
++    end
++
++    test "fails with invalid url_base64 value in HTTP2-Settings header", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      errors =
++        capture_log(fn ->
++          SimpleHTTP1Client.send(client, "GET", "/echo_protocol", [
++            "Connection: Upgrade, HTTP2-Settings",
++            "Host: banana",
++            "Upgrade: h2c",
++            "HTTP2-Settings: mumbojumbo!"
++          ])
++
++          Process.sleep(100)
++        end)
++
++      assert {:ok, "400 Bad Request", _headers, <<>>} = SimpleHTTP1Client.recv_reply(client)
++
++      assert errors =~ "Invalid http2-settings value (RFC7540§3.2.1)"
++    end
++
++    test "fails with invalid settings in HTTP2-Settings header", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      errors =
++        capture_log(fn ->
++          SimpleHTTP1Client.send(client, "GET", "/echo_protocol", [
++            "Connection: Upgrade, HTTP2-Settings",
++            "Host: banana",
++            "Upgrade: h2c",
++            "HTTP2-Settings: YWxpd2FzaGVyZQ"
++          ])
++
++          Process.sleep(100)
++        end)
++
++      {:ok, upgrade_response} = Transport.recv(client, 0)
++
++      assert {:ok, "400 Bad Request", _headers, <<>>} =
++               SimpleHTTP1Client.parse_response(client, upgrade_response)
++
++      assert errors =~ "Invalid http2-settings value (RFC7540§3.2.1)"
++    end
++  end
++
++  test "rejects h2c over TLS", context do
++    context = https_server(context)
++    client = Transport.tls_client(context, ["http/1.1"])
++
++    errors =
++      capture_log(fn ->
++        SimpleHTTP1Client.send(client, "GET", "/echo_protocol", [
++          "Connection: Upgrade, HTTP2-Settings",
++          "Host: banana",
++          "Upgrade: h2c",
++          "HTTP2-Settings: "
++        ])
++
++        Process.sleep(100)
++      end)
++
++    assert {:ok, "400 Bad Request", _, <<>>} = SimpleHTTP1Client.recv_reply(client)
++    assert errors =~ "h2c must use http (RFC7540§3.2)"
++  end
++
++  test "ignores h2c when http2 is disabled", context do
++    context = http_server(context, http_2_options: [enabled: false])
++
++    client = SimpleHTTP1Client.tcp_client(context)
++
++    SimpleHTTP1Client.send(client, "GET", "/echo_protocol", [
++      "Connection: Upgrade, HTTP2-Settings",
++      "Host: banana",
++      "Upgrade: h2c",
++      "HTTP2-Settings: "
++    ])
++
++    assert {:ok, "200 OK", _, "HTTP/1.1"} = SimpleHTTP1Client.recv_reply(client)
++  end
++end

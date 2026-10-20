@@ -1,0 +1,1894 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 36627be77..f8b16dd96 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -94,6 +94,12 @@ when adding or removing one.
+   (`Workers.DeliverWebhook`), signed per Standard Webhooks, and only reach
+   public addresses unless the instance allows otherwise. Event types and
+   payloads are a published contract; see [docs/webhooks.md](docs/webhooks.md).
++- `integrations/slack.ex` / `integrations/slack/` — the Slack integration: workspaces an organization
++  connects by installing the instance's Slack app (`NervesHubWeb.Integrations.Slack.OAuthController`
++  runs the OAuth flow), and the events Slack sends to `/integrations/slack/`,
++  which must be signed (`Integrations.Slack.VerifyRequest`). One bot token per
++  workspace, encrypted at rest with `Types.Encrypted`. Hidden unless the
++  instance has a Slack app; see [docs/slack.md](docs/slack.md).
+ - `scripts.ex` / `scripts/` — support scripts run against a device console.
+ - `workers/` — Oban workers (e.g. firmware delta building, firmware deletion).
+ - Cross-cutting: `audit_logs.ex`, `product_notifications.ex`, `tracker.ex`,
+diff --git a/config/dev.exs b/config/dev.exs
+index e8c1e45ba..a8fa78278 100644
+--- a/config/dev.exs
++++ b/config/dev.exs
+@@ -1,6 +1,7 @@
+ import Config
+ 
+ alias NervesHub.DeviceLink.PeerVerification
++alias NervesHub.Types.Encrypted
+ alias OpenApiSpex.Plug.NoneCache
+ alias Swoosh.Adapters.Local
+ 
+@@ -104,6 +105,10 @@ else
+   config :nerves_hub, analytics_enabled: false
+ end
+ 
++# Encrypts the secrets NervesHub holds for others (Slack bot tokens) in the
++# dev database. Not a secret: production sets its own.
++config :nerves_hub, Encrypted, key: Base.decode64!("ZGV2LWtleS1kZXYta2V5LWRldi1rZXktZGV2LWtleS0=")
++
+ config :nerves_hub, NervesHub.Firmwares.Upload.File,
+   enabled: true,
+   local_path: Path.expand("tmp/firmware"),
+diff --git a/config/runtime.exs b/config/runtime.exs
+index ba47bb8c0..d1eac6fe8 100644
+--- a/config/runtime.exs
++++ b/config/runtime.exs
+@@ -4,8 +4,10 @@ alias NervesHub.DeviceLink.PeerVerification
+ alias NervesHub.Devices.DeviceMessages
+ alias NervesHub.Firmwares.Upload
+ alias NervesHub.Firmwares.Upload.S3
++alias NervesHub.Integrations.Slack
+ alias NervesHub.Repo
+ alias NervesHub.Telemetry.FilteredSampler
++alias NervesHub.Types.Encrypted
+ alias Sentry.OpenTelemetry.Sampler
+ alias Sentry.OpenTelemetry.SpanProcessor
+ alias Swoosh.Adapters.SMTP
+@@ -41,6 +43,31 @@ if allow_private = System.get_env("WEBHOOKS_ALLOW_PRIVATE_DESTINATIONS") do
+   config :nerves_hub, NervesHub.Webhooks, allow_private_destinations: allow_private == "true"
+ end
+ 
++# A Slack app for this instance (docs/slack.md). The integration stays hidden
++# unless all three are set.
++if System.get_env("SLACK_CLIENT_ID") do
++  config :nerves_hub, Slack,
++    client_id: System.get_env("SLACK_CLIENT_ID"),
++    client_secret: System.get_env("SLACK_CLIENT_SECRET"),
++    signing_secret: System.get_env("SLACK_SIGNING_SECRET")
++end
++
++# Encrypts the secrets NervesHub holds on others' behalf, such as Slack bot
++# tokens (`NervesHub.Types.Encrypted`).
++if encoded_key = System.get_env("SECRETS_ENCRYPTION_KEY") do
++  case Base.decode64(encoded_key) do
++    {:ok, <<_::binary-32>> = key} ->
++      config :nerves_hub, Encrypted, key: key
++
++    _ ->
++      raise "SECRETS_ENCRYPTION_KEY must be 32 bytes, base64 encoded, such as the output of `openssl rand -base64 32`"
++  end
++else
++  if System.get_env("SLACK_CLIENT_ID") && config_env() == :prod do
++    raise "SLACK_CLIENT_ID is set, so SECRETS_ENCRYPTION_KEY must be too: Slack bot tokens are encrypted with it"
++  end
++end
++
+ config :nerves_hub, :device_socket_drainer,
+   batch_size: String.to_integer(System.get_env("DEVICE_SOCKET_DRAINER_BATCH_SIZE", "1000")),
+   batch_interval: String.to_integer(System.get_env("DEVICE_SOCKET_DRAINER_BATCH_INTERVAL", "4000")),
+diff --git a/config/test.exs b/config/test.exs
+index a1a142279..ae0385696 100644
+--- a/config/test.exs
++++ b/config/test.exs
+@@ -4,6 +4,8 @@ alias NervesHub.DeviceLink.Dispatcher
+ alias NervesHub.DeviceLink.Dispatcher.Remote
+ alias NervesHub.DeviceLink.PeerVerification
+ alias NervesHub.Firmwares.Upload.S3
++alias NervesHub.Integrations.Slack
++alias NervesHub.Types.Encrypted
+ alias Swoosh.Adapters.Test
+ 
+ config :bcrypt_elixir, log_rounds: 4
+@@ -11,6 +13,8 @@ config :bcrypt_elixir, log_rounds: 4
+ # Print only warnings and errors during test
+ config :logger, level: :warning
+ 
++config :nerves_hub, Encrypted, key: Base.decode64!("dGVzdC1rZXktdGVzdC1rZXktdGVzdC1rZXktdGVzdC0=")
++
+ config :nerves_hub, NervesHub.AnalyticsRepo,
+   url: System.get_env("CLICKHOUSE_URL", "http://default:@localhost:8123/default_test")
+ 
+@@ -80,6 +84,13 @@ config :nerves_hub, NervesHubWeb.Endpoint,
+ 
+ config :nerves_hub, Oban, testing: :manual
+ config :nerves_hub, S3, bucket: "mybucket"
++
++config :nerves_hub, Slack,
++  client_id: "test-client-id",
++  client_secret: "test-client-secret",
++  signing_secret: "test-signing-secret",
++  req_options: [plug: {Req.Test, Slack}]
++
+ # Short enough that analytics writes land within an `assert_eventually`.
+ config :nerves_hub, :analytics_buffer, max_delay: to_timeout(millisecond: 50)
+ config :nerves_hub, :firmware_download_options, plug: {Req.Test, NervesHub}
+diff --git a/docs/runtime_configuration.md b/docs/runtime_configuration.md
+index 96ee8900d..ee111d554 100644
+--- a/docs/runtime_configuration.md
++++ b/docs/runtime_configuration.md
+@@ -300,6 +300,17 @@ Read in every environment. See [Webhooks](webhooks.md).
+ | --- | --- | --- |
+ | `WEBHOOKS_ALLOW_PRIVATE_DESTINATIONS` | `false` (`true` in dev) | Whether webhooks may deliver to loopback, private, link-local and other non-public addresses. Off, a webhook can only reach public addresses: a URL with a literal private address is refused when saved, and a host name is resolved at delivery and refused if any address it resolves to is private. That is what stops a member of any organization pointing a webhook at the cloud metadata service or another internal service. Turn it on for a self-hosted instance whose receivers are on its own network, and only if every member of every organization on the instance is trusted to reach that network. |
+ 
++## Slack
++
++Read in every environment. See [Slack](slack.md) for creating the Slack app these come from. The integration is hidden unless all three Slack variables are set.
++
++| Variable | Default | Description |
++| --- | --- | --- |
++| `SLACK_CLIENT_ID` | — | The Slack app's client ID, from its **Basic Information** page. |
++| `SLACK_CLIENT_SECRET` | — | The Slack app's client secret, used to exchange an install's code for its bot token. |
++| `SLACK_SIGNING_SECRET` | — | The Slack app's signing secret. Requests to `/integrations/slack/` without a valid signature are refused. |
++| `SECRETS_ENCRYPTION_KEY` | — (a fixed key in dev and test) | 32 random bytes, base64 encoded (`openssl rand -base64 32`). Encrypts secrets NervesHub holds for others, such as Slack bot tokens, before they are stored. Required in prod when `SLACK_CLIENT_ID` is set. Changing it makes the stored secrets unreadable, so connected workspaces would have to be connected again. |
++
+ ## Branding and UI
+ 
+ Read in every environment.
+diff --git a/docs/slack.md b/docs/slack.md
+new file mode 100644
+index 000000000..4fee5f37e
+--- /dev/null
++++ b/docs/slack.md
+@@ -0,0 +1,75 @@
++# Slack
++
++An organization can connect Slack workspaces on its **Integrations** page. Connecting a workspace installs this instance's Slack app there, through Slack's own install screen.
++
++The integration is only shown when the instance has a Slack app configured. NervesCloud has one. A self-hosted instance needs its own, set up as below.
++
++## Connecting a workspace
++
++An organization admin clicks **Add to Slack** and approves the install in Slack. Slack sends them back to the Integrations page, where the workspace is listed with who connected it.
++
++- A workspace can be connected to more than one organization. Each connection is separate, and disconnecting one leaves the others.
++- Installing again in a connected workspace refreshes its token and scopes, without connecting it twice.
++- Organization-wide installs on Slack Enterprise Grid are refused. Install the app in a single workspace instead.
++
++**Disconnect** removes the connection. When it was the last organization connected to that workspace, NervesHub also revokes the app's token, which removes the app from the workspace. If someone removes the app from inside Slack, NervesHub hears about it and disconnects every organization connected to that workspace. Each of these is recorded in the organization's audit log.
++
++## What NervesHub keeps
++
++For each workspace, NervesHub keeps its id and name, the app's bot user, the scopes granted, and the bot token Slack issued. The bot token is encrypted with AES-256-GCM before it is stored, using `SECRETS_ENCRYPTION_KEY`, so a copy of the database alone does not reveal it.
++
++The app asks for these bot scopes when it is installed:
++
++| Scope | Why |
++| --- | --- |
++| `chat:write` | Post device notifications to channels the app is in. |
++| `chat:write.public` | Post to public channels without being invited first. |
++| `channels:read` | List public channels to choose from. |
++| `groups:read` | List private channels the app has been invited to. |
++| `commands` | Slash commands and message actions. |
++
++Slack only grants new scopes when the app is installed again, so the app asks for all of them now. That way a workspace connected today does not need reconnecting when channel notifications and commands arrive.
++
++## Setting up a Slack app for your instance
++
++1. Go to <https://api.slack.com/apps>, choose **Create New App**, then **From a manifest**, and pick a workspace to develop it in.
++2. Paste the manifest below, with `https://nerves-hub.example.com` replaced by your instance's URL.
++3. Under **Manage Distribution**, turn on public distribution so that workspaces other than the development one can install the app.
++4. From **Basic Information**, set `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET` and `SLACK_SIGNING_SECRET` on the instance, plus a `SECRETS_ENCRYPTION_KEY` (`openssl rand -base64 32`). See [runtime configuration](runtime_configuration.md#slack).
++5. Restart the instance. **Add to Slack** appears on each organization's Integrations page.
++
++```json
++{
++  "display_information": {
++    "name": "NervesHub",
++    "description": "Device notifications from NervesHub"
++  },
++  "features": {
++    "bot_user": {
++      "display_name": "NervesHub",
++      "always_online": true
++    }
++  },
++  "oauth_config": {
++    "redirect_urls": ["https://nerves-hub.example.com/integrations/slack/oauth/callback"],
++    "scopes": {
++      "bot": ["chat:write", "chat:write.public", "channels:read", "groups:read", "commands"]
++    }
++  },
++  "settings": {
++    "event_subscriptions": {
++      "request_url": "https://nerves-hub.example.com/integrations/slack/events",
++      "bot_events": ["app_uninstalled", "tokens_revoked"]
++    },
++    "org_deploy_enabled": false,
++    "socket_mode_enabled": false,
++    "token_rotation_enabled": false
++  }
++}
++```
++
++Slack checks the events URL when the manifest is saved, so the instance must already be reachable at that URL with `SLACK_SIGNING_SECRET` set. If it is not yet, save the manifest without `event_subscriptions`, configure and restart the instance, then add them back.
++
++## Requests from Slack
++
++Slack calls the instance under `/integrations/slack/`. Every request there must carry a valid `X-Slack-Signature` for the app's signing secret, and be no more than five minutes old. Anything else is refused with a 401. When the instance has no Slack app configured, these URLs answer 404.
+diff --git a/lib/nerves_hub/audit_logs/templates/org_templates.ex b/lib/nerves_hub/audit_logs/templates/org_templates.ex
+index bf9bf5d7e..cd0061989 100644
+--- a/lib/nerves_hub/audit_logs/templates/org_templates.ex
++++ b/lib/nerves_hub/audit_logs/templates/org_templates.ex
+@@ -6,6 +6,7 @@ defmodule NervesHub.AuditLogs.OrgTemplates do
+   alias NervesHub.Accounts.Org
+   alias NervesHub.Accounts.User
+   alias NervesHub.AuditLogs
++  alias NervesHub.Integrations.Slack.Workspace
+   alias NervesHub.Webhooks.Webhook
+ 
+   # Webhooks are described by their host rather than their URL. Some receivers
+@@ -43,6 +44,29 @@ defmodule NervesHub.AuditLogs.OrgTemplates do
+     AuditLogs.audit!(user, org, description)
+   end
+ 
++  @spec audit_slack_connected(User.t(), Org.t(), Workspace.t()) :: :ok
++  def audit_slack_connected(user, org, workspace) do
++    description = "User #{user.name} connected Slack workspace #{workspace.team_name} (#{workspace.team_id})"
++
++    AuditLogs.audit!(user, org, description)
++  end
++
++  @spec audit_slack_disconnected(User.t(), Org.t(), Workspace.t()) :: :ok
++  def audit_slack_disconnected(user, org, workspace) do
++    description = "User #{user.name} disconnected Slack workspace #{workspace.team_name} (#{workspace.team_id})"
++
++    AuditLogs.audit!(user, org, description)
++  end
++
++  # Slack said so, rather than a member, so the organization is the actor.
++  @spec audit_slack_removed(Org.t(), Workspace.t(), String.t()) :: :ok
++  def audit_slack_removed(org, workspace, reason) do
++    description =
++      "Slack workspace #{workspace.team_name} (#{workspace.team_id}) was disconnected because #{reason}"
++
++    AuditLogs.audit!(org, org, description)
++  end
++
+   defp webhook_host(%Webhook{url: url}), do: URI.parse(url).host
+ 
+   defp products(%Webhook{all_products: true}), do: "every product"
+diff --git a/lib/nerves_hub/integrations/slack.ex b/lib/nerves_hub/integrations/slack.ex
+new file mode 100644
+index 000000000..e3e8c3a4d
+--- /dev/null
++++ b/lib/nerves_hub/integrations/slack.ex
+@@ -0,0 +1,253 @@
++defmodule NervesHub.Integrations.Slack do
++  @moduledoc """
++  NervesHub's Slack app: the Slack workspaces it is installed in, and the
++  organizations connected to them.
++
++  An organization admin connects a workspace by installing the app there
++  through Slack's OAuth flow (`NervesHubWeb.Integrations.Slack.OAuthController`). Slack issues
++  one bot token per workspace, kept on the `NervesHub.Integrations.Slack.Workspace`;
++  each organization connected to the workspace has a
++  `NervesHub.Integrations.Slack.Connection`. The token is revoked when the last
++  organization disconnects, and the workspace is forgotten when Slack says
++  the app was removed from it (`handle_event/2`).
++
++  The integration is off unless the instance has a Slack app configured
++  (`configured?/0`). `docs/slack.md` describes setting one up.
++  """
++
++  import Ecto.Query
++
++  alias NervesHub.Accounts.Org
++  alias NervesHub.Accounts.Scope
++  alias NervesHub.AuditLogs.OrgTemplates
++  alias NervesHub.Integrations.Slack.Client
++  alias NervesHub.Integrations.Slack.Connection
++  alias NervesHub.Integrations.Slack.Workspace
++  alias NervesHub.Repo
++
++  require Logger
++
++  # Requested at install, including those only later features use, so that a
++  # workspace connected now does not have to be reconnected as they arrive.
++  # Slack only grants new scopes by installing the app again.
++  @scopes ~w(chat:write chat:write.public channels:read groups:read commands)
++
++  @authorize_url "https://slack.com/oauth/v2/authorize"
++
++  @doc """
++  Whether this instance has a Slack app: its client id, client secret and
++  signing secret are all set.
++  """
++  @spec configured?() :: boolean()
++  def configured?() do
++    Enum.all?([:client_id, :client_secret, :signing_secret], &(config(&1) not in [nil, ""]))
++  end
++
++  @doc false
++  def config(key), do: Application.get_env(:nerves_hub, __MODULE__, [])[key]
++
++  @doc "The bot scopes the app asks a workspace for."
++  @spec scopes() :: [String.t()]
++  def scopes(), do: @scopes
++
++  @doc """
++  Where to send a person to install the app in a workspace. Slack sends them
++  back to `redirect_uri` with `state`, which the caller has tied to their
++  session.
++  """
++  @spec authorize_url(String.t(), String.t()) :: String.t()
++  def authorize_url(state, redirect_uri) do
++    query =
++      URI.encode_query(%{
++        client_id: config(:client_id),
++        scope: Enum.join(@scopes, ","),
++        redirect_uri: redirect_uri,
++        state: state
++      })
++
++    @authorize_url <> "?" <> query
++  end
++
++  @doc "The organization's workspace connections, oldest first."
++  @spec list_connections(Org.t()) :: [Connection.t()]
++  def list_connections(%Org{id: org_id}) do
++    Connection
++    |> where(org_id: ^org_id)
++    |> order_by(asc: :inserted_at, asc: :id)
++    |> preload([:workspace, :connected_by])
++    |> Repo.all()
++  end
++
++  @doc "One of the organization's connections. Raises if it has none with that id."
++  @spec get_connection!(Org.t(), pos_integer() | String.t()) :: Connection.t()
++  def get_connection!(%Org{id: org_id}, id) do
++    Connection
++    |> where(id: ^id, org_id: ^org_id)
++    |> preload(:workspace)
++    |> Repo.one!()
++  end
++
++  @doc """
++  Finishes an install: exchanges the `code` Slack's OAuth flow returned for
++  the workspace's bot token, and connects the workspace to the scope's
++  organization.
++
++  Installing again in a workspace that is already connected refreshes its
++  token and scopes. Organization-wide installs on Enterprise Grid are refused
++  with `{:error, :enterprise_install}`: they have no single workspace.
++  """
++  @spec connect(Scope.t(), String.t(), String.t()) ::
++          {:ok, Connection.t()} | {:error, :enterprise_install | String.t() | Ecto.Changeset.t()}
++  def connect(%Scope{org: org, user: user}, code, redirect_uri) do
++    with {:ok, access} <- Client.oauth_access(code, redirect_uri),
++         {:ok, attrs} <- workspace_attrs(access) do
++      Repo.transact(fn ->
++        with {:ok, workspace} <- upsert_workspace(attrs),
++             {:ok, connection} <- find_or_insert_connection(org, workspace, user) do
++          :ok = OrgTemplates.audit_slack_connected(user, org, workspace)
++          {:ok, Repo.preload(connection, [:workspace, :connected_by])}
++        end
++      end)
++    end
++  end
++
++  defp workspace_attrs(%{"is_enterprise_install" => true}), do: {:error, :enterprise_install}
++
++  defp workspace_attrs(
++         %{
++           "token_type" => "bot",
++           "access_token" => token,
++           "app_id" => app_id,
++           "bot_user_id" => bot_user_id,
++           "team" => %{"id" => team_id, "name" => team_name}
++         } = access
++       ) do
++    {:ok,
++     %{
++       team_id: team_id,
++       team_name: team_name,
++       enterprise_id: get_in(access, ["enterprise", "id"]),
++       app_id: app_id,
++       bot_user_id: bot_user_id,
++       bot_token: token,
++       scopes: String.split(access["scope"] || "", ",", trim: true)
++     }}
++  end
++
++  defp workspace_attrs(_access), do: {:error, "Slack's answer did not include a bot token"}
++
++  defp upsert_workspace(attrs) do
++    %Workspace{}
++    |> Workspace.changeset(attrs)
++    |> Repo.insert(
++      on_conflict: {:replace, [:team_name, :enterprise_id, :app_id, :bot_user_id, :bot_token, :scopes, :updated_at]},
++      conflict_target: :team_id,
++      returning: true
++    )
++  end
++
++  defp find_or_insert_connection(org, workspace, user) do
++    case Repo.get_by(Connection, org_id: org.id, workspace_id: workspace.id) do
++      nil -> org |> Connection.create_changeset(workspace, user) |> Repo.insert()
++      connection -> {:ok, connection}
++    end
++  end
++
++  @doc """
++  Disconnects the organization from a workspace.
++
++  When it was the last organization connected there, the workspace's bot
++  token is revoked, which removes the app from the workspace, and the
++  workspace is forgotten. Otherwise the token stays: the other organizations
++  still use it.
++  """
++  @spec disconnect(Scope.t(), Connection.t()) :: :ok
++  def disconnect(%Scope{org: org, user: user}, %Connection{} = connection) do
++    {:ok, orphaned} =
++      Repo.transact(fn ->
++        # Locked so that an organization connecting at the same moment either
++        # sees the workspace deleted or keeps it from being deleted.
++        workspace =
++          Workspace
++          |> where(id: ^connection.workspace_id)
++          |> lock("FOR UPDATE")
++          |> Repo.one!()
++
++        {:ok, _} = Repo.delete(connection)
++        :ok = OrgTemplates.audit_slack_disconnected(user, org, workspace)
++
++        if Repo.exists?(where(Connection, workspace_id: ^workspace.id)) do
++          {:ok, nil}
++        else
++          {:ok, Repo.delete!(workspace)}
++        end
++      end)
++
++    if orphaned, do: revoke(orphaned)
++
++    :ok
++  end
++
++  # After the commit, so the database does not wait on Slack. Should Slack
++  # not answer, the app stays in the workspace with a token nobody holds any
++  # more; whoever administers the workspace can remove it there.
++  defp revoke(%Workspace{bot_token: token, team_id: team_id}) do
++    case Client.revoke(token) do
++      {:ok, _} -> :ok
++      {:error, error} -> Logger.warning("Could not revoke the Slack bot token for workspace #{team_id}: #{error}")
++    end
++  end
++
++  @doc """
++  Acts on an event Slack sent about workspace `team_id` (Events API,
++  `event_callback`). The app being removed from the workspace, or its bot
++  token being revoked, disconnects every organization connected there.
++  Other events are ignored.
++
++  Slack retries an event it thinks was missed, so this can see the same event
++  twice; handling one is idempotent.
++  """
++  @spec handle_event(String.t(), map()) :: :ok
++  def handle_event(team_id, %{"type" => "app_uninstalled"}),
++    do: remove_workspace(team_id, "the app was removed from it")
++
++  def handle_event(team_id, %{"type" => "tokens_revoked", "tokens" => %{"bot" => [_ | _] = bot_user_ids}}) do
++    case Repo.get_by(Workspace, team_id: team_id) do
++      %Workspace{bot_user_id: bot_user_id} = workspace ->
++        if bot_user_id in bot_user_ids do
++          remove_workspace(workspace.team_id, "its bot token was revoked")
++        else
++          :ok
++        end
++
++      nil ->
++        :ok
++    end
++  end
++
++  def handle_event(_team_id, _event), do: :ok
++
++  defp remove_workspace(team_id, reason) do
++    {:ok, :ok} =
++      Repo.transact(fn ->
++        Workspace
++        |> where(team_id: ^team_id)
++        |> preload(connections: :org)
++        |> Repo.one()
++        |> case do
++          nil ->
++            {:ok, :ok}
++
++          workspace ->
++            for connection <- workspace.connections do
++              :ok = OrgTemplates.audit_slack_removed(connection.org, workspace, reason)
++            end
++
++            _ = Repo.delete!(workspace)
++            {:ok, :ok}
++        end
++      end)
++
++    :ok
++  end
++end
+diff --git a/lib/nerves_hub/integrations/slack/client.ex b/lib/nerves_hub/integrations/slack/client.ex
+new file mode 100644
+index 000000000..f757e316a
+--- /dev/null
++++ b/lib/nerves_hub/integrations/slack/client.ex
+@@ -0,0 +1,49 @@
++defmodule NervesHub.Integrations.Slack.Client do
++  @moduledoc """
++  The Slack Web API methods NervesHub calls.
++
++  Slack answers most failures with HTTP 200 and `"ok": false`, so every
++  answer is read for `ok`, and a failure comes back as Slack's error code
++  (`"invalid_code"`, `"token_revoked"`, ...) or a description of what went
++  wrong on the way there.
++  """
++
++  alias NervesHub.Integrations.Slack
++
++  @base_url "https://slack.com/api"
++
++  @doc """
++  Exchanges the code Slack's OAuth flow returned for the workspace's bot
++  token (`oauth.v2.access`). `redirect_uri` must be the one the flow started
++  with.
++  """
++  @spec oauth_access(String.t(), String.t()) :: {:ok, map()} | {:error, String.t()}
++  def oauth_access(code, redirect_uri) do
++    post("oauth.v2.access",
++      form: [code: code, redirect_uri: redirect_uri],
++      auth: {:basic, "#{Slack.config(:client_id)}:#{Slack.config(:client_secret)}"}
++    )
++  end
++
++  @doc """
++  Revokes a bot token (`auth.revoke`), which removes NervesHub's app from
++  the workspace.
++  """
++  @spec revoke(String.t()) :: {:ok, map()} | {:error, String.t()}
++  def revoke(token) do
++    post("auth.revoke", form: [], auth: {:bearer, token})
++  end
++
++  defp post(method, opts) do
++    [method: :post, base_url: @base_url, url: method, retry: false, receive_timeout: 10_000]
++    |> Keyword.merge(opts)
++    |> Keyword.merge(Slack.config(:req_options) || [])
++    |> Req.request()
++    |> case do
++      {:ok, %Req.Response{status: 200, body: %{"ok" => true} = body}} -> {:ok, body}
++      {:ok, %Req.Response{body: %{"ok" => false, "error" => error}}} -> {:error, error}
++      {:ok, %Req.Response{status: status}} -> {:error, "HTTP #{status}"}
++      {:error, exception} -> {:error, Exception.message(exception)}
++    end
++  end
++end
+diff --git a/lib/nerves_hub/integrations/slack/connection.ex b/lib/nerves_hub/integrations/slack/connection.ex
+new file mode 100644
+index 000000000..4ec55dffb
+--- /dev/null
++++ b/lib/nerves_hub/integrations/slack/connection.ex
+@@ -0,0 +1,31 @@
++defmodule NervesHub.Integrations.Slack.Connection do
++  @moduledoc """
++  An organization connected to a Slack workspace, by a member who installed
++  NervesHub's Slack app there on the organization's behalf.
++  """
++  use Ecto.Schema
++
++  import Ecto.Changeset
++
++  alias NervesHub.Accounts.Org
++  alias NervesHub.Accounts.User
++  alias NervesHub.Integrations.Slack.Workspace
++
++  @type t :: %__MODULE__{}
++
++  schema "slack_connections" do
++    belongs_to(:org, Org)
++    belongs_to(:workspace, Workspace)
++    belongs_to(:connected_by, User)
++
++    timestamps()
++  end
++
++  @spec create_changeset(Org.t(), Workspace.t(), User.t()) :: Ecto.Changeset.t()
++  def create_changeset(%Org{} = org, %Workspace{} = workspace, %User{} = user) do
++    %__MODULE__{org_id: org.id, workspace_id: workspace.id, connected_by_id: user.id}
++    |> change()
++    |> unique_constraint([:org_id, :workspace_id])
++    |> foreign_key_constraint(:org_id)
++  end
++end
+diff --git a/lib/nerves_hub/integrations/slack/signature.ex b/lib/nerves_hub/integrations/slack/signature.ex
+new file mode 100644
+index 000000000..013e38ad2
+--- /dev/null
++++ b/lib/nerves_hub/integrations/slack/signature.ex
+@@ -0,0 +1,42 @@
++defmodule NervesHub.Integrations.Slack.Signature do
++  @moduledoc """
++  Checks that a request came from Slack.
++
++  Slack signs each request it sends (events, and later interactions and
++  slash commands) with the app's signing secret: `X-Slack-Signature` is
++  `v0=` and the hex HMAC-SHA256 of `v0:<timestamp>:<raw body>`, with the
++  timestamp from `X-Slack-Request-Timestamp`. A request more than five
++  minutes old is refused, so a captured request cannot be replayed later.
++  """
++
++  @max_age_seconds 300
++
++  @doc "The signature Slack sends for `body` sent at `timestamp`."
++  @spec sign(String.t(), String.t(), binary()) :: String.t()
++  def sign(signing_secret, timestamp, body) do
++    mac = :crypto.mac(:hmac, :sha256, signing_secret, "v0:#{timestamp}:#{body}")
++    "v0=" <> Base.encode16(mac, case: :lower)
++  end
++
++  @doc """
++  Whether `signature` is Slack's signature of `body` at `timestamp`, and
++  `timestamp` is within five minutes of `now` (Unix seconds).
++  """
++  @spec verify(String.t(), String.t(), binary(), String.t(), integer()) :: :ok | {:error, :stale | :invalid}
++  def verify(signing_secret, timestamp, body, signature, now \\ System.os_time(:second)) do
++    case Integer.parse(timestamp) do
++      {sent_at, ""} when abs(now - sent_at) <= @max_age_seconds ->
++        if Plug.Crypto.secure_compare(sign(signing_secret, timestamp, body), signature) do
++          :ok
++        else
++          {:error, :invalid}
++        end
++
++      {_sent_at, ""} ->
++        {:error, :stale}
++
++      _not_a_timestamp ->
++        {:error, :invalid}
++    end
++  end
++end
+diff --git a/lib/nerves_hub/integrations/slack/workspace.ex b/lib/nerves_hub/integrations/slack/workspace.ex
+new file mode 100644
+index 000000000..9ff6cdafd
+--- /dev/null
++++ b/lib/nerves_hub/integrations/slack/workspace.ex
+@@ -0,0 +1,44 @@
++defmodule NervesHub.Integrations.Slack.Workspace do
++  @moduledoc """
++  A Slack workspace NervesHub's Slack app is installed in.
++
++  Slack issues one bot token per workspace, however many times the app is
++  installed there, so the token lives here rather than on each
++  organization's `NervesHub.Integrations.Slack.Connection`. It is encrypted at rest
++  (`NervesHub.Types.Encrypted`).
++  """
++  use Ecto.Schema
++
++  import Ecto.Changeset
++
++  alias NervesHub.Integrations.Slack.Connection
++  alias NervesHub.Types.Encrypted
++
++  @type t :: %__MODULE__{}
++
++  schema "slack_workspaces" do
++    has_many(:connections, Connection)
++
++    field(:team_id, :string)
++    field(:team_name, :string)
++    field(:enterprise_id, :string)
++    field(:app_id, :string)
++    field(:bot_user_id, :string)
++    field(:bot_token, Encrypted, redact: true)
++    field(:scopes, {:array, :string}, default: [])
++
++    timestamps()
++  end
++
++  @doc """
++  The workspace as an OAuth exchange described it: new, or the existing one
++  with a fresh token and scopes.
++  """
++  @spec changeset(t(), map()) :: Ecto.Changeset.t()
++  def changeset(%__MODULE__{} = workspace, attrs) do
++    workspace
++    |> cast(attrs, [:team_id, :team_name, :enterprise_id, :app_id, :bot_user_id, :bot_token, :scopes])
++    |> validate_required([:team_id, :team_name, :app_id, :bot_user_id, :bot_token])
++    |> unique_constraint(:team_id)
++  end
++end
+diff --git a/lib/nerves_hub/types/encrypted.ex b/lib/nerves_hub/types/encrypted.ex
+new file mode 100644
+index 000000000..f1238a7ba
+--- /dev/null
++++ b/lib/nerves_hub/types/encrypted.ex
+@@ -0,0 +1,67 @@
++defmodule NervesHub.Types.Encrypted do
++  @moduledoc """
++  An Ecto type for a secret NervesHub holds on someone else's behalf, such as
++  a Slack bot token: a string that NervesHub has to send back out, so it
++  cannot be hashed, and that would let whoever read it act as that someone.
++
++  The value is encrypted with AES-256-GCM before it reaches the database, so
++  a leaked dump or backup carries no usable token without the key, which
++  lives outside the database. GCM authenticates as well as encrypts: a stored
++  value that was altered fails to load rather than decrypting to something
++  else.
++
++  Stored as `<<version, iv::12 bytes, tag::16 bytes, ciphertext>>`. The
++  version byte names the key format, which leaves room to rotate keys later
++  without guessing what an old row was written with.
++
++  The key is 32 bytes, configured as
++  `config :nerves_hub, NervesHub.Types.Encrypted, key: ...`, which
++  `config/runtime.exs` sets from `SECRETS_ENCRYPTION_KEY`.
++  """
++  use Ecto.Type
++
++  @version 1
++
++  # Binds a ciphertext to this purpose, so bytes encrypted under the same key
++  # for anything else will not load as one of these.
++  @aad "NervesHub.Types.Encrypted.v1"
++
++  @impl Ecto.Type
++  def type(), do: :binary
++
++  @impl Ecto.Type
++  def cast(value) when is_binary(value), do: {:ok, value}
++  def cast(_value), do: :error
++
++  @impl Ecto.Type
++  def dump(value) when is_binary(value), do: {:ok, encrypt(value)}
++  def dump(_value), do: :error
++
++  @impl Ecto.Type
++  def load(<<@version, iv::binary-12, tag::binary-16, ciphertext::binary>>) do
++    case :crypto.crypto_one_time_aead(:aes_256_gcm, key(), iv, ciphertext, @aad, tag, false) do
++      :error -> :error
++      plaintext -> {:ok, plaintext}
++    end
++  end
++
++  def load(_value), do: :error
++
++  defp encrypt(plaintext) do
++    iv = :crypto.strong_rand_bytes(12)
++    {ciphertext, tag} = :crypto.crypto_one_time_aead(:aes_256_gcm, key(), iv, plaintext, @aad, true)
++
++    <<@version, iv::binary, tag::binary, ciphertext::binary>>
++  end
++
++  defp key() do
++    case Application.get_env(:nerves_hub, __MODULE__, [])[:key] do
++      <<_::binary-32>> = key ->
++        key
++
++      _missing_or_wrong_size ->
++        raise ArgumentError,
++              "NervesHub.Types.Encrypted needs a 32 byte key; set SECRETS_ENCRYPTION_KEY to 32 random bytes, base64 encoded"
++    end
++  end
++end
+diff --git a/lib/nerves_hub_web/endpoint.ex b/lib/nerves_hub_web/endpoint.ex
+index 3502f9604..7014c5eed 100644
+--- a/lib/nerves_hub_web/endpoint.ex
++++ b/lib/nerves_hub_web/endpoint.ex
+@@ -5,6 +5,7 @@ defmodule NervesHubWeb.Endpoint do
+   alias NervesHub.Helpers.WebsocketConnectionError
+   alias NervesHubWeb.Channels.DeviceJSONSerializer
+   alias NervesHubWeb.Channels.DeviceMsgPackSerializer
++  alias NervesHubWeb.Plugs.CacheRawBody
+   alias NervesHubWeb.Plugs.ConfigureUploads
+   alias NervesHubWeb.Plugs.ImAlive
+   alias Phoenix.LiveDashboard.RequestLogger
+@@ -115,7 +116,9 @@ defmodule NervesHubWeb.Endpoint do
+     Plug.Parsers,
+     parsers: [:urlencoded, NervesHubWeb.DynamicConfigMultipart, :json],
+     pass: ["*/*"],
+-    json_decoder: Phoenix.json_library()
++    json_decoder: Phoenix.json_library(),
++    # Keeps the raw body of requests to /integrations/, whose signatures cover it.
++    body_reader: {CacheRawBody, :read_body, []}
+   )
+ 
+   plug(Sentry.PlugContext)
+diff --git a/lib/nerves_hub_web/helpers/authorization.ex b/lib/nerves_hub_web/helpers/authorization.ex
+index 91e52a7b1..99e303631 100644
+--- a/lib/nerves_hub_web/helpers/authorization.ex
++++ b/lib/nerves_hub_web/helpers/authorization.ex
+@@ -43,6 +43,11 @@ defmodule NervesHubWeb.Helpers.Authorization do
+   def authorized?(:"webhook:update", role), do: role_check(:manage, role)
+   def authorized?(:"webhook:delete", role), do: role_check(:manage, role)
+ 
++  # Connecting a Slack workspace lets the people in it hear about the whole
++  # organization's devices, and later act on them, so it is an admin's call.
++  def authorized?(:"slack_connection:create", role), do: role_check(:admin, role)
++  def authorized?(:"slack_connection:delete", role), do: role_check(:admin, role)
++
+   def authorized?(:"error_group:update", role), do: role_check(:manage, role)
+ 
+   def authorized?(:"device:console", role), do: role_check(:manage, role)
+diff --git a/lib/nerves_hub_web/integrations/slack/events_controller.ex b/lib/nerves_hub_web/integrations/slack/events_controller.ex
+new file mode 100644
+index 000000000..fcf42f1f3
+--- /dev/null
++++ b/lib/nerves_hub_web/integrations/slack/events_controller.ex
+@@ -0,0 +1,26 @@
++defmodule NervesHubWeb.Integrations.Slack.EventsController do
++  @moduledoc """
++  The Slack app's Events API request URL. Requests reach here only once
++  `NervesHubWeb.Integrations.Slack.VerifyRequest` has checked Slack signed them.
++
++  Slack expects an answer within three seconds and retries otherwise, so
++  every event is answered with a 200, including the ones NervesHub ignores.
++  """
++  use NervesHubWeb, :controller
++
++  alias NervesHub.Integrations.Slack
++
++  # Sent once, when the request URL is saved in the app's settings.
++  def create(conn, %{"type" => "url_verification", "challenge" => challenge}) when is_binary(challenge) do
++    json(conn, %{challenge: challenge})
++  end
++
++  def create(conn, %{"type" => "event_callback", "team_id" => team_id, "event" => event})
++      when is_binary(team_id) and is_map(event) do
++    :ok = Slack.handle_event(team_id, event)
++
++    send_resp(conn, 200, "")
++  end
++
++  def create(conn, _params), do: send_resp(conn, 200, "")
++end
+diff --git a/lib/nerves_hub_web/integrations/slack/oauth_controller.ex b/lib/nerves_hub_web/integrations/slack/oauth_controller.ex
+new file mode 100644
+index 000000000..e3a3dbfec
+--- /dev/null
++++ b/lib/nerves_hub_web/integrations/slack/oauth_controller.ex
+@@ -0,0 +1,100 @@
++defmodule NervesHubWeb.Integrations.Slack.OAuthController do
++  @moduledoc """
++  Connects a Slack workspace to an organization, through Slack's OAuth flow.
++
++  `install` sends an admin to Slack to install NervesHub's app, with a random
++  `state` kept in their session alongside the organization. Slack sends them
++  back to `callback`, which only accepts the `state` it gave out, so a
++  callback forged by someone else, or replayed from another session, cannot
++  attach a workspace to an organization. The organization's role is read
++  again when they come back, in case it changed meanwhile.
++  """
++  use NervesHubWeb, :controller
++
++  alias NervesHub.Accounts
++  alias NervesHub.Accounts.Scope
++  alias NervesHub.Integrations.Slack
++  alias NervesHubWeb.Helpers.Authorization
++
++  @session_key :slack_install
++
++  def install(%{assigns: %{current_scope: scope}} = conn, _params) do
++    if !Slack.configured?(), do: raise(NervesHubWeb.NotFoundError)
++
++    Authorization.authorized!(:"slack_connection:create", scope)
++
++    state = 32 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
++
++    conn
++    |> put_session(@session_key, %{"state" => state, "org_name" => scope.org.name})
++    |> redirect(external: Slack.authorize_url(state, redirect_uri()))
++  end
++
++  def callback(conn, params) do
++    pending = get_session(conn, @session_key)
++    conn = delete_session(conn, @session_key)
++
++    with %{"state" => expected, "org_name" => org_name} <- pending,
++         state when is_binary(state) <- params["state"],
++         true <- Plug.Crypto.secure_compare(expected, state) do
++      scope = org_scope(conn.assigns.current_scope, org_name)
++      Authorization.authorized!(:"slack_connection:create", scope)
++
++      finish(conn, scope, params)
++    else
++      _ ->
++        conn
++        |> put_flash(:error, "That Slack request did not start here, or has expired. Try adding the workspace again.")
++        |> redirect(to: ~p"/orgs")
++    end
++  end
++
++  defp finish(conn, scope, %{"code" => code}) when is_binary(code) do
++    case Slack.connect(scope, code, redirect_uri()) do
++      {:ok, connection} ->
++        conn
++        |> put_flash(:info, "Connected the #{connection.workspace.team_name} Slack workspace.")
++        |> redirect(to: integrations_path(scope))
++
++      {:error, :enterprise_install} ->
++        conn
++        |> put_flash(
++          :error,
++          "NervesHub connects to one Slack workspace at a time. Install it in a workspace rather than across your Enterprise Grid organization."
++        )
++        |> redirect(to: integrations_path(scope))
++
++      {:error, reason} ->
++        conn
++        |> put_flash(:error, "Slack could not be connected: #{error_message(reason)}")
++        |> redirect(to: integrations_path(scope))
++    end
++  end
++
++  # Slack sends `error=access_denied` when the person cancelled.
++  defp finish(conn, scope, _params) do
++    conn
++    |> put_flash(:info, "Slack was not connected.")
++    |> redirect(to: integrations_path(scope))
++  end
++
++  # The callback's URL names no organization (Slack has one redirect URL for
++  # every install), so the organization comes from the session, and the
++  # person's membership of it is looked up as the router does for org pages.
++  defp org_scope(scope, org_name) do
++    membership = Accounts.get_membership_by_org_name!(scope, org_name)
++
++    scope
++    |> Scope.put_org(membership.org)
++    |> Scope.put_role(membership.role)
++  end
++
++  defp error_message(%Ecto.Changeset{}), do: "its answer could not be saved"
++  defp error_message(reason) when is_binary(reason), do: reason
++
++  defp integrations_path(%Scope{org: org}), do: ~p"/org/#{org}/settings/integrations"
++
++  # Must be identical in the install and in the token exchange, and listed as
++  # a redirect URL in the Slack app's settings.
++  defp redirect_uri(), do: url(~p"/integrations/slack/oauth/callback")
++end
+diff --git a/lib/nerves_hub_web/integrations/slack/verify_request.ex b/lib/nerves_hub_web/integrations/slack/verify_request.ex
+new file mode 100644
+index 000000000..3c38b4cad
+--- /dev/null
++++ b/lib/nerves_hub_web/integrations/slack/verify_request.ex
+@@ -0,0 +1,35 @@
++defmodule NervesHubWeb.Integrations.Slack.VerifyRequest do
++  @moduledoc """
++  Refuses a request that Slack did not sign (`NervesHub.Integrations.Slack.Signature`).
++
++  The signature covers the raw request body, which `Plug.Parsers` would
++  otherwise have consumed by now; `NervesHubWeb.Plugs.CacheRawBody` keeps a
++  copy of it for paths under `/integrations/`.
++
++  Answers 404 when the instance has no Slack app, as if the routes did not
++  exist.
++  """
++  @behaviour Plug
++
++  import Plug.Conn
++
++  alias NervesHub.Integrations.Slack
++  alias NervesHub.Integrations.Slack.Signature
++
++  @impl Plug
++  def init(opts), do: opts
++
++  @impl Plug
++  def call(conn, _opts) do
++    with true <- Slack.configured?() || :not_configured,
++         [timestamp] <- get_req_header(conn, "x-slack-request-timestamp"),
++         [signature] <- get_req_header(conn, "x-slack-signature"),
++         body when is_binary(body) <- conn.assigns[:raw_body],
++         :ok <- Signature.verify(Slack.config(:signing_secret), timestamp, body, signature) do
++      conn
++    else
++      :not_configured -> conn |> send_resp(404, "") |> halt()
++      _unsigned -> conn |> send_resp(401, "") |> halt()
++    end
++  end
++end
+diff --git a/lib/nerves_hub_web/live/org/integrations.ex b/lib/nerves_hub_web/live/org/integrations.ex
+index 64b04703f..1716ce4c7 100644
+--- a/lib/nerves_hub_web/live/org/integrations.ex
++++ b/lib/nerves_hub_web/live/org/integrations.ex
+@@ -1,7 +1,9 @@
+ defmodule NervesHubWeb.Live.Org.Integrations do
+   @moduledoc """
+-  The organization's webhooks: where its products' device events are sent,
+-  which events, from which products, and how each endpoint is doing.
++  The organization's integrations: the Slack workspaces it is connected to,
++  when the instance has a Slack app, and its webhooks, which say where its
++  products' device events are sent, which events, from which products, and
++  how each endpoint is doing.
+ 
+   Members who cannot manage webhooks see each webhook's host, events, products
+   and state, but not its URL or signing secret. Some receivers carry
+@@ -9,6 +11,7 @@ defmodule NervesHubWeb.Live.Org.Integrations do
+   """
+   use NervesHubWeb, :live_view
+ 
++  alias NervesHub.Integrations.Slack
+   alias NervesHub.Products
+   alias NervesHub.Webhooks
+   alias NervesHub.Webhooks.Events
+@@ -23,11 +26,25 @@ defmodule NervesHubWeb.Live.Org.Integrations do
+     |> assign(:products, Products.get_products(scope))
+     |> assign(:event_groups, Events.grouped())
+     |> assign(:testing, MapSet.new())
++    |> assign(:slack_configured?, Slack.configured?())
+     |> close_form()
+     |> assign_webhooks()
++    |> assign_slack_connections()
+     |> ok()
+   end
+ 
++  def handle_event("disconnect-slack", %{"connection_id" => id}, socket) do
++    authorized!(:"slack_connection:delete", socket.assigns.current_scope)
++
++    connection = Slack.get_connection!(socket.assigns.org, id)
++    :ok = Slack.disconnect(socket.assigns.current_scope, connection)
++
++    socket
++    |> assign_slack_connections()
++    |> put_flash(:info, "Disconnected the #{connection.workspace.team_name} Slack workspace.")
++    |> noreply()
++  end
++
+   def handle_event("new", _params, socket) do
+     authorized!(:"webhook:create", socket.assigns.current_scope)
+ 
+@@ -173,6 +190,14 @@ defmodule NervesHubWeb.Live.Org.Integrations do
+     |> noreply()
+   end
+ 
++  defp assign_slack_connections(%{assigns: %{slack_configured?: false}} = socket) do
++    assign(socket, :slack_connections, [])
++  end
++
++  defp assign_slack_connections(socket) do
++    assign(socket, :slack_connections, Slack.list_connections(socket.assigns.org))
++  end
++
+   defp assign_webhooks(socket) do
+     assign(socket, :webhooks, Webhooks.list_webhooks(socket.assigns.org))
+   end
+diff --git a/lib/nerves_hub_web/live/org/integrations.html.heex b/lib/nerves_hub_web/live/org/integrations.html.heex
+index eeba56bf7..ea32e131f 100644
+--- a/lib/nerves_hub_web/live/org/integrations.html.heex
++++ b/lib/nerves_hub_web/live/org/integrations.html.heex
+@@ -5,6 +5,58 @@
+ 
+   <div class="h-0 flex-1 overflow-y-auto">
+     <div class="flex flex-col items-start justify-between gap-4 p-6">
++      <div :if={@slack_configured?} id="slack" class="flex w-full flex-col rounded border border-base-700 bg-surface-raised">
++        <div class="flex h-14 items-center justify-between border-b border-base-700 px-4">
++          <div class="text-base font-medium text-base-50">Slack</div>
++          <%!-- A form rather than a link: starting an install is a change, so it carries the CSRF token. --%>
++          <.form
++            :if={authorized?(:"slack_connection:create", @current_scope)}
++            for={%{}}
++            action={~p"/org/#{@org}/settings/integrations/slack/install"}
++            method="post"
++          >
++            <.button type="submit" aria-label="Add a Slack workspace">
++              <.icon name="add" />Add to Slack
++            </.button>
++          </.form>
++        </div>
++
++        <div class="flex flex-col gap-3 p-6">
++          <p class="w-2/3 text-sm">
++            Connect a Slack workspace to send this organization's device notifications to its channels. Connecting installs
++            NervesHub's Slack app in the workspace, which takes an admin of this organization.
++          </p>
++        </div>
++
++        <div :if={@slack_connections == []} class="border-t border-base-700 p-6">
++          <p class="text-sm text-base-400">No Slack workspace is connected.</p>
++        </div>
++
++        <div
++          :for={connection <- @slack_connections}
++          id={"slack-connection-#{connection.id}"}
++          class="flex flex-wrap items-center justify-between gap-3 border-t border-base-700 p-6"
++        >
++          <div class="flex min-w-0 flex-col gap-1">
++            <span class="font-medium text-base-50">{connection.workspace.team_name}</span>
++            <span class="text-sm text-base-400">
++              Connected by {if connection.connected_by, do: connection.connected_by.name, else: "a former member"} on
++              <.local_datetime at={connection.inserted_at} time_zone={@time_zone} format={:long_date} zone_label={false} />
++            </span>
++          </div>
++
++          <.button
++            :if={authorized?(:"slack_connection:delete", @current_scope)}
++            type="button"
++            phx-click="disconnect-slack"
++            phx-value-connection_id={connection.id}
++            data-confirm={"Disconnect the #{connection.workspace.team_name} Slack workspace? Its channels stop hearing from this organization."}
++          >
++            Disconnect
++          </.button>
++        </div>
++      </div>
++
+       <div class="flex w-full flex-col rounded border border-base-700 bg-surface-raised">
+         <div class="flex h-14 items-center justify-between border-b border-base-700 px-4">
+           <div class="text-base font-medium text-base-50">Webhooks</div>
+diff --git a/lib/nerves_hub_web/plugs/cache_raw_body.ex b/lib/nerves_hub_web/plugs/cache_raw_body.ex
+new file mode 100644
+index 000000000..afb3bbde2
+--- /dev/null
++++ b/lib/nerves_hub_web/plugs/cache_raw_body.ex
+@@ -0,0 +1,32 @@
++defmodule NervesHubWeb.Plugs.CacheRawBody do
++  @moduledoc """
++  A `Plug.Parsers` body reader that keeps a copy of the raw body, as
++  `conn.assigns.raw_body`, for requests whose signature covers it: those
++  other services send to `/integrations/`, such as Slack's (see
++  `NervesHubWeb.Integrations.Slack.VerifyRequest`).
++
++  Other requests are read as `Plug.Conn.read_body/2` would, and keep nothing,
++  so a large upload is not held in memory twice.
++  """
++
++  @paths ["/integrations/"]
++
++  @spec read_body(Plug.Conn.t(), keyword()) :: {:ok | :more, binary(), Plug.Conn.t()} | {:error, term()}
++  def read_body(conn, opts) do
++    case Plug.Conn.read_body(conn, opts) do
++      {status, body, conn} when status in [:ok, :more] ->
++        {status, body, keep(conn, body)}
++
++      error ->
++        error
++    end
++  end
++
++  defp keep(%Plug.Conn{request_path: path} = conn, body) do
++    if String.starts_with?(path, @paths) do
++      Plug.Conn.assign(conn, :raw_body, (conn.assigns[:raw_body] || "") <> body)
++    else
++      conn
++    end
++  end
++end
+diff --git a/lib/nerves_hub_web/router.ex b/lib/nerves_hub_web/router.ex
+index 5871dc2c7..dd128d0e7 100644
+--- a/lib/nerves_hub_web/router.ex
++++ b/lib/nerves_hub_web/router.ex
+@@ -26,6 +26,8 @@ defmodule NervesHubWeb.Router do
+   alias NervesHubWeb.API.Plugs.Product
+   alias NervesHubWeb.API.Plugs.RequireAuthenticatedUser
+   alias NervesHubWeb.API.UI
++  alias NervesHubWeb.Integrations.Slack
++  alias NervesHubWeb.Integrations.Slack.VerifyRequest
+   alias NervesHubWeb.Mounts.CurrentPath
+   alias NervesHubWeb.Mounts.EnrichSentryContext
+   alias NervesHubWeb.Mounts.SetUsersTimezone
+@@ -74,6 +76,13 @@ defmodule NervesHubWeb.Router do
+     plug(Device)
+   end
+ 
++  # Requests from Slack: signed rather than authenticated, and without a
++  # session or CSRF token.
++  pipeline :slack do
++    plug(:accepts, ["json"])
++    plug(VerifyRequest)
++  end
++
+   scope "/api" do
+     pipe_through(:api)
+     get("/openapi", OpenApiSpec, [])
+@@ -277,6 +286,25 @@ defmodule NervesHubWeb.Router do
+     post("/auth/cli/:token", SessionController, :cli_confirm)
+   end
+ 
++  # Installing the Slack app in a workspace, and linking a person's Slack
++  # account: both for somebody signed in.
++  scope "/", Slack, as: :slack do
++    pipe_through([:browser, :require_authenticated_user])
++
++    # Where Slack sends someone back after they install the app. Slack has
++    # one redirect URL for every install, so it names no organization.
++    get("/integrations/slack/oauth/callback", OAuthController, :callback)
++    post("/org/:org_name/settings/integrations/slack/install", OAuthController, :install)
++  end
++
++  # The URLs Slack calls, grouped under /integrations with those of any other
++  # chat service that comes later.
++  scope "/integrations/slack", Slack, as: :slack do
++    pipe_through(:slack)
++
++    post("/events", EventsController, :create)
++  end
++
+   scope "/", NervesHubWeb do
+     # Only unauthenticated users can use these routes
+     pipe_through([:browser, :redirect_if_user_is_authenticated])
+diff --git a/priv/repo/migrations/20261014093827_create_slack_workspaces.exs b/priv/repo/migrations/20261014093827_create_slack_workspaces.exs
+new file mode 100644
+index 000000000..c127064ec
+--- /dev/null
++++ b/priv/repo/migrations/20261014093827_create_slack_workspaces.exs
+@@ -0,0 +1,35 @@
++defmodule NervesHub.Repo.Migrations.CreateSlackWorkspaces do
++  use Ecto.Migration
++
++  def change() do
++    # A Slack workspace NervesHub's app is installed in, and the one bot token
++    # Slack issues for it.
++    create table(:slack_workspaces) do
++      add(:team_id, :string, null: false)
++      add(:team_name, :string, null: false)
++      add(:enterprise_id, :string)
++      add(:app_id, :string, null: false)
++      add(:bot_user_id, :string, null: false)
++      add(:bot_token, :binary, null: false)
++      add(:scopes, {:array, :string}, null: false, default: [])
++
++      timestamps()
++    end
++
++    create(unique_index(:slack_workspaces, [:team_id]))
++
++    # An organization connected to a workspace. A workspace can be connected
++    # to more than one organization.
++    create table(:slack_connections) do
++      add(:org_id, references(:orgs, on_delete: :delete_all), null: false)
++      add(:workspace_id, references(:slack_workspaces, on_delete: :delete_all), null: false)
++      add(:connected_by_id, references(:users, on_delete: :nilify_all))
++
++      timestamps()
++    end
++
++    create(unique_index(:slack_connections, [:org_id, :workspace_id]))
++    create(index(:slack_connections, [:workspace_id]))
++    create(index(:slack_connections, [:connected_by_id]))
++  end
++end
+diff --git a/test/nerves_hub/integrations/slack/signature_test.exs b/test/nerves_hub/integrations/slack/signature_test.exs
+new file mode 100644
+index 000000000..5c72543d6
+--- /dev/null
++++ b/test/nerves_hub/integrations/slack/signature_test.exs
+@@ -0,0 +1,29 @@
++defmodule NervesHub.Integrations.Slack.SignatureTest do
++  use ExUnit.Case, async: true
++
++  alias NervesHub.Integrations.Slack.Signature
++
++  # The worked example in Slack's "Verifying requests from Slack" guide.
++  @secret "8f742231b10e8888abcd99yyyzzz85a5"
++  @timestamp "1531420618"
++  @body "token=xyzz0WbapA4vBCDEFasx0q6G&team_id=T1DC2JH3J&team_domain=testteamnow&channel_id=G8PSS9T3V&channel_name=foobar&user_id=U2CERLKJA&user_name=roadrunner&command=%2Fwebhook-collect&text=&response_url=https%3A%2F%2Fhooks.slack.com%2Fcommands%2FT1DC2JH3J%2F397700885554%2F96rGlfmibIGlgcZRskXaIFfN&trigger_id=398738663015.47445629121.803a0bc887a14d10d2c447fce8b6703c"
++  @signature "v0=a2114d57b48eac39b9ad189dd8316235a7b4a8d21a10bd27519666489c69b503"
++
++  test "matches Slack's worked example" do
++    assert Signature.sign(@secret, @timestamp, @body) == @signature
++    assert :ok = Signature.verify(@secret, @timestamp, @body, @signature, 1_531_420_618 + 60)
++  end
++
++  test "refuses a changed body or the wrong secret" do
++    now = 1_531_420_618
++
++    assert {:error, :invalid} = Signature.verify(@secret, @timestamp, @body <> "&x=1", @signature, now)
++    assert {:error, :invalid} = Signature.verify("another-secret", @timestamp, @body, @signature, now)
++    assert {:error, :invalid} = Signature.verify(@secret, "not-a-time", @body, @signature, now)
++  end
++
++  test "refuses a request more than five minutes old, or from the future" do
++    assert {:error, :stale} = Signature.verify(@secret, @timestamp, @body, @signature, 1_531_420_618 + 301)
++    assert {:error, :stale} = Signature.verify(@secret, @timestamp, @body, @signature, 1_531_420_618 - 301)
++  end
++end
+diff --git a/test/nerves_hub/integrations/slack_test.exs b/test/nerves_hub/integrations/slack_test.exs
+new file mode 100644
+index 000000000..a62cd7009
+--- /dev/null
++++ b/test/nerves_hub/integrations/slack_test.exs
+@@ -0,0 +1,232 @@
++defmodule NervesHub.Integrations.SlackTest do
++  use NervesHub.DataCase, async: false
++
++  alias NervesHub.Accounts.Org
++  alias NervesHub.Accounts.Scope
++  alias NervesHub.AuditLogs
++  alias NervesHub.Fixtures
++  alias NervesHub.Integrations.Slack
++  alias NervesHub.Integrations.Slack.Connection
++  alias NervesHub.Integrations.Slack.Workspace
++
++  @redirect_uri "https://nerves-hub.example.com/integrations/slack/oauth/callback"
++
++  setup do
++    user = Fixtures.user_fixture()
++    org = Fixtures.org_fixture(user)
++
++    %{org: org, scope: %Scope{org: org, user: user, role: :admin}, user: user}
++  end
++
++  # What `oauth.v2.access` answers for a bot install.
++  defp access(overrides \\ %{}) do
++    Map.merge(
++      %{
++        "ok" => true,
++        "access_token" => "xoxb-test-bot-token",
++        "token_type" => "bot",
++        "scope" => "chat:write,chat:write.public,channels:read,groups:read,commands",
++        "bot_user_id" => "U0KRQLJ9H",
++        "app_id" => "A0KRD7HC3",
++        "team" => %{"name" => "Acme Fleet", "id" => "T9TK3CUKW"},
++        "enterprise" => nil,
++        "authed_user" => %{"id" => "U1234"},
++        "is_enterprise_install" => false
++      },
++      overrides
++    )
++  end
++
++  defp stub_slack(answers) do
++    test_pid = self()
++
++    Req.Test.stub(Slack, fn conn ->
++      {:ok, body, conn} = Plug.Conn.read_body(conn)
++      method = conn.path_info |> List.last()
++      send(test_pid, {:slack, method, Plug.Conn.get_req_header(conn, "authorization"), URI.decode_query(body)})
++      Req.Test.json(conn, Map.fetch!(answers, method))
++    end)
++  end
++
++  defp connect!(scope, access \\ access()) do
++    stub_slack(%{"oauth.v2.access" => access, "auth.revoke" => %{"ok" => true, "revoked" => true}})
++    {:ok, connection} = Slack.connect(scope, "a-code", @redirect_uri)
++    connection
++  end
++
++  describe "connect/3" do
++    test "exchanges the code, and connects the workspace to the organization", %{org: org, scope: scope, user: user} do
++      stub_slack(%{"oauth.v2.access" => access()})
++
++      assert {:ok, %Connection{} = connection} = Slack.connect(scope, "a-code", @redirect_uri)
++
++      assert_received {:slack, "oauth.v2.access", ["Basic " <> credentials], params}
++      assert Base.decode64!(credentials) == "test-client-id:test-client-secret"
++      assert params == %{"code" => "a-code", "redirect_uri" => @redirect_uri}
++
++      assert %Workspace{
++               team_id: "T9TK3CUKW",
++               team_name: "Acme Fleet",
++               bot_user_id: "U0KRQLJ9H",
++               bot_token: "xoxb-test-bot-token",
++               scopes: ["chat:write", "chat:write.public", "channels:read", "groups:read", "commands"]
++             } = connection.workspace
++
++      assert connection.org_id == org.id
++      assert connection.connected_by_id == user.id
++
++      assert [log] = AuditLogs.logs_for(org)
++      assert log.description =~ "connected Slack workspace Acme Fleet (T9TK3CUKW)"
++    end
++
++    test "keeps the bot token encrypted in the database", %{scope: scope} do
++      connect!(scope)
++
++      %Postgrex.Result{rows: [[stored]]} = Repo.query!("SELECT bot_token FROM slack_workspaces")
++
++      refute stored =~ "xoxb"
++    end
++
++    test "installing again refreshes the token, without connecting twice", %{org: org, scope: scope} do
++      connect!(scope)
++      connect!(scope, access(%{"access_token" => "xoxb-new-token", "scope" => "chat:write"}))
++
++      assert [%Connection{workspace: %Workspace{bot_token: "xoxb-new-token", scopes: ["chat:write"]}}] =
++               Slack.list_connections(org)
++
++      assert Repo.aggregate(Workspace, :count) == 1
++    end
++
++    test "two organizations can connect the same workspace", %{scope: scope, user: user} do
++      other_org = Fixtures.org_fixture(user, %{name: "elsewhere"})
++
++      first = connect!(scope)
++      second = connect!(%{scope | org: other_org})
++
++      assert first.workspace_id == second.workspace_id
++      assert Repo.aggregate(Workspace, :count) == 1
++    end
++
++    test "refuses an organization-wide Enterprise Grid install", %{org: org, scope: scope} do
++      stub_slack(%{"oauth.v2.access" => access(%{"is_enterprise_install" => true, "team" => nil})})
++
++      assert {:error, :enterprise_install} = Slack.connect(scope, "a-code", @redirect_uri)
++      assert Slack.list_connections(org) == []
++    end
++
++    test "passes on Slack's error", %{org: org, scope: scope} do
++      stub_slack(%{"oauth.v2.access" => %{"ok" => false, "error" => "invalid_code"}})
++
++      assert {:error, "invalid_code"} = Slack.connect(scope, "a-code", @redirect_uri)
++      assert Slack.list_connections(org) == []
++    end
++  end
++
++  describe "disconnect/2" do
++    test "revokes the token and forgets the workspace when no organization is left", %{org: org, scope: scope} do
++      connection = connect!(scope)
++
++      assert :ok = Slack.disconnect(scope, connection)
++
++      assert_received {:slack, "auth.revoke", ["Bearer xoxb-test-bot-token"], _}
++      assert Slack.list_connections(org) == []
++      assert Repo.aggregate(Workspace, :count) == 0
++
++      assert [disconnected, _connected] = AuditLogs.logs_for(org)
++      assert disconnected.description =~ "disconnected Slack workspace Acme Fleet"
++    end
++
++    test "keeps the token while another organization still uses it", %{scope: scope, user: user} do
++      other_org = Fixtures.org_fixture(user, %{name: "elsewhere"})
++      connection = connect!(scope)
++      connect!(%{scope | org: other_org})
++
++      assert :ok = Slack.disconnect(scope, connection)
++
++      refute_received {:slack, "auth.revoke", _, _}
++      assert [%Connection{}] = Slack.list_connections(other_org)
++    end
++
++    test "still disconnects when Slack cannot revoke the token", %{org: org, scope: scope} do
++      connection = connect!(scope)
++      stub_slack(%{"auth.revoke" => %{"ok" => false, "error" => "invalid_auth"}})
++
++      assert :ok = Slack.disconnect(scope, connection)
++      assert Slack.list_connections(org) == []
++    end
++  end
++
++  describe "handle_event/2" do
++    setup %{scope: scope, user: user} do
++      other_org = Fixtures.org_fixture(user, %{name: "elsewhere"})
++      connect!(scope)
++      connect!(%{scope | org: other_org})
++
++      %{other_org: other_org}
++    end
++
++    test "the app being removed disconnects every organization", %{org: org, other_org: other_org} do
++      assert :ok = Slack.handle_event("T9TK3CUKW", %{"type" => "app_uninstalled"})
++
++      assert Slack.list_connections(org) == []
++      assert Slack.list_connections(other_org) == []
++      assert Repo.aggregate(Workspace, :count) == 0
++
++      assert [removed, _connected] = AuditLogs.logs_for(org)
++      assert removed.description =~ "was disconnected because the app was removed from it"
++      assert removed.actor_type == Org
++
++      # Slack retries events it thinks were missed.
++      assert :ok = Slack.handle_event("T9TK3CUKW", %{"type" => "app_uninstalled"})
++    end
++
++    test "only the bot token being revoked disconnects", %{org: org} do
++      assert :ok =
++               Slack.handle_event("T9TK3CUKW", %{
++                 "type" => "tokens_revoked",
++                 "tokens" => %{"oauth" => ["U1234"], "bot" => []}
++               })
++
++      assert [_] = Slack.list_connections(org)
++
++      assert :ok =
++               Slack.handle_event("T9TK3CUKW", %{
++                 "type" => "tokens_revoked",
++                 "tokens" => %{"bot" => ["U0KRQLJ9H"]}
++               })
++
++      assert Slack.list_connections(org) == []
++    end
++
++    test "ignores other workspaces and other events", %{org: org} do
++      assert :ok = Slack.handle_event("T000000", %{"type" => "app_uninstalled"})
++      assert :ok = Slack.handle_event("T9TK3CUKW", %{"type" => "app_mention"})
++
++      assert [_] = Slack.list_connections(org)
++    end
++  end
++
++  test "authorize_url/2 asks for the app's scopes and carries the state" do
++    url = URI.parse(Slack.authorize_url("a-state", @redirect_uri))
++
++    assert url.host == "slack.com"
++    assert url.path == "/oauth/v2/authorize"
++
++    assert %{
++             "client_id" => "test-client-id",
++             "scope" => "chat:write,chat:write.public,channels:read,groups:read,commands",
++             "redirect_uri" => @redirect_uri,
++             "state" => "a-state"
++           } = URI.decode_query(url.query)
++  end
++
++  test "configured?/0 needs the client id, client secret and signing secret" do
++    assert Slack.configured?()
++
++    config = Application.get_env(:nerves_hub, Slack)
++    on_exit(fn -> Application.put_env(:nerves_hub, Slack, config) end)
++
++    Application.put_env(:nerves_hub, Slack, Keyword.put(config, :signing_secret, nil))
++    refute Slack.configured?()
++  end
++end
+diff --git a/test/nerves_hub/types/encrypted_test.exs b/test/nerves_hub/types/encrypted_test.exs
+new file mode 100644
+index 000000000..403ebc6bd
+--- /dev/null
++++ b/test/nerves_hub/types/encrypted_test.exs
+@@ -0,0 +1,30 @@
++defmodule NervesHub.Types.EncryptedTest do
++  use ExUnit.Case, async: true
++
++  alias NervesHub.Types.Encrypted
++
++  test "a dumped value loads back as itself" do
++    assert {:ok, stored} = Encrypted.dump("xoxb-a-bot-token")
++    assert {:ok, "xoxb-a-bot-token"} = Encrypted.load(stored)
++  end
++
++  test "stores neither the value nor the same bytes twice" do
++    {:ok, first} = Encrypted.dump("xoxb-a-bot-token")
++    {:ok, second} = Encrypted.dump("xoxb-a-bot-token")
++
++    refute first =~ "xoxb"
++    refute first == second
++  end
++
++  test "refuses a stored value that was altered" do
++    {:ok, <<head::binary-size(30), byte, rest::binary>>} = Encrypted.dump("xoxb-a-bot-token")
++
++    assert :error = Encrypted.load(<<head::binary, Bitwise.bxor(byte, 1), rest::binary>>)
++    assert :error = Encrypted.load("not encrypted at all")
++  end
++
++  test "only casts strings" do
++    assert {:ok, "token"} = Encrypted.cast("token")
++    assert :error = Encrypted.cast(42)
++  end
++end
+diff --git a/test/nerves_hub_web/integrations/slack/events_controller_test.exs b/test/nerves_hub_web/integrations/slack/events_controller_test.exs
+new file mode 100644
+index 000000000..d1a37f95c
+--- /dev/null
++++ b/test/nerves_hub_web/integrations/slack/events_controller_test.exs
+@@ -0,0 +1,85 @@
++defmodule NervesHubWeb.Integrations.Slack.EventsControllerTest do
++  use NervesHubWeb.ConnCase, async: false
++
++  alias NervesHub.Accounts.Scope
++  alias NervesHub.Fixtures
++  alias NervesHub.Integrations.Slack
++  alias NervesHub.Integrations.Slack.Signature
++
++  defp send_event(conn, payload, opts \\ []) do
++    body = Jason.encode!(payload)
++    timestamp = Integer.to_string(Keyword.get(opts, :timestamp, System.os_time(:second)))
++    signature = Keyword.get(opts, :signature, Signature.sign("test-signing-secret", timestamp, body))
++
++    conn
++    |> put_req_header("content-type", "application/json")
++    |> put_req_header("x-slack-request-timestamp", timestamp)
++    |> put_req_header("x-slack-signature", signature)
++    |> post(~p"/integrations/slack/events", body)
++  end
++
++  test "answers Slack's URL verification", %{conn: conn} do
++    conn =
++      send_event(conn, %{
++        "type" => "url_verification",
++        "challenge" => "3eZbrw1aBm2rZgRNFdxV2595E9CY3gmdALWMmHkvFXO7tYXAYM8P",
++        "token" => "x"
++      })
++
++    assert json_response(conn, 200) == %{"challenge" => "3eZbrw1aBm2rZgRNFdxV2595E9CY3gmdALWMmHkvFXO7tYXAYM8P"}
++  end
++
++  test "refuses a request Slack did not sign", %{conn: conn} do
++    payload = %{"type" => "url_verification", "challenge" => "x"}
++
++    assert conn |> send_event(payload, signature: "v0=forged") |> response(401)
++    assert build_conn() |> send_event(payload, timestamp: System.os_time(:second) - 600) |> response(401)
++
++    assert build_conn()
++           |> put_req_header("content-type", "application/json")
++           |> post(~p"/integrations/slack/events", Jason.encode!(payload))
++           |> response(401)
++  end
++
++  test "disconnects a workspace the app was removed from", %{conn: conn} do
++    user = Fixtures.user_fixture()
++    org = Fixtures.org_fixture(user)
++
++    Req.Test.stub(Slack, fn conn ->
++      Req.Test.json(conn, %{
++        "ok" => true,
++        "access_token" => "xoxb-a-bot-token",
++        "token_type" => "bot",
++        "bot_user_id" => "U0KRQLJ9H",
++        "app_id" => "A0KRD7HC3",
++        "team" => %{"name" => "Acme Fleet", "id" => "T9TK3CUKW"}
++      })
++    end)
++
++    {:ok, _} = Slack.connect(%Scope{org: org, user: user, role: :admin}, "a-code", "https://example.com/callback")
++
++    payload = %{
++      "type" => "event_callback",
++      "team_id" => "T9TK3CUKW",
++      "event" => %{"type" => "app_uninstalled"},
++      "event_id" => "Ev0PV52K21"
++    }
++
++    assert conn |> send_event(payload) |> response(200)
++    assert Slack.list_connections(org) == []
++  end
++
++  test "answers events it does not handle", %{conn: conn} do
++    payload = %{"type" => "event_callback", "team_id" => "T0", "event" => %{"type" => "app_mention"}}
++
++    assert conn |> send_event(payload) |> response(200)
++  end
++
++  test "is not found when the instance has no Slack app", %{conn: conn} do
++    config = Application.get_env(:nerves_hub, Slack)
++    on_exit(fn -> Application.put_env(:nerves_hub, Slack, config) end)
++    Application.put_env(:nerves_hub, Slack, Keyword.put(config, :signing_secret, nil))
++
++    assert conn |> send_event(%{"type" => "url_verification", "challenge" => "x"}) |> response(404)
++  end
++end
+diff --git a/test/nerves_hub_web/integrations/slack/oauth_controller_test.exs b/test/nerves_hub_web/integrations/slack/oauth_controller_test.exs
+new file mode 100644
+index 000000000..ec63d9e40
+--- /dev/null
++++ b/test/nerves_hub_web/integrations/slack/oauth_controller_test.exs
+@@ -0,0 +1,116 @@
++defmodule NervesHubWeb.Integrations.Slack.OAuthControllerTest do
++  use NervesHubWeb.ConnCase.Browser, async: false
++
++  alias NervesHub.Accounts.OrgUser
++  alias NervesHub.Integrations.Slack
++  alias NervesHub.Repo
++
++  defp install_path(org), do: ~p"/org/#{org}/settings/integrations/slack/install"
++
++  defp stub_oauth(answer) do
++    Req.Test.stub(Slack, &Req.Test.json(&1, answer))
++  end
++
++  defp oauth_answer() do
++    %{
++      "ok" => true,
++      "access_token" => "xoxb-a-bot-token",
++      "token_type" => "bot",
++      "scope" => "chat:write",
++      "bot_user_id" => "U0KRQLJ9H",
++      "app_id" => "A0KRD7HC3",
++      "team" => %{"name" => "Acme Fleet", "id" => "T9TK3CUKW"},
++      "is_enterprise_install" => false
++    }
++  end
++
++  # Starts an install, and returns the conn carrying its session and the state
++  # Slack would send back.
++  defp start_install(conn, org) do
++    conn = post(conn, install_path(org))
++    "https://slack.com/oauth/v2/authorize?" <> query = redirected_to(conn, 302)
++
++    {recycle(conn), URI.decode_query(query)}
++  end
++
++  test "install sends an admin to Slack, with a state for the callback", %{conn: conn, org: org} do
++    {_conn, query} = start_install(conn, org)
++
++    assert %{"client_id" => "test-client-id", "state" => state, "redirect_uri" => redirect_uri} = query
++    assert byte_size(state) >= 40
++    assert redirect_uri == url(~p"/integrations/slack/oauth/callback")
++  end
++
++  test "install is for admins only", %{conn: conn, org: org} do
++    Repo.update_all(OrgUser, set: [role: :manage])
++
++    assert_error_sent(401, fn -> post(conn, install_path(org)) end)
++  end
++
++  test "the callback connects the workspace and returns to the Integrations page", %{conn: conn, org: org} do
++    {conn, %{"state" => state}} = start_install(conn, org)
++    stub_oauth(oauth_answer())
++
++    conn = get(conn, ~p"/integrations/slack/oauth/callback?#{[code: "a-code", state: state]}")
++
++    assert redirected_to(conn) == ~p"/org/#{org}/settings/integrations"
++    assert Phoenix.Flash.get(conn.assigns.flash, :info) == "Connected the Acme Fleet Slack workspace."
++    assert [%{workspace: %{team_id: "T9TK3CUKW"}}] = Slack.list_connections(org)
++  end
++
++  test "the callback refuses a state it did not give out", %{conn: conn, org: org} do
++    {conn, _query} = start_install(conn, org)
++    stub_oauth(oauth_answer())
++
++    conn = get(conn, ~p"/integrations/slack/oauth/callback?#{[code: "a-code", state: "forged"]}")
++
++    assert redirected_to(conn) == ~p"/orgs"
++    assert Phoenix.Flash.get(conn.assigns.flash, :error) =~ "did not start here"
++    assert Slack.list_connections(org) == []
++  end
++
++  test "the callback only works once", %{conn: conn, org: org} do
++    {conn, %{"state" => state}} = start_install(conn, org)
++    stub_oauth(oauth_answer())
++
++    conn = get(conn, ~p"/integrations/slack/oauth/callback?#{[code: "a-code", state: state]}")
++    conn = conn |> recycle() |> get(~p"/integrations/slack/oauth/callback?#{[code: "a-code", state: state]}")
++
++    assert redirected_to(conn) == ~p"/orgs"
++  end
++
++  test "the callback checks the role again", %{conn: conn, org: org} do
++    {conn, %{"state" => state}} = start_install(conn, org)
++    Repo.update_all(OrgUser, set: [role: :manage])
++
++    assert_error_sent(401, fn -> get(conn, ~p"/integrations/slack/oauth/callback?#{[code: "a-code", state: state]}") end)
++
++    assert Slack.list_connections(org) == []
++  end
++
++  test "the callback says so when the person cancelled at Slack", %{conn: conn, org: org} do
++    {conn, %{"state" => state}} = start_install(conn, org)
++
++    conn = get(conn, ~p"/integrations/slack/oauth/callback?#{[error: "access_denied", state: state]}")
++
++    assert redirected_to(conn) == ~p"/org/#{org}/settings/integrations"
++    assert Phoenix.Flash.get(conn.assigns.flash, :info) == "Slack was not connected."
++  end
++
++  test "the callback passes on Slack's refusal", %{conn: conn, org: org} do
++    {conn, %{"state" => state}} = start_install(conn, org)
++    stub_oauth(%{"ok" => false, "error" => "invalid_code"})
++
++    conn = get(conn, ~p"/integrations/slack/oauth/callback?#{[code: "a-code", state: state]}")
++
++    assert Phoenix.Flash.get(conn.assigns.flash, :error) == "Slack could not be connected: invalid_code"
++  end
++
++  test "install is not found when the instance has no Slack app", %{conn: conn, org: org} do
++    config = Application.get_env(:nerves_hub, Slack)
++    on_exit(fn -> Application.put_env(:nerves_hub, Slack, config) end)
++    Application.put_env(:nerves_hub, Slack, Keyword.put(config, :client_id, nil))
++
++    assert_error_sent(404, fn -> post(conn, install_path(org)) end)
++  end
++end
+diff --git a/test/nerves_hub_web/live/org/integrations_test.exs b/test/nerves_hub_web/live/org/integrations_test.exs
+index 69511e78a..bd6eaf93b 100644
+--- a/test/nerves_hub_web/live/org/integrations_test.exs
++++ b/test/nerves_hub_web/live/org/integrations_test.exs
+@@ -4,6 +4,7 @@ defmodule NervesHubWeb.Live.Org.IntegrationsTest do
+   alias NervesHub.Accounts.OrgUser
+   alias NervesHub.Accounts.Scope
+   alias NervesHub.Fixtures
++  alias NervesHub.Integrations.Slack
+   alias NervesHub.Repo
+   alias NervesHub.Webhooks
+   alias NervesHub.Webhooks.Signature
+@@ -300,6 +301,91 @@ defmodule NervesHubWeb.Live.Org.IntegrationsTest do
+     |> assert_has("p", text: "This organization has the most webhooks it can have")
+   end
+ 
++  describe "Slack" do
++    defp connect_slack(%{org: org, user: user}, team \\ %{"name" => "Acme Fleet", "id" => "T9TK3CUKW"}) do
++      Req.Test.stub(Slack, fn conn ->
++        case conn.path_info do
++          [_, "oauth.v2.access"] ->
++            Req.Test.json(conn, %{
++              "ok" => true,
++              "access_token" => "xoxb-a-bot-token",
++              "token_type" => "bot",
++              "bot_user_id" => "U0KRQLJ9H",
++              "app_id" => "A0KRD7HC3",
++              "team" => team
++            })
++
++          [_, "auth.revoke"] ->
++            Req.Test.json(conn, %{"ok" => true, "revoked" => true})
++        end
++      end)
++
++      {:ok, connection} =
++        Slack.connect(%Scope{org: org, user: user, role: :admin}, "a-code", "https://example.com/callback")
++
++      connection
++    end
++
++    test "lists the connected workspaces, and who connected them", context do
++      %{conn: conn, org: org, user: user} = context
++      connection = connect_slack(context)
++
++      conn
++      |> visit(integrations_path(org))
++      |> assert_has("#slack button", text: "Add to Slack")
++      |> assert_has("#slack-connection-#{connection.id} span", text: "Acme Fleet")
++      |> assert_has("#slack-connection-#{connection.id} span", text: "Connected by #{user.name}")
++    end
++
++    test "says when no workspace is connected", %{conn: conn, org: org} do
++      conn
++      |> visit(integrations_path(org))
++      |> assert_has("#slack p", text: "No Slack workspace is connected.")
++    end
++
++    test "disconnects a workspace", context do
++      %{conn: conn, org: org} = context
++      connection = connect_slack(context)
++
++      conn
++      |> visit(integrations_path(org))
++      |> within("#slack-connection-#{connection.id}", &click_button(&1, "Disconnect"))
++      |> assert_has("[role='alert']", text: "Disconnected the Acme Fleet Slack workspace.")
++      |> refute_has("#slack-connection-#{connection.id}")
++
++      assert Slack.list_connections(org) == []
++    end
++
++    test "is for admins to change", context do
++      %{conn: conn, org: org} = context
++      connection = connect_slack(context)
++      Repo.update_all(OrgUser, set: [role: :manage])
++
++      session =
++        conn
++        |> visit(integrations_path(org))
++        |> assert_has("#slack-connection-#{connection.id} span", text: "Acme Fleet")
++        |> refute_has("#slack button", text: "Add to Slack")
++        |> refute_has("#slack-connection-#{connection.id} button", text: "Disconnect")
++
++      Process.flag(:trap_exit, true)
++
++      assert {{%NervesHubWeb.UnauthorizedError{}, _}, _} =
++               catch_exit(render_click(session.view, "disconnect-slack", %{"connection_id" => connection.id}))
++    end
++
++    test "is hidden when the instance has no Slack app", %{conn: conn, org: org} do
++      config = Application.get_env(:nerves_hub, Slack)
++      on_exit(fn -> Application.put_env(:nerves_hub, Slack, config) end)
++      Application.put_env(:nerves_hub, Slack, Keyword.put(config, :client_id, nil))
++
++      conn
++      |> visit(integrations_path(org))
++      |> refute_has("#slack")
++      |> assert_has("div", text: "Webhooks")
++    end
++  end
++
+   describe "a member who cannot manage webhooks" do
+     setup context do
+       webhook = webhook_fixture(context)

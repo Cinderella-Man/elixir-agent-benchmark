@@ -1,0 +1,2515 @@
+diff --git a/assets/admin/views/newsItemView.js b/assets/admin/views/newsItemView.js
+index a43ff668d7..588409ca4c 100644
+--- a/assets/admin/views/newsItemView.js
++++ b/assets/admin/views/newsItemView.js
+@@ -36,6 +36,7 @@ export default class newsItemView {
+     new BelongsToWidget("logger", "person");
+     new BelongsToWidget("author", "person");
+     new BelongsToWidget("source", "news_source");
++    new BelongsToWidget("submitter", "person");
+ 
+     if ($(".js-quick-form").length) {
+       $(".ui.menu").remove();
+@@ -45,7 +46,7 @@ export default class newsItemView {
+ 
+     let $images = $(".js-image-options");
+ 
+-    $images.data("options").forEach(function(url) {
++    ($images.data("options") || []).forEach(function(url) {
+       let img = new Image();
+       img.setAttribute("style", "display: none");
+       img.setAttribute("class", "ui image");
+diff --git a/assets/app/app.js b/assets/app/app.js
+index c0a8492cd9..1c5e96e52a 100644
+--- a/assets/app/app.js
++++ b/assets/app/app.js
+@@ -29,6 +29,11 @@ u(document).handle("click", ".js-toggle-nav", function(event) {
+   }, 50);
+ });
+ 
++u(document).handle("click", ".js-toggle_element", function(event) {
++  const href = u(event.target).attr("href");
++  u(href).toggleClass("is-hidden");
++});
++
+ u(document).handle("click", ".js-account-nav", function(event) {
+   const content = u(".js-account-nav-content").html();
+   overlay.html(content).show();
+@@ -63,6 +68,16 @@ u(document).handle("click", "[data-share]", function(event) {
+   new Share(overlay).load(u(this).data("share"));
+ });
+ 
++// flash messages
++function closeFlash(element) {
++  element.addClass("is-closing");
++  setTimeout(() => { element.remove(); }, 1000);
++}
++
++u(document).handle("click", ".js-close_flash", function(event) {
++  closeFlash(u(event.target).closest('.flash_container'));
++});
++
+ // open share dialogs in their own window (order matters or next rule will apply)
+ u(document).handle("click", ".js-share-popup", function(event) {
+   var h, href, left, shareWindow, top, w;
+@@ -247,6 +262,7 @@ u(document).on("turbolinks:load", function() {
+   formatTimes();
+   deepLink();
+   impress();
++  setTimeout(() => { closeFlash(u(".flash_container")); }, 10*1000);
+ });
+ 
+ Turbolinks.start();
+diff --git a/assets/app/components/auth.scss b/assets/app/components/auth.scss
+index a54165d04f..8f2b896426 100644
+--- a/assets/app/components/auth.scss
++++ b/assets/app/components/auth.scss
+@@ -1,5 +1,5 @@
+ .auth {
+-  margin: $padding-small auto;
++  margin: $base-spacing auto;
+   max-width: 500px;
+   padding: 30px;
+   width: 100%;
+diff --git a/assets/app/components/flash.scss b/assets/app/components/flash.scss
+index 16cb7e8516..0c16cd1505 100644
+--- a/assets/app/components/flash.scss
++++ b/assets/app/components/flash.scss
+@@ -1,24 +1,72 @@
++$flash_types: (success #d4ffd4) (error #ffd5d1);
++
+ .flash {
+-  background: $light-blue;
++  background: rgba($light-blue, 0.975);
+   color: $blue;
++  font-size: 0.875em;
+   font-weight: bold;
+-  padding: $padding-small;
++  padding: 0.5em 1em;
+   text-align: center;
+ 
++  .flash-close { path { stroke: $blue; } }
++
+   &--inline {
+     margin-bottom: $base-spacing;
+   }
+ 
+-  &--success, &--result {
+-    background: $light-green;
+-    color: $green;
+-  }
+-  &--error {
+-    background: $light-red;
+-    color: $red;
++  // Themes
++  $types:
++    (success, rgba($light-green, 0.975), darken($green, 10%)),
++    (error, rgba($red, 0.975), $white)
++  ;
++  @each $type, $bg, $text in $types {
++    &--#{$type} {
++      background: $bg;
++      color: $text;
++      .flash-close {
++        path { stroke: $text; }
++      }
++    }
+   }
+ 
+-  p:last-child {
+-    margin-bottom: 0;
++  &-message { padding-top: 1px; }
++  p:last-child { margin-bottom: 0; }
++
++  // NOTE: Flashes inside the container work differently than flashes throughout a document
++  &_container {
++    text-align: center;
++    transition: all 0.05s ease-in-out;
++    padding: 0 $mobile-spacing;
++
++    &.is-closing {
++      pointer-events: none;
++      opacity: 0;
++      transform: scale(0.95);
++      transform-origin: top;
++    }
++
++    .flash {
++      border-radius: 0 0 3px 3px;
++      max-width: 100%;
++      width: 440px;
++      display: inline-flex;
++      position: relative;
++
++      &-message {
++        flex: 1 auto;
++        text-align: left;
++      }
++
++      &-close {
++        padding-left: 0.75em;
++        font-size: 20px;
++        font-weight: bold;
++
++        svg {
++          width: 10px;
++          height: 10px;
++        }
++      }
++    }
+   }
+ }
+diff --git a/assets/app/components/footer.scss b/assets/app/components/footer.scss
+index 5cdef47eb7..4f6e67ebf2 100644
+--- a/assets/app/components/footer.scss
++++ b/assets/app/components/footer.scss
+@@ -1,6 +1,6 @@
+ // NOTE: Update $footer-height in variables.scss when any changes affect height of the primary footer element
+ .footer {
+-  $width: 1160px;
++  $width: 1280px;
+   background: $white;
+   border-top: 2px solid $border-color;
+   font-family: $code;
+@@ -43,7 +43,7 @@
+ 
+           a {
+             color: $black;
+-            
++
+             &:hover {
+               color: #000000;
+               text-decoration: underline;
+diff --git a/assets/app/components/form.scss b/assets/app/components/form.scss
+index a02dadb0ab..42a13c0082 100644
+--- a/assets/app/components/form.scss
++++ b/assets/app/components/form.scss
+@@ -1,4 +1,14 @@
+ .form {
++  $border: 1px solid $black;
++
++  label {
++    display: block;
++    font-family: $code;
++    font-weight: 700;
++    font-size: 0.75em;
++    margin-bottom: 0.5em;
++  }
++
+   &-element {
+     margin-bottom: $base-spacing;
+     width: 100%;
+@@ -16,26 +26,10 @@
+       }
+     }
+ 
+-    &-note {
+-      font-family: $code;
+-      font-size: 0.6875em;
+-      font-style: italic;
+-      text-align: right;
+-      margin-top: 5px;
+-    }
+-
+-    label {
+-      display: block;
+-      font-family: $code;
+-      font-weight: 700;
+-      font-size: 0.75em;
+-      margin-bottom: 0.5em;
+-    }
+-
+     textarea,
+     input {
+       border: none;
+-      border-bottom: 1px solid $black;
++      border-bottom: $border;
+       color: $black;
+       line-height: 1.5em;
+       padding: 0.75em 0;
+@@ -45,6 +39,21 @@
+         color: $medium-grey;
+       }
+     }
++
++    textarea {
++      resize: vertical !important;
++      height: 50px;
++    }
++
++    &-error,
++    &-note {
++      color: $medium-grey;
++      font-family: $code;
++      font-size: 0.6875em;
++      font-style: italic;
++      margin: 5px 0;
++    }
++    &-error { color: $red; }
+   }
+ 
+   &-submit {
+@@ -90,4 +99,50 @@
+       &:hover { background: darken($green, 10%); }
+     }
+   }
++
++  &-checklist {
++    margin: 0 0 $base-spacing;
++
++    & > label {
++      margin-bottom: $base-spacing / 2;
++    }
++
++    &-item {
++      border-top: 1px solid $light-grey;
++      padding: 15px 0 13px;
++
++      &:last-child {
++        border-bottom: $border;
++      }
++
++      label {
++        align-items: center;
++        font-family: $content;
++        font-size: 0.875em;
++        font-weight: normal;
++        display: flex;
++        margin: 0;
++
++        .form-checklist-item-text {
++          flex: 1 100%;
++          user-select: none;
++        }
++
++        input[type=checkbox] { display: none; }
++        input[type=checkbox] + .form-checklist-item-box {
++          flex: 0 0 21px;
++          border: 1px solid $black;
++          display: block;
++          margin: 0 1em;
++          width: 21px;
++          height: 21px;
++          position: relative;
++          top: -1px;
++        }
++        input[type=checkbox]:checked + .form-checklist-item-box {
++          background: url('/images/icons/form-checkmark.svg') center no-repeat;
++        }
++      }
++    }
++  }
+ }
+diff --git a/assets/app/components/header.scss b/assets/app/components/header.scss
+index 6548b6593e..3efb6eeb03 100644
+--- a/assets/app/components/header.scss
++++ b/assets/app/components/header.scss
+@@ -13,8 +13,10 @@
+ .page-page-weekly,
+ .page-page-nightly {
+   .header {
+-    background: $black;
+-    border-bottom: 1px solid rgba($border-color, 0.1);
++    &-container {
++      background: $black;
++      border-bottom: 1px solid rgba($border-color, 0.1);
++    }
+ 
+     &-logo a {
+       background-image: url('/images/brand/changelog-logomark-white.svg');
+@@ -51,13 +53,16 @@
+ // NOTE: Update $header-height and $header-height--mobile in variables.scss when any changes affect height
+ .header {
+   @include position(fixed, 0 0 null);
+-  background-color: rgba($white, .98);
+-  border-bottom: 1px solid $light-grey;
+-  padding: 7px $mobile-spacing;
+   width: 100%;
+   z-index: 999;
+ 
+-  @include breakpoint(tablet) { padding: 13px $base-spacing; }
++  &-container {
++    background-color: rgba($white, .98);
++    border-bottom: 1px solid $light-grey;
++    padding: 7px $mobile-spacing;
++
++    @include breakpoint(tablet) { padding: 13px $base-spacing; }
++  }
+ 
+   @include breakpoint(tablet, max) {
+     .nav-open & {
+@@ -223,7 +228,7 @@
+         font-size: 15px;
+         font-weight: 500;
+         line-height: 1.125em;
+-        margin: 0 16px;
++        margin: 0 0.75em;
+ 
+         a {
+           color: $medium-grey;
+@@ -244,6 +249,11 @@
+             width: 100%;
+           }
+         }
++
++        &.is-desktop_only {
++          display: none;
++          @include breakpoint(mobile) { display: block; }
++        }
+       }
+     }
+ 
+@@ -260,19 +270,10 @@
+       align-items: center;
+       display: flex;
+       margin-top: 0;
+-      margin-right: 10px;
+-
+-      @include breakpoint(tablet) {
+-        margin-right: 20px;
+-      }
+-
+-      .header-nav-list-item:last-child {
+-        margin-right: 0;
+-      }
+ 
+       &-user {
+         $size: 25px;
+-        margin: 0;
++        margin: 0 10px;
+         text-align: center;
+ 
+         &,
+@@ -286,12 +287,18 @@
+           border-radius: $base-border-radius;
+         }
+       }
++
++      .tooltip {
++        margin-right: 13px;
++      }
+     }
+   }
+ 
+   &-search {
+     display: none;
+-    @include breakpoint(tablet) { display: block; }
++    margin-left: 10px;
++
++    @include breakpoint(desktop) { display: block; }
+ 
+     input {
+       background: rgba($black, .05);
+diff --git a/assets/app/components/subnav.scss b/assets/app/components/subnav.scss
+index 11391ff588..cab9028da2 100644
+--- a/assets/app/components/subnav.scss
++++ b/assets/app/components/subnav.scss
+@@ -1,23 +1,38 @@
+ .subnav {
+-  border-bottom: 1px solid $light-grey;
+   margin-bottom: $base-spacing*1.5;
++  position: relative;
++
++  &:before {
++    border-bottom: 1px solid $light-grey;
++    content: "";
++    position: absolute;
++    bottom: -1px;
++    left: 0;
++    right: 0;
++  }
+ 
+   &-list {
+-    display: none;
+-    @media (min-width: 901px) { display: block; }
++    display: flex;
++    justify-content: flex-start;
+ 
+     &-item {
+-      display: inline-block;
++      flex: 0 auto;
+ 
+       a {
+         border-bottom: 1px solid transparent;
+         color: $black;
+         display: block;
+-        height: 58px;
+-        padding: 1em;
++        font-size: 0.825em;
++        height: 42px;
++        padding: 0 0.5em 0.5em 0;
+         transform: translateY(1px);
+         transition: border 0.2s $base-easing;
+ 
++        @include breakpoint(tablet) {
++          font-size: 1em;
++          padding: 0 1em 1em;
++        }
++
+         small {
+           margin: 0;
+           position: relative;
+@@ -31,12 +46,4 @@
+       }
+     }
+   }
+-
+-  &-select {
+-    display: block;
+-    @media (min-width: 901px) { display: none; }
+-    margin-bottom: $base-spacing/2;
+-    padding: 0.5em;
+-    width: 100%;
+-  }
+ }
+diff --git a/assets/app/helpers/_all.scss b/assets/app/helpers/_all.scss
+index 97379a3289..9898eff8b1 100644
+--- a/assets/app/helpers/_all.scss
++++ b/assets/app/helpers/_all.scss
+@@ -6,3 +6,4 @@
+ @import 'keyframes';
+ @import 'mixins/all';
+ @import 'a11y';
++@import 'adjustors';
+diff --git a/assets/app/helpers/adjustors.scss b/assets/app/helpers/adjustors.scss
+new file mode 100644
+index 0000000000..f46e7cc4de
+--- /dev/null
++++ b/assets/app/helpers/adjustors.scss
+@@ -0,0 +1,3 @@
++.is-hidden {
++  display: none;
++}
+diff --git a/assets/app/helpers/variables.scss b/assets/app/helpers/variables.scss
+index 84acb62ad7..4d0a8db5ff 100644
+--- a/assets/app/helpers/variables.scss
++++ b/assets/app/helpers/variables.scss
+@@ -12,7 +12,8 @@ $blue: #2D3589;
+ $lightest-grey: #f5f5f5;
+ $light-grey: #e6e5e6;
+ $medium-grey: #878b8f;
+-$red: #ef5125;
++$dark-grey: darken($medium-grey, 30%);
++$red: #FC4C02;
+ $light-red: lighten($red, 20%);
+ $blue-grey: #222C36;
+ 
+diff --git a/assets/app/layout/_all.scss b/assets/app/layout/_all.scss
+index 4d4e4e8920..cf0087021b 100644
+--- a/assets/app/layout/_all.scss
++++ b/assets/app/layout/_all.scss
+@@ -1,4 +1,4 @@
+-@import 'account';
++@import 'basic';
+ @import 'article';
+ @import 'episode';
+ @import 'live';
+@@ -35,14 +35,6 @@ body {
+     background-color: $black;
+   }
+ 
+-  // Pages that should have their content vertically centered
+-  .page-auth-new &,
+-  .page-person-join & {
+-    align-items: center;
+-    display: flex;
+-    justify-content: center;
+-  }
+-
+   // TODO: Decide where this should go. Lives on the news index (homepage)
+   &-podcasts {
+     background: $black;
+diff --git a/assets/app/layout/account.scss b/assets/app/layout/account.scss
+deleted file mode 100644
+index b97162a764..0000000000
+--- a/assets/app/layout/account.scss
++++ /dev/null
+@@ -1,3 +0,0 @@
+-.page_account {
+-  @include wrap(1000px, 20px);
+-}
+diff --git a/assets/app/layout/article.scss b/assets/app/layout/article.scss
+index d88879e4ca..cee45d25ef 100644
+--- a/assets/app/layout/article.scss
++++ b/assets/app/layout/article.scss
+@@ -1,5 +1,4 @@
+ .article {
+-
+   .richtext {
+     @include wrap;
+     max-width: 860px;
+diff --git a/assets/app/layout/basic.scss b/assets/app/layout/basic.scss
+new file mode 100644
+index 0000000000..c9347ed63d
+--- /dev/null
++++ b/assets/app/layout/basic.scss
+@@ -0,0 +1,3 @@
++.page_basic {
++  @include wrap(920px, 0);
++}
+diff --git a/assets/package.json b/assets/package.json
+index 80fbd9eaeb..9acd31dec0 100644
+--- a/assets/package.json
++++ b/assets/package.json
+@@ -27,6 +27,7 @@
+     "handlebars-loader": "^1.3.0",
+     "mocha": "^3.5.0",
+     "node-sass": "^4.5.0",
++    "postcss-loader": "^2.1.1",
+     "sass-loader": "^6.0.6",
+     "style-loader": "^0.18.2",
+     "webpack": "^3.4.1",
+diff --git a/assets/postcss.config.js b/assets/postcss.config.js
+new file mode 100644
+index 0000000000..0beef93fef
+--- /dev/null
++++ b/assets/postcss.config.js
+@@ -0,0 +1,5 @@
++module.exports = {
++    plugins: [
++        require('autoprefixer'),
++    ]
++}
+diff --git a/assets/webpack.config.js b/assets/webpack.config.js
+index 7b11213d79..671c794065 100644
+--- a/assets/webpack.config.js
++++ b/assets/webpack.config.js
+@@ -20,7 +20,7 @@ var common = {
+       },
+       {
+         test: [/\.scss$/, /\.css$/],
+-        loader: ExtractTextPlugin.extract({use: "css-loader!sass-loader", fallback: "style-loader"})
++        loader: ExtractTextPlugin.extract({use: "css-loader!postcss-loader!sass-loader", fallback: "style-loader"})
+       },
+       {
+         test: /\.(png|jpg|gif|svg)$/,
+diff --git a/assets/yarn.lock b/assets/yarn.lock
+index b0dc848059..9a51cc36a2 100644
+--- a/assets/yarn.lock
++++ b/assets/yarn.lock
+@@ -24,6 +24,10 @@ ajv-keywords@^2.0.0:
+   version "2.1.1"
+   resolved "https://registry.yarnpkg.com/ajv-keywords/-/ajv-keywords-2.1.1.tgz#617997fc5f60576894c435f940d819e135b80762"
+ 
++ajv-keywords@^3.1.0:
++  version "3.1.0"
++  resolved "https://registry.yarnpkg.com/ajv-keywords/-/ajv-keywords-3.1.0.tgz#ac2b27939c543e95d2c06e7f7f5c27be4aa543be"
++
+ ajv@^4.9.1:
+   version "4.11.8"
+   resolved "https://registry.yarnpkg.com/ajv/-/ajv-4.11.8.tgz#82ffb02b29e662ae53bdc20af15947706739c536"
+@@ -40,6 +44,14 @@ ajv@^5.0.0, ajv@^5.1.0, ajv@^5.1.5:
+     fast-json-stable-stringify "^2.0.0"
+     json-schema-traverse "^0.3.0"
+ 
++ajv@^6.1.0:
++  version "6.2.0"
++  resolved "https://registry.yarnpkg.com/ajv/-/ajv-6.2.0.tgz#afac295bbaa0152449e522742e4547c1ae9328d2"
++  dependencies:
++    fast-deep-equal "^1.0.0"
++    fast-json-stable-stringify "^2.0.0"
++    json-schema-traverse "^0.3.0"
++
+ align-text@^0.1.1, align-text@^0.1.3:
+   version "0.1.4"
+   resolved "https://registry.yarnpkg.com/align-text/-/align-text-0.1.4.tgz#0cd90a561093f35d0a99256c22b7069433fad117"
+@@ -84,7 +96,7 @@ ansi-styles@^2.2.1:
+   version "2.2.1"
+   resolved "https://registry.yarnpkg.com/ansi-styles/-/ansi-styles-2.2.1.tgz#b432dd3358b634cf75e1e4664368240533c1ddbe"
+ 
+-ansi-styles@^3.1.0:
++ansi-styles@^3.1.0, ansi-styles@^3.2.0:
+   version "3.2.0"
+   resolved "https://registry.yarnpkg.com/ansi-styles/-/ansi-styles-3.2.0.tgz#c159b8d5be0f9e5a6f346dab94f16ce022161b88"
+   dependencies:
+@@ -878,6 +890,14 @@ chalk@^2.0.0, chalk@^2.3.0:
+     escape-string-regexp "^1.0.5"
+     supports-color "^4.0.0"
+ 
++chalk@^2.3.1:
++  version "2.3.1"
++  resolved "https://registry.yarnpkg.com/chalk/-/chalk-2.3.1.tgz#523fe2678aec7b04e8041909292fe8b17059b796"
++  dependencies:
++    ansi-styles "^3.2.0"
++    escape-string-regexp "^1.0.5"
++    supports-color "^5.2.0"
++
+ chardet@^0.4.0:
+   version "0.4.2"
+   resolved "https://registry.yarnpkg.com/chardet/-/chardet-0.4.2.tgz#b5473b33dc97c424e5d98dc87d55d4d8a29c8bf2"
+@@ -1107,6 +1127,18 @@ core-util-is@1.0.2, core-util-is@~1.0.0:
+   version "1.0.2"
+   resolved "https://registry.yarnpkg.com/core-util-is/-/core-util-is-1.0.2.tgz#b5fd54220aa2bc5ab57aab7140c940754503c1a7"
+ 
++cosmiconfig@^2.1.0, cosmiconfig@^2.1.1:
++  version "2.2.2"
++  resolved "https://registry.yarnpkg.com/cosmiconfig/-/cosmiconfig-2.2.2.tgz#6173cebd56fac042c1f4390edf7af6c07c7cb892"
++  dependencies:
++    is-directory "^0.3.1"
++    js-yaml "^3.4.3"
++    minimist "^1.2.0"
++    object-assign "^4.1.0"
++    os-homedir "^1.0.1"
++    parse-json "^2.2.0"
++    require-from-string "^1.1.0"
++
+ create-ecdh@^4.0.0:
+   version "4.0.0"
+   resolved "https://registry.yarnpkg.com/create-ecdh/-/create-ecdh-4.0.0.tgz#888c723596cdf7612f6498233eebd7a35301737d"
+@@ -1489,6 +1521,10 @@ esprima@^2.6.0:
+   version "2.7.3"
+   resolved "https://registry.yarnpkg.com/esprima/-/esprima-2.7.3.tgz#96e3b70d5779f6ad49cd032673d1c312767ba581"
+ 
++esprima@^4.0.0:
++  version "4.0.0"
++  resolved "https://registry.yarnpkg.com/esprima/-/esprima-4.0.0.tgz#4499eddcd1110e0b218bacf2fa7f7f59f55ca804"
++
+ esrecurse@^4.1.0:
+   version "4.2.0"
+   resolved "https://registry.yarnpkg.com/esrecurse/-/esrecurse-4.2.0.tgz#fa9568d98d3823f9a41d91e902dcab9ea6e5b163"
+@@ -1936,6 +1972,10 @@ has-flag@^2.0.0:
+   version "2.0.0"
+   resolved "https://registry.yarnpkg.com/has-flag/-/has-flag-2.0.0.tgz#e8207af1cc7b30d446cc70b734b5e8be18f88d51"
+ 
++has-flag@^3.0.0:
++  version "3.0.0"
++  resolved "https://registry.yarnpkg.com/has-flag/-/has-flag-3.0.0.tgz#b5d454dc2199ae225699f3467e5a07f3b955bafd"
++
+ has-unicode@^2.0.0:
+   version "2.0.1"
+   resolved "https://registry.yarnpkg.com/has-unicode/-/has-unicode-2.0.1.tgz#e0e6fe6a28cf51138855e086d1691e771de2a8b9"
+@@ -2163,6 +2203,10 @@ is-builtin-module@^1.0.0:
+   dependencies:
+     builtin-modules "^1.0.0"
+ 
++is-directory@^0.3.1:
++  version "0.3.1"
++  resolved "https://registry.yarnpkg.com/is-directory/-/is-directory-0.3.1.tgz#61339b6f2475fc772fd9c9d83f5c8575dc154ae1"
++
+ is-dotfile@^1.0.0:
+   version "1.0.3"
+   resolved "https://registry.yarnpkg.com/is-dotfile/-/is-dotfile-1.0.3.tgz#a6a2f32ffd2dfb04f5ca25ecd0f6b83cf798a1e1"
+@@ -2312,6 +2356,13 @@ js-tokens@^3.0.0, js-tokens@^3.0.2:
+   version "3.0.2"
+   resolved "https://registry.yarnpkg.com/js-tokens/-/js-tokens-3.0.2.tgz#9866df395102130e38f7f996bceb65443209c25b"
+ 
++js-yaml@^3.4.3:
++  version "3.10.0"
++  resolved "https://registry.yarnpkg.com/js-yaml/-/js-yaml-3.10.0.tgz#2e78441646bd4682e963f22b6e92823c309c62dc"
++  dependencies:
++    argparse "^1.0.7"
++    esprima "^4.0.0"
++
+ js-yaml@~3.7.0:
+   version "3.7.0"
+   resolved "https://registry.yarnpkg.com/js-yaml/-/js-yaml-3.7.0.tgz#5c967ddd837a9bfdca5f2de84253abe8a1c03b80"
+@@ -2946,7 +2997,7 @@ os-browserify@^0.3.0:
+   version "0.3.0"
+   resolved "https://registry.yarnpkg.com/os-browserify/-/os-browserify-0.3.0.tgz#854373c7f5c2315914fc9bfc6bd8238fdda1ec27"
+ 
+-os-homedir@^1.0.0:
++os-homedir@^1.0.0, os-homedir@^1.0.1:
+   version "1.0.2"
+   resolved "https://registry.yarnpkg.com/os-homedir/-/os-homedir-1.0.2.tgz#ffbc4988336e0e833de0c168c7ef152121aa7fb3"
+ 
+@@ -3096,7 +3147,7 @@ performance-now@^2.1.0:
+   version "1.3.0"
+ 
+ "phoenix_html@file:../deps/phoenix_html":
+-  version "2.10.4"
++  version "2.10.5"
+ 
+ pify@^2.0.0:
+   version "2.3.0"
+@@ -3187,6 +3238,38 @@ postcss-filter-plugins@^2.0.0:
+     postcss "^5.0.4"
+     uniqid "^4.0.0"
+ 
++postcss-load-config@^1.2.0:
++  version "1.2.0"
++  resolved "https://registry.yarnpkg.com/postcss-load-config/-/postcss-load-config-1.2.0.tgz#539e9afc9ddc8620121ebf9d8c3673e0ce50d28a"
++  dependencies:
++    cosmiconfig "^2.1.0"
++    object-assign "^4.1.0"
++    postcss-load-options "^1.2.0"
++    postcss-load-plugins "^2.3.0"
++
++postcss-load-options@^1.2.0:
++  version "1.2.0"
++  resolved "https://registry.yarnpkg.com/postcss-load-options/-/postcss-load-options-1.2.0.tgz#b098b1559ddac2df04bc0bb375f99a5cfe2b6d8c"
++  dependencies:
++    cosmiconfig "^2.1.0"
++    object-assign "^4.1.0"
++
++postcss-load-plugins@^2.3.0:
++  version "2.3.0"
++  resolved "https://registry.yarnpkg.com/postcss-load-plugins/-/postcss-load-plugins-2.3.0.tgz#745768116599aca2f009fad426b00175049d8d92"
++  dependencies:
++    cosmiconfig "^2.1.1"
++    object-assign "^4.1.0"
++
++postcss-loader@^2.1.1:
++  version "2.1.1"
++  resolved "https://registry.yarnpkg.com/postcss-loader/-/postcss-loader-2.1.1.tgz#208935af3b1d65e1abb1a870a912dd12e7b36895"
++  dependencies:
++    loader-utils "^1.1.0"
++    postcss "^6.0.0"
++    postcss-load-config "^1.2.0"
++    schema-utils "^0.4.0"
++
+ postcss-merge-idents@^2.1.5:
+   version "2.1.7"
+   resolved "https://registry.yarnpkg.com/postcss-merge-idents/-/postcss-merge-idents-2.1.7.tgz#4c5530313c08e1d5b3bbf3d2bbc747e278eea270"
+@@ -3364,6 +3447,14 @@ postcss@^5.0.10, postcss@^5.0.11, postcss@^5.0.12, postcss@^5.0.13, postcss@^5.0
+     source-map "^0.5.6"
+     supports-color "^3.2.3"
+ 
++postcss@^6.0.0:
++  version "6.0.19"
++  resolved "https://registry.yarnpkg.com/postcss/-/postcss-6.0.19.tgz#76a78386f670b9d9494a655bf23ac012effd1555"
++  dependencies:
++    chalk "^2.3.1"
++    source-map "^0.6.1"
++    supports-color "^5.2.0"
++
+ postcss@^6.0.1:
+   version "6.0.16"
+   resolved "https://registry.yarnpkg.com/postcss/-/postcss-6.0.16.tgz#112e2fe2a6d2109be0957687243170ea5589e146"
+@@ -3725,6 +3816,10 @@ require-directory@^2.1.1:
+   version "2.1.1"
+   resolved "https://registry.yarnpkg.com/require-directory/-/require-directory-2.1.1.tgz#8c64ad5fd30dab1c976e2344ffe7f792a6a6df42"
+ 
++require-from-string@^1.1.0:
++  version "1.2.1"
++  resolved "https://registry.yarnpkg.com/require-from-string/-/require-from-string-1.2.1.tgz#529c9ccef27380adfec9a2f965b649bbee636418"
++
+ require-main-filename@^1.0.1:
+   version "1.0.1"
+   resolved "https://registry.yarnpkg.com/require-main-filename/-/require-main-filename-1.0.1.tgz#97f717b69d48784f5f526a6c5aa8ffdda055a4d1"
+@@ -3810,6 +3905,13 @@ schema-utils@^0.3.0:
+   dependencies:
+     ajv "^5.0.0"
+ 
++schema-utils@^0.4.0:
++  version "0.4.5"
++  resolved "https://registry.yarnpkg.com/schema-utils/-/schema-utils-0.4.5.tgz#21836f0608aac17b78f9e3e24daff14a5ca13a3e"
++  dependencies:
++    ajv "^6.1.0"
++    ajv-keywords "^3.1.0"
++
+ scss-tokenizer@^0.2.3:
+   version "0.2.3"
+   resolved "https://registry.yarnpkg.com/scss-tokenizer/-/scss-tokenizer-0.2.3.tgz#8eb06db9a9723333824d3f5530641149847ce5d1"
+@@ -4097,6 +4199,12 @@ supports-color@^5.1.0:
+   dependencies:
+     has-flag "^2.0.0"
+ 
++supports-color@^5.2.0:
++  version "5.2.0"
++  resolved "https://registry.yarnpkg.com/supports-color/-/supports-color-5.2.0.tgz#b0d5333b1184dd3666cbe5aa0b45c5ac7ac17a4a"
++  dependencies:
++    has-flag "^3.0.0"
++
+ svgo@^0.7.0:
+   version "0.7.2"
+   resolved "https://registry.yarnpkg.com/svgo/-/svgo-0.7.2.tgz#9f5772413952135c6fefbf40afe6a4faa88b4bb5"
+diff --git a/lib/changelog/data/factory.ex b/lib/changelog/data/factory.ex
+index b2fffcb950..dfaa8ba7d0 100644
+--- a/lib/changelog/data/factory.ex
++++ b/lib/changelog/data/factory.ex
+@@ -170,6 +170,7 @@ defmodule Changelog.Factory do
+       name: sequence(:name, &"Joe Blow #{&1}"),
+       email: sequence(:email, &"joe-#{&1}@email.com"),
+       handle: sequence(:handle, &"joeblow-#{&1}"),
++      settings: %Changelog.Person.Settings{},
+       admin: false
+     }
+   end
+diff --git a/lib/changelog/data/news/news_item.ex b/lib/changelog/data/news/news_item.ex
+index 196c751787..1113a4d67f 100644
+--- a/lib/changelog/data/news/news_item.ex
++++ b/lib/changelog/data/news/news_item.ex
+@@ -25,6 +25,7 @@ defmodule Changelog.NewsItem do
+ 
+     belongs_to :author, Person
+     belongs_to :logger, Person
++    belongs_to :submitter, Person
+     belongs_to :source, NewsSource
+     has_one :news_queue, NewsQueue, foreign_key: :item_id, on_delete: :delete_all
+     has_many :news_item_topics, NewsItemTopic, foreign_key: :item_id, on_delete: :delete_all
+@@ -34,6 +35,7 @@ defmodule Changelog.NewsItem do
+   end
+ 
+   def audio(query \\ __MODULE__),                      do: from(q in query, where: q.type == ^:audio)
++  def declined(query \\ __MODULE__),                   do: from(q in query, where: q.status == ^:declined)
+   def drafted(query \\ __MODULE__),                    do: from(q in query, where: q.status == ^:draft)
+   def highest_ctr_first(query \\ __MODULE__),          do: from(q in query, order_by: fragment("click_count::float / NULLIF(impression_count, 0) desc nulls last"))
+   def logged_by(query \\ __MODULE__, person),          do: from(q in query, where: q.logger_id == ^person.id)
+@@ -41,6 +43,7 @@ defmodule Changelog.NewsItem do
+   def pinned(query \\ __MODULE__),                     do: from(q in query, where: q.pinned)
+   def unpinned(query \\ __MODULE__),                   do: from(q in query, where: not(q.pinned))
+   def search(query, term),                             do: from(q in query, where: fragment("search_vector @@ plainto_tsquery('english', ?)", ^term))
++  def submitted(query \\ __MODULE__),                  do: from(q in query, where: q.status == ^:submitted)
+   def with_episode(query \\ __MODULE__, episode),      do: from(q in query, where: q.object_id == ^"#{episode.podcast.slug}:#{episode.slug}")
+   def with_object(query \\ __MODULE__),                do: from(q in query, where: not(is_nil(q.object_id)))
+   def with_object_prefix(query \\ __MODULE__, prefix), do: from(q in query, where: like(q.object_id, ^"#{prefix}%"))
+@@ -60,7 +63,7 @@ defmodule Changelog.NewsItem do
+ 
+   def insert_changeset(item, attrs \\ %{}) do
+     item
+-    |> cast(attrs, ~w(status type url headline story pinned published_at author_id logger_id object_id source_id))
++    |> cast(attrs, ~w(status type url headline story pinned published_at author_id logger_id submitter_id object_id source_id))
+     |> validate_required([:type, :url, :headline, :logger_id])
+     |> validate_format(:url, Regexp.http, message: Regexp.http_message)
+     |> foreign_key_constraint(:author_id)
+@@ -69,6 +72,13 @@ defmodule Changelog.NewsItem do
+     |> cast_assoc(:news_item_topics)
+   end
+ 
++  def submission_changeset(item, attrs \\ %{}) do
++    item
++    |> cast(attrs, ~w(url headline story author_id submitter_id))
++    |> validate_required([:type, :url, :headline, :submitter_id])
++    |> validate_format(:url, Regexp.http, message: Regexp.http_message)
++  end
++
+   def update_changeset(item, attrs \\ %{}) do
+     item
+     |> insert_changeset(attrs)
+@@ -108,6 +118,7 @@ defmodule Changelog.NewsItem do
+     |> Ecto.Query.preload(:author)
+     |> Ecto.Query.preload(:logger)
+     |> Ecto.Query.preload(:source)
++    |> Ecto.Query.preload(:submitter)
+     |> preload_topics()
+   end
+ 
+@@ -116,6 +127,7 @@ defmodule Changelog.NewsItem do
+     |> Repo.preload(:author)
+     |> Repo.preload(:logger)
+     |> Repo.preload(:source)
++    |> Repo.preload(:submitter)
+     |> preload_topics()
+   end
+ 
+@@ -130,13 +142,16 @@ defmodule Changelog.NewsItem do
+     |> Repo.preload(:topics)
+   end
+ 
++  def decline!(item), do: item |> change(%{status: :declined}) |> Repo.update!
+   def queue!(item), do: item |> change(%{status: :queued}) |> Repo.update!
+   def publish!(item), do: item |> change(%{status: :published, published_at: Timex.now}) |> Repo.update!
+ 
+   def is_audio(item), do: item.type == :audio
+   def is_video(item), do: item.type == :video
+-  def is_draft(item), do: item.status == :draft
++
++  def is_draft(item),     do: item.status == :draft
+   def is_published(item), do: item.status == :published
++  def is_queued(item),    do: item.status == :queued
+ 
+   def track_click(item) do
+     item
+diff --git a/lib/changelog/data/news/news_queue.ex b/lib/changelog/data/news/news_queue.ex
+index c3bd04358d..0b16b0718a 100644
+--- a/lib/changelog/data/news/news_queue.ex
++++ b/lib/changelog/data/news/news_queue.ex
+@@ -3,7 +3,7 @@ defmodule Changelog.NewsQueue do
+ 
+   require Logger
+ 
+-  alias Changelog.{Buffer, NewsItem, NewsQueue}
++  alias Changelog.{Buffer, NewsItem, NewsQueue, Notifier}
+ 
+   schema "news_queue" do
+     field :position, :float
+@@ -111,20 +111,26 @@ defmodule Changelog.NewsQueue do
+   def publish(item = %NewsItem{}) do
+     case Repo.get_by(NewsQueue, item_id: item.id) do
+       entry = %NewsQueue{} -> publish(entry)
+-      nil -> Buffer.queue(NewsItem.publish!(item))
++      nil -> publish_item(item)
+     end
+   end
+ 
+   def publish(entry = %NewsQueue{}) do
+     entry = Repo.preload(entry, :item)
+-    item = NewsItem.publish!(entry.item)
++    publish_item(entry.item)
+     Repo.delete!(entry)
+-    Buffer.queue(item)
+-    Logger.info("News: Published ##{item.id}")
+   end
+ 
+   def publish(nil) do
+     Logger.info("News: Published bupkis")
+     false
+   end
++
++  defp publish_item(item = %NewsItem{}) do
++    item = NewsItem.publish!(item)
++    Task.start_link(fn -> Buffer.queue(item) end)
++    Task.start_link(fn -> Notifier.notify(item) end)
++    Logger.info("News: Published ##{item.id}")
++    true
++  end
+ end
+diff --git a/lib/changelog/data/person.ex b/lib/changelog/data/person.ex
+index 3b162ff34d..931a96dda7 100644
+--- a/lib/changelog/data/person.ex
++++ b/lib/changelog/data/person.ex
+@@ -5,6 +5,20 @@ defmodule Changelog.Person do
+                    Post, Regexp}
+   alias Timex.Duration
+ 
++  defmodule Settings do
++    use Changelog.Data
++
++    @primary_key false
++    embedded_schema do
++      field :email_on_authored_news, :boolean, default: true
++      field :email_on_submitted_news, :boolean, default: true
++    end
++
++    def changeset(struct, attrs) do
++      cast(struct, attrs, [:email_on_authored_news, :email_on_submitted_news])
++    end
++  end
++
+   schema "people" do
+     field :name, :string
+     field :email, :string
+@@ -22,6 +36,8 @@ defmodule Changelog.Person do
+     field :admin, :boolean
+     field :avatar, Files.Avatar.Type
+ 
++    embeds_one :settings, Settings, on_replace: :update
++
+     has_many :podcast_hosts, PodcastHost, on_delete: :delete_all
+     has_many :episode_hosts, EpisodeHost, on_delete: :delete_all
+     has_many :episode_guests, EpisodeGuest, on_delete: :delete_all
+@@ -44,6 +60,11 @@ defmodule Changelog.Person do
+     from(p in query, where: p.joined_at > ^today)
+   end
+ 
++  def get_by_encoded_id(token) do
++    [id, email] = __MODULE__.decoded_id(token)
++    Repo.get_by(__MODULE__, id: id, email: email)
++  end
++
+   def get_by_ueberauth(%{provider: :twitter, info: %{nickname: handle}}) do
+     Repo.get_by(__MODULE__, twitter_handle: handle)
+   end
+@@ -66,8 +87,9 @@ defmodule Changelog.Person do
+ 
+   defp changeset_with_allowed_params(struct, params, allowed) do
+     struct
+-    |> cast_attachments(params, ~w(avatar), allow_urls: true)
+     |> cast(params, allowed)
++    |> cast_embed(:settings)
++    |> cast_attachments(params, ~w(avatar), allow_urls: true)
+     |> validate_required([:name, :email, :handle])
+     |> validate_format(:website, Regexp.http, message: Regexp.http_message)
+     |> validate_format(:handle, Regexp.slug, message: Regexp.slug_message)
+@@ -108,6 +130,15 @@ defmodule Changelog.Person do
+     String.split(decoded, "|")
+   end
+ 
++  def encoded_id(person) do
++    {:ok, Base.encode16("#{person.id}|#{person.email}")}
++  end
++
++  def decoded_id(encoded) do
++    {:ok, decoded} = Base.decode16(encoded)
++    String.split(decoded, "|")
++  end
++
+   def episode_count(person) do
+     host_count = Repo.count(from(e in EpisodeHost, where: e.person_id == ^person.id))
+     guest_count = Repo.count(from(e in EpisodeGuest, where: e.person_id == ^person.id))
+diff --git a/lib/changelog/faker.ex b/lib/changelog/faker.ex
+index a445a0a5cf..f5045ed7c8 100644
+--- a/lib/changelog/faker.ex
++++ b/lib/changelog/faker.ex
+@@ -1,7 +1,9 @@
+ defmodule Changelog.Faker do
+   alias Changelog.Hashid
+ 
+-  def name do
++  def name, do: Enum.random(names())
++
++  def names do
+     [
+       "Place Holder",
+       "Temp Orary",
+@@ -16,7 +18,7 @@ defmodule Changelog.Faker do
+       "Crypt Ography",
+       "Ima Dev",
+       "Wemade Oneup"
+-    ] |> Enum.random
++    ]
+   end
+ 
+   def handle(name) do
+diff --git a/lib/changelog/notifier.ex b/lib/changelog/notifier.ex
+new file mode 100644
+index 0000000000..84e650283e
+--- /dev/null
++++ b/lib/changelog/notifier.ex
+@@ -0,0 +1,29 @@
++defmodule Changelog.Notifier do
++  alias Changelog.{Mailer, NewsItem}
++  alias ChangelogWeb.Email
++
++  def notify(item = %NewsItem{}) do
++    item = NewsItem.preload_all(item)
++
++    if item.submitter == item.author do
++      deliver_submitter_email(item.submitter, item)
++    else
++      deliver_author_email(item.author, item)
++      deliver_submitter_email(item.submitter, item)
++    end
++  end
++
++  defp deliver_author_email(person, _item) when is_nil(person), do: false
++  defp deliver_author_email(person, item) do
++    if person.settings.email_on_authored_news do
++      Email.authored_news_published(person, item) |> Mailer.deliver_later
++    end
++  end
++
++  defp deliver_submitter_email(person, _item) when is_nil(person), do: false
++  defp deliver_submitter_email(person, item) do
++    if person.settings.email_on_submitted_news do
++      Email.submitted_news_published(person, item) |> Mailer.deliver_later
++    end
++  end
++end
+diff --git a/lib/changelog_web/controllers/admin/news/news_item_controller.ex b/lib/changelog_web/controllers/admin/news/news_item_controller.ex
+index 5a8566e55b..3442629eb2 100644
+--- a/lib/changelog_web/controllers/admin/news/news_item_controller.ex
++++ b/lib/changelog_web/controllers/admin/news/news_item_controller.ex
+@@ -20,6 +20,12 @@ defmodule ChangelogWeb.Admin.NewsItemController do
+       |> Repo.all
+       |> Enum.map(&(&1.item))
+ 
++    submitted =
++      NewsItem.submitted
++      |> NewsItem.newest_first(:inserted_at)
++      |> NewsItem.preload_all
++      |> Repo.all
++
+     page =
+       NewsItem.published
+       |> NewsItem.newest_first
+@@ -45,15 +51,16 @@ defmodule ChangelogWeb.Admin.NewsItemController do
+       |> Enum.sort(&(Timex.after?(&1.updated_at, &2.updated_at)))
+       |> Enum.chunk(activity_count)
+ 
+-    render(conn, :index, drafts: drafts, queued: queued, activity: activity, published: page.entries, page: page)
++    render(conn, :index, drafts: drafts, submitted: submitted, queued: queued,
++                         activity: activity, published: page.entries, page: page)
+   end
+ 
+-  def new(conn, params) do
++  def new(conn = %{assigns: %{current_user: me}}, params) do
+     url = UrlKit.normalize_url(params["url"])
+     html = UrlKit.get_html(url)
+ 
+     changeset =
+-      conn.assigns.current_user
++      me
+       |> build_assoc(:logged_news_items,
+         url: url,
+         headline: String.capitalize(HtmlKit.get_title(html)),
+@@ -85,9 +92,9 @@ defmodule ChangelogWeb.Admin.NewsItemController do
+     end
+   end
+ 
+-  def edit(conn, %{"id" => id}) do
++  def edit(conn = %{assigns: %{current_user: me}}, %{"id" => id}) do
+     item = Repo.get!(NewsItem, id) |> NewsItem.preload_topics()
+-    changeset = NewsItem.update_changeset(item)
++    changeset = NewsItem.update_changeset(item, %{logger_id: item.logger_id || me.id})
+     render(conn, :edit, item: item, changeset: changeset)
+   end
+ 
+@@ -110,6 +117,15 @@ defmodule ChangelogWeb.Admin.NewsItemController do
+     end
+   end
+ 
++  def decline(conn, %{"id" => id}) do
++    item = Repo.get!(NewsItem, id)
++    NewsItem.decline!(item)
++
++    conn
++    |> put_flash(:result, "success")
++    |> redirect(to: admin_news_item_path(conn, :index))
++  end
++
+   def delete(conn, %{"id" => id}) do
+     item = Repo.get!(NewsItem, id)
+     Repo.delete!(item)
+diff --git a/lib/changelog_web/controllers/home_controller.ex b/lib/changelog_web/controllers/home_controller.ex
+index aa9ba3891b..f4db810ae5 100644
+--- a/lib/changelog_web/controllers/home_controller.ex
++++ b/lib/changelog_web/controllers/home_controller.ex
+@@ -4,7 +4,7 @@ defmodule ChangelogWeb.HomeController do
+   alias Changelog.{Person, Slack}
+   alias Craisin.Subscriber
+ 
+-  plug RequireUser
++  plug RequireUser, "except from email links" when action not in [:opt_out]
+ 
+   def show(conn, %{"subscribed" => newsletter_id}), do: render(conn, :show, subscribed: newsletter_id, unsubscribed: nil)
+   def show(conn, %{"unsubscribed" => newsletter_id}), do: render(conn, :show, subscribed: nil, unsubscribed: newsletter_id)
+@@ -65,6 +65,16 @@ defmodule ChangelogWeb.HomeController do
+     |> redirect(to: home_path(conn, :show))
+   end
+ 
++  def opt_out(conn, %{"token" => token, "notification" => notification}) do
++    if person = Person.get_by_encoded_id(token) do
++      person
++      |> Person.changeset(%{settings: %{notification => false}})
++      |> Repo.update()
++    end
++
++    render(conn, :opt_out)
++  end
++
+   defp set_slack_id(person) do
+     if person.slack_id do
+       person
+diff --git a/lib/changelog_web/controllers/news/news_item_controller.ex b/lib/changelog_web/controllers/news/news_item_controller.ex
+index e9f12ba934..a9f0314841 100644
+--- a/lib/changelog_web/controllers/news/news_item_controller.ex
++++ b/lib/changelog_web/controllers/news/news_item_controller.ex
+@@ -5,6 +5,7 @@ defmodule ChangelogWeb.NewsItemController do
+   alias ChangelogWeb.NewsItemView
+ 
+   plug RequireAdmin, "before preview" when action in [:preview]
++  plug RequireUser, "before submitting" when action in [:new, :create]
+ 
+   def index(conn, params) do
+     pinned =
+@@ -40,6 +41,27 @@ defmodule ChangelogWeb.NewsItemController do
+     render(conn, :index, ads: ads, pinned: pinned, items: items, page: page)
+   end
+ 
++  def new(conn, _params) do
++    changeset = NewsItem.submission_changeset(%NewsItem{})
++    render(conn, :new, changeset: changeset)
++  end
++
++  def create(conn = %{assigns: %{current_user: user}}, %{"news_item" => item_params}) do
++    item = %NewsItem{type: :link, author_id: user.id, submitter_id: user.id, status: :submitted}
++    changeset = NewsItem.submission_changeset(item, item_params)
++
++    case Repo.insert(changeset) do
++      {:ok, _item} ->
++        conn
++        |> put_flash(:success, "We received your submission! Stay awesome 💚")
++        |> redirect(to: root_path(conn, :index))
++      {:error, changeset} ->
++        conn
++        |> put_flash(:error, "Something went wrong. 😭")
++        |> render(:new, changeset: changeset)
++    end
++  end
++
+   def show(conn, %{"id" => slug}) do
+     hashid = slug |> String.split("-") |> List.last
+ 
+diff --git a/lib/changelog_web/email.ex b/lib/changelog_web/email.ex
+index 3f7f4b6998..4aa7045620 100644
+--- a/lib/changelog_web/email.ex
++++ b/lib/changelog_web/email.ex
+@@ -54,6 +54,26 @@ defmodule ChangelogWeb.Email do
+     |> render(:subscriber_welcome)
+   end
+ 
++  def authored_news_published(person, item) do
++    logbot_email()
++    |> put_header("X-CMail-GroupName", "Authored News")
++    |> to(person)
++    |> subject("You're on Changelog News!")
++    |> assign(:person, person)
++    |> assign(:item, item)
++    |> render(:authored_news_published)
++  end
++
++  def submitted_news_published(person, item) do
++    logbot_email()
++    |> put_header("X-CMail-GroupName", "Submitted News")
++    |> to(person)
++    |> subject("Your submission is on Changelog News!")
++    |> assign(:person, person)
++    |> assign(:item, item)
++    |> render(:submitted_news_published)
++  end
++
+   defp logbot_email do
+     new_email()
+     |> from("logbot@changelog.com")
+diff --git a/lib/changelog_web/helpers/public_helpers.ex b/lib/changelog_web/helpers/public_helpers.ex
+index beec78473c..b818b4cb6a 100644
+--- a/lib/changelog_web/helpers/public_helpers.ex
++++ b/lib/changelog_web/helpers/public_helpers.ex
+@@ -10,7 +10,7 @@ defmodule ChangelogWeb.Helpers.PublicHelpers do
+   def error_message(form, field) do
+     case form.errors[field] do
+       {message, _} ->
+-        content_tag :p, class: "form_element_note" do
++        content_tag :p, class: "form-element-error" do
+           message
+         end
+       nil -> ""
+diff --git a/lib/changelog_web/plugs/require_user.ex b/lib/changelog_web/plugs/require_user.ex
+index 635a7729b9..06c84da33b 100644
+--- a/lib/changelog_web/plugs/require_user.ex
++++ b/lib/changelog_web/plugs/require_user.ex
+@@ -13,8 +13,8 @@ defmodule ChangelogWeb.Plug.RequireUser do
+       conn
+     else
+       conn
+-      |> put_flash(:error, "You must sign in first.")
+-      |> redirect(to: Helpers.root_path(conn, :index))
++      |> put_flash(:error, "Please sign in first. ✊")
++      |> redirect(to: Helpers.sign_in_path(conn, :new))
+       |> halt()
+     end
+   end
+diff --git a/lib/changelog_web/router.ex b/lib/changelog_web/router.ex
+index 95cc7bd586..14bd775f3d 100644
+--- a/lib/changelog_web/router.ex
++++ b/lib/changelog_web/router.ex
+@@ -60,6 +60,7 @@ defmodule ChangelogWeb.Router do
+ 
+     get "/news", NewsItemController, :index
+     resources "/news/items", NewsItemController, except: [:show]
++    delete "/news/items/:id/decline", NewsItemController, :decline, as: :news_item
+     post "/news/items/:id/move", NewsItemController, :move, as: :news_item
+     resources "/news/sources", NewsSourceController, except: [:show]
+     get "/news/sponsorships/schedule", NewsSponsorshipController, :schedule
+@@ -112,7 +113,6 @@ defmodule ChangelogWeb.Router do
+   scope "/", ChangelogWeb do
+     pipe_through [:browser, :public]
+ 
+-    # people and auth
+     get "/join", PersonController, :join, as: :person
+     post "/join", PersonController, :join, as: :person
+     get "/subscribe", PersonController, :subscribe, as: :person
+@@ -121,19 +121,20 @@ defmodule ChangelogWeb.Router do
+     resources "/~", HomeController, only: [:show, :update], singleton: true
+     get "/~/profile", HomeController, :profile
+     get "/~/account", HomeController, :account
++    get "/~/nope/:token/:notification", HomeController, :opt_out
+ 
+     post "/~/slack", HomeController, :slack
+     post "/~/subscribe/:id", HomeController, :subscribe
+     post "/~/unsubscribe/:id", HomeController, :unsubscribe
+ 
+-    get "/community", PageController, :community
+     get "/in", AuthController, :new, as: :sign_in
+     post "/in", AuthController, :new, as: :sign_in
+     get "/in/:token", AuthController, :create, as: :sign_in
+     get "/out", AuthController, :delete, as: :sign_out
+ 
+     get "/", NewsItemController, :index, as: :root
+-    resources "/news", NewsItemController, only: [:show], as: :news_item
++    get "/news/submit", NewsItemController, :new
++    resources "/news", NewsItemController, only: [:show, :create], as: :news_item
+     get "/news/:id/visit", NewsItemController, :visit, as: :news_item
+     post "/news/impress", NewsItemController, :impress, as: :news_item
+     resources "/ads", NewsAdController, only: [:show], as: :news_ad
+@@ -159,6 +160,7 @@ defmodule ChangelogWeb.Router do
+     # static pages
+     get "/about", PageController, :about
+     get "/coc", PageController, :coc
++    get "/community", PageController, :community
+     get "/contact", PageController, :contact
+     get "/films", PageController, :films
+     get "/films/gophercon-2015", PageController, :films_gophercon_2015
+diff --git a/lib/changelog_web/templates/admin/episode/_table.html.eex b/lib/changelog_web/templates/admin/episode/_table.html.eex
+index 01bebfe9e4..cff7de3abd 100644
+--- a/lib/changelog_web/templates/admin/episode/_table.html.eex
++++ b/lib/changelog_web/templates/admin/episode/_table.html.eex
+@@ -3,7 +3,7 @@
+     <tr>
+       <th>Slug</th>
+       <th>Name</th>
+-    <%= if @status == "draft" do %>
++    <%= if @status == :draft do %>
+       <th>Record Time</th>
+     <% else %>
+       <th>Duration</th>
+diff --git a/lib/changelog_web/templates/admin/episode/index.html.eex b/lib/changelog_web/templates/admin/episode/index.html.eex
+index ccf0d2c3ba..8b81f53ad3 100644
+--- a/lib/changelog_web/templates/admin/episode/index.html.eex
++++ b/lib/changelog_web/templates/admin/episode/index.html.eex
+@@ -12,17 +12,17 @@
+ <div class="ui basic segment">
+ <%= if Enum.any?(@drafts) do %>
+   <h2 class="ui header">Drafts</h2>
+-  <%= render("_table.html", conn: @conn, status: "draft", podcast: @podcast, episodes: @drafts) %>
++  <%= render("_table.html", conn: @conn, status: :draft, podcast: @podcast, episodes: @drafts) %>
+ <% end %>
+ 
+ <%= if Enum.any?(@scheduled) do %>
+   <h2 class="ui header">Scheduled</h2>
+-  <%= render("_table.html", conn: @conn, status: "scheduled", podcast: @podcast, episodes: @scheduled) %>
++  <%= render("_table.html", conn: @conn, status: :scheduled, podcast: @podcast, episodes: @scheduled) %>
+ <% end %>
+ 
+ <%= if Enum.any?(@episodes) do %>
+   <h2 class="ui header">Published</h2>
+-  <%= render("_table.html", conn: @conn, status: "published", podcast: @podcast, episodes: @episodes) %>
++  <%= render("_table.html", conn: @conn, status: :published, podcast: @podcast, episodes: @episodes) %>
+   <%= pagination_links @conn, @page, [@podcast.slug], path: &admin_podcast_episode_path/4 %>
+ <% end %>
+ </div>
+diff --git a/lib/changelog_web/templates/admin/news_item/_form.html.eex b/lib/changelog_web/templates/admin/news_item/_form.html.eex
+index e2a86ab2cd..3e8c51d1e9 100644
+--- a/lib/changelog_web/templates/admin/news_item/_form.html.eex
++++ b/lib/changelog_web/templates/admin/news_item/_form.html.eex
+@@ -107,20 +107,38 @@
+     </div>
+   </div>
+ 
+-  <div class="field required <%= error_class(f, :logger_id) %>">
+-    <%= label(f, :logger_id, "Logged By") %>
+-    <div class="ui fluid remote logger search selection dropdown">
+-      <i class="dropdown icon"></i>
+-      <% logger = load_from_form(f, Person, :logger) %>
+-      <%= if logger do %>
+-        <%= hidden_input(f, :logger_id, value: logger.id) %>
+-        <div class="selected text"><%= logger.name %></div>
+-      <% else %>
+-        <%= hidden_input(f, :logger_id) %>
+-        <div class="default text">Select Changelogger</div>
+-      <% end %>
++  <div class="two fields">
++    <div class="field required <%= error_class(f, :logger_id) %>">
++      <%= label(f, :logger_id, "Logged By") %>
++      <div class="ui fluid remote logger search selection dropdown">
++        <i class="dropdown icon"></i>
++        <% logger = load_from_form(f, Person, :logger) %>
++        <%= if logger do %>
++          <%= hidden_input(f, :logger_id, value: logger.id) %>
++          <div class="selected text"><%= logger.name %></div>
++        <% else %>
++          <%= hidden_input(f, :logger_id) %>
++          <div class="default text">Select Changelogger</div>
++        <% end %>
++      </div>
++      <%= error_message(f, :logger_id) %>
++    </div>
++
++    <div class="field <%= error_class(f, :submitter_id) %>">
++      <%= label_with_clear(:submitter_id, "Submitted By") %>
++      <div class="ui fluid remote submitter search selection dropdown">
++        <i class="dropdown icon"></i>
++        <% submitter = load_from_form(f, Person, :submitter) %>
++        <%= if submitter do %>
++          <%= hidden_input(f, :submitter_id, value: submitter.id) %>
++          <div class="selected text"><%= submitter.name %></div>
++        <% else %>
++          <%= hidden_input(f, :submitter_id) %>
++          <div class="default text">Select Submitter</div>
++        <% end %>
++      </div>
++      <%= error_message(f, :submitter_id) %>
+     </div>
+-    <%= error_message(f, :logger_id) %>
+   </div>
+ 
+   <div class="inline field">
+@@ -133,11 +151,11 @@
+   <div class="ui hidden divider"></div>
+ 
+   <div class="ui equal width stackable grid">
+-  <%= if is_persisted(f.data) && !NewsItem.is_draft(f.data) do %>
++  <%= if NewsItem.is_published(f.data) || NewsItem.is_queued(f.data) do %>
+     <div class="column"><%= submit_button(:primary, "Save", current_path(@conn)) %></div>
+     <div class="column"><%= submit_button(:secondary, "Save and Close", next_param(@conn, admin_news_item_path(@conn, :index))) %></div>
+     <div class="column">
+-    <%= if !NewsItem.is_published(f.data) do %>
++    <%= if NewsItem.is_queued(f.data) do %>
+       <button class="ui green fluid basic button" type="submit" name="queue" value="publish">Publish</button>
+     <% end %>
+     </div>
+diff --git a/lib/changelog_web/templates/admin/news_item/_table.html.eex b/lib/changelog_web/templates/admin/news_item/_table.html.eex
+index d07d3abb61..9edfae3538 100644
+--- a/lib/changelog_web/templates/admin/news_item/_table.html.eex
++++ b/lib/changelog_web/templates/admin/news_item/_table.html.eex
+@@ -5,7 +5,7 @@
+         <th>Type</th>
+         <th>Headline</th>
+         <th>Topics</th>
+-      <%= if @status == "published" do %>
++      <%= if @status == :published do %>
+         <th><i class="mouse pointer icon"></i> / <i class="eye icon"></i></th>
+         <th>CTR</th>
+         <th>Publish Time</th>
+@@ -16,7 +16,7 @@
+       </tr>
+     </thead>
+ 
+-  <%= if @status == "queued" do %>
++  <%= if @status == :queued do %>
+     <tbody class="js-queue" data-csrf="<%= get_csrf_token() %>">
+   <% else %>
+     <tbody>
+@@ -24,14 +24,21 @@
+     <%= for item <- @items do %>
+       <tr data-id="<%= item.id %>">
+         <td class="center aligned">
++        <%= if is_loaded(item.submitter) do %>
++          <%= link to: admin_person_path(@conn, :edit, item.submitter), title: "Submitter" do %>
++            <img class="ui avatar image" src="<%= PersonView.avatar_url(item.submitter) %>">
++          <% end %>
++        <% end %>
++        <%= if is_loaded(item.logger) do %>
+           <%= link to: admin_person_path(@conn, :edit, item.logger), title: "Logger" do %>
+             <img class="ui avatar image" src="<%= PersonView.avatar_url(item.logger) %>">
+           <% end %>
+-          <%= if is_loaded(item.author) do %>
+-              <%= link to: admin_person_path(@conn, :edit, item.author), title: "Author" do %>
+-                <img class="ui avatar image" src="<%= PersonView.avatar_url(item.author) %>">
+-              <% end %>
++        <% end %>
++        <%= if is_loaded(item.author) && @status != :submitted do %>
++          <%= link to: admin_person_path(@conn, :edit, item.author), title: "Author" do %>
++            <img class="ui avatar image" src="<%= PersonView.avatar_url(item.author) %>">
+           <% end %>
++        <% end %>
+         </td>
+         <td><%= item.type %></td>
+         <td>
+@@ -43,7 +50,7 @@
+           <%= link "##{topic.slug}", to: admin_topic_path(@conn, :edit, topic.slug) %><br/>
+         <% end %>
+         </td>
+-      <%= if @status == "published" do %>
++      <%= if @status == :published do %>
+         <td><%= item.click_count %> / <%= item.impression_count %></td>
+         <td><%= ctr(item) %>%</td>
+         <td><%= ts(item.published_at) %></td>
+@@ -52,12 +59,16 @@
+       <% end %>
+         <td class="center aligned">
+           <div class="ui small basic buttons">
+-          <%= if @status == "queued" do %>
++          <%= if @status == :queued do %>
+             <%= icon_link "move", to: admin_news_item_path(@conn, :edit, item) %>
+           <% end %>
+             <%= icon_link "eye", to: show_or_preview_path(@conn, item) %>
+             <%= icon_link "edit", to: admin_news_item_path(@conn, :edit, item) %>
++          <%= if @status == :submitted do %>
++            <%= icon_link "thumbs down", to: admin_news_item_path(@conn, :decline, item), method: :delete, data: [confirm: "Decline this item?"] %>
++          <% else %>
+             <%= icon_link "trash", to: admin_news_item_path(@conn, :delete, item), method: :delete, data: [confirm: "Are you sure?"] %>
++          <% end %>
+           </div>
+         </td>
+       </tr>
+diff --git a/lib/changelog_web/templates/admin/news_item/index.html.eex b/lib/changelog_web/templates/admin/news_item/index.html.eex
+index 1f6afecc54..ee266782c2 100644
+--- a/lib/changelog_web/templates/admin/news_item/index.html.eex
++++ b/lib/changelog_web/templates/admin/news_item/index.html.eex
+@@ -33,12 +33,17 @@
+ <div class="ui basic segment">
+   <%= if Enum.any?(@drafts) do %>
+     <h2 class="ui header">My Drafts</h2>
+-    <%= render("_table.html", conn: @conn, status: "draft", items: @drafts) %>
++    <%= render("_table.html", conn: @conn, status: :draft, items: @drafts) %>
++  <% end %>
++
++  <%= if Enum.any?(@submitted) do %>
++    <h2 class="ui header">Submitted</h2>
++    <%= render("_table.html", conn: @conn, status: :submitted, items: @submitted) %>
+   <% end %>
+ 
+   <h2 class="ui header">Queued</h2>
+   <%= if Enum.any?(@queued) do %>
+-    <%= render("_table.html", conn: @conn, status: "queued", items: @queued) %>
++    <%= render("_table.html", conn: @conn, status: :queued, items: @queued) %>
+   <% else %>
+     <div class="ui basic segment icon message">
+       <i class="meh face icon"></i>
+@@ -97,7 +102,7 @@
+ 
+ <%= if Enum.any?(@published) do %>
+   <h2 class="ui header">Published (<%= @page.total_entries |> comma_separated %>)</h2>
+-  <%= render("_table.html", conn: @conn, status: "published", items: @published) %>
++  <%= render("_table.html", conn: @conn, status: :published, items: @published) %>
+   <%= pagination_links(@conn, @page, path: &admin_news_item_path/3) %>
+ <% end %>
+ </div>
+diff --git a/lib/changelog_web/templates/admin/person/_form.html.eex b/lib/changelog_web/templates/admin/person/_form.html.eex
+index f458bb5de9..8aab6fa1de 100644
+--- a/lib/changelog_web/templates/admin/person/_form.html.eex
++++ b/lib/changelog_web/templates/admin/person/_form.html.eex
+@@ -1,32 +1,42 @@
+ <%= form_for @changeset, @action, [class: "ui form", multipart: true], fn f -> %>
+-  <div class="field required <%= error_class(f, :name) %>">
+-    <%= label f, :name, "Name" %>
+-    <%= text_input f, :name, placeholder: "Grace Hopper" %>
+-    <%= error_message(f, :name) %>
++  <div class="two fields">
++    <div class="fourteen wide field required <%= error_class(f, :name) %>">
++      <%= label(f, :name, "Name") %>
++      <%= text_input(f, :name, placeholder: "Grace Hopper") %>
++      <%= error_message(f, :name) %>
++    </div>
++
++    <div class="two wide field">
++      <%= label(f, :admin) %>
++      <div class="ui fitted toggle checkbox">
++        <%= checkbox(f, :admin, class: "hidden") %>
++        <label></label>
++      </div>
++    </div>
+   </div>
+ 
+   <div class="field required <%= error_class(f, :email) %>">
+-    <%= label f, :email, "Email" %>
++    <%= label(f, :email, "Email") %>
+     <%= email_input(f, :email, placeholder: "grace@hopper.com", autocapitalize: "none") %>
+     <%= error_message(f, :email) %>
+   </div>
+ 
+   <div class="three fields">
+     <div class="field required <%= error_class(f, :handle) %>">
+-      <%= label f, :handle, "Handle" %>
+-      <%= text_input f, :handle, placeholder: "gracehopper", autocapitalize: "none" %>
++      <%= label(f, :handle, "Handle") %>
++      <%= text_input(f, :handle, placeholder: "gracehopper", autocapitalize: "none") %>
+       <%= error_message(f, :handle) %>
+     </div>
+ 
+     <div class="field <%= error_class(f, :github_handle) %>">
+-      <%= label f, :github_handle, "On GitHub" %>
+-      <%= text_input f, :github_handle, placeholder: "gracehopper", autocapitalize: "none" %>
++      <%= label(f, :github_handle, "On GitHub") %>
++      <%= text_input(f, :github_handle, placeholder: "gracehopper", autocapitalize: "none") %>
+       <%= error_message(f, :github_handle) %>
+     </div>
+ 
+     <div class="field <%= error_class(f, :twitter_handle) %>">
+-      <%= label f, :twitter_handle, "On Twitter" %>
+-      <%= text_input f, :twitter_handle, placeholder: "gracehopper", autocapitalize: "none" %>
++      <%= label(f, :twitter_handle, "On Twitter") %>
++      <%= text_input(f, :twitter_handle, placeholder: "gracehopper", autocapitalize: "none") %>
+       <%= error_message(f, :twitter_handle) %>
+     </div>
+   </div>
+@@ -61,32 +71,42 @@
+ 
+   <div class="two fields">
+     <div class="field <%= error_class(f, :website) %>">
+-      <%= label f, :website %>
+-      <%= text_input f, :website, placeholder: "https://en.wikipedia.org/wiki/Grace_Hopper", autocapitalize: "none" %>
++      <%= label(f, :website) %>
++      <%= text_input(f, :website, placeholder: "https://en.wikipedia.org/wiki/Grace_Hopper", autocapitalize: "none") %>
+       <%= error_message(f, :website) %>
+     </div>
+ 
+     <div class="field <%= error_class(f, :location) %>">
+-      <%= label f, :location %>
+-      <%= text_input f, :location, placeholder: "New York, New York" %>
++      <%= label(f, :location) %>
++      <%= text_input(f, :location, placeholder: "New York, New York") %>
+       <%= error_message(f, :location) %>
+     </div>
+   </div>
+ 
+   <div class="field <%= error_class(f, :bio) %>">
+-    <%= label f, :bio %>
++    <%= label(f, :bio) %>
+     <%= textarea f, :bio %>
+     <%= error_message(f, :bio) %>
+   </div>
+ 
++<%= inputs_for f, :settings, fn(i) -> %>
+   <div class="inline field">
+     <div class="ui toggle checkbox">
+-      <%= checkbox(f, :admin, class: "hidden") %>
+-      <%= label(f, :admin) %>
++      <%= checkbox(i, :email_on_authored_news, class: "hidden") %>
++      <%= label(f, :email_on_authored_news, "Email on authored news") %>
+     </div>
+   </div>
+ 
++  <div class="inline field">
++    <div class="ui toggle checkbox">
++      <%= checkbox(i, :email_on_submitted_news, class: "hidden") %>
++      <%= label(f, :email_on_submitted_news, "Email on submitted news") %>
++    </div>
++  </div>
++<% end %>
++
+ <%= if !is_persisted(f.data) do %>
++  <div class="ui divider"></div>
+   <div class="inline fields">
+     <label>Send Welcome Email</label>
+     <div class="field">
+diff --git a/lib/changelog_web/templates/admin/post/index.html.eex b/lib/changelog_web/templates/admin/post/index.html.eex
+index 63e61b6b0a..f3c8a73671 100644
+--- a/lib/changelog_web/templates/admin/post/index.html.eex
++++ b/lib/changelog_web/templates/admin/post/index.html.eex
+@@ -15,17 +15,17 @@
+ <div class="ui basic segment">
+ <%= if Enum.any?(@drafts) do %>
+   <h2 class="ui header">Drafts</h2>
+-  <%= render("_table.html", conn: @conn, status: "draft", posts: @drafts) %>
++  <%= render("_table.html", conn: @conn, status: :draft, posts: @drafts) %>
+ <% end %>
+ 
+ <%= if Enum.any?(@scheduled) do %>
+   <h2 class="ui header">Scheduled</h2>
+-  <%= render("_table.html", conn: @conn, status: "scheduled", posts: @scheduled) %>
++  <%= render("_table.html", conn: @conn, status: :scheduled, posts: @scheduled) %>
+ <% end %>
+ 
+ <%= if Enum.any?(@posts) do %>
+   <h2 class="ui header">Published</h2>
+-  <%= render("_table.html", conn: @conn, status: "published", posts: @posts) %>
++  <%= render("_table.html", conn: @conn, status: :published, posts: @posts) %>
+   <%= pagination_links(@conn, @page, path: &admin_post_path/3) %>
+ <% end %>
+ </div>
+diff --git a/lib/changelog_web/templates/admin/search/episode.html.eex b/lib/changelog_web/templates/admin/search/episode.html.eex
+index 9684c0f098..5bdb45ec76 100644
+--- a/lib/changelog_web/templates/admin/search/episode.html.eex
++++ b/lib/changelog_web/templates/admin/search/episode.html.eex
+@@ -4,7 +4,7 @@
+   </h1>
+ 
+ <%= if Enum.any?(@results) do %>
+-  <%= render(EpisodeView, "_table.html", conn: @conn, podcast: List.first(@results).podcast, episodes: @results, status: "published") %>
++  <%= render(EpisodeView, "_table.html", conn: @conn, podcast: List.first(@results).podcast, episodes: @results, status: :published) %>
+ <% end %>
+ </div>
+ 
+diff --git a/lib/changelog_web/templates/admin/search/news_item.html.eex b/lib/changelog_web/templates/admin/search/news_item.html.eex
+index 61a3c7e511..4021c8aaf4 100644
+--- a/lib/changelog_web/templates/admin/search/news_item.html.eex
++++ b/lib/changelog_web/templates/admin/search/news_item.html.eex
+@@ -4,7 +4,7 @@
+   </h1>
+ 
+ <%= if Enum.any?(@results) do %>
+-  <%= render(NewsItemView, "_table.html", conn: @conn, items: Enum.map(@results, &NewsItem.preload_all/1), status: "published") %>
++  <%= render(NewsItemView, "_table.html", conn: @conn, items: Enum.map(@results, &NewsItem.preload_all/1), status: :published) %>
+ <% end %>
+ </div>
+ 
+diff --git a/lib/changelog_web/templates/email/authored_news_published.html.eex b/lib/changelog_web/templates/email/authored_news_published.html.eex
+new file mode 100644
+index 0000000000..44496e9aeb
+--- /dev/null
++++ b/lib/changelog_web/templates/email/authored_news_published.html.eex
+@@ -0,0 +1,15 @@
++<tr>
++  <td class="content-block" itemprop="handler" itemscope itemtype="http://schema.org/HttpActionHandler">
++    <p><%= greeting(@person) %></p>
++
++    <p>Something you created just got featured on Changelog News! Check it out:</p>
++
++    <p><%= link(@item.headline, to: news_item_url(Endpoint, :show, NewsItemView.slug(@item)), itemprop: "url") %></p>
++
++    <p>Each week's most popular news items are also featured in <%= link "our newsletter", to: page_url(Endpoint, :weekly) %>. Share this link with your friends to increase your odds and keep your 👀 peeled.</p>
++
++    <p>Don't want these notifications? <em><%= link("Disable 'em", to: PersonView.opt_out_url(Endpoint, @person, "email_on_authored_news")) %></em></p>
++
++    <p>💚, Logbot</p>
++  </td>
++</tr>
+diff --git a/lib/changelog_web/templates/email/authored_news_published.text.eex b/lib/changelog_web/templates/email/authored_news_published.text.eex
+new file mode 100644
+index 0000000000..15ec1f14e3
+--- /dev/null
++++ b/lib/changelog_web/templates/email/authored_news_published.text.eex
+@@ -0,0 +1,14 @@
++<%= greeting(@person) %>
++
++
++Something you created just got featured[1] on Changelog News!
++
++Each week's most popular news items are also featured in our newsletter[2]. Share this link with your friends to increase your odds and keep your 👀 peeled.
++
++Don't want these notifications? Disable 'em[3]
++
++[1]: <%= news_item_url(Endpoint, :show, NewsItemView.slug(@item)) %>
++[2]: <%= page_url(Endpoint, :weekly) %>
++[3]: <%= PersonView.opt_out_url(Endpoint, @person, "email_on_authored_news") %>
++
++💚, Logbot
+diff --git a/lib/changelog_web/templates/email/community_welcome.html.eex b/lib/changelog_web/templates/email/community_welcome.html.eex
+index c7aee4f0f8..11a2ceaf38 100644
+--- a/lib/changelog_web/templates/email/community_welcome.html.eex
++++ b/lib/changelog_web/templates/email/community_welcome.html.eex
+@@ -1,6 +1,6 @@
+ <tr>
+   <td class="content-block" itemprop="handler" itemscope itemtype="http://schema.org/HttpActionHandler">
+-    <h1>Hey <%= PersonView.first_name(@person) %>,</h1>
++    <p><%= greeting(@person) %></p>
+ 
+     <p>Welcome to the Changelog Community!</p>
+ 
+diff --git a/lib/changelog_web/templates/email/community_welcome.text.eex b/lib/changelog_web/templates/email/community_welcome.text.eex
+index c4dd4da795..8e58f09025 100644
+--- a/lib/changelog_web/templates/email/community_welcome.text.eex
++++ b/lib/changelog_web/templates/email/community_welcome.text.eex
+@@ -1,4 +1,5 @@
+-Hey <%= PersonView.first_name(@person) %>,
++<%= greeting(@person) %>
++
+ 
+ Welcome to the Changelog Community!
+ 
+diff --git a/lib/changelog_web/templates/email/guest_thanks.html.eex b/lib/changelog_web/templates/email/guest_thanks.html.eex
+index d109522a3d..94eeb281f5 100644
+--- a/lib/changelog_web/templates/email/guest_thanks.html.eex
++++ b/lib/changelog_web/templates/email/guest_thanks.html.eex
+@@ -1,6 +1,6 @@
+ <tr>
+   <td class="content-block" itemprop="handler" itemscope itemtype="http://schema.org/HttpActionHandler">
+-    <p>Hey <%= PersonView.first_name(@person) %>,</p>
++    <p><%= greeting(@person) %></p>
+     <%= md_to_html(@message) |> raw %>
+   </td>
+ </tr>
+diff --git a/lib/changelog_web/templates/email/guest_thanks.text.eex b/lib/changelog_web/templates/email/guest_thanks.text.eex
+index 44c031bc8d..aeb58944bb 100644
+--- a/lib/changelog_web/templates/email/guest_thanks.text.eex
++++ b/lib/changelog_web/templates/email/guest_thanks.text.eex
+@@ -1,3 +1,4 @@
+-Hey <%= PersonView.first_name(@person) %>,
++<%= greeting(@person) %>
++
+ 
+ <%= @message %>
+diff --git a/lib/changelog_web/templates/email/guest_welcome.html.eex b/lib/changelog_web/templates/email/guest_welcome.html.eex
+index 89c4c89b66..8370bdbef7 100644
+--- a/lib/changelog_web/templates/email/guest_welcome.html.eex
++++ b/lib/changelog_web/templates/email/guest_welcome.html.eex
+@@ -1,6 +1,6 @@
+ <tr>
+   <td class="content-block" itemprop="handler" itemscope itemtype="http://schema.org/HttpActionHandler">
+-    <p>Hey <%= PersonView.first_name(@person) %>,</p>
++    <p><%= greeting(@person) %></p>
+ 
+     <p>We're prepping for your show and just plugged your info in to our system. For the best outcome, please read through our <%= link "Guest Setup Guide", to: page_url(Endpoint, :guest), title: "Guest Setup Guide" %>.</p>
+ 
+diff --git a/lib/changelog_web/templates/email/guest_welcome.text.eex b/lib/changelog_web/templates/email/guest_welcome.text.eex
+index b2656c6eaf..75a4d5e177 100644
+--- a/lib/changelog_web/templates/email/guest_welcome.text.eex
++++ b/lib/changelog_web/templates/email/guest_welcome.text.eex
+@@ -1,4 +1,5 @@
+-Hey <%= PersonView.first_name(@person) %>,
++<%= greeting(@person) %>
++
+ 
+ We're prepping for your show and just plugged your info in to our system. For the best outcome, please read through our Guest Setup Guide:
+ 
+diff --git a/lib/changelog_web/templates/email/sign_in.html.eex b/lib/changelog_web/templates/email/sign_in.html.eex
+index 02dd2b25b3..62292f97a3 100644
+--- a/lib/changelog_web/templates/email/sign_in.html.eex
++++ b/lib/changelog_web/templates/email/sign_in.html.eex
+@@ -1,6 +1,6 @@
+ <tr>
+   <td class="content-block" itemprop="handler" itemscope itemtype="http://schema.org/HttpActionHandler">
+-    <h1>Hey <%= PersonView.first_name(@person) %>,</h1>
++    <p><%= greeting(@person) %></p>
+ 
+     <p>You requested a fancy, passwordless sign in link. <em>Here you go:</em></p>
+ 
+diff --git a/lib/changelog_web/templates/email/sign_in.text.eex b/lib/changelog_web/templates/email/sign_in.text.eex
+index 30accc1832..e76b18a7fc 100644
+--- a/lib/changelog_web/templates/email/sign_in.text.eex
++++ b/lib/changelog_web/templates/email/sign_in.text.eex
+@@ -1,10 +1,10 @@
+-Hey <%= PersonView.first_name(@person) %>,
++<%= greeting(@person) %>
++
+ 
+ You requested a fancy, passwordless sign in link. Here you go:
+ 
+ <%= AuthView.auth_url(Endpoint, @person) %>
+ 
+-
+ This link will self-destruct in <%= auth_link_expires_in(@person) %>.
+ 
+ Already Expired? Request a new link: <%= sign_in_url(Endpoint, :new) %>
+diff --git a/lib/changelog_web/templates/email/submitted_news_published.html.eex b/lib/changelog_web/templates/email/submitted_news_published.html.eex
+new file mode 100644
+index 0000000000..b0648c3675
+--- /dev/null
++++ b/lib/changelog_web/templates/email/submitted_news_published.html.eex
+@@ -0,0 +1,15 @@
++<tr>
++  <td class="content-block" itemprop="handler" itemscope itemtype="http://schema.org/HttpActionHandler">
++    <p><%= greeting(@person) %></p>
++
++    <p>Your submission got published! Here's the link to share with your network of friends:</p>
++
++    <p><%= link(@item.headline, to: news_item_url(Endpoint, :show, NewsItemView.slug(@item)), itemprop: "url") %></p>
++
++    <p>If this post resonates with our readers, it'll also be featured in <%= link "Changelog Weekly", to: page_url(Endpoint, :weekly) %>. Keep your 👀 peeled for that!</p>
++
++    <p>Don't want these notifications? <em><%= link("Disable 'em", to: PersonView.opt_out_url(Endpoint, @person, "email_on_submitted_news")) %></em></p>
++
++    <p>💚, Logbot</p>
++  </td>
++</tr>
+diff --git a/lib/changelog_web/templates/email/submitted_news_published.text.eex b/lib/changelog_web/templates/email/submitted_news_published.text.eex
+new file mode 100644
+index 0000000000..950bb23ce8
+--- /dev/null
++++ b/lib/changelog_web/templates/email/submitted_news_published.text.eex
+@@ -0,0 +1,14 @@
++<%= greeting(@person) %>
++
++
++Your submission[1] got published!
++
++If this post resonates with our readers, it'll also be featured in Changelog Weekly[2]. Keep your 👀 peeled for that!
++
++Don't want these notifications? Disable 'em[3]
++
++[1]: <%= news_item_url(Endpoint, :show, NewsItemView.slug(@item)) %>
++[2]: <%= page_url(Endpoint, :weekly) %>
++[3]: <%= PersonView.opt_out_url(Endpoint, @person, "email_on_submitted_news") %>
++
++💚, Logbot
+diff --git a/lib/changelog_web/templates/email/subscriber_welcome.html.eex b/lib/changelog_web/templates/email/subscriber_welcome.html.eex
+index ebf3ea1fc5..9097b10a2c 100644
+--- a/lib/changelog_web/templates/email/subscriber_welcome.html.eex
++++ b/lib/changelog_web/templates/email/subscriber_welcome.html.eex
+@@ -1,6 +1,6 @@
+ <tr>
+   <td class="content-block" itemprop="handler" itemscope itemtype="http://schema.org/HttpActionHandler">
+-    <h1>Hey there,</h1>
++    <p><%= greeting(@person) %></p>
+ 
+     <p>You subscribed to Changelog News!</p>
+ 
+diff --git a/lib/changelog_web/templates/email/subscriber_welcome.text.eex b/lib/changelog_web/templates/email/subscriber_welcome.text.eex
+index 5fa7bac578..4c22cd092c 100644
+--- a/lib/changelog_web/templates/email/subscriber_welcome.text.eex
++++ b/lib/changelog_web/templates/email/subscriber_welcome.text.eex
+@@ -1,4 +1,5 @@
+-Hey there,
++<%= greeting(@person) %>
++
+ 
+ You subscribed to Changelog News!
+ 
+diff --git a/lib/changelog_web/templates/home/_nav.html.eex b/lib/changelog_web/templates/home/_nav.html.eex
+index 29a85afa21..4aa76d29bc 100644
+--- a/lib/changelog_web/templates/home/_nav.html.eex
++++ b/lib/changelog_web/templates/home/_nav.html.eex
+@@ -12,11 +12,4 @@
+       <%= link "Account", to: home_path(@conn, :account) %>
+     </li>
+   </ul>
+-
+-  <!-- TODO: Finish mobile nav functionality -->
+-  <select class="subnav-select" name="select">
+-    <option value="" selected>Subscriptions</option>
+-    <option value="">Public Profile</option>
+-    <option value="">Account</option>
+-  </select>
+ </nav>
+diff --git a/lib/changelog_web/templates/home/account.html.eex b/lib/changelog_web/templates/home/account.html.eex
+index 11eecd64d3..8e50f2ca29 100644
+--- a/lib/changelog_web/templates/home/account.html.eex
++++ b/lib/changelog_web/templates/home/account.html.eex
+@@ -1,4 +1,4 @@
+-<div class="page_account">
++<div class="page_basic">
+   <%= render("_nav.html", conn: @conn) %>
+ 
+   <%= form_for @changeset, home_path(@conn, :update), [class: "form", multipart: true], fn f -> %>
+@@ -26,6 +26,27 @@
+       </div>
+     </div>
+ 
++    <div class="form-checklist">
++      <label>Notification Settings</label>
++      <%= inputs_for f, :settings, fn i -> %>
++        <div class="form-checklist-item <%= error_class(f, :email_on_submitted_news) %>">
++          <label>
++            <%= checkbox(i, :email_on_submitted_news) %>
++            <span class="form-checklist-item-box"></span>
++            <span class="form-checklist-item-text">Email me when something I submit gets featured in Changelog News</span>
++          </label>
++        </div>
++
++        <div class="form-checklist-item <%= error_class(f, :email_on_authored_news) %>">
++          <label>
++            <%= checkbox(i, :email_on_authored_news) %>
++            <span class="form-checklist-item-box"></span>
++            <span class="form-checklist-item-text">Email me when something I authored gets featured in Changelog News</span>
++          </label>
++        </div>
++      <% end %>
++    </div>
++
+     <div class="form-submit">
+       <p class="form-submit-toc"></p>
+       <div>
+diff --git a/lib/changelog_web/templates/home/opt_out.html.eex b/lib/changelog_web/templates/home/opt_out.html.eex
+new file mode 100644
+index 0000000000..0689b92ab5
+--- /dev/null
++++ b/lib/changelog_web/templates/home/opt_out.html.eex
+@@ -0,0 +1,11 @@
++<article class="article">
++  <div class="richtext">
++    <h1>Never Gonna Get It</h1>
++
++    <p>Notification disabled! Change your mind? <%= link "Sign In", to: sign_in_path(@conn, :new) %> to manage notifications and other settings.</p>
++
++    <div class="video-container">
++      <iframe src="https://www.youtube.com/embed/BVeZnsuY7Vc?rel=0&amp;showinfo=0" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen></iframe>
++    </div>
++  </div>
++</article>
+diff --git a/lib/changelog_web/templates/home/profile.html.eex b/lib/changelog_web/templates/home/profile.html.eex
+index c42a076efc..7877377c3e 100644
+--- a/lib/changelog_web/templates/home/profile.html.eex
++++ b/lib/changelog_web/templates/home/profile.html.eex
+@@ -1,8 +1,8 @@
+-<div class="page_account">
++<div class="page_basic">
+   <%= render("_nav.html", conn: @conn) %>
+ 
+   <div class="flash flash--inline flash--success">
+-    <p>Public profiles are launching soon. Add your info today to reserve your username.</p>
++    <div class="flash-message"><p>Public profiles are launching soon. Add your info today to reserve your username.</p></div>
+   </div>
+ 
+   <%= form_for @changeset, home_path(@conn, :update), [class: "form", multipart: true], fn f -> %>
+diff --git a/lib/changelog_web/templates/home/show.html.eex b/lib/changelog_web/templates/home/show.html.eex
+index fe02d1d629..508e54dd84 100644
+--- a/lib/changelog_web/templates/home/show.html.eex
++++ b/lib/changelog_web/templates/home/show.html.eex
+@@ -1,4 +1,4 @@
+-<div class="page_account">
++<div class="page_basic">
+   <%= render("_nav.html", assigns) %>
+ 
+   <div class="account_subscriptions">
+diff --git a/lib/changelog_web/templates/layout/_header.html.eex b/lib/changelog_web/templates/layout/_header.html.eex
+index 99ecfcd9fa..e1022b9978 100644
+--- a/lib/changelog_web/templates/layout/_header.html.eex
++++ b/lib/changelog_web/templates/layout/_header.html.eex
+@@ -1,57 +1,74 @@
+ <header class="header">
+-  <div class="header-wrap">
+-    <h1 class="header-logo"><%= link "Changelog", to: "/", title: "Go $home" %></h1>
++  <div class="header-container">
++    <div class="header-wrap">
++      <h1 class="header-logo"><%= link "Changelog", to: "/", title: "Go $home" %></h1>
+ 
+-    <nav class="header-nav">
+-      <div class="header-nav-wrap">
+-        <ul class="header-nav-primary header-nav-list">
+-          <li class="header-nav-list-item <%= active_class(@conn, ["news_item", "news_ad"]) %>"><%= link "News", to: root_path(@conn, :index) %></li>
+-          <li class="header-nav-list-item <%= active_class(@conn, ["podcast"]) %>"><%= link "Podcasts", to: podcast_path(@conn, :index) %></li>
+-          <li class="header-nav-list-item <%= active_class(@conn, ["page-community", "person-join"]) %>"><%= link "Community", to: page_path(@conn, :community) %></li>
+-          <%= if !@current_user do %>
+-            <li class="header-nav-list-item <%= active_class(@conn, ["person-subscribe"]) %>"><%= link "Subscribe", to: person_path(@conn, :subscribe) %></li>
+-          <% end %>
+-        </ul>
++      <nav class="header-nav">
++        <div class="header-nav-wrap">
++          <ul class="header-nav-primary header-nav-list">
++            <li class="header-nav-list-item <%= active_class(@conn, ["news_item", "news_ad"]) %>"><%= link "News", to: root_path(@conn, :index) %></li>
++            <li class="header-nav-list-item <%= active_class(@conn, ["podcast"]) %>"><%= link "Podcasts", to: podcast_path(@conn, :index) %></li>
++            <li class="header-nav-list-item <%= active_class(@conn, ["page-community", "person-join"]) %>"><%= link "Community", to: page_path(@conn, :community) %></li>
++            <%= if !@current_user do %>
++              <li class="header-nav-list-item <%= active_class(@conn, ["person-subscribe"]) %>"><%= link "Subscribe", to: person_path(@conn, :subscribe) %></li>
++            <% end %>
++          </ul>
+ 
+-        <div class="header-nav-secondary">
+-          <%= if @current_user do %>
+-            <button class="has-tooltip">
+-              <img class="header-nav-secondary-user" src="<%= PersonView.avatar_url(@current_user) %>" width="35" height="35" alt="<%= @current_user.name %> Avatar">
+-            </button>
+-            <div class="tooltip" data-placement="bottom-end">
+-              <div class="tooltip-arrow"></div>
+-              <div class="tooltip-wrap">
+-                <ul class="tooltip-list">
+-                  <%= if @current_user.admin do %>
+-                    <li><%= link "Admin", to: admin_page_path(@conn, :index), data: [turbolinks: false] %></li>
+-                  <% end %>
+-                  <li><%= link "My Subscriptions", to: home_path(@conn, :show) %></li>
+-                  <li><%= link "Profile Settings", to: home_path(@conn, :profile) %></li>
+-                  <li><%= link "Account Settings", to: home_path(@conn, :account) %></li>
+-                </ul>
+-                <div class="tooltip-footer">
+-                  <%= link "Sign Out", to: sign_out_path(@conn, :delete) %>
+-                </div>
+-              </div>
+-            </div>
+-          <% else %>
++          <div class="header-nav-secondary">
+             <ul class="header-nav-list">
+-              <li class="header-nav-list-item"><%= link "Sign In", to: sign_in_path(@conn, :new), class: "header-button" %></li>
++              <li class="header-nav-list-item is-desktop_only"><%= link "Submit News", to: news_item_path(@conn, :new), class: "header-button" %></li>
+             </ul>
+-          <% end %>
+-        </div>
+ 
+-        <form action="<%= search_path(@conn, :search) %>" method="get" class="header-search">
+-          <label class="visually_hidden" for="name">Search</label>
+-          <input name="q" type="text" placeholder="Search Changelog" value="" />
+-        </form>
++            <%= if @current_user do %>
++              <button class="has-tooltip">
++                <img class="header-nav-secondary-user" src="<%= PersonView.avatar_url(@current_user) %>" width="35" height="35" alt="<%= @current_user.name %> Avatar">
++              </button>
++              <div class="tooltip" data-placement="bottom-end">
++                <div class="tooltip-arrow"></div>
++                <div class="tooltip-wrap">
++                  <ul class="tooltip-list">
++                    <%= if @current_user.admin do %>
++                      <li><%= link "Admin", to: admin_page_path(@conn, :index), data: [turbolinks: false] %></li>
++                    <% end %>
++                    <li><%= link "My Subscriptions", to: home_path(@conn, :show) %></li>
++                    <li><%= link "Profile Settings", to: home_path(@conn, :profile) %></li>
++                    <li><%= link "Account Settings", to: home_path(@conn, :account) %></li>
++                  </ul>
++                  <div class="tooltip-footer">
++                    <%= link "Sign Out", to: sign_out_path(@conn, :delete) %>
++                  </div>
++                </div>
++              </div>
++            <% else %>
++              <ul class="header-nav-list">
++                <li class="header-nav-list-item"><%= link "Sign In", to: sign_in_path(@conn, :new), class: "header-button" %></li>
++              </ul>
++            <% end %>
++
++            <form action="<%= search_path(@conn, :search) %>" method="get" class="header-search">
++              <label class="visually_hidden" for="name">Search</label>
++              <input name="q" type="text" placeholder="Search Changelog" value="" />
++            </form>
+ 
+-        <button class="header-menu js-toggle-nav" title="Toggle Menu">
+-          <span class="header-menu-box"><span class="header-menu-inner"></span></span>
+-        </button>
+-      </div>
+-    </nav>
++            <button class="header-menu js-toggle-nav" title="Toggle Menu">
++              <span class="header-menu-box"><span class="header-menu-inner"></span></span>
++            </button>
++          </div>
++        </div>
++      </nav>
++    </div>
+   </div>
++
++  <%= if get_flash(@conn) do %>
++    <div class="flash_container">
++      <%= for {type, message} <- get_flash(@conn) do %>
++        <div class="flash flash--<%= type %>">
++          <div class="flash-message" role="alert"><p><%= message %></p></div>
++          <button class="flash-close js-close_flash" aria-label="Close"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="M1 9L9 1M1 1l8 8" fill="none" stroke="#000000" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"/></svg></button>
++        </div>
++      <% end %>
++    </div>
++  <% end %>
+ </header>
+ 
+ <nav class="mobile_nav">
+@@ -67,6 +84,7 @@
+           <%= if !@current_user do %>
+             <li class="mobile_nav-list-item"><%= link "Subscribe", to: person_path(@conn, :subscribe) %></li>
+           <% end %>
++          <li class="mobile_nav-list-item"><%= link "Submit News", to: news_item_path(@conn, :new) %></li>
+         </ul>
+       </div>
+     </div>
+diff --git a/lib/changelog_web/templates/layout/app.html.eex b/lib/changelog_web/templates/layout/app.html.eex
+index eec276b68e..9381d2a857 100644
+--- a/lib/changelog_web/templates/layout/app.html.eex
++++ b/lib/changelog_web/templates/layout/app.html.eex
+@@ -48,9 +48,7 @@
+       <p>You are using an <strong>outdated</strong> browser. Please <a href="http://browsehappy.com/">upgrade your browser</a> to improve your experience.</p>
+     <![endif]-->
+     <%= render("_header.html", assigns) %>
+-    <%= for {type, message} <- get_flash(@conn) do %>
+-      <div class="flash flash--<%= type %>"><%= message %></div>
+-    <% end %>
++
+     <main class="main">
+       <%= render(@view_module, @view_template, assigns) %>
+     </main>
+diff --git a/lib/changelog_web/templates/news_item/new.html.eex b/lib/changelog_web/templates/news_item/new.html.eex
+new file mode 100644
+index 0000000000..a96fd2655c
+--- /dev/null
++++ b/lib/changelog_web/templates/news_item/new.html.eex
+@@ -0,0 +1,46 @@
++<div class="page_basic">
++  <h1>Submit News</h1>
++
++  <%= form_for @changeset, news_item_path(@conn, :create), fn f -> %>
++    <div class="form-element_wrap">
++      <div class="form-element <%= error_class(f, :url) %>">
++        <label>URL<span>*</span></label>
++        <%= text_input(f, :url, placeholder: "https://example.com", type: "url", required: true) %>
++        <%= error_message(f, :url) %>
++      </div>
++    </div>
++
++    <div class="form-element_wrap">
++      <div class="form-element <%= error_class(f, :headline) %>">
++        <label>What is it?<span>*</span></label>
++        <%= text_input(f, :headline, placeholder: "Article or project title...", required: true) %>
++        <%= error_message(f, :headline) %>
++      </div>
++    </div>
++
++    <div class="form-element_wrap">
++      <div class="form-element <%= error_class(f, :story) %>">
++        <label>Why is it interesting?</label>
++        <%= textarea(f, :story, placeholder: "What do you think?") %>
++        <%= error_message(f, :story) %>
++        <p class="form-element-note">Try some Markdown. It *may* work.</p>
++      </div>
++    </div>
++
++    <div class="form-submit">
++      <p class="form-submit-toc"><a href="#guidelines" class="js-toggle_element">View submission guidelines</a></p>
++      <div>
++        <input value="Submit" type="submit">
++        <div class="form_submit_responses"></div>
++      </div>
++    </div>
++  <% end %>
++
++  <div id="guidelines" class="richtext richtext--small is-hidden">
++    <hr>
++    <h3>Submission Guidelines</h3>
++    <p>Integer posuere erat a ante venenatis dapibus posuere velit aliquet. Donec ullamcorper nulla non metus auctor fringilla. Aenean eu leo quam. Pellentesque ornare sem lacinia quam venenatis vestibulum. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Cras justo odio, dapibus ac facilisis in, egestas eget quam.</p>
++    <p>Maecenas faucibus mollis interdum. Morbi leo risus, porta ac consectetur ac, vestibulum at eros. Donec ullamcorper nulla non metus auctor fringilla.</p>
++    <p>Cras mattis consectetur purus sit amet fermentum. Cras justo odio, dapibus ac facilisis in, egestas eget quam. Fusce dapibus, tellus ac cursus commodo, tortor mauris condimentum nibh, ut fermentum massa justo sit amet risus.</p>
++  </div>
++</div>
+diff --git a/lib/changelog_web/views/email_view.ex b/lib/changelog_web/views/email_view.ex
+index 63edb89afd..243186ace8 100644
+--- a/lib/changelog_web/views/email_view.ex
++++ b/lib/changelog_web/views/email_view.ex
+@@ -1,10 +1,21 @@
+ defmodule ChangelogWeb.EmailView do
+   use ChangelogWeb, :public_view
+ 
+-  alias ChangelogWeb.{AuthView, Endpoint, PersonView}
++  alias Changelog.Faker
++  alias ChangelogWeb.{AuthView, Endpoint, NewsItemView, PersonView}
+ 
+   def auth_link_expires_in(person) do
+     diff = Timex.diff(person.auth_token_expires_at, Timex.now, :duration)
+     Timex.format_duration(diff, :humanized)
+   end
++
++  def greeting(person) do
++    label = if Enum.member?(Faker.names, person.name) do
++      "there"
++    else
++      PersonView.first_name(person)
++    end
++
++    "Hey #{label},"
++  end
+ end
+diff --git a/lib/changelog_web/views/person_view.ex b/lib/changelog_web/views/person_view.ex
+index 0eaeef8df1..8569892f90 100644
+--- a/lib/changelog_web/views/person_view.ex
++++ b/lib/changelog_web/views/person_view.ex
+@@ -1,7 +1,7 @@
+ defmodule ChangelogWeb.PersonView do
+   use ChangelogWeb, :public_view
+ 
+-  alias Changelog.Files
++  alias Changelog.{Files, Person}
+   alias ChangelogWeb.{Endpoint, SharedView, PodcastView}
+ 
+   def avatar_path(person, version) do
+@@ -81,4 +81,14 @@ defmodule ChangelogWeb.PersonView do
+     |> Enum.map(fn(x) -> ~s{<a href="#{x.url}">#{x.text}</a>} end)
+     |> Enum.join(", ")
+   end
++
++  def opt_out_path(conn, person, notification) do
++    {:ok, encoded} = Person.encoded_id(person)
++    home_path(conn, :opt_out, encoded, notification)
++  end
++
++  def opt_out_url(conn, person, notification) do
++    {:ok, encoded} = Person.encoded_id(person)
++    home_url(conn, :opt_out, encoded, notification)
++  end
+ end
+diff --git a/priv/repo/migrations/20180228161858_add_settings_to_people.exs b/priv/repo/migrations/20180228161858_add_settings_to_people.exs
+new file mode 100644
+index 0000000000..ea2e0a26d9
+--- /dev/null
++++ b/priv/repo/migrations/20180228161858_add_settings_to_people.exs
+@@ -0,0 +1,9 @@
++defmodule Changelog.Repo.Migrations.AddSettingsToPeople do
++  use Ecto.Migration
++
++  def change do
++    alter table(:people) do
++      add :settings, :map, default: %{}
++    end
++  end
++end
+diff --git a/priv/repo/migrations/20180305172725_add_submitter_to_news_items.exs b/priv/repo/migrations/20180305172725_add_submitter_to_news_items.exs
+new file mode 100644
+index 0000000000..1e8be0e3d7
+--- /dev/null
++++ b/priv/repo/migrations/20180305172725_add_submitter_to_news_items.exs
+@@ -0,0 +1,11 @@
++defmodule Changelog.Repo.Migrations.AddSubmitterToNewsItems do
++  use Ecto.Migration
++
++  def change do
++    alter table(:news_items) do
++      add :submitter_id, references(:people)
++    end
++
++    create index(:news_items, [:submitter_id])
++  end
++end
+diff --git a/test/changelog/data/news/news_queue_test.exs b/test/changelog/data/news/news_queue_test.exs
+index 7e297198e1..1ca3129436 100644
+--- a/test/changelog/data/news/news_queue_test.exs
++++ b/test/changelog/data/news/news_queue_test.exs
+@@ -3,7 +3,7 @@ defmodule Changelog.NewsQueueTest do
+ 
+   import Mock
+ 
+-  alias Changelog.{Buffer, NewsItem, NewsQueue}
++  alias Changelog.{Buffer, NewsItem, NewsQueue, Notifier}
+ 
+   describe "append" do
+     test "when queue is empty" do
+@@ -142,10 +142,14 @@ defmodule Changelog.NewsQueueTest do
+     test "it publishes the given item and buffers it even if it's not in the queue" do
+       item = insert(:news_item)
+ 
+-      with_mock(Buffer, [queue: fn(_) -> true end]) do
++      with_mocks([
++        {Buffer, [], [queue: fn(_) -> true end]},
++        {Notifier, [], [notify: fn(_) -> true end]}
++      ]) do
+         NewsQueue.publish(item)
+         assert Repo.count(NewsItem.published) == 1
+         assert called(Buffer.queue(:_))
++        assert called(Notifier.notify(:_))
+       end
+     end
+ 
+diff --git a/test/changelog/notifier_test.exs b/test/changelog/notifier_test.exs
+new file mode 100644
+index 0000000000..61f3a18644
+--- /dev/null
++++ b/test/changelog/notifier_test.exs
+@@ -0,0 +1,60 @@
++defmodule Changelog.NotifierTest do
++  use Changelog.DataCase
++  use Bamboo.Test
++
++  alias Changelog.Notifier
++  alias ChangelogWeb.Email
++
++  describe "notify" do
++    test "when item has no submitter or author" do
++      item = insert(:news_item)
++      Notifier.notify(item)
++      assert_no_emails_delivered()
++    end
++
++    test "when submitter has email notifications enabled" do
++      person = insert(:person, settings: %{email_on_submitted_news: true})
++      item = insert(:news_item, submitter: person)
++      Notifier.notify(item)
++      assert_delivered_email Email.submitted_news_published(person, item)
++    end
++
++    test "when submitter has email notifications disabled" do
++      person = insert(:person, settings: %{email_on_submitted_news: false})
++      item = insert(:news_item, submitter: person)
++      Notifier.notify(item)
++      assert_no_emails_delivered()
++    end
++
++    test "when submitter and author are same person, notifications enabled" do
++      person = insert(:person, settings: %{email_on_submitted_news: true})
++      item = insert(:news_item, submitter: person, author: person)
++      Notifier.notify(item)
++      assert_delivered_email Email.submitted_news_published(person, item)
++      refute_delivered_email Email.authored_news_published(person, item)
++    end
++
++    test "when author has email notifications enabled" do
++      person = insert(:person, settings: %{email_on_authored_news: true})
++      item = insert(:news_item, author: person)
++      Notifier.notify(item)
++      assert_delivered_email Email.authored_news_published(person, item)
++    end
++
++    test "when author has email notifications disabled" do
++      person = insert(:person, settings: %{email_on_authored_news: false})
++      item = insert(:news_item, author: person)
++      Notifier.notify(item)
++      assert_no_emails_delivered()
++    end
++
++    test "when submitter and author both have notifications enabled" do
++      submitter = insert(:person, settings: %{email_on_submitted_news: true})
++      author = insert(:person, settings: %{email_on_authored_news: true})
++      item = insert(:news_item, author: author, submitter: submitter)
++      Notifier.notify(item)
++      assert_delivered_email Email.authored_news_published(author, item)
++      assert_delivered_email Email.submitted_news_published(submitter, item)
++    end
++  end
++end
+diff --git a/test/changelog_web/controllers/admin/news/news_item_controller_test.exs b/test/changelog_web/controllers/admin/news/news_item_controller_test.exs
+index d72a15db98..7e82e72838 100644
+--- a/test/changelog_web/controllers/admin/news/news_item_controller_test.exs
++++ b/test/changelog_web/controllers/admin/news/news_item_controller_test.exs
+@@ -113,6 +113,27 @@ defmodule ChangelogWeb.Admin.NewsItemControllerTest do
+     assert count(NewsItem) == count_before
+   end
+ 
++  @tag :as_admin
++  test "deletes a news item and redirects", %{conn: conn} do
++    news_item = insert(:news_item)
++
++    conn = delete(conn, admin_news_item_path(conn, :delete, news_item.id))
++
++    assert redirected_to(conn) == admin_news_item_path(conn, :index)
++    assert count(NewsItem) == 0
++  end
++
++  @tag :as_admin
++  test "declines a news item and redirects", %{conn: conn} do
++    news_item = insert(:news_item)
++
++    conn = delete(conn, admin_news_item_path(conn, :decline, news_item.id))
++
++    assert redirected_to(conn) == admin_news_item_path(conn, :index)
++    assert count(NewsItem) == 1
++    assert count(NewsItem.declined) == 1
++  end
++
+   test "requires user auth on all actions", %{conn: conn} do
+     Enum.each([
+       get(conn, admin_news_item_path(conn, :index)),
+@@ -121,6 +142,7 @@ defmodule ChangelogWeb.Admin.NewsItemControllerTest do
+       get(conn, admin_news_item_path(conn, :edit, "123")),
+       put(conn, admin_news_item_path(conn, :update, "123"), news_item: @valid_attrs),
+       delete(conn, admin_news_item_path(conn, :delete, "123")),
++      delete(conn, admin_news_item_path(conn, :decline, "123"))
+     ], fn conn ->
+       assert html_response(conn, 302)
+       assert conn.halted
+diff --git a/test/changelog_web/controllers/home_controller_test.exs b/test/changelog_web/controllers/home_controller_test.exs
+index cf54a29236..b11d444a69 100644
+--- a/test/changelog_web/controllers/home_controller_test.exs
++++ b/test/changelog_web/controllers/home_controller_test.exs
+@@ -1,6 +1,8 @@
+ defmodule ChangelogWeb.HomeControllerTest do
+   use ChangelogWeb.ConnCase
+ 
++  alias Changelog.Person
++
+   @tag :as_user
+   test "renders the home page", %{conn: conn} do
+     conn = get(conn, home_path(conn, :show))
+@@ -32,7 +34,24 @@ defmodule ChangelogWeb.HomeControllerTest do
+     assert html_response(conn, 200) =~ ~r/problem/
+   end
+ 
+-  test "requires user on all actions", %{conn: conn} do
++  test "opting out of notifications", %{conn: conn} do
++    person = insert(:person)
++    {:ok, token} = Person.encoded_id(person)
++    conn = get(conn, home_path(conn, :opt_out, token, "email_on_authored_news"))
++    assert conn.status == 200
++    refute Repo.get(Person, person.id).settings.email_on_authored_news
++  end
++
++  @tag :as_inserted_user
++  test "signeed in and opting out of notifications", %{conn: conn} do
++    person = conn.assigns.current_user
++    {:ok, token} = Person.encoded_id(person)
++    conn = get(conn, home_path(conn, :opt_out, token, "email_on_submitted_news"))
++    assert conn.status == 200
++    refute Repo.get(Person, person.id).settings.email_on_submitted_news
++  end
++
++  test "requires user on all actions except email links", %{conn: conn} do
+     Enum.each([
+       get(conn, home_path(conn, :show)),
+       get(conn, home_path(conn, :profile)),
+diff --git a/test/changelog_web/controllers/news/news_item_controller_test.exs b/test/changelog_web/controllers/news/news_item_controller_test.exs
+index cb7132b204..ee8d0e8043 100644
+--- a/test/changelog_web/controllers/news/news_item_controller_test.exs
++++ b/test/changelog_web/controllers/news/news_item_controller_test.exs
+@@ -3,7 +3,7 @@ defmodule ChangelogWeb.NewsItemControllerTest do
+ 
+   import ChangelogWeb.NewsItemView, only: [hashid: 1, slug: 1]
+ 
+-  alias Changelog.NewsItem
++  alias Changelog.{NewsItem, NewsQueue}
+ 
+   test "getting the index", %{conn: conn} do
+     i1 = insert(:news_item)
+@@ -102,4 +102,34 @@ defmodule ChangelogWeb.NewsItemControllerTest do
+     item = Repo.get(NewsItem, item.id)
+     assert item.impression_count == 0
+   end
++
++  test "getting the form to submit news", %{conn: conn} do
++    conn = get(conn, news_item_path(conn, :new))
++    assert redirected_to(conn) == sign_in_path(conn, :new)
++  end
++
++  @tag :as_user
++  test "renders the form to submit news", %{conn: conn} do
++    conn = get(conn, news_item_path(conn, :new))
++    assert html_response(conn, 200) =~ ~r/submit/
++  end
++
++  @tag :as_inserted_user
++  test "creates news item and sets it as submitted", %{conn: conn} do
++    conn = post(conn, news_item_path(conn, :create), news_item: %{url: "https://ohai.me/x", headline: "dig it?"})
++
++    assert redirected_to(conn) == root_path(conn, :index)
++    assert count(NewsItem.submitted) == 1
++    assert count(NewsItem.published) == 0
++    assert count(NewsQueue) == 0
++  end
++
++  @tag :as_inserted_user
++  test "does not create with invalid attributes", %{conn: conn} do
++    count_before = count(NewsItem)
++    conn = post(conn, news_item_path(conn, :create), news_item: %{url: "https://just.this"})
++
++    assert html_response(conn, 200) =~ ~r/error/
++    assert count(NewsItem) == count_before
++  end
+ end

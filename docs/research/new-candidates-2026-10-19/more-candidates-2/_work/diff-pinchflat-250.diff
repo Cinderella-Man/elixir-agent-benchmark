@@ -1,0 +1,411 @@
+diff --git a/lib/pinchflat/application.ex b/lib/pinchflat/application.ex
+index 7defa36ad..49adcf007 100644
+--- a/lib/pinchflat/application.ex
++++ b/lib/pinchflat/application.ex
+@@ -24,7 +24,7 @@ defmodule Pinchflat.Application do
+       PinchflatWeb.Endpoint
+     ]
+ 
+-    :ok = Oban.Telemetry.attach_default_logger()
++    attach_oban_telemetry()
+     Logger.add_handlers(:pinchflat)
+ 
+     # See https://hexdocs.pm/elixir/Supervisor.html
+@@ -40,4 +40,11 @@ defmodule Pinchflat.Application do
+     PinchflatWeb.Endpoint.config_change(changed, removed)
+     :ok
+   end
++
++  defp attach_oban_telemetry do
++    events = [[:oban, :job, :start], [:oban, :job, :stop], [:oban, :job, :exception]]
++
++    :ok = Oban.Telemetry.attach_default_logger()
++    :telemetry.attach_many("job-telemetry-broadcast", events, &PinchflatWeb.Telemetry.job_state_change_broadcast/4, [])
++  end
+ end
+diff --git a/lib/pinchflat/downloading/media_download_worker.ex b/lib/pinchflat/downloading/media_download_worker.ex
+index fc1bc99df..42c5ca477 100644
+--- a/lib/pinchflat/downloading/media_download_worker.ex
++++ b/lib/pinchflat/downloading/media_download_worker.ex
+@@ -4,7 +4,7 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+   use Oban.Worker,
+     queue: :media_fetching,
+     unique: [period: :infinity, states: [:available, :scheduled, :retryable, :executing]],
+-    tags: ["media_item", "media_fetching"]
++    tags: ["media_item", "media_fetching", "show_in_dashboard"]
+ 
+   require Logger
+ 
+diff --git a/lib/pinchflat/downloading/media_quality_upgrade_worker.ex b/lib/pinchflat/downloading/media_quality_upgrade_worker.ex
+index ec325ef4e..4f554fae5 100644
+--- a/lib/pinchflat/downloading/media_quality_upgrade_worker.ex
++++ b/lib/pinchflat/downloading/media_quality_upgrade_worker.ex
+@@ -4,7 +4,7 @@ defmodule Pinchflat.Downloading.MediaQualityUpgradeWorker do
+   use Oban.Worker,
+     queue: :media_fetching,
+     unique: [period: :infinity, states: [:available, :scheduled, :retryable, :executing]],
+-    tags: ["media_item", "media_fetching"]
++    tags: ["media_item", "media_fetching", "show_in_dashboard"]
+ 
+   require Logger
+ 
+diff --git a/lib/pinchflat/fast_indexing/fast_indexing_worker.ex b/lib/pinchflat/fast_indexing/fast_indexing_worker.ex
+index ccd712636..368da172f 100644
+--- a/lib/pinchflat/fast_indexing/fast_indexing_worker.ex
++++ b/lib/pinchflat/fast_indexing/fast_indexing_worker.ex
+@@ -4,7 +4,7 @@ defmodule Pinchflat.FastIndexing.FastIndexingWorker do
+   use Oban.Worker,
+     queue: :fast_indexing,
+     unique: [period: :infinity, states: [:available, :scheduled, :retryable]],
+-    tags: ["media_source", "fast_indexing"]
++    tags: ["media_source", "fast_indexing", "show_in_dashboard"]
+ 
+   require Logger
+ 
+diff --git a/lib/pinchflat/metadata/source_metadata_storage_worker.ex b/lib/pinchflat/metadata/source_metadata_storage_worker.ex
+index b922f6208..52ec81074 100644
+--- a/lib/pinchflat/metadata/source_metadata_storage_worker.ex
++++ b/lib/pinchflat/metadata/source_metadata_storage_worker.ex
+@@ -3,7 +3,7 @@ defmodule Pinchflat.Metadata.SourceMetadataStorageWorker do
+ 
+   use Oban.Worker,
+     queue: :remote_metadata,
+-    tags: ["media_source", "source_metadata", "remote_metadata"],
++    tags: ["media_source", "source_metadata", "remote_metadata", "show_in_dashboard"],
+     max_attempts: 3
+ 
+   require Logger
+diff --git a/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex b/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex
+index 50af81e93..5dbac3ef8 100644
+--- a/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex
++++ b/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex
+@@ -4,7 +4,7 @@ defmodule Pinchflat.SlowIndexing.MediaCollectionIndexingWorker do
+   use Oban.Worker,
+     queue: :media_collection_indexing,
+     unique: [period: :infinity, states: [:available, :scheduled, :retryable]],
+-    tags: ["media_source", "media_collection_indexing"]
++    tags: ["media_source", "media_collection_indexing", "show_in_dashboard"]
+ 
+   require Logger
+ 
+diff --git a/lib/pinchflat/tasks/tasks_query.ex b/lib/pinchflat/tasks/tasks_query.ex
+new file mode 100644
+index 000000000..64d35fb2f
+--- /dev/null
++++ b/lib/pinchflat/tasks/tasks_query.ex
+@@ -0,0 +1,45 @@
++defmodule Pinchflat.Tasks.TasksQuery do
++  @moduledoc """
++  Query helpers for the Tasks context.
++
++  These methods are made to be one-ish liners used
++  to compose queries. Each method should strive to do
++  _one_ thing. These don't need to be tested as
++  they are just building blocks for other functionality
++  which, itself, will be tested.
++  """
++  import Ecto.Query, warn: false
++
++  alias Pinchflat.Tasks.Task
++
++  # This allows the module to be aliased and query methods to be used
++  # all in one go
++  # usage: use Pinchflat.Tasks.TasksQuery
++  defmacro __using__(_opts) do
++    quote do
++      import Ecto.Query, warn: false
++
++      alias unquote(__MODULE__)
++    end
++  end
++
++  def new do
++    Task
++  end
++
++  def join_job(query) do
++    query
++    |> join(:left, [t], j in assoc(t, :job))
++    |> preload([t, j], job: j)
++  end
++
++  def in_state(states) when is_list(states) do
++    dynamic([t, j], j.state in ^states)
++  end
++
++  def in_state(state), do: in_state([state])
++
++  def has_tag(tag) do
++    dynamic([t, j], ^tag in j.tags)
++  end
++end
+diff --git a/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex b/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex
+index 34147efc7..018bcef40 100644
+--- a/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex
++++ b/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex
+@@ -6,7 +6,7 @@ defmodule Pinchflat.Pages.HistoryTableLive do
+   alias Pinchflat.Utils.NumberUtils
+   alias PinchflatWeb.CustomComponents.TextComponents
+ 
+-  @limit 10
++  @limit 5
+ 
+   def render(%{records: []} = assigns) do
+     ~H"""
+diff --git a/lib/pinchflat_web/controllers/pages/page_html/home.html.heex b/lib/pinchflat_web/controllers/pages/page_html/home.html.heex
+index d018bcb86..c0ecb82b0 100644
+--- a/lib/pinchflat_web/controllers/pages/page_html/home.html.heex
++++ b/lib/pinchflat_web/controllers/pages/page_html/home.html.heex
+@@ -26,8 +26,15 @@
+ </div>
+ 
+ <div class="rounded-sm border shadow-default border-strokedark bg-boxdark mt-4 p-5">
+-  <span class="text-2xl font-medium mb-4">History</span>
++  <span class="text-2xl font-medium mb-4">Media History</span>
+   <section class="mt-6">
+     <%= live_render(@conn, Pinchflat.Pages.HistoryTableLive) %>
+   </section>
+ </div>
++
++<div class="rounded-sm border shadow-default border-strokedark bg-boxdark mt-4 p-5">
++  <span class="text-2xl font-medium mb-4">Active Tasks</span>
++  <section class="mt-6 min-h-80">
++    <%= live_render(@conn, Pinchflat.Pages.JobTableLive) %>
++  </section>
++</div>
+diff --git a/lib/pinchflat_web/controllers/pages/page_html/job_table_live.ex b/lib/pinchflat_web/controllers/pages/page_html/job_table_live.ex
+new file mode 100644
+index 000000000..d65f7247c
+--- /dev/null
++++ b/lib/pinchflat_web/controllers/pages/page_html/job_table_live.ex
+@@ -0,0 +1,97 @@
++defmodule Pinchflat.Pages.JobTableLive do
++  use PinchflatWeb, :live_view
++  use Pinchflat.Tasks.TasksQuery
++
++  alias Pinchflat.Repo
++  alias Pinchflat.Tasks.Task
++  alias PinchflatWeb.CustomComponents.TextComponents
++
++  def render(%{tasks: []} = assigns) do
++    ~H"""
++    <div class="mb-4 flex items-center">
++      <p>Nothing Here!</p>
++    </div>
++    """
++  end
++
++  def render(assigns) do
++    ~H"""
++    <div class="max-w-full overflow-x-auto">
++      <.table rows={@tasks} table_class="text-white">
++        <:col :let={task} label="Task">
++          <%= worker_to_task_name(task.job.worker) %>
++        </:col>
++        <:col :let={task} label="Subject">
++          <.subtle_link href={task_to_link(task)}>
++            <%= StringUtils.truncate(task_to_record_name(task), 35) %>
++          </.subtle_link>
++        </:col>
++        <:col :let={task} label="Attempt No.">
++          <%= task.job.attempt %>
++        </:col>
++        <:col :let={task} label="Started At">
++          <%= format_datetime(task.job.attempted_at) %>
++        </:col>
++      </.table>
++    </div>
++    """
++  end
++
++  def mount(_params, _session, socket) do
++    PinchflatWeb.Endpoint.subscribe("job:state")
++
++    {:ok, assign(socket, tasks: get_tasks())}
++  end
++
++  def handle_info(%{topic: "job:state", event: "change"}, socket) do
++    {:noreply, assign(socket, tasks: get_tasks())}
++  end
++
++  defp get_tasks do
++    TasksQuery.new()
++    |> TasksQuery.join_job()
++    |> where(^TasksQuery.in_state("executing"))
++    |> where(^TasksQuery.has_tag("show_in_dashboard"))
++    |> order_by([t, j], desc: j.attempted_at)
++    |> Repo.all()
++    |> Repo.preload([:media_item, :source])
++  end
++
++  defp worker_to_task_name(worker) do
++    final_module_part =
++      worker
++      |> String.split(".")
++      |> Enum.at(-1)
++
++    map_worker_to_task_name(final_module_part)
++  end
++
++  defp map_worker_to_task_name("FastIndexingWorker"), do: "Fast Indexing Source"
++  defp map_worker_to_task_name("MediaDownloadWorker"), do: "Downloading Media"
++  defp map_worker_to_task_name("MediaCollectionIndexingWorker"), do: "Indexing Source"
++  defp map_worker_to_task_name("MediaQualityUpgradeWorker"), do: "Upgrading Media Quality"
++  defp map_worker_to_task_name("SourceMetadataStorageWorker"), do: "Fetching Source Metadata"
++  defp map_worker_to_task_name(other), do: other <> " (Report to Devs)"
++
++  defp task_to_record_name(%Task{} = task) do
++    case task do
++      %Task{source: source} when source != nil -> source.custom_name
++      %Task{media_item: mi} when mi != nil -> mi.title
++      _ -> "Unknown Record"
++    end
++  end
++
++  defp task_to_link(%Task{} = task) do
++    case task do
++      %Task{source: source} when source != nil -> ~p"/sources/#{source.id}"
++      %Task{media_item: mi} when mi != nil -> ~p"/sources/#{mi.source_id}/media/#{mi}"
++      _ -> "#"
++    end
++  end
++
++  defp format_datetime(nil), do: ""
++
++  defp format_datetime(datetime) do
++    TextComponents.datetime_in_zone(%{datetime: datetime, format: "%Y-%m-%d %H:%M"})
++  end
++end
+diff --git a/lib/pinchflat_web/telemetry.ex b/lib/pinchflat_web/telemetry.ex
+index 172e290a2..8ce908a55 100644
+--- a/lib/pinchflat_web/telemetry.ex
++++ b/lib/pinchflat_web/telemetry.ex
+@@ -19,6 +19,11 @@ defmodule PinchflatWeb.Telemetry do
+     Supervisor.init(children, strategy: :one_for_one)
+   end
+ 
++  @doc false
++  def job_state_change_broadcast(_event, _measure, _meta, _config) do
++    PinchflatWeb.Endpoint.broadcast("job:state", "change", nil)
++  end
++
+   def metrics do
+     [
+       # Phoenix Metrics
+diff --git a/test/pinchflat_web/controllers/pages/job_table_live_test.exs b/test/pinchflat_web/controllers/pages/job_table_live_test.exs
+new file mode 100644
+index 000000000..9e62b4e83
+--- /dev/null
++++ b/test/pinchflat_web/controllers/pages/job_table_live_test.exs
+@@ -0,0 +1,111 @@
++defmodule PinchflatWeb.Pages.JobTableLiveTest do
++  use PinchflatWeb.ConnCase
++
++  import Ecto.Query, warn: false
++  import Phoenix.LiveViewTest
++  import Pinchflat.MediaFixtures
++  import Pinchflat.SourcesFixtures
++
++  alias Pinchflat.Utils.StringUtils
++  alias Pinchflat.Pages.JobTableLive
++  alias Pinchflat.Downloading.MediaDownloadWorker
++  alias Pinchflat.FastIndexing.FastIndexingWorker
++
++  describe "initial rendering" do
++    test "shows message when no records", %{conn: conn} do
++      {:ok, _view, html} = live_isolated(conn, JobTableLive, session: %{})
++
++      assert html =~ "Nothing Here!"
++      refute html =~ "Subject"
++    end
++
++    test "shows records when present", %{conn: conn} do
++      {_source, _media_item, _task, _job} = create_media_item_job()
++      {:ok, _view, html} = live_isolated(conn, JobTableLive, session: %{})
++
++      assert html =~ "Subject"
++    end
++
++    test "doesn't show records when not in executing state", %{conn: conn} do
++      {_source, _media_item, _task, _job} = create_media_item_job(:scheduled)
++      {_source, _media_item, _task, _job} = create_media_item_job(:completed)
++      {:ok, _view, html} = live_isolated(conn, JobTableLive, session: %{})
++
++      assert html =~ "Nothing Here!"
++      refute html =~ "Subject"
++    end
++  end
++
++  describe "job rendering" do
++    test "shows worker name", %{conn: conn} do
++      {_source, _media_item, _task, _job} = create_media_item_job()
++      {:ok, _view, html} = live_isolated(conn, JobTableLive, session: %{})
++
++      assert html =~ "Downloading Media"
++    end
++
++    test "shows the media item title", %{conn: conn} do
++      {_source, media_item, _task, _job} = create_media_item_job()
++      {:ok, _view, html} = live_isolated(conn, JobTableLive, session: %{})
++
++      assert html =~ StringUtils.truncate(media_item.title, 35)
++    end
++
++    test "shows a media item link", %{conn: conn} do
++      {_source, media_item, _task, _job} = create_media_item_job()
++      {:ok, _view, html} = live_isolated(conn, JobTableLive, session: %{})
++
++      assert html =~ ~p"/sources/#{media_item.source_id}/media/#{media_item}"
++    end
++
++    test "shows the source custom name", %{conn: conn} do
++      {source, _task, _job} = create_source_job()
++      {:ok, _view, html} = live_isolated(conn, JobTableLive, session: %{})
++
++      assert html =~ StringUtils.truncate(source.custom_name, 35)
++    end
++
++    test "shows a source link", %{conn: conn} do
++      {source, _task, _job} = create_source_job()
++      {:ok, _view, html} = live_isolated(conn, JobTableLive, session: %{})
++
++      assert html =~ ~p"/sources/#{source.id}"
++    end
++
++    test "listens for job:state change events", %{conn: conn} do
++      {_source, _media_item, _task, _job} = create_media_item_job()
++      {:ok, _view, _html} = live_isolated(conn, JobTableLive, session: %{})
++
++      PinchflatWeb.Endpoint.broadcast("job:state", "change", nil)
++
++      assert_receive %Phoenix.Socket.Broadcast{topic: "job:state", event: "change", payload: nil}
++    end
++  end
++
++  defp create_media_item_job(job_state \\ :executing) do
++    source = source_fixture()
++    media_item = media_item_fixture(source_id: source.id)
++    {:ok, task} = MediaDownloadWorker.kickoff_with_task(media_item)
++
++    Oban.Job
++    |> where([j], j.id == ^task.job_id)
++    |> Repo.update_all(set: [state: to_string(job_state)])
++
++    job = Repo.get!(Oban.Job, task.job_id)
++
++    {source, media_item, task, job}
++  end
++
++  defp create_source_job(job_state \\ :executing) do
++    source = source_fixture()
++    {:ok, task} = FastIndexingWorker.kickoff_with_task(source)
++
++    Oban.Job
++    |> where([j], j.id == ^task.job_id)
++    |> Repo.update_all(set: [state: to_string(job_state)])
++
++    job = Repo.get!(Oban.Job, task.job_id)
++
++    {source, task, job}
++  end
++end

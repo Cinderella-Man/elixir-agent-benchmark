@@ -1,0 +1,268 @@
+diff --git a/assets/js/phoenix_live_view/dom_patch.js b/assets/js/phoenix_live_view/dom_patch.js
+index ab6e2a7d00..522b3379fc 100644
+--- a/assets/js/phoenix_live_view/dom_patch.js
++++ b/assets/js/phoenix_live_view/dom_patch.js
+@@ -363,11 +363,6 @@ export default class DOMPatch {
+               ref.lockRef &&
+               (!this.undoRef || !ref.isLockUndoneBy(this.undoRef))
+             ) {
+-              if (DOM.isUploadInput(fromEl)) {
+-                DOM.mergeAttrs(fromEl, toEl, { isIgnored: true });
+-                this.trackBefore("updated", fromEl, toEl);
+-                updates.push(fromEl);
+-              }
+               DOM.applyStickyOperations(fromEl);
+               const isLocked = fromEl.hasAttribute(PHX_REF_LOCK);
+               const clone = isLocked
+diff --git a/assets/js/phoenix_live_view/hooks.js b/assets/js/phoenix_live_view/hooks.js
+index ac543d6ed3..0eb0adb688 100644
+--- a/assets/js/phoenix_live_view/hooks.js
++++ b/assets/js/phoenix_live_view/hooks.js
+@@ -20,6 +20,7 @@ const Hooks = {
+     },
+ 
+     mounted() {
++      this.js().ignoreAttributes(this.el, ["value"]);
+       this.preflightedWas = this.preflightedRefs();
+     },
+ 
+diff --git a/lib/phoenix_component.ex b/lib/phoenix_component.ex
+index 1868ab68b6..78392549fb 100644
+--- a/lib/phoenix_component.ex
++++ b/lib/phoenix_component.ex
+@@ -3348,7 +3348,6 @@ defmodule Phoenix.Component do
+       name={@upload.name}
+       accept={@accept}
+       data-phx-hook="Phoenix.LiveFileUpload"
+-      data-phx-update="ignore"
+       data-phx-upload-ref={@upload.ref}
+       data-phx-active-refs={join_refs(for(entry <- @upload.entries, do: entry.ref))}
+       data-phx-done-refs={join_refs(for(entry <- @upload.entries, entry.done?, do: entry.ref))}
+diff --git a/test/e2e/support/issues/issue_4078.ex b/test/e2e/support/issues/issue_4078.ex
+new file mode 100644
+index 0000000000..49ea3266d1
+--- /dev/null
++++ b/test/e2e/support/issues/issue_4078.ex
+@@ -0,0 +1,63 @@
++defmodule Phoenix.LiveViewTest.E2E.Issue4078Live do
++  # https://github.com/phoenixframework/phoenix_live_view/issues/4078
++  #
++  # live_file_input uses data-phx-update="ignore" to preserve file selection,
++  # but this was blocking updates to attributes like class, disabled, and style.
++  # This test verifies these attributes can now be changed dynamically.
++  use Phoenix.LiveView, layout: {__MODULE__, :live}
++
++  def render("live.html", assigns) do
++    ~H"""
++    <meta name="csrf-token" content={Plug.CSRFProtection.get_csrf_token()} />
++    <script src="/assets/phoenix/phoenix.min.js">
++    </script>
++    <script type="module">
++      import {LiveSocket} from "/assets/phoenix_live_view/phoenix_live_view.esm.js"
++      let csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content");
++      let liveSocket = new LiveSocket("/live", window.Phoenix.Socket, {
++        params: {_csrf_token: csrfToken},
++      })
++      liveSocket.connect()
++    </script>
++    {@inner_content}
++    """
++  end
++
++  def mount(_params, _session, socket) do
++    {:ok,
++     socket
++     |> assign(:disabled?, true)
++     |> assign(:custom_class, "initial-class")
++     |> allow_upload(:avatar, accept: ~w(.jpg .jpeg .png .txt), max_entries: 2)}
++  end
++
++  def handle_event("validate", _params, socket), do: {:noreply, socket}
++
++  def handle_event("toggle-disabled", _params, socket) do
++    {:noreply, assign(socket, :disabled?, !socket.assigns.disabled?)}
++  end
++
++  def handle_event("toggle-class", _params, socket) do
++    new_class =
++      if socket.assigns.custom_class == "initial-class",
++        do: "updated-class",
++        else: "initial-class"
++
++    {:noreply, assign(socket, :custom_class, new_class)}
++  end
++
++  def render(assigns) do
++    ~H"""
++    <form id="upload-form" phx-change="validate">
++      <.live_file_input upload={@uploads.avatar} disabled={@disabled?} class={@custom_class} />
++    </form>
++
++    <button id="toggle-disabled" type="button" phx-click="toggle-disabled">Toggle Disabled</button>
++    <button id="toggle-class" type="button" phx-click="toggle-class">Toggle Class</button>
++
++    <article :for={entry <- @uploads.avatar.entries} class="upload-entry">
++      <span class="entry-name">{entry.client_name}</span>
++    </article>
++    """
++  end
++end
+diff --git a/test/e2e/test_helper.exs b/test/e2e/test_helper.exs
+index a282529bda..77eef2f1c6 100644
+--- a/test/e2e/test_helper.exs
++++ b/test/e2e/test_helper.exs
+@@ -248,6 +248,7 @@ defmodule Phoenix.LiveViewTest.E2E.Router do
+       live "/3681", Issue3681Live
+       live "/3681/away", Issue3681.AwayLive
+       live "/3941", Issue3941Live
++      live "/4078", Issue4078Live
+     end
+ 
+     post "/submit", SubmitController, :submit
+diff --git a/test/e2e/tests/issues/4078.spec.js b/test/e2e/tests/issues/4078.spec.js
+new file mode 100644
+index 0000000000..b2562b969f
+--- /dev/null
++++ b/test/e2e/tests/issues/4078.spec.js
+@@ -0,0 +1,92 @@
++import { test, expect } from "../../test-fixtures";
++import { syncLV } from "../../utils";
++
++// https://github.com/phoenixframework/phoenix_live_view/issues/4078
++// live_file_input should respect changing assigns like disabled and class
++
++test("live_file_input respects disabled attribute changes", async ({
++  page,
++}) => {
++  await page.goto("/issues/4078");
++  await syncLV(page);
++
++  const input = page.locator("#upload-form input[type='file']");
++
++  // Initially disabled
++  await expect(input).toBeDisabled();
++
++  // Click to enable
++  await page.locator("#toggle-disabled").click();
++  await syncLV(page);
++
++  // Should now be enabled
++  await expect(input).not.toBeDisabled();
++
++  // Click to disable again
++  await page.locator("#toggle-disabled").click();
++  await syncLV(page);
++
++  // Should be disabled again
++  await expect(input).toBeDisabled();
++});
++
++test("live_file_input respects class attribute changes", async ({ page }) => {
++  await page.goto("/issues/4078");
++  await syncLV(page);
++
++  const input = page.locator("#upload-form input[type='file']");
++
++  // Initially has initial-class
++  await expect(input).toHaveClass(/initial-class/);
++
++  // Click to change class
++  await page.locator("#toggle-class").click();
++  await syncLV(page);
++
++  // Should have updated-class
++  await expect(input).toHaveClass(/updated-class/);
++
++  // Click to change class back
++  await page.locator("#toggle-class").click();
++  await syncLV(page);
++
++  // Should have initial-class again
++  await expect(input).toHaveClass(/initial-class/);
++});
++
++test("live_file_input preserves files when attributes change", async ({
++  page,
++}) => {
++  await page.goto("/issues/4078");
++  await syncLV(page);
++
++  // First enable the input
++  await page.locator("#toggle-disabled").click();
++  await syncLV(page);
++
++  const input = page.locator("#upload-form input[type='file']");
++  await expect(input).not.toBeDisabled();
++
++  // Select a file
++  await input.setInputFiles({
++    name: "test.txt",
++    mimeType: "text/plain",
++    buffer: Buffer.from("test content"),
++  });
++  await syncLV(page);
++
++  // Verify file is selected (entry should appear)
++  await expect(page.locator(".upload-entry")).toBeVisible();
++  await expect(page.locator(".entry-name")).toContainText("test.txt");
++
++  // Change class attribute - file should remain selected
++  await page.locator("#toggle-class").click();
++  await syncLV(page);
++
++  // Verify file is still selected after class change
++  await expect(page.locator(".upload-entry")).toBeVisible();
++  await expect(page.locator(".entry-name")).toContainText("test.txt");
++
++  // Verify class was changed
++  await expect(input).toHaveClass(/updated-class/);
++});
+diff --git a/test/phoenix_component/components_test.exs b/test/phoenix_component/components_test.exs
+index 07d75bd667..58c0ebdc78 100644
+--- a/test/phoenix_component/components_test.exs
++++ b/test/phoenix_component/components_test.exs
+@@ -667,7 +667,7 @@ defmodule Phoenix.LiveView.ComponentsTest do
+       assert t2h(
+                ~H|<.live_file_input upload={@conf} class="<script>alert('nice try');</script>" />|
+              ) ==
+-               ~X|<input type="file" accept="" data-phx-hook="Phoenix.LiveFileUpload" data-phx-update="ignore" data-phx-active-refs="foo" data-phx-done-refs="" data-phx-preflighted-refs="" data-phx-auto-upload class="&lt;script&gt;alert(&#39;nice try&#39;);&lt;/script&gt;">|
++               ~X|<input type="file" accept="" data-phx-hook="Phoenix.LiveFileUpload" data-phx-active-refs="foo" data-phx-done-refs="" data-phx-preflighted-refs="" data-phx-auto-upload class="&lt;script&gt;alert(&#39;nice try&#39;);&lt;/script&gt;">|
+     end
+ 
+     test "renders optional webkitdirectory attribute" do
+@@ -678,7 +678,7 @@ defmodule Phoenix.LiveView.ComponentsTest do
+       }
+ 
+       assert t2h(~H|<.live_file_input upload={@conf} webkitdirectory />|) ==
+-               ~X|<input type="file" accept="" data-phx-hook="Phoenix.LiveFileUpload" data-phx-update="ignore" data-phx-active-refs="foo" data-phx-done-refs="" data-phx-preflighted-refs="" webkitdirectory>|
++               ~X|<input type="file" accept="" data-phx-hook="Phoenix.LiveFileUpload" data-phx-active-refs="foo" data-phx-done-refs="" data-phx-preflighted-refs="" webkitdirectory>|
+     end
+ 
+     test "renders optional capture attribute" do
+@@ -689,7 +689,7 @@ defmodule Phoenix.LiveView.ComponentsTest do
+       }
+ 
+       assert t2h(~H|<.live_file_input upload={@conf} capture="user" />|) ==
+-               ~X|<input type="file" accept="" data-phx-hook="Phoenix.LiveFileUpload" data-phx-update="ignore" data-phx-active-refs="foo" data-phx-done-refs="" data-phx-preflighted-refs="" capture="user">|
++               ~X|<input type="file" accept="" data-phx-hook="Phoenix.LiveFileUpload" data-phx-active-refs="foo" data-phx-done-refs="" data-phx-preflighted-refs="" capture="user">|
+     end
+ 
+     test "sets accept from config" do
+@@ -701,7 +701,7 @@ defmodule Phoenix.LiveView.ComponentsTest do
+       }
+ 
+       assert t2h(~H|<.live_file_input upload={@conf} />|) ==
+-               ~X|<input type="file" accept=".png" data-phx-hook="Phoenix.LiveFileUpload" data-phx-update="ignore" data-phx-active-refs="foo" data-phx-done-refs="" data-phx-preflighted-refs="">|
++               ~X|<input type="file" accept=".png" data-phx-hook="Phoenix.LiveFileUpload" data-phx-active-refs="foo" data-phx-done-refs="" data-phx-preflighted-refs="">|
+     end
+ 
+     test "renders accept override" do
+@@ -713,7 +713,7 @@ defmodule Phoenix.LiveView.ComponentsTest do
+       }
+ 
+       assert t2h(~H|<.live_file_input upload={@conf} accept=".jpeg" />|) ==
+-               ~X|<input type="file" accept=".jpeg" data-phx-hook="Phoenix.LiveFileUpload" data-phx-update="ignore" data-phx-active-refs="foo" data-phx-done-refs="" data-phx-preflighted-refs="">|
++               ~X|<input type="file" accept=".jpeg" data-phx-hook="Phoenix.LiveFileUpload" data-phx-active-refs="foo" data-phx-done-refs="" data-phx-preflighted-refs="">|
+     end
+   end
+ 

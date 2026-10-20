@@ -1,0 +1,302 @@
+import Config
+
+# Exercise the local upload-serving path (no nginx in tests either).
+config :vutuv, :serve_uploads_locally, true
+
+# Disable the fire-and-forget screenshot/gravatar tasks in tests: they would
+# use the SQL Sandbox connection from a process that does not own it (crashing
+# under async tests) and make a live HTTP request / launch headless Chromium.
+config :vutuv, :generate_screenshots, false
+config :vutuv, :fetch_gravatar, false
+# No test may find a real browser either: `PageScreenshot.binary/0` otherwise
+# walks $PATH and the macOS app bundles, and a render that misses the capture's
+# 30-second deadline leaves the row at `stage: "rendering"` with no page and no
+# log (issues #2178, #2186, #2189). A path that does not exist makes
+# `PageRender.renderable?/1` answer false, the way a host without a browser
+# behaves. See docs/architecture/attachments.md, "The suite never runs that
+# browser". A test that wants a stub sets its own value, which wins over this.
+config :vutuv, :chromium_path, "/vutuv/no/chromium/in/tests"
+# Ads ship disabled (config/config.exs); the test suite exercises the full ad
+# flow, so it runs with the system on. ads_disabled_test.exs flips it off.
+config :vutuv, :ads_enabled, true
+config :vutuv, :sweep_pending_images, false
+config :vutuv, :sweep_post_drafts, false
+# The video pipeline (issue #1906) is a polling GenServer that would touch the
+# sandbox from outside and run ffmpeg for a minute per clip; tests drive
+# Vutuv.Videos.Job.run/1 directly on tiny clips. Videos.Pipeline.nudge/0 casts
+# into the void then.
+config :vutuv, :video_pipeline, false
+# The same for a file's preview pages (issue #2105): a polling GenServer that
+# would claim rows from outside the sandbox and shell out to poppler or
+# Chromium. Tests drive Vutuv.Attachments.Pages.render/1 and sweep/1 directly.
+config :vutuv, :attachment_pipeline, false
+
+# The waiting-post backstop (#2106) — the tests call `Vutuv.Posts.Pending.sweep/1`
+# themselves, and a sweeper running beside them would publish a row a test is
+# about to assert is still waiting.
+config :vutuv, :pending_sweeper, false
+# The composer's draft autosave (issue #1148) normally waits for a pause in the
+# typing. Zero means it writes as part of the `validate` that changed something,
+# so a test can assert on the stored draft right after `render_change` instead
+# of racing a timer.
+config :vutuv, :composer_draft_debounce_ms, 0
+# The tab ticker's silence between two windows (issue #1668) would swallow the
+# second arrival in a test that fires two. Zero here; the test that covers the
+# silence sets its own value.
+config :vutuv, :feed_ticker_cooldown_ms, 0
+# The same for the browser tab's teaser (issue #1681): its silence is half a
+# minute in production and would swallow every second arrival a test fires. The
+# test that covers the silence sets its own value.
+config :vutuv, :tab_teaser_cooldown_ms, 0
+config :vutuv, :sweep_unconfirmed_registrations, false
+# The daily retention sweep of the account-activity log would touch the sandbox
+# from outside; tests call Vutuv.AccountEvents.delete_expired/0 directly.
+config :vutuv, :sweep_account_events, false
+config :vutuv, :sweep_ad_sightings, false
+# The daily retention sweep of the media-job log, same reason; tests call
+# Vutuv.MediaJobs.delete_expired/0 directly.
+config :vutuv, :sweep_media_jobs, false
+# The OAuth housekeeping sweep (abandoned client registrations, spent
+# authorization codes) would touch the sandbox from outside; tests call
+# Vutuv.ApiAuth.sweep/0 directly.
+config :vutuv, :sweep_api_auth, false
+# The installation-defaults cache (Vutuv.Prefs.Cache) reloads from the DB on
+# PubSub messages, which would touch the sandbox from outside; with it off,
+# pref resolution falls back to the shipped defaults and tests inject
+# installation defaults via Vutuv.Prefs.Cache.store/1 (see prefs_test.exs).
+config :vutuv, :prefs_defaults_cache, false
+# The hashtag-linkability memo is off here for the same reason it is elsewhere
+# a win: its answers outlive the process that asked. A global one-minute memo
+# would let one test's "no such tag" stand for the next test's freshly created
+# one, so every test sees the live query and the cache's own tests
+# (linkable_cache_test.exs) start an isolated instance.
+config :vutuv, :linkable_tag_cache, false
+config :vutuv, :markdown_cache, false
+# Same deal for the screenshot blocklist's cache: with it off, every check
+# reads the table from the calling (sandbox-owning) process, so a test that
+# inserts an entry sees it act immediately.
+config :vutuv, :screenshot_blocklist_cache, false
+config :vutuv, :send_unread_message_emails, false
+
+# The digest sweeper would run from a process that does not own the SQL Sandbox
+# connection; tests call Vutuv.Activity.Digest.send_pending/0 directly.
+config :vutuv, :send_notification_digest_emails, false
+config :vutuv, :moderation_sweeper, false
+# Webhook deliveries run inline in tests (Vutuv.Webhooks.deliver_due/0 with a
+# stubbed HTTP layer); the polling GenServer would touch the sandbox from
+# outside. Vutuv.Webhooks.Deliverer.nudge/0 casts into the void then.
+config :vutuv, :webhook_deliverer, false
+config :vutuv, :fediverse_deliverer, false
+# No accounts suggested on the welcome window's last step, so every test sees
+# the two-step shape and no test can send a real WebFinger request by ticking a
+# box: the shipped German list names accounts on other servers, and
+# `Vutuv.Fediverse.follow_remote/2` would go and look them up. The suggestions
+# themselves are covered in `test/vutuv/welcome_test.exs`, which sets this key
+# to a local member and is `async: false` for exactly that reason.
+config :vutuv, :welcome_suggestions, %{}
+# The hourly remote-follower re-check would likewise touch the sandbox from
+# outside; tests call Vutuv.Fediverse.prune_due_followers/1 directly with a
+# stubbed HTTP layer.
+config :vutuv, :fediverse_follower_pruning, false
+# The hourly retention sweep of stored remote replies, same reasoning; tests
+# call Vutuv.Fediverse.expire_due_notes/1 directly.
+config :vutuv, :fediverse_note_sweeping, false
+# The on-view freshness re-fetch spawns a task under Vutuv.TaskSupervisor, which
+# does not own the sandbox connection — so it would crash there, and only into
+# the log, since nothing awaits a Task. Tests call
+# Vutuv.Fediverse.refresh_note/1 directly with a stubbed HTTP layer.
+config :vutuv, :fediverse_note_refresh, false
+# The like/repost counts refresher (issue #1283) polls other servers on a timer,
+# outside the sandbox; tests call Vutuv.Fediverse.refresh_counts/1 and
+# refresh_due_counts/0 directly with a stubbed HTTP layer.
+config :vutuv, :fediverse_counts, false
+# The server status sampler reads /proc and df on a timer and would answer
+# every test with this machine; the tests start it themselves on a fixture.
+config :vutuv, :server_status_sampler, false
+# The investor page's 12-month reach runs its aggregate in a Task, outside the
+# sandbox; without the runner the page computes in its own process instead.
+config :vutuv, :reach_runner, false
+
+# Downloading the pictures of followed accounts (issue #1163) runs in a Task,
+# which would sit outside the SQL sandbox; tests call
+# Vutuv.Fediverse.Media.fetch_now/1 directly with a stubbed HTTP layer.
+config :vutuv, :fediverse_media_fetch, false
+config :vutuv, :fediverse_quote_resolve, false
+config :vutuv, :fediverse_mention_resolve, false
+# Post link-screenshots drain via a polling GenServer that would touch the
+# sandbox from outside; tests call Vutuv.Posts.Screenshots.deliver_due/1 directly
+# with a stubbed capture. ScreenshotWorker.nudge/0 casts into the void then.
+config :vutuv, :post_screenshot_worker, false
+# The same for the organization homepage-screenshot queue; tests call
+# Vutuv.Organizations.Screenshots.deliver_due/1 directly with a stubbed capture.
+config :vutuv, :organization_screenshot_worker, false
+# AI image moderation is off in tests: images release immediately, so the
+# whole existing suite sees today's behavior. The moderation tests flip
+# :moderate_images on per-test and drain via ImageScans.deliver_due/1 with a
+# stubbed judge (no Ollama call); the polling worker stays off regardless
+# (sandbox rule). ImageScanWorker.nudge/0 casts into the void then.
+config :vutuv, :moderate_images, false
+config :vutuv, :image_scan_worker, false
+# The link-preview page check is off for the same reason: no test should reach
+# for Ollama. Its own tests flip :screenshot_page_check on and inject a `plug:`
+# responder through :screenshot_check_req_options.
+config :vutuv, :screenshot_page_check, false
+# Translations are ON in tests so the request/display paths are exercised;
+# the queue tests drain via Translations.deliver_due/1 with a stubbed
+# translator, and the polling worker stays off (sandbox rule) — its nudge/0
+# casts into the void. The one "flag off" test flips :translate_posts in its
+# own sync file.
+config :vutuv, :translate_posts, true
+config :vutuv, :translation_worker, false
+# The fediverse inbound rate cap counts in a GLOBAL in-memory bucket the SQL
+# sandbox never rolls back, and ~29 test files share the literal actor
+# "https://social.example/users/alice" — so one full run draws the shipped
+# 60/hour actor budget down until whichever file the seed puts last starts
+# failing with :inbound_capped (first bitten at ~7860 tests). Effectively
+# unlimited here; the cap's own tests set tight values per test and restore
+# THIS configured value afterwards (fetch_env, not delete_env).
+config :vutuv, :fediverse_inbound_caps, {1_000_000, 1_000_000}
+# Same arrangement for the Arbeitszeugnis analysis: the queue tests drain via
+# Checks.deliver_due/1 with a stubbed analysis function, and neither the
+# polling worker nor the daily skill fetch may run from the sandbox.
+# CheckWorker.nudge/0 casts into the void then.
+config :vutuv, :reference_check_worker, false
+config :vutuv, :reference_skill_refresher, false
+config :vutuv, :fetch_reference_skill, false
+# The overnight daily-report mailer; its DB tally would touch the sandbox from
+# outside. Vutuv.Reports is called directly in reports_test.exs instead.
+config :vutuv, :daily_report_email, false
+# The sign-up trap's hourly report tick would touch the sandbox from outside;
+# tests call Vutuv.SignupTrap.run/2 directly.
+config :vutuv, :signup_trap_report, false
+config :vutuv, :link_spam_check, false
+# The 23:59 head-count recorder behind the investor page's growth curve; same
+# sandbox reason. Vutuv.PeopleHistory.record/1 is called directly in
+# people_history_test.exs instead.
+config :vutuv, :record_people_history, false
+# The nightly job-posting lifecycle sweeper is off in tests (a background
+# process must not touch the SQL Sandbox it doesn't own); call
+# Vutuv.Jobs.Sweeper.sweep/0 directly in the test that exercises it.
+config :vutuv, :jobs_sweeper, false
+# The saved-search alert digest sweeper is off in tests (same sandbox reason);
+# call Vutuv.SavedSearches.AlertSweeper.sweep/1 directly in its test.
+config :vutuv, :saved_search_alerts, false
+# The members' own automatic post deletion (issue #1255), same sandbox reason;
+# call Vutuv.Posts.AutoDeletion.sweep/1 directly in its test.
+config :vutuv, :auto_post_deletion_sweeper, false
+# Bounce detection: the log watcher must not touch the filesystem and the
+# unreachable-account sweep would touch the sandbox from outside. Both the
+# Deliverability context and parser are called directly in their tests.
+config :vutuv, :bounce_watcher, false
+config :vutuv, :sweep_unreachable_accounts, false
+# Keep the per-module :info override off so the suite stays at the quiet
+# :warning level; Vutuv.OpsLogVisibilityTest exercises the override directly.
+config :vutuv, :ops_log_visibility, false
+# The stuck-broadcast sweep would touch the sandbox from outside; tests call
+# Vutuv.Newsletters.BroadcastResumer.sweep/0 directly.
+config :vutuv, :resume_stuck_broadcasts, false
+# No headless Chromium in tests; the evidence capture is exercised manually.
+config :vutuv, :capture_report_evidence, false
+# Resolve every host to a fixed public IP so the SSRF fetch-time check
+# (`Vutuv.Ssrf.resolves_to_internal?/1`) never hits real DNS in tests; the SSRF
+# tests override this per-test to return an internal address.
+config :vutuv, :ssrf_resolver, fn _host, _family -> {:ok, [{93, 184, 216, 34}]} end
+# Moderation emails deliver inline in tests: the async task would swallow the
+# Swoosh test adapter's {:email, ...} message (it goes to the calling process).
+config :vutuv, :async_email, false
+config :vutuv, :reconcile_people_count, false
+config :vutuv, :refresh_top_posters, false
+# Every profile LiveView test performs a connected mount; the inline social
+# feeds must never fetch a remote network from there. The feed tests flip
+# these on per-test and stub HTTP via :mastodon_req_options /
+# :bluesky_req_options.
+config :vutuv, :fetch_mastodon_posts, false
+config :vutuv, :fetch_friendica_posts, false
+config :vutuv, :fetch_bluesky_posts, false
+config :vutuv, :fetch_bookwyrm_posts, false
+config :vutuv, :fetch_code_stats, false
+# The followed-tag pull (issue #2126): off, so the standing job never starts and
+# would use the SQL sandbox connection from a process that does not own it. Its
+# tests flip it on per-test and stub HTTP via :external_tag_req_options.
+config :vutuv, :fetch_external_tag_posts, false
+# Book review metadata/covers (Open Library): off, so a create_post with a
+# review never fetches; the review tests call the fetchers directly with
+# stubbed HTTP (:book_metadata_req_options / :book_covers_req_options).
+config :vutuv, :fetch_book_metadata, false
+# Organization domain re-check GenServer would touch the sandbox from outside; tests
+# call Vutuv.Organizations.recheck_domain/1 directly. DNS / well-known verification
+# is off too, so the suite never hits real DNS / HTTP; the domain tests flip
+# :verify_organization_domains on per-test and stub via :organizations_dns_resolver /
+# :organizations_req_options.
+config :vutuv, :recheck_organization_domains, false
+config :vutuv, :verify_organization_domains, false
+
+# Personal-webpage link verification: same story as the organization flags above. The
+# hourly re-check GenServer stays off (tests call
+# Vutuv.Profiles.LinkVerification.recheck/1 directly); verification is off so the
+# suite never hits real DNS / HTTP, and the link tests flip :verify_user_links on
+# per-test and stub via :user_links_dns_resolver / :user_links_req_options.
+config :vutuv, :recheck_user_links, false
+config :vutuv, :verify_user_links, false
+
+# Verified social-media handles: same story. The hourly re-check GenServer stays
+# off (tests call Vutuv.Profiles.SocialAccountVerification.recheck/1 directly);
+# verification is off so the suite never hits the real Bluesky AppView, and the
+# verification tests flip :verify_social_accounts on per-test and stub via
+# :bluesky_req_options.
+config :vutuv, :recheck_social_accounts, false
+config :vutuv, :verify_social_accounts, false
+config :vutuv, :mastodon_api_enabled, true
+
+# Push is on in production (the VAPID pair derives itself), but off here so no
+# test outside the push suite fires a real POST at a push service — the
+# dispatcher runs on every notification, and a subscription row is all it
+# takes. The push tests enable it per test.
+config :vutuv, :web_push_enabled, false
+
+# Keep the Regenerator's stdout progress lines out of the test output.
+config :vutuv, :regenerator_quiet, true
+
+# Off by default so the suite's many logins do not share (and exhaust) one
+# process-wide counter. The dedicated rate-limit test enables it explicitly.
+config :vutuv, :rate_limit, enabled: false
+
+config :vutuv, VutuvWeb.Endpoint,
+  url: [host: "localhost", port: 4001],
+  http: [port: 4001],
+  server: false,
+  public_url: "http://localhost:4000/",
+  # Test-only signing key. Non-sensitive: the suite just needs a stable value
+  # present so sessions / Phoenix.Token work. Production reads its own key from
+  # SECRET_KEY_BASE in config/runtime.exs.
+  secret_key_base: "+kJdlpOIQpuhsEHBa3bnyGjoAZMdkw7ig6N9J+pidN8pnjstub+viBVf9vSYFB8k"
+
+config :logger, level: :warning
+
+config :vutuv, Vutuv.Repo,
+  adapter: Ecto.Adapters.Postgres,
+  username: "postgres",
+  password: "postgres",
+  # A worktree runs its own suite against the same Postgres, so it gets its own
+  # test database (`Vutuv.MixProject.worktree_name/1`, same reasoning as the dev
+  # one). `MIX_TEST_PARTITION` still isolates targeted runs inside one checkout.
+  database:
+    "vutuv1_test#{Vutuv.MixProject.worktree_suffix()}#{System.get_env("MIX_TEST_PARTITION")}",
+  hostname: System.get_env("DATABASE_HOST", "localhost"),
+  pool: Ecto.Adapters.SQL.Sandbox,
+  # The suite runs ~20 async cases; the default pool (10) plus the default
+  # 50ms/1s queue budget starves setup checkouts on a loaded dev machine
+  # (observed 2026-07-20: dozens of "connection not available and request was
+  # dropped from queue" failures at test SETUP while the same tree was green
+  # at --max-cases 6, and identical on a clean main — purely environmental).
+  # One connection per concurrent case plus headroom, and a patient queue:
+  # correctness never depends on checkout latency in tests.
+  pool_size: 30,
+  queue_target: 500,
+  queue_interval: 5_000
+
+config :vutuv, Vutuv.Mailer, adapter: Swoosh.Adapters.Test
+
+# The bounce ingestion endpoint (POST /webhooks/bounces) is enabled with a
+# fixed token in tests; production reads BOUNCE_WEBHOOK_TOKEN at runtime.
+config :vutuv, :bounce_webhook_token, "test-bounce-webhook-token"

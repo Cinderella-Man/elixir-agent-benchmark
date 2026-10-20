@@ -1,0 +1,236 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2fbb8a4..225fcfc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,10 @@
+ # Changelog
+ 
++## 0.11.0 - Unreleased
++
++- Sign and verify the OAuth state cookie, rejecting unsigned or tampered cookies before the provider callback. Protected strategies now require a stable host-provided `conn.secret_key_base` (a strong binary secret) across both phases and all application instances. Restart in-flight OAuth flows after upgrading.
++- Require Plug 1.10 or later for signed-cookie support.
++
+ ## 0.10.5 - 2023-03-09
+ 
+ - Fix default port selection when none is specified on the host header [#181](https://github.com/ueberauth/ueberauth/pull/181)
+diff --git a/lib/ueberauth/strategy.ex b/lib/ueberauth/strategy.ex
+index f4015c6..dd8bd38 100644
+--- a/lib/ueberauth/strategy.ex
++++ b/lib/ueberauth/strategy.ex
+@@ -285,6 +285,13 @@ defmodule Ueberauth.Strategy do
+   We strongly recommend never disabling this feature, unless you have some technical
+   limitations that forces you to do so.
+ 
++  Protected strategies sign the state cookie. The host application must set
++  `conn.secret_key_base` to a stable, strong binary secret before running
++  either phase, using the same secret across requests and application instances.
++  Plug raises a configuration error when a protected request has no valid secret.
++  After upgrading from unsigned state cookies, users must restart any in-flight
++  OAuth flows; unsigned cookies are rejected.
++
+   To change the SameSite attribute of the cookie holding the state parameter, you can use the `:state_param_cookie_same_site` option:
+ 
+       defmodule MyStrategy do
+@@ -415,6 +422,7 @@ defmodule Ueberauth.Strategy do
+ 
+     conn
+     |> Conn.put_resp_cookie(@state_param_cookie_name, state,
++      sign: true,
+       same_site: get_state_param_cookie_same_site(strategy)
+     )
+     |> Helpers.add_state_param(state)
+@@ -422,7 +430,7 @@ defmodule Ueberauth.Strategy do
+ 
+   defp get_state_cookie(conn) do
+     conn
+-    |> Conn.fetch_session()
++    |> Conn.fetch_cookies(signed: [@state_param_cookie_name])
+     |> Map.get(:cookies)
+     |> Map.get(@state_param_cookie_name)
+   end
+diff --git a/mix.exs b/mix.exs
+index 80f5cfa..e9b03a8 100644
+--- a/mix.exs
++++ b/mix.exs
+@@ -2,7 +2,7 @@ defmodule Ueberauth.Mixfile do
+   use Mix.Project
+ 
+   @source_url "https://github.com/ueberauth/ueberauth"
+-  @version "0.10.8"
++  @version "0.11.0"
+ 
+   def project do
+     [
+@@ -34,7 +34,7 @@ defmodule Ueberauth.Mixfile do
+ 
+   defp deps do
+     [
+-      {:plug, "~> 1.5"},
++      {:plug, "~> 1.10"},
+ 
+       # Tools
+       {:dialyxir, ">= 0.0.0", only: [:dev], runtime: false},
+diff --git a/test/ueberauth_test.exs b/test/ueberauth_test.exs
+index 9e33c32..e181d93 100644
+--- a/test/ueberauth_test.exs
++++ b/test/ueberauth_test.exs
+@@ -8,6 +8,7 @@ defmodule UeberauthTest do
+ 
+   doctest Ueberauth
+ 
++  @secret_key_base String.duplicate("test-secret", 8)
+   @opts Support.SpecRouter.init([])
+   @session_options Plug.Session.init(
+                      store: Plug.Session.COOKIE,
+@@ -336,6 +337,7 @@ defmodule UeberauthTest do
+   test "run_request with a state param by default" do
+     conn =
+       conn(:get, "/oauth/simple-provider/", id: "foo")
++      |> Map.put(:secret_key_base, @secret_key_base)
+       |> Ueberauth.run_request(
+         "simple-provider",
+         {Support.ProviderWithCsrfAttackEnabled,
+@@ -343,13 +345,17 @@ defmodule UeberauthTest do
+       )
+       |> Plug.Conn.fetch_cookies()
+ 
+-    assert conn.cookies["ueberauth.state_param"] != nil
++    assert conn.resp_cookies["ueberauth.state_param"].value !=
++             conn.private[:ueberauth_state_param]
++
++    assert conn.resp_cookies["ueberauth.state_param"].same_site == "Lax"
+     assert conn.private[:ueberauth_state_param] != nil
+   end
+ 
+   test "run_request with a custom state param cookie samesite" do
+     conn =
+       conn(:get, "/oauth/simple-provider/", id: "foo")
++      |> Map.put(:secret_key_base, @secret_key_base)
+       |> Ueberauth.run_request(
+         "simple-provider",
+         {Support.ProviderWithCustomCookieSameSite,
+@@ -368,6 +374,7 @@ defmodule UeberauthTest do
+       )
+ 
+     assert conn.private[:ueberauth_state_param] == nil
++    refute Map.has_key?(conn.resp_cookies, "ueberauth.state_param")
+   end
+ 
+   test "run_callback" do
+@@ -399,6 +406,7 @@ defmodule UeberauthTest do
+     conn =
+       :get
+       |> conn("/oauth/simple-provider/", id: "foo")
++      |> Map.put(:secret_key_base, @secret_key_base)
+       |> Ueberauth.run_request(
+         "simple-provider",
+         {Support.ProviderWithCsrfAttackEnabled,
+@@ -417,18 +425,105 @@ defmodule UeberauthTest do
+         code: code,
+         state: state
+       )
+-      |> Map.put(:cookies, conn.cookies)
+-      |> Map.put(:req_cookies, conn.req_cookies)
++      |> Map.put(:secret_key_base, @secret_key_base)
++      |> put_req_cookie("ueberauth.state_param", conn.resp_cookies["ueberauth.state_param"].value)
+       |> Plug.Session.call(@session_options)
+       |> Ueberauth.run_callback(
+         "simple-provider",
+         {Support.ProviderWithCsrfAttackEnabled, []}
+       )
+ 
+-    assert conn.halted == true and conn.cookies == %{}
++    assert conn.halted == true
++    assert fetch_cookies(conn).cookies == %{}
++    assert conn.resp_cookies["ueberauth.state_param"].max_age == 0
+     assert conn.resp_body =~ ~s|http://localhost/fetch_user?code=#{code}|
+   end
+ 
++  test "protected requests require a valid secret" do
++    for secret <- [nil, :invalid] do
++      assert_raise FunctionClauseError, fn ->
++        conn(:get, "/oauth/simple-provider/")
++        |> Map.put(:secret_key_base, secret)
++        |> Ueberauth.run_request("simple-provider", {Support.ProviderWithCsrfAttackEnabled, []})
++      end
++    end
++  end
++
++  test "run_callback verifies signed state cookies even when cookies were already fetched" do
++    request =
++      conn(:get, "/oauth/simple-provider/")
++      |> Map.put(:secret_key_base, @secret_key_base)
++      |> Ueberauth.run_request("simple-provider", {Support.ProviderWithCsrfAttackEnabled, []})
++
++    state = request.private[:ueberauth_state_param]
++    cookie = request.resp_cookies["ueberauth.state_param"].value
++
++    for fetched? <- [false, true] do
++      callback =
++        conn(:get, "/oauth/simple-provider/callback", state: state, code: "simple-code")
++        |> Map.put(:secret_key_base, @secret_key_base)
++        |> put_req_cookie("ueberauth.state_param", cookie)
++
++      callback = if fetched?, do: fetch_cookies(callback), else: callback
++
++      assert fetch_cookies(callback, signed: ["ueberauth.state_param"]).cookies[
++               "ueberauth.state_param"
++             ] == state
++
++      callback =
++        Ueberauth.run_callback(
++          callback,
++          "simple-provider",
++          {Support.ProviderWithCsrfAttackEnabled, []}
++        )
++
++      assert callback.assigns[:ueberauth_auth] != nil
++      assert callback.assigns[:ueberauth_failure] == nil
++      assert callback.resp_cookies["ueberauth.state_param"].max_age == 0
++    end
++  end
++
++  test "run_callback rejects invalid state cookies before invoking the provider" do
++    request =
++      conn(:get, "/oauth/simple-provider/")
++      |> Map.put(:secret_key_base, @secret_key_base)
++      |> Ueberauth.run_request("simple-provider", {Support.ProviderWithCsrfAttackEnabled, []})
++
++    state = request.private[:ueberauth_state_param]
++    cookie = request.resp_cookies["ueberauth.state_param"].value
++
++    for {value, param, secret} <- [
++          {state, state, @secret_key_base},
++          {cookie <> "tampered", state, @secret_key_base},
++          {"SFMyNTY.invalid.signature", state, @secret_key_base},
++          {cookie, state, String.duplicate("other-secret", 8)},
++          {cookie, "different-state", @secret_key_base},
++          {cookie, nil, @secret_key_base},
++          {nil, state, @secret_key_base}
++        ],
++        fetched? <- [false, true] do
++      callback =
++        conn(:get, "/oauth/simple-provider/callback", state: param)
++        |> Map.put(:secret_key_base, secret)
++
++      callback =
++        if value, do: put_req_cookie(callback, "ueberauth.state_param", value), else: callback
++
++      callback = if fetched?, do: fetch_cookies(callback), else: callback
++
++      callback =
++        Ueberauth.run_callback(
++          callback,
++          "simple-provider",
++          {Support.ProviderWithCsrfAttackEnabled, []}
++        )
++
++      assert callback.assigns[:ueberauth_auth] == nil
++      assert [error] = callback.assigns.ueberauth_failure.errors
++      assert error.message_key == "csrf_attack"
++    end
++  end
++
+   defp assert_standard_info(auth) do
+     info = auth.info
+ 

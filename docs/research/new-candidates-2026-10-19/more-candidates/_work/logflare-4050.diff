@@ -1,0 +1,2081 @@
+diff --git a/lib/logflare/application.ex b/lib/logflare/application.ex
+index da74fd3688..51ced4df32 100644
+--- a/lib/logflare/application.ex
++++ b/lib/logflare/application.ex
+@@ -8,6 +8,7 @@ defmodule Logflare.Application do
+   alias Logflare.Networking
+   alias Logflare.Backends.Adaptor.BigQueryAdaptor
+   alias Logflare.Backends.Spool.Health, as: SpoolHealth
++  alias Logflare.Backends.Spool.SpoolAck
+   alias Logflare.Backends.UserMonitoring
+   alias Logflare.ContextCache
+   alias Logflare.Logs
+@@ -72,6 +73,7 @@ defmodule Logflare.Application do
+         Counters,
+         RateCounters,
+         RateSampler,
++        SpoolAck,
+         Logs.LogEvents.Cache,
+         {Phoenix.PubSub, name: Logflare.PubSub},
+         PubSubRates,
+@@ -117,6 +119,7 @@ defmodule Logflare.Application do
+         Counters,
+         RateCounters,
+         RateSampler,
++        SpoolAck,
+         # Backends needs to be before Source.Supervisor
+         Logflare.Backends,
+         Logflare.Sources.Source.Supervisor,
+diff --git a/lib/logflare/backends.ex b/lib/logflare/backends.ex
+index ca02628faa..a8a2813ac6 100644
+--- a/lib/logflare/backends.ex
++++ b/lib/logflare/backends.ex
+@@ -730,11 +730,23 @@ defmodule Logflare.Backends do
+   @doc """
+   Dispatches events from the spool consumer directly to backends, bypassing the spool producer path.
+   Use this in the consumer pipeline to avoid re-routing events back to the spool in `:both` mode.
++
++  `handle` is the spool queue message (SQS receipt handle / PubSub ack id)
++  these records were decoded from, or `nil` if they didn't come from the
++  spool. Stamped onto each event as `spool_handle` so `IngestEventQueue` can
++  track, per handle, how many pipeline completions are still outstanding
++  before `Logflare.Backends.Spool.SpoolAck` acks it — see that module's
++  moduledoc.
+   """
+-  @spec dispatch_from_spool([map()], Source.t()) :: {:ok, non_neg_integer()}
+-  def dispatch_from_spool(spool_records, source) do
++  @spec dispatch_from_spool([map()], Source.t(), term()) :: {:ok, non_neg_integer()}
++  def dispatch_from_spool(spool_records, source, handle \\ nil) do
+     ensure_source_sup_started(source)
+-    log_events = Enum.map(spool_records, &LogEvent.make_from_spool(&1, source))
++
++    log_events =
++      Enum.map(spool_records, fn record ->
++        LogEvent.make_from_spool(record, source, handle)
++      end)
++
+     count = length(log_events)
+ 
+     :telemetry.execute(
+diff --git a/lib/logflare/backends/adaptor/clickhouse_adaptor/pipeline.ex b/lib/logflare/backends/adaptor/clickhouse_adaptor/pipeline.ex
+index aa9b2dbe40..36eae153a7 100644
+--- a/lib/logflare/backends/adaptor/clickhouse_adaptor/pipeline.ex
++++ b/lib/logflare/backends/adaptor/clickhouse_adaptor/pipeline.ex
+@@ -35,6 +35,7 @@ defmodule Logflare.Backends.Adaptor.ClickHouseAdaptor.Pipeline do
+   alias Logflare.Backends.BufferProducer
+   alias Logflare.Backends.IngestEventQueue
+   alias Logflare.Backends.IngestEventQueue.LogEventPointer
++  alias Logflare.Backends.Spool.SpoolAck
+   alias Logflare.LogEvent
+   alias Logflare.LogEvent.TypeDetection
+   alias Logflare.Mapper
+@@ -274,10 +275,13 @@ defmodule Logflare.Backends.Adaptor.ClickHouseAdaptor.Pipeline do
+     decrement_in_flight(successful, failed)
+     emit_missing_ids_telemetry(failed)
+ 
+-    Enum.each(successful, fn message ->
++    successful
++    |> Enum.reduce(%{}, fn message, counts ->
+       pointer = message_pointer(message)
+       IngestEventQueue.delete_id(pointer.tid, pointer.gen_event_id)
++      Map.update(counts, pointer.spool_handle, 1, &(&1 + 1))
+     end)
++    |> Enum.each(fn {handle, count} -> SpoolAck.ack(handle, count) end)
+ 
+     if failed != [] do
+       failed
+@@ -674,10 +678,13 @@ defmodule Logflare.Backends.Adaptor.ClickHouseAdaptor.Pipeline do
+       %{backend_type: :clickhouse, backend_id: backend_id, reason: reason}
+     )
+ 
+-    Enum.each(payloads, fn payload ->
++    payloads
++    |> Enum.reduce(%{}, fn payload, counts ->
+       pointer = message_pointer(payload)
+       IngestEventQueue.delete_id(pointer.tid, pointer.gen_event_id)
++      Map.update(counts, pointer.spool_handle, 1, &(&1 + 1))
+     end)
++    |> Enum.each(fn {handle, count} -> SpoolAck.ack(handle, count) end)
+   end
+ 
+   @spec drop_reason_message(drop_reason()) :: String.t()
+diff --git a/lib/logflare/backends/ingest_event_queue.ex b/lib/logflare/backends/ingest_event_queue.ex
+index a89fad1220..33dcd6d678 100644
+--- a/lib/logflare/backends/ingest_event_queue.ex
++++ b/lib/logflare/backends/ingest_event_queue.ex
+@@ -22,6 +22,7 @@ defmodule Logflare.Backends.IngestEventQueue do
+   alias Logflare.Sources.Source
+   alias Logflare.Backends.Backend
+   alias Logflare.Backends.IngestEventQueue.LogEventPointer
++  alias Logflare.Backends.Spool.SpoolAck
+   alias Logflare.LogEvent
+ 
+   require Ex2ms
+@@ -35,7 +36,7 @@ defmodule Logflare.Backends.IngestEventQueue do
+   @consolidated_max_queue_size 120_000
+   @requeue_pointer_collision_retries 2
+   @pointer_batch_key_match_spec (for event_type <- [:log, :metric, :trace] do
+-                                   {{:_, :_, :_, :_, :_, event_type, :"$1"},
++                                   {{:_, :_, :_, :_, :_, event_type, :"$1", :_},
+                                     [{:is_integer, :"$1"}], [{{event_type, :"$1"}}]}
+                                  end)
+ 
+@@ -696,30 +697,18 @@ defmodule Logflare.Backends.IngestEventQueue do
+   # `gen_event_id` makes this row independent from any duplicate event id. If insert_new/2
+   # rejects the pointer or the queue disappears during publication, only this insertion's
+   # generation row is removed.
+-  # Pointer row shape: {event_id, generation_tid, gen_event_id, size, retries, event_type, day_bucket}.
++  # Pointer row shape:
++  # {event_id, generation_tid, gen_event_id, size, retries, event_type, day_bucket, spool_handle}.
+   defp insert_pointer_batch(sid_bid_pid, queue_tid, batch) do
+     queues_key = pointer_queues_key(sid_bid_pid)
+     gen_tid = current_generation_tid(queues_key)
+ 
+-    for %{id: id} = event <- batch do
+-      gen_event_id = make_ref()
+-
+-      row =
+-        {id, gen_tid, gen_event_id, :erlang.external_size(event.body), event.retries || 0,
+-         event.event_type, event.day_bucket}
+-
+-      :ets.insert(gen_tid, {gen_event_id, event})
+-
+-      try do
+-        if not :ets.insert_new(queue_tid, row) do
+-          :ets.delete(gen_tid, gen_event_id)
+-        end
+-      rescue
+-        error in ArgumentError ->
+-          delete_id(gen_tid, gen_event_id)
+-          reraise error, __STACKTRACE__
+-      end
+-    end
++    batch
++    |> Enum.group_by(& &1.spool_handle)
++    |> Enum.each(fn {handle, events} ->
++      SpoolAck.bump(handle, length(events))
++      insert_reserved_rows(gen_tid, queue_tid, handle, events)
++    end)
+ 
+     :ok
+   rescue
+@@ -732,6 +721,34 @@ defmodule Logflare.Backends.IngestEventQueue do
+       end
+   end
+ 
++  defp insert_reserved_rows(_gen_tid, _queue_tid, _handle, []), do: :ok
++
++  defp insert_reserved_rows(gen_tid, queue_tid, handle, [%{id: id} = event | rest]) do
++    gen_event_id = make_ref()
++
++    row =
++      {id, gen_tid, gen_event_id, :erlang.external_size(event.body), event.retries || 0,
++       event.event_type, event.day_bucket, handle}
++
++    try do
++      :ets.insert(gen_tid, {gen_event_id, event})
++
++      if :ets.insert_new(queue_tid, row) do
++        :ok
++      else
++        :ets.delete(gen_tid, gen_event_id)
++        SpoolAck.ack(handle, 1)
++      end
++    rescue
++      error in ArgumentError ->
++        delete_id(gen_tid, gen_event_id)
++        SpoolAck.ack(handle, length(rest) + 1)
++        reraise error, __STACKTRACE__
++    end
++
++    insert_reserved_rows(gen_tid, queue_tid, handle, rest)
++  end
++
+   @spec pointer_queues_key(consolidated_table_key() | table_key() | spool_producer_table_key()) ::
+           consolidated_queues_key() | queues_key() | spool_producer_queues_key()
+   defp pointer_queues_key({:consolidated, bid, _pid}), do: {:consolidated, bid}
+@@ -758,7 +775,7 @@ defmodule Logflare.Backends.IngestEventQueue do
+          to_tid when to_tid != nil <- get_tid(to) do
+       moved =
+         :ets.foldl(
+-          fn {id, _, _, _, _, _, _}, acc -> acc + take_and_insert(from_tid, to_tid, id) end,
++          fn {id, _, _, _, _, _, _, _}, acc -> acc + take_and_insert(from_tid, to_tid, id) end,
+           0,
+           from_tid
+         )
+@@ -922,7 +939,7 @@ defmodule Logflare.Backends.IngestEventQueue do
+   def pop_pending_pointers(_, 0), do: {:ok, [], nil}
+ 
+   def pop_pending_pointers(sid_bid_pid, n) when is_integer(n) do
+-    ms = [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
++    ms = [{{:"$1", :_, :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
+ 
+     pop_selected_pointers(sid_bid_pid, n, ms)
+   end
+@@ -976,7 +993,7 @@ defmodule Logflare.Backends.IngestEventQueue do
+       )
+       when event_type in [:log, :metric, :trace] and is_integer(day_bucket) and
+              is_integer(n) and n > 0 do
+-    ms = [{{:"$1", :_, :_, :_, :_, event_type, day_bucket}, [], [:"$1"]}]
++    ms = [{{:"$1", :_, :_, :_, :_, event_type, day_bucket, :_}, [], [:"$1"]}]
+ 
+     pop_selected_pointers(sid_bid_pid, n, ms)
+   end
+@@ -1011,7 +1028,7 @@ defmodule Logflare.Backends.IngestEventQueue do
+ 
+   defp claim_pointers([id | ids], tid, pointers) do
+     case take_pointer_row(tid, id) do
+-      {:ok, {^id, gen_tid, gen_event_id, size, retries, event_type, day_bucket}} ->
++      {:ok, {^id, gen_tid, gen_event_id, size, retries, event_type, day_bucket, spool_handle}} ->
+         pointer = %LogEventPointer{
+           id: id,
+           tid: gen_tid,
+@@ -1020,7 +1037,8 @@ defmodule Logflare.Backends.IngestEventQueue do
+           size: size,
+           retries: retries,
+           event_type: event_type,
+-          day_bucket: day_bucket
++          day_bucket: day_bucket,
++          spool_handle: spool_handle
+         }
+ 
+         claim_pointers(ids, tid, [pointer | pointers])
+@@ -1083,6 +1101,8 @@ defmodule Logflare.Backends.IngestEventQueue do
+       requeue_payload_to_candidate(candidate_tids, queues_key, pointer, payload_builder)
+ 
+     delete_id(pointer.tid, pointer.gen_event_id)
++    SpoolAck.ack(pointer.spool_handle, 1)
++
+     result
+   end
+ 
+@@ -1125,11 +1145,14 @@ defmodule Logflare.Backends.IngestEventQueue do
+ 
+     case insert_generation_payload(gen_tid, gen_event_id, payload) do
+       :ok ->
++        SpoolAck.bump(new_pointer.spool_handle, 1)
++
+         case publish_requeued_pointer(new_pointer, @requeue_pointer_collision_retries) do
+           :ok ->
+             {:ok, new_pointer}
+ 
+           {:error, reason} = error when reason in [:already_exists, :not_initialized] ->
++            SpoolAck.ack(new_pointer.spool_handle, 1)
+             delete_id(gen_tid, gen_event_id)
+             error
+         end
+@@ -1175,16 +1198,10 @@ defmodule Logflare.Backends.IngestEventQueue do
+ 
+   defp remove_dangling_pointer(queue_tid, id) do
+     case :ets.lookup(queue_tid, id) do
+-      [{^id, gen_tid, gen_event_id, _, _, _, _} = row] ->
++      [{^id, gen_tid, gen_event_id, _, _, _, _, spool_handle} = row] ->
+         case lookup_event(gen_tid, gen_event_id) do
+-          nil ->
+-            # Delete only the row inspected above. If another writer replaced it, this
+-            # is a no-op and the bounded publication retry re-evaluates that winner.
+-            :ets.delete_object(queue_tid, row)
+-            :retry
+-
+-          _payload ->
+-            :resolvable
++          nil -> reclaim_dangling_pointer(queue_tid, row, spool_handle)
++          _payload -> :resolvable
+         end
+ 
+       [] ->
+@@ -1196,6 +1213,14 @@ defmodule Logflare.Backends.IngestEventQueue do
+       {:error, :not_initialized}
+   end
+ 
++  defp reclaim_dangling_pointer(queue_tid, row, spool_handle) do
++    if :ets.select_delete(queue_tid, [{row, [], [true]}]) == 1 do
++      SpoolAck.ack(spool_handle, 1)
++    end
++
++    :retry
++  end
++
+   @doc """
+   Re-inserts a previously-claimed pointer directly into the queue it was claimed from
+   (`pointer.queue_tid`) — no round-robin redistribution, since that producer just proved
+@@ -1240,7 +1265,7 @@ defmodule Logflare.Backends.IngestEventQueue do
+ 
+   defp pointer_row(pointer) do
+     {pointer.id, pointer.tid, pointer.gen_event_id, pointer.size, pointer.retries,
+-     pointer.event_type, pointer.day_bucket}
++     pointer.event_type, pointer.day_bucket, pointer.spool_handle}
+   end
+ 
+   defp reinsert_queue_priority({{_, _, pid}, tid}) do
+@@ -1262,11 +1287,15 @@ defmodule Logflare.Backends.IngestEventQueue do
+   def pop_pending(_, 0), do: {:ok, []}
+ 
+   def pop_pending(sid_bid_pid, n) when is_integer(n) do
+-    ms = [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
++    ms = [{{:"$1", :_, :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
+ 
+     with tid when tid != nil <- get_tid(sid_bid_pid),
+          {:ok, ids} <- select_pointer_ids(tid, ms, n) do
+-      {events, claimed, stale?} = claim_events(ids, tid, [], 0)
++      {events, claimed, stale?, handles} = claim_events(ids, tid, [], 0, [])
++
++      handles
++      |> Enum.frequencies()
++      |> Enum.each(fn {handle, count} -> SpoolAck.ack(handle, count) end)
+ 
+       if stale? and claimed == 0 do
+         {:error, :not_initialized}
+@@ -1279,22 +1308,24 @@ defmodule Logflare.Backends.IngestEventQueue do
+     end
+   end
+ 
+-  defp claim_events([], _tid, events, claimed),
+-    do: {:lists.reverse(events), claimed, false}
++  defp claim_events([], _tid, events, claimed, handles),
++    do: {:lists.reverse(events), claimed, false, handles}
+ 
+-  defp claim_events([id | ids], tid, events, claimed) do
++  defp claim_events([id | ids], tid, events, claimed, handles) do
+     case take_pointer_row(tid, id) do
+-      {:ok, {^id, gen_tid, gen_event_id, _, _, _, _}} ->
++      {:ok, {^id, gen_tid, gen_event_id, _, _, _, _, spool_handle}} ->
++        handles = [spool_handle | handles]
++
+         case take_pointer_event({gen_tid, gen_event_id}) do
+-          nil -> claim_events(ids, tid, events, claimed + 1)
+-          event -> claim_events(ids, tid, [event | events], claimed + 1)
++          nil -> claim_events(ids, tid, events, claimed + 1, handles)
++          event -> claim_events(ids, tid, [event | events], claimed + 1, handles)
+         end
+ 
+       :missing ->
+-        claim_events(ids, tid, events, claimed)
++        claim_events(ids, tid, events, claimed, handles)
+ 
+       :stale ->
+-        {:lists.reverse(events), claimed, true}
++        {:lists.reverse(events), claimed, true, handles}
+     end
+   end
+ 
+@@ -1401,7 +1432,7 @@ defmodule Logflare.Backends.IngestEventQueue do
+   end
+ 
+   def truncate_tid(tid, status, n) when status in [:all, :pending] do
+-    ms = [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$_"]}]
++    ms = [{{:"$1", :_, :_, :_, :_, :_, :_, :_}, [], [:"$_"]}]
+ 
+     with size when is_integer(size) <- :ets.info(tid, :size) do
+       to_keep = select_to_insert(tid, ms, size, n)
+@@ -1536,11 +1567,15 @@ defmodule Logflare.Backends.IngestEventQueue do
+   def drop_pending({_, _, _}, 0), do: {:ok, 0}
+ 
+   def drop_pending({_, _, _} = sid_bid_pid, n) when is_integer(n) do
+-    ms = [{{:"$1", :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
++    ms = [{{:"$1", :_, :_, :_, :_, :_, :_, :_}, [], [:"$1"]}]
+ 
+     with tid when tid != nil <- get_tid(sid_bid_pid),
+          {:ok, ids} <- select_pointer_ids(tid, ms, n) do
+-      {dropped, stale?} = drop_claimed(ids, tid, 0)
++      {dropped, stale?, handles} = drop_claimed(ids, tid, 0, [])
++
++      handles
++      |> Enum.frequencies()
++      |> Enum.each(fn {handle, count} -> SpoolAck.ack(handle, count) end)
+ 
+       if stale? and dropped == 0 do
+         {:error, :not_initialized}
+@@ -1560,19 +1595,19 @@ defmodule Logflare.Backends.IngestEventQueue do
+     end
+   end
+ 
+-  defp drop_claimed([], _tid, dropped), do: {dropped, false}
++  defp drop_claimed([], _tid, dropped, handles), do: {dropped, false, handles}
+ 
+-  defp drop_claimed([id | ids], tid, dropped) do
++  defp drop_claimed([id | ids], tid, dropped, handles) do
+     case take_pointer_row(tid, id) do
+-      {:ok, {^id, gen_tid, gen_event_id, _, _, _, _}} ->
++      {:ok, {^id, gen_tid, gen_event_id, _, _, _, _, spool_handle}} ->
+         delete_id(gen_tid, gen_event_id)
+-        drop_claimed(ids, tid, dropped + 1)
++        drop_claimed(ids, tid, dropped + 1, [spool_handle | handles])
+ 
+       :missing ->
+-        drop_claimed(ids, tid, dropped)
++        drop_claimed(ids, tid, dropped, handles)
+ 
+       :stale ->
+-        {dropped, true}
++        {dropped, true, handles}
+     end
+   end
+ 
+diff --git a/lib/logflare/backends/ingest_event_queue/log_event_pointer.ex b/lib/logflare/backends/ingest_event_queue/log_event_pointer.ex
+index 7955485e83..6e88118ded 100644
+--- a/lib/logflare/backends/ingest_event_queue/log_event_pointer.ex
++++ b/lib/logflare/backends/ingest_event_queue/log_event_pointer.ex
+@@ -15,6 +15,10 @@ defmodule Logflare.Backends.IngestEventQueue.LogEventPointer do
+   `Logflare.Backends.IngestEventQueue.reinsert_pointer/1`) without going through
+   round-robin redistribution — the producer that owns `queue_tid` just proved itself
+   alive by claiming this.
++
++  `spool_handle` is the spool queue message this event was decoded from (or `nil`) —
++  carried here so `Logflare.Backends.Spool.SpoolAck` can be told this pointer is done
++  without resolving the event body first.
+   """
+ 
+   alias Logflare.LogEvent.TypeDetection
+@@ -37,7 +41,8 @@ defmodule Logflare.Backends.IngestEventQueue.LogEventPointer do
+     :size,
+     :retries,
+     :event_type,
+-    :day_bucket
++    :day_bucket,
++    :spool_handle
+   ]
+ 
+   @type t :: %__MODULE__{
+@@ -48,6 +53,7 @@ defmodule Logflare.Backends.IngestEventQueue.LogEventPointer do
+           size: non_neg_integer(),
+           retries: non_neg_integer(),
+           event_type: TypeDetection.event_type(),
+-          day_bucket: integer()
++          day_bucket: integer(),
++          spool_handle: term()
+         }
+ end
+diff --git a/lib/logflare/backends/spool/consumer_pipeline.ex b/lib/logflare/backends/spool/consumer_pipeline.ex
+index 71acfffd41..a07efa7072 100644
+--- a/lib/logflare/backends/spool/consumer_pipeline.ex
++++ b/lib/logflare/backends/spool/consumer_pipeline.ex
+@@ -10,6 +10,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline do
+   alias Logflare.Backends.Spool.ConsumerPipeline.QueueProducer
+   alias Logflare.Backends.Spool.MemoryMonitor
+   alias Logflare.Backends.Spool.ProviderConfig
++  alias Logflare.Backends.Spool.SpoolAck
+   alias Logflare.Sources
+ 
+   @behaviour Broadway.Acknowledger
+@@ -66,21 +67,22 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline do
+   end
+ 
+   @spec transform(map(), keyword()) :: Message.t()
+-  def transform(%{segment: segment} = unparsed, _opts) do
++  def transform(%{segment: segment, handle: handle} = unparsed, _opts) do
+     in_flight_ref = QueueProducer.get_in_flight_ref()
+ 
+     %Message{
+       data: unparsed,
+       acknowledger:
+-        {__MODULE__, :noop, %{in_flight_ref: in_flight_ref, bytes: byte_size(segment)}}
++        {__MODULE__, :noop,
++         %{in_flight_ref: in_flight_ref, bytes: byte_size(segment), handle: handle}}
+     }
+   end
+ 
+-  # Queue acking is managed by the producer; this only decrements its
+-  # max_in_flight counter.
+   @impl Broadway.Acknowledger
+   def ack(_ack_ref, successful, failed) do
+-    decrement_in_flight(successful ++ failed)
++    all = successful ++ failed
++    decrement_in_flight(all)
++    release_segment_bumps(successful)
+ 
+     if failed != [] do
+       :telemetry.execute(
+@@ -95,6 +97,12 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline do
+     :ok
+   end
+ 
++  defp release_segment_bumps(messages) do
++    messages
++    |> Enum.frequencies_by(&handle_of/1)
++    |> Enum.each(fn {handle, count} -> SpoolAck.ack(handle, count) end)
++  end
++
+   @spec decrement_in_flight([Message.t()]) :: :ok
+   defp decrement_in_flight(messages) do
+     messages
+@@ -115,6 +123,9 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline do
+   defp bytes_of(%{acknowledger: {_, _, %{} = ack_data}}), do: Map.get(ack_data, :bytes, 0)
+   defp bytes_of(_), do: 0
+ 
++  defp handle_of(%{acknowledger: {_, _, %{} = ack_data}}), do: Map.get(ack_data, :handle)
++  defp handle_of(_), do: nil
++
+   # A segment that fails to parse fails just this one message.
+   @impl Broadway
+   def handle_message(
+@@ -167,44 +178,53 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline do
+       %{backend_type: :spool_consumer, batch_trigger: batch_trigger}
+     )
+ 
+-    failed_source_ids =
++    failed_keys =
+       messages
+-      |> Enum.flat_map(fn message -> Enum.map(message.data, &{message, &1}) end)
+-      |> Enum.group_by(fn {_message, record} -> record_source_id(record) end, fn {_message,
+-                                                                                  record} ->
+-        record
+-      end)
+-      |> Enum.flat_map(fn
+-        {nil, records} ->
+-          emit_skipped_telemetry(:missing_source_id, length(records))
+-          Logger.debug("spool_consumer: #{length(records)} events missing source_id, skipping")
+-          []
+-
+-        {source_id, records} ->
+-          dispatch_group(source_id, records)
++      |> Enum.group_by(&handle_of/1)
++      |> Enum.flat_map(fn {handle, handle_messages} ->
++        dispatch_handle_group(handle, handle_messages)
+       end)
+       |> MapSet.new()
+ 
+-    fail_dispatched(messages, failed_source_ids)
++    fail_dispatched(messages, failed_keys)
+   end
+ 
+-  defp fail_dispatched(messages, failed_source_ids) do
+-    if Enum.empty?(failed_source_ids) do
++  defp dispatch_handle_group(handle, messages) do
++    messages
++    |> Enum.flat_map(fn message -> Enum.map(message.data, &{message, &1}) end)
++    |> Enum.group_by(fn {_message, record} -> record_source_id(record) end, fn {_message, record} ->
++      record
++    end)
++    |> Enum.flat_map(fn
++      {nil, records} ->
++        emit_skipped_telemetry(:missing_source_id, length(records))
++        Logger.debug("spool_consumer: #{length(records)} events missing source_id, skipping")
++        []
++
++      {source_id, records} ->
++        source_id |> dispatch_group(records, handle) |> Enum.map(&{handle, &1})
++    end)
++  end
++
++  defp fail_dispatched(messages, failed_keys) do
++    if Enum.empty?(failed_keys) do
+       messages
+     else
+-      Enum.map(messages, &fail_message(&1, failed_source_ids))
++      Enum.map(messages, &fail_message(&1, failed_keys))
+     end
+   end
+ 
+-  defp fail_message(message, failed_source_ids) do
+-    if Enum.any?(message.data, &MapSet.member?(failed_source_ids, record_source_id(&1))) do
++  defp fail_message(message, failed_keys) do
++    handle = handle_of(message)
++
++    if Enum.any?(message.data, &MapSet.member?(failed_keys, {handle, record_source_id(&1)})) do
+       Message.failed(message, :dispatch_error)
+     else
+       message
+     end
+   end
+ 
+-  defp dispatch_group(source_id, lines) do
++  defp dispatch_group(source_id, lines, handle) do
+     case Sources.Cache.get_by(id: source_id) do
+       nil ->
+         emit_skipped_telemetry(:unknown_source_id, length(lines))
+@@ -216,7 +236,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline do
+         []
+ 
+       source ->
+-        {:ok, _} = Backends.dispatch_from_spool(lines, source)
++        {:ok, _} = Backends.dispatch_from_spool(lines, source, handle)
+         []
+     end
+   rescue
+diff --git a/lib/logflare/backends/spool/consumer_pipeline/queue_producer.ex b/lib/logflare/backends/spool/consumer_pipeline/queue_producer.ex
+index e1c28c6a1f..f2473ab2aa 100644
+--- a/lib/logflare/backends/spool/consumer_pipeline/queue_producer.ex
++++ b/lib/logflare/backends/spool/consumer_pipeline/queue_producer.ex
+@@ -37,15 +37,16 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducer do
+   ## Draining
+ 
+   Implements `Broadway.Producer.prepare_for_draining/1`: freezes
+-  `handle_demand/2` and the `:poll` loop, acks `current` if already fully
+-  exhausted, and nacks everything else (including any in-flight prefetch)
+-  so it's redelivered rather than silently lost.
++  `handle_demand/2` and the `:poll` loop, and nacks anything not yet fully
++  handed off (including any in-flight prefetch) so it's redelivered rather
++  than silently lost.
+ 
+   ## Queue acking
+ 
+-  A queue message is acked once all of its file's segments have been
+-  transferred into the emit buffer and drained, regardless of whether
+-  Broadway has actually finished processing them.
++  This producer never acks a queue message directly. It registers each
++  handle with `SpoolAck` and bumps it once per segment; `SpoolAck` performs
++  the real ack once every segment and the events they decoded into have
++  all been processed (see its moduledoc).
+ 
+   ## Spool file format
+ 
+@@ -66,6 +67,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducer do
+ 
+   alias Logflare.Backends.Spool.Encoder
+   alias Logflare.Backends.Spool.MemoryMonitor
++  alias Logflare.Backends.Spool.SpoolAck
+ 
+   @throttle_interval 100
+   @min_backoff 100
+@@ -118,8 +120,6 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducer do
+ 
+   @impl Broadway.Producer
+   def prepare_for_draining(state) do
+-    state = maybe_ack_exhausted(state)
+-
+     if handle = current_handle(state.current) do
+       nack_and_notify(state.queue_mod, state.queue_url, handle, :draining)
+     end
+@@ -131,6 +131,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducer do
+     {:noreply, [], %{state | draining: true, demand: 0, current: nil, prefetch: nil}}
+   end
+ 
++  defp current_handle(%{segments: [], handle: _}), do: nil
+   defp current_handle(%{handle: handle}), do: handle
+   defp current_handle(nil), do: nil
+ 
+@@ -180,7 +181,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducer do
+           {[], state}
+         else
+           state
+-          |> maybe_ack_exhausted()
++          |> maybe_clear_exhausted()
+           |> maybe_load_next()
+           |> maybe_start_prefetch()
+           |> emit_from_buffer()
+@@ -253,14 +254,14 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducer do
+   defp buffered?(%{current: %{segments: []}}), do: false
+   defp buffered?(_), do: true
+ 
+-  defp maybe_ack_exhausted(%{current: %{segments: [], handle: handle}} = state) do
+-    ack_and_notify(state.queue_mod, state.queue_url, handle, :buffer_exhausted)
+-    %{state | current: nil}
+-  end
++  defp maybe_clear_exhausted(%{current: %{segments: []}} = state),
++    do: %{state | current: nil}
+ 
+-  defp maybe_ack_exhausted(state), do: state
++  defp maybe_clear_exhausted(state), do: state
+ 
+   defp maybe_load_next(%{current: nil, prefetch: {:ready, {:ok, handle, segments}}} = state) do
++    SpoolAck.register(handle, state.queue_mod, state.queue_url)
++    SpoolAck.bump(handle, length(segments))
+     %{state | current: %{handle: handle, segments: segments}, prefetch: nil}
+   end
+ 
+@@ -381,7 +382,8 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducer do
+ 
+     if to_emit != [], do: :atomics.add(state.in_flight_ref, 1, bytes_emitted)
+ 
+-    events = Enum.map(to_emit, &%{segment: &1})
++    handle = state.current.handle
++    events = Enum.map(to_emit, &%{segment: &1, handle: handle})
+ 
+     new_state = %{
+       state
+diff --git a/lib/logflare/backends/spool/spool_ack.ex b/lib/logflare/backends/spool/spool_ack.ex
+new file mode 100644
+index 0000000000..d3772d66b5
+--- /dev/null
++++ b/lib/logflare/backends/spool/spool_ack.ex
+@@ -0,0 +1,135 @@
++defmodule Logflare.Backends.Spool.SpoolAck do
++  @moduledoc """
++  Tracks, per spool queue message (`handle` — an SQS receipt handle or
++  PubSub ack id), how many pipeline completions are still outstanding
++  before that message can be acked.
++
++  `register/3` creates the row at count 0. `bump/2` and `ack/2` are plain
++  ETS counter updates, safe to call from any process, any number of times,
++  in any order. A `nil` handle is a no-op for both. Once a decrement
++  brings the count to zero or below, the real queue ack (`queue_mod.ack/2`)
++  is performed asynchronously and the row removed.
++
++  Some terminal outcomes (e.g. a pointer whose generation was rotated out
++  before a retry could resolve it) are intentionally never acked here —
++  the message redelivers instead, giving it a fresh attempt from the
++  durable spool file. That leaves the old handle's row orphaned, so a
++  periodic sweep (`sweep_stale/1`) deletes any row older than
++  `@stale_after_ms` without acking it.
++  """
++
++  use GenServer
++
++  import Logflare.Utils.Guards, only: [is_pos_integer: 1]
++
++  @table :spool_ack
++  @sweep_interval_ms :timer.minutes(1)
++  @stale_after_ms :timer.minutes(10)
++
++  @spec start_link(keyword()) :: GenServer.on_start()
++  def start_link(opts \\ []) do
++    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
++  end
++
++  @impl GenServer
++  def init(_opts) do
++    :ets.new(@table, [:public, :named_table, :set, write_concurrency: true])
++    schedule_sweep()
++    {:ok, %{}}
++  end
++
++  @doc """
++  Creates the counter row for `handle`, starting at 0. Call this exactly
++  once, when `handle` is first obtained — before anything can legitimately
++  call `bump/2` or `ack/2` for it.
++  """
++  @spec register(term(), module(), String.t()) :: :ok
++  def register(handle, queue_mod, queue_url) when not is_nil(handle) do
++    :ets.insert(@table, {handle, 0, queue_mod, queue_url, System.monotonic_time(:millisecond)})
++    :ok
++  end
++
++  @doc "Increments `handle`'s outstanding count by `n`. No-op for a nil handle."
++  @spec bump(term(), pos_integer()) :: :ok
++  def bump(nil, _n), do: :ok
++
++  def bump(handle, n) when is_pos_integer(n) do
++    :ets.update_counter(@table, handle, {2, n})
++    :ok
++  rescue
++    ArgumentError ->
++      emit_missing_handle_telemetry(:bump)
++      :ok
++  end
++
++  @doc """
++  Decrements `handle`'s outstanding count by `n`. No-op for a nil handle.
++  Triggers the real queue ack once the count reaches zero.
++  """
++  @spec ack(term(), pos_integer()) :: :ok
++  def ack(nil, _n), do: :ok
++
++  def ack(handle, n) when is_pos_integer(n) do
++    case :ets.update_counter(@table, handle, {2, -n}) do
++      count when count <= 0 -> perform_ack(handle)
++      _ -> :ok
++    end
++  rescue
++    ArgumentError ->
++      emit_missing_handle_telemetry(:ack)
++      :ok
++  end
++
++  defp emit_missing_handle_telemetry(op) do
++    :telemetry.execute([:logflare, :backends, :spool, :ack, :missing_handle], %{}, %{op: op})
++  end
++
++  defp perform_ack(handle) do
++    case :ets.take(@table, handle) do
++      [{^handle, _count, queue_mod, queue_url, _registered_at}] ->
++        GenServer.cast(__MODULE__, {:perform_ack, queue_mod, queue_url, handle})
++
++      [] ->
++        :ok
++    end
++  end
++
++  @impl GenServer
++  def handle_cast({:perform_ack, queue_mod, queue_url, handle}, state) do
++    result = queue_mod.ack(queue_url, handle)
++
++    :telemetry.execute([:logflare, :backends, :spool, :queue, :ack], %{}, %{
++      reason: :events_processed,
++      result: if(result == :ok, do: :ok, else: :error)
++    })
++
++    {:noreply, state}
++  end
++
++  @impl GenServer
++  def handle_info(:sweep, state) do
++    sweep_stale(@stale_after_ms)
++    schedule_sweep()
++    {:noreply, state}
++  end
++
++  defp schedule_sweep, do: Process.send_after(self(), :sweep, @sweep_interval_ms)
++
++  @doc false
++  @spec sweep_stale(non_neg_integer()) :: :ok
++  def sweep_stale(stale_after_ms) do
++    cutoff = System.monotonic_time(:millisecond) - stale_after_ms
++    match_spec = [{{:_, :_, :_, :_, :"$1"}, [{:<, :"$1", cutoff}], [true]}]
++    deleted = :ets.select_delete(@table, match_spec)
++
++    if deleted > 0 do
++      :telemetry.execute(
++        [:logflare, :backends, :spool, :ack, :swept_stale],
++        %{count: deleted},
++        %{}
++      )
++    end
++
++    :ok
++  end
++end
+diff --git a/lib/logflare/logs/log_event.ex b/lib/logflare/logs/log_event.ex
+index 3337e1c235..58d50177b3 100644
+--- a/lib/logflare/logs/log_event.ex
++++ b/lib/logflare/logs/log_event.ex
+@@ -34,6 +34,7 @@ defmodule Logflare.LogEvent do
+     field :day_bucket, :integer
+     # Indicates if the event was removed from ets during ingest
+     field :is_popped, :boolean, virtual: true, default: false
++    field :spool_handle, :any, virtual: true, default: nil
+ 
+     embeds_one :pipeline_error, PipelineError do
+       field :stage, :string
+@@ -50,7 +51,9 @@ defmodule Logflare.LogEvent do
+   Handles both NDJSON (string keys, ISO8601 ingested_at) and ETF (atom keys,
+   native DateTime) formats written by the producer.
+   """
+-  @spec make_from_spool(map(), Source.t()) :: t()
++  @spec make_from_spool(map(), Source.t(), term()) :: t()
++  def make_from_spool(record, source, handle \\ nil)
++
+   def make_from_spool(
+         %{
+           id: id,
+@@ -58,7 +61,8 @@ defmodule Logflare.LogEvent do
+           event_type: event_type,
+           ingested_at: ingested_at_us
+         } = record,
+-        source
++        source,
++        handle
+       )
+       when is_integer(ingested_at_us) do
+     ingested_at_dt = DateTime.from_unix!(ingested_at_us, :microsecond)
+@@ -75,7 +79,8 @@ defmodule Logflare.LogEvent do
+       valid: true,
+       drop: false,
+       day_bucket: day_bucket,
+-      via_rule_id: Map.get(record, :via_rule_id)
++      via_rule_id: Map.get(record, :via_rule_id),
++      spool_handle: handle
+     }
+   end
+ 
+@@ -86,7 +91,8 @@ defmodule Logflare.LogEvent do
+           "event_type" => event_type,
+           "ingested_at" => ingested_at
+         } = record,
+-        source
++        source,
++        handle
+       ) do
+     {:ok, ingested_at_dt, _} = DateTime.from_iso8601(ingested_at)
+     day_bucket = body["timestamp"] && DayBucket.from_microseconds(body["timestamp"])
+@@ -102,7 +108,8 @@ defmodule Logflare.LogEvent do
+       valid: true,
+       drop: false,
+       day_bucket: day_bucket,
+-      via_rule_id: Map.get(record, "via_rule_id")
++      via_rule_id: Map.get(record, "via_rule_id"),
++      spool_handle: handle
+     }
+   end
+ 
+diff --git a/lib/logflare/sources/source/bigquery/pipeline.ex b/lib/logflare/sources/source/bigquery/pipeline.ex
+index fcf13bd6ae..4fdf216d42 100644
+--- a/lib/logflare/sources/source/bigquery/pipeline.ex
++++ b/lib/logflare/sources/source/bigquery/pipeline.ex
+@@ -18,6 +18,7 @@ defmodule Logflare.Sources.Source.BigQuery.Pipeline do
+   alias Logflare.Backends.IngestEventQueue
+   alias Logflare.Backends.IngestEventQueue.LogEventPointer
+   alias Logflare.Backends.BufferProducer
++  alias Logflare.Backends.Spool.SpoolAck
+   alias Logflare.Sources.Source.BigQuery.Schema
+   alias Logflare.Sources.Source.RateSampler
+   alias Logflare.Sources.Source.Supervisor
+@@ -194,10 +195,13 @@ defmodule Logflare.Sources.Source.BigQuery.Pipeline do
+   defp finalize_acked_events({sid, bid} = queues_key, successful) do
+     record? = bid == nil and should_record_recent?(sid)
+ 
+-    Enum.each(successful, fn %{data: %LogEventPointer{} = pointer} ->
++    successful
++    |> Enum.reduce(%{}, fn %{data: %LogEventPointer{} = pointer}, counts ->
+       if record?, do: record_recent_copy(queues_key, pointer)
+       IngestEventQueue.delete_id(pointer.tid, pointer.gen_event_id)
++      Map.update(counts, pointer.spool_handle, 1, &(&1 + 1))
+     end)
++    |> Enum.each(fn {handle, count} -> SpoolAck.ack(handle, count) end)
+   end
+ 
+   defp record_recent_copy(queues_key, %LogEventPointer{} = pointer) do
+@@ -597,18 +601,21 @@ defmodule Logflare.Sources.Source.BigQuery.Pipeline do
+     retriable_count = length(retriable)
+     Logger.info("Requeuing #{retriable_count} BigQuery events for retry")
+ 
+-    events =
++    resolved =
+       for pointer <- retriable,
+           event = IngestEventQueue.lookup_event(pointer.tid, pointer.gen_event_id),
+           not is_nil(event) do
+         IngestEventQueue.delete_id(pointer.tid, pointer.gen_event_id)
+-        %{event | retries: pointer.retries + 1}
++        {pointer, %{event | retries: pointer.retries + 1}}
+       end
+ 
+-    emit_requeue_lookup_miss_telemetry(sid_bid, retriable_count - length(events))
++    emit_requeue_lookup_miss_telemetry(sid_bid, retriable_count - length(resolved))
+ 
++    events = Enum.map(resolved, fn {_pointer, event} -> event end)
+     if events != [], do: IngestEventQueue.add_to_table(sid_bid, events)
+ 
++    Enum.each(resolved, fn {pointer, _event} -> SpoolAck.ack(pointer.spool_handle, 1) end)
++
+     :ok
+   end
+ 
+@@ -639,9 +646,12 @@ defmodule Logflare.Sources.Source.BigQuery.Pipeline do
+   defp drop_pointers(pointers, reason) do
+     Logger.warning("Dropping #{length(pointers)} BigQuery events: #{reason}")
+ 
+-    Enum.each(pointers, fn pointer ->
++    pointers
++    |> Enum.reduce(%{}, fn pointer, counts ->
+       IngestEventQueue.delete_id(pointer.tid, pointer.gen_event_id)
++      Map.update(counts, pointer.spool_handle, 1, &(&1 + 1))
+     end)
++    |> Enum.each(fn {handle, count} -> SpoolAck.ack(handle, count) end)
+   end
+ 
+   # Emit per-event ingest telemetry from handle_batch, where the full LogEvent is
+diff --git a/lib/telemetry.ex b/lib/telemetry.ex
+index d07fddcef0..aa0110473b 100644
+--- a/lib/telemetry.ex
++++ b/lib/telemetry.ex
+@@ -617,6 +617,18 @@ defmodule Logflare.Telemetry do
+         description:
+           "Spool queue nack (requeue) count by reason, and whether the underlying SQS/PubSub call itself succeeded"
+       ),
++      counter("logflare.backends.spool.ack.missing_handle.count",
++        event_name: [:logflare, :backends, :spool, :ack, :missing_handle],
++        tags: [:op],
++        description:
++          "Count of SpoolAck bump/2 or ack/2 calls against a handle with no row (already resolved, orphaned by redelivery, or swept as stale)"
++      ),
++      sum("logflare.backends.spool.ack.swept_stale.count",
++        event_name: [:logflare, :backends, :spool, :ack, :swept_stale],
++        measurement: :count,
++        description:
++          "Count of SpoolAck rows deleted by the periodic stale sweep (orphaned by redelivery under a new handle, not acked)"
++      ),
+       sum("logflare.backends.spool.consumer.skipped.count",
+         tags: [:reason],
+         description: "Spool consumer: events skipped (missing/unknown source_id) by reason"
+diff --git a/test/logflare/backends/adaptor/clickhouse_adaptor/pipeline_test.exs b/test/logflare/backends/adaptor/clickhouse_adaptor/pipeline_test.exs
+index 9081b14553..637e925148 100644
+--- a/test/logflare/backends/adaptor/clickhouse_adaptor/pipeline_test.exs
++++ b/test/logflare/backends/adaptor/clickhouse_adaptor/pipeline_test.exs
+@@ -2,6 +2,7 @@ defmodule Logflare.Backends.Adaptor.ClickHouseAdaptor.PipelineTest do
+   use Logflare.DataCase, async: false
+ 
+   import ExUnit.CaptureLog
++  import Mimic
+ 
+   alias Broadway.Message
+   alias Logflare.Backends
+@@ -13,6 +14,8 @@ defmodule Logflare.Backends.Adaptor.ClickHouseAdaptor.PipelineTest do
+   alias Logflare.Backends.DynamicPipeline
+   alias Logflare.Backends.IngestEventQueue
+   alias Logflare.Backends.IngestEventQueue.LogEventPointer
++  alias Logflare.Backends.Spool.Queue.PubSub, as: QueueMod
++  alias Logflare.Backends.Spool.SpoolAck
+   alias Logflare.Mapper
+   alias Logflare.TestUtils
+ 
+@@ -88,7 +91,7 @@ defmodule Logflare.Backends.Adaptor.ClickHouseAdaptor.PipelineTest do
+ 
+   defp queued_pointer(queue_tid, event_id) do
+     case :ets.lookup(queue_tid, event_id) do
+-      [{^event_id, gen_tid, gen_event_id, size, retries, event_type, day_bucket}] ->
++      [{^event_id, gen_tid, gen_event_id, size, retries, event_type, day_bucket, spool_handle}] ->
+         %LogEventPointer{
+           id: event_id,
+           tid: gen_tid,
+@@ -97,7 +100,8 @@ defmodule Logflare.Backends.Adaptor.ClickHouseAdaptor.PipelineTest do
+           size: size,
+           retries: retries,
+           event_type: event_type,
+-          day_bucket: day_bucket
++          day_bucket: day_bucket,
++          spool_handle: spool_handle
+         }
+ 
+       [] ->
+@@ -1256,6 +1260,150 @@ defmodule Logflare.Backends.Adaptor.ClickHouseAdaptor.PipelineTest do
+       assert metadata.backend_id == backend.id
+       assert metadata.backend_type == :clickhouse
+     end
++
++    test "acks the pointer's spool handle on success, performing the real queue ack once its count reaches zero",
++         %{source: source, backend: backend} do
++      handle = "spool-handle-#{System.unique_integer([:positive])}"
++      SpoolAck.register(handle, QueueMod, "queue-url")
++      SpoolAck.bump(handle, 1)
++
++      test_pid = self()
++      stub(QueueMod, :ack, fn url, h -> send(test_pid, {:acked, url, h}) end)
++
++      event = build(:log_event, source: source, message: "Test")
++      gen_tid = setup_generation_events([event])
++      pointer = %{pointer_for(event, gen_tid) | spool_handle: handle}
++
++      message = %Message{
++        data: pointer,
++        acknowledger: {Pipeline, :ack_id, %{backend_id: backend.id}}
++      }
++
++      assert :ok = Pipeline.ack(:ack_ref, [message], [])
++
++      assert_receive {:acked, "queue-url", ^handle}
++      assert :ets.lookup(:spool_ack, handle) == []
++    end
++
++    test "acks the pointer's spool handle when dropped after exhausting retries", %{
++      source: source,
++      backend: backend
++    } do
++      handle = "spool-handle-#{System.unique_integer([:positive])}"
++      SpoolAck.register(handle, QueueMod, "queue-url")
++      SpoolAck.bump(handle, 1)
++
++      test_pid = self()
++      stub(QueueMod, :ack, fn url, h -> send(test_pid, {:acked, url, h}) end)
++
++      max_retries = Pipeline.max_retries()
++      event = build(:log_event, source: source, message: "Test") |> Map.put(:retries, max_retries)
++      gen_tid = setup_generation_events([event])
++      pointer = %{pointer_for(event, gen_tid) | spool_handle: handle}
++
++      failed_message = %Message{
++        data: pointer,
++        acknowledger: {Pipeline, :ack_id, %{backend_id: backend.id}},
++        status: {:failed, "connection error"}
++      }
++
++      capture_log(fn -> Pipeline.ack(:ack_ref, [], [failed_message]) end)
++
++      assert_receive {:acked, "queue-url", ^handle}
++      assert :ets.lookup(:spool_ack, handle) == []
++    end
++
++    test "acks the pointer's spool handle only once retries are actually exhausted, not on an intermediate retry",
++         %{source: source, backend: backend} do
++      handle = "spool-handle-#{System.unique_integer([:positive])}"
++      SpoolAck.register(handle, QueueMod, "queue-url")
++      SpoolAck.bump(handle, 1)
++
++      test_pid = self()
++      stub(QueueMod, :ack, fn url, h -> send(test_pid, {:acked, url, h}) end)
++
++      event = build(:log_event, source: source, message: "Test") |> Map.put(:retries, 0)
++      gen_tid = setup_generation_events([event])
++      retry_key = {:consolidated, backend.id, self()}
++      assert {:ok, queue_tid} = IngestEventQueue.upsert_tid(retry_key)
++      pointer = %{pointer_for(event, gen_tid, queue_tid) | spool_handle: handle}
++
++      first_failure = %Message{
++        data: pointer,
++        acknowledger: {Pipeline, :ack_id, %{backend_id: backend.id}},
++        status: {:failed, "first connection error"}
++      }
++
++      capture_log(fn -> Pipeline.ack(:ack_ref, [], [first_failure]) end)
++
++      # the body is still live -- requeued for another attempt, not dropped, so
++      # no ack yet even though this specific attempt failed
++      refute_receive {:acked, "queue-url", ^handle}
++
++      assert [{^handle, 1, QueueMod, "queue-url", _registered_at}] =
++               :ets.lookup(:spool_ack, handle)
++
++      assert {:ok, [retry_pointer], ^queue_tid} =
++               IngestEventQueue.pop_pending_pointers(retry_key, 1)
++
++      assert retry_pointer.retries == Pipeline.max_retries()
++      assert retry_pointer.spool_handle == handle
++
++      second_failure = %Message{
++        data: retry_pointer,
++        acknowledger: {Pipeline, :ack_id, %{backend_id: backend.id}},
++        status: {:failed, "second connection error"}
++      }
++
++      log = capture_log(fn -> Pipeline.ack(:ack_ref, [], [second_failure]) end)
++
++      assert log =~ "Dropping 1 ClickHouse events: exhausted #{Pipeline.max_retries()} retries"
++      assert_receive {:acked, "queue-url", ^handle}
++      assert :ets.lookup(:spool_ack, handle) == []
++    end
++
++    test "does not ack the pointer's spool handle when a retriable event's generation is already gone",
++         %{source: source, backend: backend} do
++      handle = "spool-handle-#{System.unique_integer([:positive])}"
++      SpoolAck.register(handle, QueueMod, "queue-url")
++      SpoolAck.bump(handle, 1)
++
++      test_pid = self()
++      stub(QueueMod, :ack, fn url, h -> send(test_pid, {:acked, url, h}) end)
++
++      event = build(:log_event, source: source, message: "Test") |> Map.put(:retries, 0)
++      gen_tid = setup_generation_events([event])
++      pointer = %{pointer_for(event, gen_tid) | spool_handle: handle}
++
++      # simulate GenerationJanitor dropping the generation before retry lookup
++      :ets.delete(gen_tid)
++
++      failed_message = %Message{
++        data: pointer,
++        acknowledger: {Pipeline, :ack_id, %{backend_id: backend.id}},
++        status: {:failed, "connection error"}
++      }
++
++      capture_log(fn -> Pipeline.ack(:ack_ref, [], [failed_message]) end)
++
++      refute_receive {:acked, "queue-url", ^handle}
++
++      assert [{^handle, 1, QueueMod, "queue-url", _registered_at}] =
++               :ets.lookup(:spool_ack, handle)
++    end
++
++    test "a nil spool handle (an event that never came from the spool) is untouched by ack/3", %{
++      source: source,
++      backend: backend
++    } do
++      event = build(:log_event, source: source, message: "Test")
++      gen_tid = setup_generation_events([event])
++      message = batch_message(event, gen_tid, backend.id)
++
++      # No SpoolAck.register/3 call for anything here -- if ack/3 tried to
++      # touch a real handle, this would crash instead of silently no-op'ing.
++      assert :ok = Pipeline.ack(:ack_ref, [message], [])
++    end
+   end
+ 
+   if Pipeline.max_retries() > 0 do
+diff --git a/test/logflare/backends/ingest_event_queue_test.exs b/test/logflare/backends/ingest_event_queue_test.exs
+index 84003c2adf..494a2d52c0 100644
+--- a/test/logflare/backends/ingest_event_queue_test.exs
++++ b/test/logflare/backends/ingest_event_queue_test.exs
+@@ -1,6 +1,8 @@
+ defmodule Logflare.Backends.IngestEventQueueTest do
+   use Logflare.DataCase
+ 
++  import Mimic
++
+   alias Logflare.LogEvent
+   alias Logflare.PubSubRates
+   alias Logflare.Backends.IngestEventQueue.BufferCacheWorker
+@@ -9,6 +11,8 @@ defmodule Logflare.Backends.IngestEventQueueTest do
+   alias Logflare.Backends.IngestEventQueue.GenerationJanitor
+   alias Logflare.Backends.IngestEventQueue.LogEventPointer
+   alias Logflare.Backends.IngestEventQueue
++  alias Logflare.Backends.Spool.Queue.PubSub, as: QueueMod
++  alias Logflare.Backends.Spool.SpoolAck
+ 
+   setup do
+     insert(:plan)
+@@ -459,7 +463,7 @@ defmodule Logflare.Backends.IngestEventQueueTest do
+       rows_before = pointer_tid |> :ets.tab2list()
+ 
+       gen_event_id_by_id =
+-        Map.new(rows_before, fn {id, _gen_tid, gen_event_id, _, _, _, _} ->
++        Map.new(rows_before, fn {id, _gen_tid, gen_event_id, _, _, _, _, _} ->
+           {id, gen_event_id}
+         end)
+ 
+@@ -484,6 +488,30 @@ defmodule Logflare.Backends.IngestEventQueueTest do
+       assert %LogEvent{} = IngestEventQueue.lookup_event(gen_tid, remaining_gen_event_id)
+     end
+ 
++    test "drop_pending/2 acks a shared handle's units via a single batched call", %{
++      source: source,
++      source_backend_pid: sbp
++    } do
++      handle = "spool-handle-#{System.unique_integer([:positive])}"
++      SpoolAck.register(handle, QueueMod, "queue-url")
++
++      events = for _ <- 1..5, do: %{build(:log_event, source: source) | spool_handle: handle}
++      assert :ok = IngestEventQueue.add_to_table(sbp, events)
++
++      test_pid = self()
++
++      stub(SpoolAck, :ack, fn h, n ->
++        send(test_pid, {:ack_call, h, n})
++        :ets.update_counter(:spool_ack, h, {2, -n})
++        :ok
++      end)
++
++      assert {:ok, 5} = IngestEventQueue.drop_pending(sbp, 5)
++
++      assert_receive {:ack_call, ^handle, 5}
++      refute_receive {:ack_call, ^handle, _}
++    end
++
+     @tag :race
+     test "drop_pending/2 never deletes events claimed by pointer consumers", %{
+       source: source,
+@@ -889,6 +917,53 @@ defmodule Logflare.Backends.IngestEventQueueTest do
+     end
+   end
+ 
++  describe "add_to_table/2 SpoolAck reservation" do
++    setup do
++      user = insert(:user)
++      source = insert(:source, user: user)
++      sbp = {source.id, insert(:backend, user: user).id, self()}
++      IngestEventQueue.upsert_tid(sbp)
++      [source: source, sbp: sbp]
++    end
++
++    test "reserves a handle's units before any of its pointers become visible to a claimer",
++         %{source: source, sbp: sbp} do
++      handle = "spool-handle-#{System.unique_integer([:positive])}"
++      SpoolAck.register(handle, QueueMod, "queue-url")
++
++      test_pid = self()
++
++      stub(SpoolAck, :bump, fn h, n ->
++        send(test_pid, {:bump, h, n, IngestEventQueue.total_pending(sbp)})
++        :ets.update_counter(:spool_ack, h, {2, n})
++        :ok
++      end)
++
++      events = for _ <- 1..3, do: %{build(:log_event, source: source) | spool_handle: handle}
++      assert :ok = IngestEventQueue.add_to_table(sbp, events)
++
++      assert_receive {:bump, ^handle, 3, pending_at_bump_time}
++      assert pending_at_bump_time == 0
++      assert IngestEventQueue.total_pending(sbp) == 3
++    end
++
++    test "bumps once for a batch sharing a handle, compensating a losing insert_new/2 within it",
++         %{source: source, sbp: sbp} do
++      handle = "spool-handle-#{System.unique_integer([:positive])}"
++      SpoolAck.register(handle, QueueMod, "queue-url")
++
++      winner = %{build(:log_event, source: source) | spool_handle: handle}
++      loser = %{winner | body: Map.put(winner.body, "event_message", "newer")}
++
++      assert :ok = IngestEventQueue.add_to_table(sbp, [winner, loser])
++
++      assert [{^handle, 1, QueueMod, "queue-url", _registered_at}] =
++               :ets.lookup(:spool_ack, handle)
++
++      assert IngestEventQueue.total_pending(sbp) == 1
++    end
++  end
++
+   describe "pointer reinsertion" do
+     setup do
+       user = insert(:user)
+@@ -1002,7 +1077,7 @@ defmodule Logflare.Backends.IngestEventQueueTest do
+       queue_tid = IngestEventQueue.get_tid(sbp)
+       [existing_pointer_row] = :ets.lookup(queue_tid, event.id)
+ 
+-      {_, existing_gen_tid, existing_gen_event_id, _, _, _, _} = existing_pointer_row
++      {_, existing_gen_tid, existing_gen_event_id, _, _, _, _, _} = existing_pointer_row
+       queues_key = {sid, bid}
+       assert :ok = IngestEventQueue.new_generations([queues_key])
+       staged_gen_tid = IngestEventQueue.current_generation_tid(queues_key)
+@@ -1022,6 +1097,34 @@ defmodule Logflare.Backends.IngestEventQueueTest do
+                duplicate
+     end
+ 
++    test "acks the old pointer's spool handle when a newer pointer already exists", %{
++      source: source,
++      sbp: {sid, bid, _pid} = sbp
++    } do
++      handle = "spool-handle-#{System.unique_integer([:positive])}"
++      SpoolAck.register(handle, QueueMod, "queue-url")
++
++      event = %{build(:log_event, source: source) | spool_handle: handle}
++      assert :ok = IngestEventQueue.add_to_table(sbp, [event])
++      assert {:ok, [pointer], _tid} = IngestEventQueue.pop_pending_pointers(sbp, 1)
++
++      duplicate = %{event | body: Map.put(event.body, "event_message", "newer")}
++      assert :ok = IngestEventQueue.add_to_table(sbp, [duplicate])
++      queues_key = {sid, bid}
++      assert :ok = IngestEventQueue.new_generations([queues_key])
++
++      assert [{^handle, 2, _, _, _}] = :ets.lookup(:spool_ack, handle)
++
++      assert {:error, :already_exists} =
++               IngestEventQueue.requeue_payload(
++                 queues_key,
++                 %{pointer | retries: pointer.retries + 1},
++                 fn new_pointer -> {:retried, new_pointer} end
++               )
++
++      assert [{^handle, 1, _, _, _}] = :ets.lookup(:spool_ack, handle)
++    end
++
+     test "replaces a same-ID pointer whose generation payload is gone", %{
+       source: source,
+       sbp: {sid, bid, _pid} = sbp
+@@ -1030,6 +1133,13 @@ defmodule Logflare.Backends.IngestEventQueueTest do
+       assert :ok = IngestEventQueue.add_to_table(sbp, [event])
+       assert {:ok, [pointer], _tid} = IngestEventQueue.pop_pending_pointers(sbp, 1)
+ 
++      dangling_handle = "spool-handle-#{System.unique_integer([:positive])}"
++      SpoolAck.register(dangling_handle, QueueMod, "queue-url")
++      SpoolAck.bump(dangling_handle, 1)
++
++      test_pid = self()
++      stub(QueueMod, :ack, fn url, h -> send(test_pid, {:acked, url, h}) end)
++
+       stale_gen_tid = :ets.new(:stale_retry_generation, [:set, :public])
+       stale_gen_event_id = make_ref()
+ 
+@@ -1037,7 +1147,8 @@ defmodule Logflare.Backends.IngestEventQueueTest do
+         pointer
+         | tid: stale_gen_tid,
+           gen_event_id: stale_gen_event_id,
+-          retries: 99
++          retries: 99,
++          spool_handle: dangling_handle
+       }
+ 
+       :ets.delete(stale_gen_tid)
+@@ -1054,6 +1165,11 @@ defmodule Logflare.Backends.IngestEventQueueTest do
+       refute published_pointer.gen_event_id == stale_gen_event_id
+       assert published_pointer.retries == 1
+ 
++      # the dangling row's own unit is acked exactly once, atomically with the
++      # ETS row being reclaimed -- not left outstanding, not double-acked
++      assert_receive {:acked, "queue-url", ^dangling_handle}
++      assert :ets.lookup(:spool_ack, dangling_handle) == []
++
+       assert {:ok, [^published_pointer], _tid} =
+                IngestEventQueue.pop_pending_pointers(sbp, 1)
+ 
+@@ -1497,6 +1613,31 @@ defmodule Logflare.Backends.IngestEventQueueTest do
+       assert {:ok, []} = IngestEventQueue.pop_pending(key, 10)
+     end
+ 
++    test "acks a shared handle's units via a single batched call, not once per event", %{
++      key: key,
++      source: source
++    } do
++      handle = "spool-handle-#{System.unique_integer([:positive])}"
++      SpoolAck.register(handle, QueueMod, "queue-url")
++
++      events = for _ <- 1..5, do: %{build(:log_event, source: source) | spool_handle: handle}
++      :ok = IngestEventQueue.add_to_table(key, events)
++
++      test_pid = self()
++
++      stub(SpoolAck, :ack, fn h, n ->
++        send(test_pid, {:ack_call, h, n})
++        :ets.update_counter(:spool_ack, h, {2, -n})
++        :ok
++      end)
++
++      assert {:ok, popped} = IngestEventQueue.pop_pending(key, 5)
++      assert length(popped) == 5
++
++      assert_receive {:ack_call, ^handle, 5}
++      refute_receive {:ack_call, ^handle, _}
++    end
++
+     test "returns error when queue not initialized" do
+       assert {:error, :not_initialized} = IngestEventQueue.pop_pending({999, 999, self()}, 5)
+     end
+diff --git a/test/logflare/backends/spool/consumer_pipeline/queue_producer_test.exs b/test/logflare/backends/spool/consumer_pipeline/queue_producer_test.exs
+index 0221234f59..787d212ee1 100644
+--- a/test/logflare/backends/spool/consumer_pipeline/queue_producer_test.exs
++++ b/test/logflare/backends/spool/consumer_pipeline/queue_producer_test.exs
+@@ -120,6 +120,13 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducerTest do
+     end)
+   end
+ 
++  # Confirms the producer registered `handle` and bumped it once per segment
++  # (defaults to 1, the common single-segment case).
++  defp assert_spool_ack_registered(handle, segment_count \\ 1) do
++    assert [{^handle, ^segment_count, QueueMod, "projects/p/subscriptions/s", _registered_at}] =
++             :ets.lookup(:spool_ack, handle)
++  end
++
+   # contents: %{file_key => body} | %{file_key => :raise} | %{file_key => {:error, reason}}
+   # `:raise` simulates a crashing download (e.g. an uncaught exception during
+   # a prefetch) — safe_fetch_next's rescue always loses the queue handle for
+@@ -182,10 +189,9 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducerTest do
+   end
+ 
+   describe "happy path" do
+-    test "streams segments from a file and acks the queue message once exhausted" do
++    test "streams segments from a file, registers the handle with SpoolAck, and never acks it directly" do
+       TestUtils.attach_forwarder([:logflare, :backends, :spool, :queue, :receive])
+       TestUtils.attach_forwarder([:logflare, :backends, :spool, :storage, :get])
+-      TestUtils.attach_forwarder([:logflare, :backends, :spool, :queue, :ack])
+ 
+       stub_ack_nack(self())
+       stub_queue([queue_message("h1", "0/a.v3.etf")])
+@@ -200,7 +206,13 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducerTest do
+         |> Enum.take(1)
+ 
+       assert emitted_ids(events) == ["e1", "e2"]
+-      assert_receive {:acked, "h1"}, 2000
++
++      # Draining every segment is no longer this producer's cue to ack —
++      # SpoolAck owns that now, once real processing completes (see its own
++      # test suite). This producer's only remaining job is registering the
++      # handle so SpoolAck knows how to ack it later.
++      refute_receive {:acked, "h1"}, 300
++      assert_spool_ack_registered("h1")
+ 
+       assert_receive {:telemetry_event, [:logflare, :backends, :spool, :queue, :receive],
+                       %{count: 1}, %{result: :ok}}
+@@ -209,9 +221,6 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducerTest do
+                       %{bytes: bytes, segment_count: 1}, %{result: :ok}}
+ 
+       assert bytes > 0
+-
+-      assert_receive {:telemetry_event, [:logflare, :backends, :spool, :queue, :ack], %{},
+-                      %{reason: :buffer_exhausted}}
+     end
+ 
+     test "streams segments from a zstd-compressed .etf.zst file" do
+@@ -228,7 +237,8 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducerTest do
+         |> Enum.take(1)
+ 
+       assert emitted_ids(events) == ["e1", "e2"]
+-      assert_receive {:acked, "h1"}, 2000
++      refute_receive {:acked, "h1"}, 300
++      assert_spool_ack_registered("h1")
+     end
+ 
+     test "emits one Broadway item per segment" do
+@@ -252,7 +262,8 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducerTest do
+         |> Enum.take(2)
+ 
+       assert emitted_ids(events) == ["e1", "e2", "e3"]
+-      assert_receive {:acked, "h1"}, 2000
++      refute_receive {:acked, "h1"}, 300
++      assert_spool_ack_registered("h1", 2)
+     end
+ 
+     test "streams every segment from a file with multiple raw segments compressed once as a whole (group commit)" do
+@@ -274,7 +285,8 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducerTest do
+         |> Enum.take(3)
+ 
+       assert emitted_ids(events) == ["e1", "e2", "e3", "e4", "e5", "e6"]
+-      assert_receive {:acked, "h1"}, 2000
++      refute_receive {:acked, "h1"}, 300
++      assert_spool_ack_registered("h1", 3)
+     end
+ 
+     test "streams every segment from a file with multiple uncompressed segments (group commit)" do
+@@ -298,7 +310,8 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducerTest do
+         |> Enum.take(2)
+ 
+       assert emitted_ids(events) == ["e1", "e2", "e3"]
+-      assert_receive {:acked, "h1"}, 2000
++      refute_receive {:acked, "h1"}, 300
++      assert_spool_ack_registered("h1", 2)
+     end
+   end
+ 
+@@ -475,7 +488,8 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducerTest do
+       :atomics.sub(in_flight_ref, 1, byte_size(second.segment))
+       [third] = GenStage.stream([{pid, max_demand: 10}]) |> Enum.take(1)
+       assert emitted_ids([third]) == ["e3"]
+-      assert_receive {:acked, "h1"}, 2000
++      refute_receive {:acked, "h1"}, 300
++      assert_spool_ack_registered("h1", 3)
+     end
+ 
+     test "an :infinity budget (the default) emits every segment without capping" do
+@@ -500,7 +514,8 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducerTest do
+         |> Enum.take(3)
+ 
+       assert emitted_ids(events) == ["e1", "e2", "e3"]
+-      assert_receive {:acked, "h1"}, 2000
++      refute_receive {:acked, "h1"}, 300
++      assert_spool_ack_registered("h1", 3)
+     end
+   end
+ 
+@@ -565,7 +580,8 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducerTest do
+         |> Enum.take(2)
+ 
+       assert emitted_ids(events) == ["e1", "e3"]
+-      assert_receive {:acked, "h1"}, 2000
++      refute_receive {:acked, "h1"}, 300
++      assert_spool_ack_registered("h1")
+     end
+ 
+     test "a crashing blocking fetch does not kill the producer process" do
+@@ -638,9 +654,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducerTest do
+     # poison is emitted as-is and isolated to its own Broadway message by
+     # ConsumerPipeline.handle_message/3 (covered in consumer_pipeline_test.exs).
+     # The file itself still acks normally.
+-    test "emits an unparseable segment as-is and acks the file as exhausted, not decode_error" do
+-      TestUtils.attach_forwarder([:logflare, :backends, :spool, :queue, :ack])
+-
++    test "emits an unparseable segment as-is, not decode_error, and does not ack it directly" do
+       stub_ack_nack(self())
+       stub_queue([queue_message("h1", "0/corrupt.v3.etf")])
+       # Well-formed bytes for storage.get and a valid frame, but not a valid
+@@ -653,12 +667,10 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducerTest do
+         GenStage.stream([{pid, max_demand: 10}])
+         |> Enum.take(1)
+ 
+-      assert events == [%{segment: "this is not valid etf"}]
+-
+-      assert_receive {:acked, "h1"}, 2000
++      assert events == [%{segment: "this is not valid etf", handle: "h1"}]
+ 
+-      assert_receive {:telemetry_event, [:logflare, :backends, :spool, :queue, :ack], %{},
+-                      %{reason: :buffer_exhausted}}
++      refute_receive {:acked, "h1"}, 300
++      assert_spool_ack_registered("h1")
+     end
+ 
+     test "acks with reason: :decode_error when the downloaded .zst content is not valid zstd" do
+@@ -730,10 +742,8 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducerTest do
+         |> Enum.take(1)
+ 
+       assert emitted_ids(events) == ["e1"]
+-      assert_receive {:acked, "h1"}, 2000
+-
+-      assert_receive {:telemetry_event, [:logflare, :backends, :spool, :queue, :ack], %{},
+-                      %{reason: :buffer_exhausted}}
++      refute_receive {:acked, "h1"}, 300
++      assert_spool_ack_registered("h1")
+     end
+ 
+     test "nacks (not acks) a file tagged with a version newer than this build understands" do
+@@ -846,14 +856,14 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline.QueueProducerTest do
+       )
+     end
+ 
+-    test "acks an already-exhausted current file (everything in it was already handed off safely)" do
++    test "neither acks nor nacks an already-exhausted current file (SpoolAck owns its fate from here)" do
+       stub_ack_nack(self())
+ 
+       state = draining_state(%{current: %{handle: "h1", segments: []}})
+ 
+       assert {:noreply, [], new_state} = QueueProducer.prepare_for_draining(state)
+ 
+-      assert_receive {:acked, "h1"}
++      refute_receive {:acked, "h1"}
+       refute_receive {:nacked, "h1"}
+       assert new_state.draining == true
+       assert new_state.demand == 0
+diff --git a/test/logflare/backends/spool/consumer_pipeline_test.exs b/test/logflare/backends/spool/consumer_pipeline_test.exs
+index e11fe5aafc..889d7c6382 100644
+--- a/test/logflare/backends/spool/consumer_pipeline_test.exs
++++ b/test/logflare/backends/spool/consumer_pipeline_test.exs
+@@ -7,6 +7,8 @@ defmodule Logflare.Backends.Spool.ConsumerPipelineTest do
+   alias Broadway.Message
+   alias Logflare.Backends.Spool.ConsumerPipeline
+   alias Logflare.Backends.Spool.MemoryMonitor
++  alias Logflare.Backends.Spool.Queue.PubSub, as: QueueMod
++  alias Logflare.Backends.Spool.SpoolAck
+   alias Logflare.TestUtils
+ 
+   setup :set_mimic_global
+@@ -40,7 +42,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipelineTest do
+   describe "transform/2" do
+     test "wraps the producer's raw segment and stashes its byte size for the in-flight counter" do
+       segment = :erlang.term_to_binary([%{"id" => "e1"}, %{"id" => "e2"}])
+-      unparsed = %{segment: segment}
++      unparsed = %{segment: segment, handle: "receipt-1"}
+ 
+       assert %Message{data: ^unparsed, acknowledger: {ConsumerPipeline, :noop, ack_data}} =
+                ConsumerPipeline.transform(unparsed, [])
+@@ -49,6 +51,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipelineTest do
+       # to give back rather than a message count.
+       assert ack_data.bytes == byte_size(segment)
+       assert Map.has_key?(ack_data, :in_flight_ref)
++      assert ack_data.handle == "receipt-1"
+     end
+   end
+ 
+@@ -127,7 +130,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipelineTest do
+ 
+       pid = self()
+ 
+-      stub(Logflare.Backends, :dispatch_from_spool, fn event_params, dispatched_source ->
++      stub(Logflare.Backends, :dispatch_from_spool, fn event_params, dispatched_source, _handle ->
+         send(pid, {:dispatched, event_params, dispatched_source.id})
+         {:ok, length(event_params)}
+       end)
+@@ -147,7 +150,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipelineTest do
+ 
+       pid = self()
+ 
+-      stub(Logflare.Backends, :dispatch_from_spool, fn event_params, _source ->
++      stub(Logflare.Backends, :dispatch_from_spool, fn event_params, _source, _handle ->
+         send(pid, {:dispatched, Enum.map(event_params, & &1["id"])})
+         {:ok, length(event_params)}
+       end)
+@@ -165,7 +168,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipelineTest do
+ 
+       pid = self()
+ 
+-      stub(Logflare.Backends, :dispatch_from_spool, fn event_params, _source ->
++      stub(Logflare.Backends, :dispatch_from_spool, fn event_params, _source, _handle ->
+         send(pid, {:dispatched, Enum.map(event_params, & &1["id"])})
+         {:ok, length(event_params)}
+       end)
+@@ -186,7 +189,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipelineTest do
+ 
+       pid = self()
+ 
+-      stub(Logflare.Backends, :dispatch_from_spool, fn event_params, source ->
++      stub(Logflare.Backends, :dispatch_from_spool, fn event_params, source, _handle ->
+         send(pid, {:dispatched, source.id, Enum.map(event_params, & &1["id"])})
+         {:ok, length(event_params)}
+       end)
+@@ -214,7 +217,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipelineTest do
+ 
+       pid = self()
+ 
+-      stub(Logflare.Backends, :dispatch_from_spool, fn event_params, source ->
++      stub(Logflare.Backends, :dispatch_from_spool, fn event_params, source, _handle ->
+         send(pid, {:dispatched, event_params, source.id})
+         {:ok, length(event_params)}
+       end)
+@@ -241,7 +244,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipelineTest do
+ 
+       pid = self()
+ 
+-      stub(Logflare.Backends, :dispatch_from_spool, fn event_params, source ->
++      stub(Logflare.Backends, :dispatch_from_spool, fn event_params, source, _handle ->
+         send(pid, {:dispatched, event_params, source.id})
+         {:ok, length(event_params)}
+       end)
+@@ -265,7 +268,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipelineTest do
+ 
+       pid = self()
+ 
+-      stub(Logflare.Backends, :dispatch_from_spool, fn event_params, dispatched_source ->
++      stub(Logflare.Backends, :dispatch_from_spool, fn event_params, dispatched_source, _handle ->
+         if dispatched_source.id == source.id do
+           raise FunctionClauseError
+         end
+@@ -286,6 +289,41 @@ defmodule Logflare.Backends.Spool.ConsumerPipelineTest do
+       assert_receive {:telemetry_event, [:logflare, :backends, :spool, :consumer, :skipped],
+                       %{count: 1}, %{reason: :dispatch_error}}
+     end
++
++    test "does not fail a handle's message when only a different handle's dispatch for the same source fails" do
++      source = insert(:source, user: insert(:user))
++      failing_handle = "spool-handle-failing-#{System.unique_integer([:positive])}"
++      healthy_handle = "spool-handle-healthy-#{System.unique_integer([:positive])}"
++
++      failing = %Message{
++        data: [record(source.id, Ecto.UUID.generate())],
++        acknowledger: {ConsumerPipeline, :noop, %{handle: failing_handle}}
++      }
++
++      healthy = %Message{
++        data: [record(source.id, Ecto.UUID.generate())],
++        acknowledger: {ConsumerPipeline, :noop, %{handle: healthy_handle}}
++      }
++
++      pid = self()
++
++      stub(Logflare.Backends, :dispatch_from_spool, fn event_params, _source, handle ->
++        if handle == failing_handle do
++          raise FunctionClauseError
++        end
++
++        send(pid, {:dispatched, handle})
++        {:ok, length(event_params)}
++      end)
++
++      assert [returned_failing, returned_healthy] =
++               ConsumerPipeline.handle_batch(:default, [failing, healthy], %{}, %{})
++
++      assert returned_failing.status == {:failed, :dispatch_error}
++      assert returned_healthy.status == :ok
++
++      assert_receive {:dispatched, ^healthy_handle}
++    end
+   end
+ 
+   describe "ack/3" do
+@@ -316,6 +354,42 @@ defmodule Logflare.Backends.Spool.ConsumerPipelineTest do
+                       [:logflare, :backends, :spool, :consumer, :messages_failed], _, _}
+     end
+ 
++    test "releases a segment's bump only when it succeeds, not when dispatch fails" do
++      success_handle = "spool-handle-#{System.unique_integer([:positive])}"
++      failed_handle = "spool-handle-#{System.unique_integer([:positive])}"
++      SpoolAck.register(success_handle, QueueMod, "queue-url")
++      SpoolAck.bump(success_handle, 1)
++      SpoolAck.register(failed_handle, QueueMod, "queue-url")
++      SpoolAck.bump(failed_handle, 1)
++
++      test_pid = self()
++      stub(QueueMod, :ack, fn url, h -> send(test_pid, {:acked, url, h}) end)
++
++      successful = [
++        %Message{data: [], acknowledger: {ConsumerPipeline, :noop, %{handle: success_handle}}}
++      ]
++
++      failed = [
++        %Message{
++          data: [],
++          acknowledger: {ConsumerPipeline, :noop, %{handle: failed_handle}},
++          status: {:failed, :dispatch_error}
++        }
++      ]
++
++      assert ConsumerPipeline.ack(:ref, successful, failed) == :ok
++
++      assert_receive {:acked, "queue-url", ^success_handle}
++      assert :ets.lookup(:spool_ack, success_handle) == []
++
++      # a dispatch_error never reached any pipeline's own ack/3, so releasing
++      # its bump here would ack a segment that was never actually delivered
++      refute_receive {:acked, "queue-url", ^failed_handle}
++
++      assert [{^failed_handle, 1, QueueMod, "queue-url", _registered_at}] =
++               :ets.lookup(:spool_ack, failed_handle)
++    end
++
+     test "returns each message's bytes (not its count) to the producer's in-flight budget" do
+       ref = :atomics.new(1, signed: true)
+       :atomics.add(ref, 1, 300)
+diff --git a/test/logflare/backends/spool/spool_ack_test.exs b/test/logflare/backends/spool/spool_ack_test.exs
+new file mode 100644
+index 0000000000..e35b48049c
+--- /dev/null
++++ b/test/logflare/backends/spool/spool_ack_test.exs
+@@ -0,0 +1,136 @@
++defmodule Logflare.Backends.Spool.SpoolAckTest do
++  use ExUnit.Case, async: false
++
++  import Mimic
++
++  alias Logflare.Backends.Spool.Queue.PubSub, as: QueueMod
++  alias Logflare.Backends.Spool.SpoolAck
++
++  setup :set_mimic_global
++
++  defp unique_handle, do: "handle-#{System.unique_integer([:positive])}"
++
++  describe "nil handle" do
++    test "bump/2 is a no-op" do
++      assert SpoolAck.bump(nil, 1) == :ok
++      assert SpoolAck.bump(nil, 5) == :ok
++    end
++
++    test "ack/2 is a no-op, never performs a queue ack" do
++      test_pid = self()
++      stub(QueueMod, :ack, fn _url, _handle -> send(test_pid, :ack_called) end)
++
++      assert SpoolAck.ack(nil, 1) == :ok
++
++      refute_receive :ack_called, 200
++    end
++  end
++
++  describe "register/3, bump/2, ack/2" do
++    test "a handle bumped once and acked once performs the real queue ack" do
++      handle = unique_handle()
++      test_pid = self()
++
++      stub(QueueMod, :ack, fn url, ^handle ->
++        send(test_pid, {:acked, url, handle})
++        :ok
++      end)
++
++      SpoolAck.register(handle, QueueMod, "queue-url")
++      SpoolAck.bump(handle, 1)
++      SpoolAck.ack(handle, 1)
++
++      assert_receive {:acked, "queue-url", ^handle}
++      assert :ets.lookup(:spool_ack, handle) == []
++    end
++
++    test "does not ack until every bump has a matching ack" do
++      handle = unique_handle()
++      test_pid = self()
++      stub(QueueMod, :ack, fn _url, h -> send(test_pid, {:acked, h}) end)
++
++      SpoolAck.register(handle, QueueMod, "queue-url")
++      SpoolAck.bump(handle, 3)
++      SpoolAck.ack(handle, 1)
++      SpoolAck.ack(handle, 1)
++
++      refute_receive {:acked, ^handle}, 200
++
++      SpoolAck.ack(handle, 1)
++
++      assert_receive {:acked, ^handle}
++    end
++
++    test "multiple bumps require an equal number of acks before the count reaches zero" do
++      handle = unique_handle()
++      test_pid = self()
++      stub(QueueMod, :ack, fn _url, h -> send(test_pid, {:acked, h}) end)
++
++      SpoolAck.register(handle, QueueMod, "queue-url")
++      SpoolAck.bump(handle, 1)
++      SpoolAck.bump(handle, 1)
++      SpoolAck.bump(handle, 1)
++      SpoolAck.ack(handle, 1)
++
++      refute_receive {:acked, ^handle}, 200
++
++      SpoolAck.ack(handle, 1)
++      refute_receive {:acked, ^handle}, 200
++
++      SpoolAck.ack(handle, 1)
++      assert_receive {:acked, ^handle}
++    end
++
++    test "ack/2 tolerates the count going negative without acking twice" do
++      handle = unique_handle()
++      test_pid = self()
++      stub(QueueMod, :ack, fn _url, h -> send(test_pid, {:acked, h}) end)
++
++      SpoolAck.register(handle, QueueMod, "queue-url")
++      SpoolAck.bump(handle, 1)
++      SpoolAck.ack(handle, 1)
++      assert_receive {:acked, ^handle}
++
++      # A stray extra ack for an already-resolved handle must not raise or
++      # perform a second queue ack -- the row is already gone.
++      assert SpoolAck.ack(handle, 1) == :ok
++      refute_receive {:acked, ^handle}, 200
++    end
++
++    test "bump/2 against a never-registered handle does not raise" do
++      assert SpoolAck.bump(unique_handle(), 1) == :ok
++    end
++
++    test "ack/2 against a never-registered handle does not raise" do
++      assert SpoolAck.ack(unique_handle(), 1) == :ok
++    end
++  end
++
++  describe "sweep_stale/1" do
++    test "deletes a row older than the given threshold without performing a queue ack" do
++      handle = unique_handle()
++      test_pid = self()
++      stub(QueueMod, :ack, fn _url, h -> send(test_pid, {:acked, h}) end)
++
++      SpoolAck.register(handle, QueueMod, "queue-url")
++      SpoolAck.bump(handle, 3)
++      Process.sleep(5)
++
++      assert :ok = SpoolAck.sweep_stale(0)
++
++      assert :ets.lookup(:spool_ack, handle) == []
++      refute_receive {:acked, ^handle}, 200
++    end
++
++    test "leaves a row younger than the given threshold alone" do
++      handle = unique_handle()
++      SpoolAck.register(handle, QueueMod, "queue-url")
++      SpoolAck.bump(handle, 1)
++
++      assert :ok = SpoolAck.sweep_stale(:timer.minutes(10))
++
++      assert [{^handle, 1, QueueMod, "queue-url", _registered_at}] =
++               :ets.lookup(:spool_ack, handle)
++    end
++  end
++end
+diff --git a/test/logflare/bigquery/pipeline_test.exs b/test/logflare/bigquery/pipeline_test.exs
+index ac1be57d3e..e6fec37ac2 100644
+--- a/test/logflare/bigquery/pipeline_test.exs
++++ b/test/logflare/bigquery/pipeline_test.exs
+@@ -13,6 +13,8 @@ defmodule Logflare.BigQuery.PipelineTest do
+   alias Logflare.Backends.IngestEventQueue
+   alias Logflare.Backends.IngestEventQueue.LogEventPointer
+   alias Logflare.Backends.Adaptor.BigQueryAdaptor
++  alias Logflare.Backends.Spool.Queue.PubSub, as: QueueMod
++  alias Logflare.Backends.Spool.SpoolAck
+   alias Logflare.LogEvent
+   alias Logflare.Repo
+   alias Logflare.Sources.Source.BigQuery.Pipeline
+@@ -54,6 +56,33 @@ defmodule Logflare.BigQuery.PipelineTest do
+       assert requeued.retries == 1
+     end
+ 
++    test "ack acks the old pointer's spool handle when successfully requeuing a retriable event",
++         %{source: source} do
++      Mimic.set_mimic_global()
++      handle = "spool-handle-#{System.unique_integer([:positive])}"
++      SpoolAck.register(handle, QueueMod, "queue-url")
++
++      sid_bid_pid = {source.id, nil, self()}
++      IngestEventQueue.upsert_tid(sid_bid_pid)
++      le = %{build(:log_event, source: source) | spool_handle: handle}
++      IngestEventQueue.add_to_table(sid_bid_pid, [le])
++
++      {:ok, [pointer], _tid} = IngestEventQueue.pop_pending_pointers(sid_bid_pid, 1)
++
++      assert [{^handle, count_before, _, _, _}] = :ets.lookup(:spool_ack, handle)
++
++      ref = {sid_bid_pid, %{max_retries: 1}}
++      message = Pipeline.transform(pointer, ref: ref)
++      {mod, ref, _data} = message.acknowledger
++
++      mod.ack(ref, [], [message])
++
++      # the old pointer's unit is acked, and the requeued replacement bumps a
++      # fresh one of its own -- net count is unchanged, not leaked upward
++      assert [{^handle, count_after, _, _, _}] = :ets.lookup(:spool_ack, handle)
++      assert count_after == count_before
++    end
++
+     test "ack emits telemetry and logs a warning when a retriable event's generation is already gone",
+          %{source: source} do
+       sid_bid_pid = {source.id, nil, self()}
+@@ -90,6 +119,39 @@ defmodule Logflare.BigQuery.PipelineTest do
+       assert IngestEventQueue.total_pending(sid_bid_pid) == 0
+     end
+ 
++    test "ack does not ack the pointer's spool handle when a retriable event's generation is already gone",
++         %{source: source} do
++      Mimic.set_mimic_global()
++      handle = "spool-handle-#{System.unique_integer([:positive])}"
++      SpoolAck.register(handle, QueueMod, "queue-url")
++
++      test_pid = self()
++      stub(QueueMod, :ack, fn url, h -> send(test_pid, {:acked, url, h}) end)
++
++      sid_bid_pid = {source.id, nil, self()}
++      IngestEventQueue.upsert_tid(sid_bid_pid)
++      le = %{build(:log_event, source: source) | spool_handle: handle}
++      IngestEventQueue.add_to_table(sid_bid_pid, [le])
++
++      {:ok, [pointer], _tid} = IngestEventQueue.pop_pending_pointers(sid_bid_pid, 1)
++
++      # simulate GenerationJanitor dropping the generation before retry lookup
++      queues_key = Tuple.delete_at(sid_bid_pid, 2)
++      assert [{gen_tid, _created_at}] = IngestEventQueue.list_generations(queues_key)
++      :ok = IngestEventQueue.drop_generation(queues_key, gen_tid)
++
++      ack_ref = {sid_bid_pid, %{max_retries: 1}}
++      message = Pipeline.transform(pointer, ref: ack_ref)
++      {mod, ack_ref, _data} = message.acknowledger
++
++      capture_log(fn -> mod.ack(ack_ref, [], [message]) end)
++
++      refute_receive {:acked, "queue-url", ^handle}
++
++      assert [{^handle, 1, QueueMod, "queue-url", _registered_at}] =
++               :ets.lookup(:spool_ack, handle)
++    end
++
+     test "ack will not requeue failed events that have exhausted retries", %{source: source} do
+       sid_bid_pid = {source.id, nil, self()}
+       IngestEventQueue.upsert_tid(sid_bid_pid)
+@@ -111,6 +173,81 @@ defmodule Logflare.BigQuery.PipelineTest do
+       assert IngestEventQueue.lookup_event(pointer.tid, pointer.gen_event_id) == nil
+     end
+ 
++    test "ack acks the pointer's spool handle on success, performing the real queue ack once its count reaches zero",
++         %{source: source} do
++      Mimic.set_mimic_global()
++      handle = "spool-handle-#{System.unique_integer([:positive])}"
++      SpoolAck.register(handle, QueueMod, "queue-url")
++
++      test_pid = self()
++      stub(QueueMod, :ack, fn url, h -> send(test_pid, {:acked, url, h}) end)
++
++      sid_bid_pid = {source.id, nil, self()}
++      IngestEventQueue.upsert_tid(sid_bid_pid)
++      le = %{build(:log_event, source: source) | spool_handle: handle}
++      IngestEventQueue.add_to_table(sid_bid_pid, [le])
++
++      {:ok, [pointer], _tid} = IngestEventQueue.pop_pending_pointers(sid_bid_pid, 1)
++
++      ref = {sid_bid_pid, %{max_retries: 0}}
++      message = Pipeline.transform(pointer, ref: ref)
++      {mod, ref, _} = message.acknowledger
++
++      mod.ack(ref, [message], [])
++
++      assert_receive {:acked, "queue-url", ^handle}
++      assert :ets.lookup(:spool_ack, handle) == []
++    end
++
++    test "ack acks the pointer's spool handle when dropped after exhausting retries", %{
++      source: source
++    } do
++      Mimic.set_mimic_global()
++      handle = "spool-handle-#{System.unique_integer([:positive])}"
++      SpoolAck.register(handle, QueueMod, "queue-url")
++
++      test_pid = self()
++      stub(QueueMod, :ack, fn url, h -> send(test_pid, {:acked, url, h}) end)
++
++      sid_bid_pid = {source.id, nil, self()}
++      IngestEventQueue.upsert_tid(sid_bid_pid)
++      le = %{build(:log_event, source: source) | spool_handle: handle}
++      IngestEventQueue.add_to_table(sid_bid_pid, [le])
++
++      {:ok, [pointer], _tid} = IngestEventQueue.pop_pending_pointers(sid_bid_pid, 1)
++      pointer = %{pointer | retries: 1}
++
++      ref = {sid_bid_pid, %{max_retries: 1}}
++      message = Pipeline.transform(pointer, ref: ref)
++      {mod, ref, _data} = message.acknowledger
++
++      capture_log(fn -> mod.ack(ref, [], [message]) end)
++
++      assert_receive {:acked, "queue-url", ^handle}
++      assert :ets.lookup(:spool_ack, handle) == []
++    end
++
++    test "a nil spool handle (an event that never came from the spool) is untouched by ack", %{
++      source: source
++    } do
++      sid_bid_pid = {source.id, nil, self()}
++      IngestEventQueue.upsert_tid(sid_bid_pid)
++      le = build(:log_event, source: source)
++      IngestEventQueue.add_to_table(sid_bid_pid, [le])
++
++      {:ok, [pointer], _tid} = IngestEventQueue.pop_pending_pointers(sid_bid_pid, 1)
++
++      ref = {sid_bid_pid, %{max_retries: 0}}
++      message = Pipeline.transform(pointer, ref: ref)
++      {mod, ref, _} = message.acknowledger
++
++      # No SpoolAck.register/3 call for anything here -- if ack tried to touch
++      # a real handle, this would crash instead of silently no-op'ing.
++      mod.ack(ref, [message], [])
++
++      assert IngestEventQueue.lookup_event(pointer.tid, pointer.gen_event_id) == nil
++    end
++
+     test "ack deletes the generation-store row immediately but records an independent copy into the recent-events cache",
+          %{source: source} do
+       sid_bid_pid = {source.id, nil, self()}
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index 35fca4d383..cd64c8618e 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -8,6 +8,7 @@ Mimic.copy(Broadway)
+ Mimic.copy(Logflare.Backends.Spool.MemoryMonitor)
+ Mimic.copy(Logflare.Backends.Spool.Storage.GCS)
+ Mimic.copy(Logflare.Backends.Spool.Queue.PubSub)
++Mimic.copy(Logflare.Backends.Spool.SpoolAck)
+ Mimic.copy(Ch)
+ Mimic.copy(ConfigCat)
+ Mimic.copy(ConfigCat.User)

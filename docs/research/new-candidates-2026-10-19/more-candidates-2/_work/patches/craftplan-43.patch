@@ -1,0 +1,1271 @@
+From 27f79108f6ae71380bfca85f60a864c8f61c7da6 Mon Sep 17 00:00:00 2001
+From: Shy Alter <puemos@gmail.com>
+Date: Sat, 26 Sep 2026 20:14:15 +0200
+Subject: [PATCH] fix(catalog): restore product deletion and recipe removal
+
+---
+ VERSION                                       |   2 +-
+ lib/craftplan/catalog/bom.ex                  |   4 +
+ lib/craftplan/catalog/bom_component.ex        |   4 +
+ lib/craftplan/catalog/bom_rollup.ex           |   5 +
+ lib/craftplan/catalog/labor_step.ex           |   4 +
+ .../product_live/form_component_recipe.ex     |  76 ++++---
+ ...174200_cascade_product_recipe_deletion.exs | 134 +++++++++++
+ .../20260926174201.json                       | 209 ++++++++++++++++++
+ .../catalog_bom_rollups/20260926174202.json   | 193 ++++++++++++++++
+ .../repo/catalog_boms/20260926174203.json     | 189 ++++++++++++++++
+ .../catalog_labor_steps/20260926174204.json   | 159 +++++++++++++
+ .../catalog/product_deletion_test.exs         |  81 +++++++
+ ...anage_products_recipe_simple_live_test.exs |  44 ++++
+ 13 files changed, 1067 insertions(+), 37 deletions(-)
+ create mode 100644 priv/repo/migrations/20260926174200_cascade_product_recipe_deletion.exs
+ create mode 100644 priv/resource_snapshots/repo/catalog_bom_components/20260926174201.json
+ create mode 100644 priv/resource_snapshots/repo/catalog_bom_rollups/20260926174202.json
+ create mode 100644 priv/resource_snapshots/repo/catalog_boms/20260926174203.json
+ create mode 100644 priv/resource_snapshots/repo/catalog_labor_steps/20260926174204.json
+ create mode 100644 test/craftplan/catalog/product_deletion_test.exs
+
+diff --git a/VERSION b/VERSION
+index faef31a4..39e898a4 100644
+--- a/VERSION
++++ b/VERSION
+@@ -1 +1 @@
+-0.7.0
++0.7.1
+diff --git a/lib/craftplan/catalog/bom.ex b/lib/craftplan/catalog/bom.ex
+index f2a29680..4699a15a 100644
+--- a/lib/craftplan/catalog/bom.ex
++++ b/lib/craftplan/catalog/bom.ex
+@@ -32,6 +32,10 @@ defmodule Craftplan.Catalog.BOM do
+     table "catalog_boms"
+     repo Craftplan.Repo
+ 
++    references do
++      reference :product, on_delete: :delete
++    end
++
+     custom_indexes do
+       index [:product_id],
+         unique: true,
+diff --git a/lib/craftplan/catalog/bom_component.ex b/lib/craftplan/catalog/bom_component.ex
+index e515867c..32d5cf60 100644
+--- a/lib/craftplan/catalog/bom_component.ex
++++ b/lib/craftplan/catalog/bom_component.ex
+@@ -31,6 +31,10 @@ defmodule Craftplan.Catalog.BOMComponent do
+   postgres do
+     table "catalog_bom_components"
+     repo Craftplan.Repo
++
++    references do
++      reference :bom, on_delete: :delete
++    end
+   end
+ 
+   actions do
+diff --git a/lib/craftplan/catalog/bom_rollup.ex b/lib/craftplan/catalog/bom_rollup.ex
+index ee11d94d..9a5ff509 100644
+--- a/lib/craftplan/catalog/bom_rollup.ex
++++ b/lib/craftplan/catalog/bom_rollup.ex
+@@ -8,6 +8,11 @@ defmodule Craftplan.Catalog.BOMRollup do
+   postgres do
+     table "catalog_bom_rollups"
+     repo Craftplan.Repo
++
++    references do
++      reference :bom, on_delete: :delete
++      reference :product, on_delete: :delete
++    end
+   end
+ 
+   actions do
+diff --git a/lib/craftplan/catalog/labor_step.ex b/lib/craftplan/catalog/labor_step.ex
+index cf4d93c3..b70ed425 100644
+--- a/lib/craftplan/catalog/labor_step.ex
++++ b/lib/craftplan/catalog/labor_step.ex
+@@ -10,6 +10,10 @@ defmodule Craftplan.Catalog.LaborStep do
+   postgres do
+     table "catalog_labor_steps"
+     repo Craftplan.Repo
++
++    references do
++      reference :bom, on_delete: :delete
++    end
+   end
+ 
+   actions do
+diff --git a/lib/craftplan_web/live/manage/product_live/form_component_recipe.ex b/lib/craftplan_web/live/manage/product_live/form_component_recipe.ex
+index e31508a7..073ac354 100644
+--- a/lib/craftplan_web/live/manage/product_live/form_component_recipe.ex
++++ b/lib/craftplan_web/live/manage/product_live/form_component_recipe.ex
+@@ -178,16 +178,17 @@ defmodule CraftplanWeb.ProductLive.FormComponentRecipe do
+ 
+                         <!-- Mobile Remove Button -->
+                         <%= if latest_version(@boms) == @bom.version do %>
+-                          <label class="-mt-1 -mr-2 cursor-pointer p-1 text-stone-400 hover:text-stone-700 md:hidden">
+-                            <input
+-                              type="checkbox"
+-                              phx-click="remove_form"
+-                              phx-target={@myself}
+-                              phx-value-path={components_form.name}
+-                              class="hidden"
+-                            />
++                          <button
++                            id={"remove-component-#{components_form.index}-mobile"}
++                            type="button"
++                            phx-click="remove_form"
++                            phx-target={@myself}
++                            phx-value-path={components_form.name}
++                            aria-label="Remove component"
++                            class="-mt-1 -mr-2 cursor-pointer p-1 text-stone-400 hover:text-stone-700 md:hidden"
++                          >
+                             <.icon name="hero-x-mark" class="h-5 w-5" />
+-                          </label>
++                          </button>
+                         <% end %>
+                       </div>
+                     </div>
+@@ -235,18 +236,19 @@ defmodule CraftplanWeb.ProductLive.FormComponentRecipe do
+                       <%= if latest_version(@boms) != @bom.version do %>
+                         <span class="text-stone-400">Read-only</span>
+                       <% else %>
+-                        <label class="cursor-pointer">
+-                          <input
+-                            type="checkbox"
+-                            phx-click="remove_form"
+-                            phx-target={@myself}
+-                            phx-value-path={components_form.name}
+-                            class="hidden"
+-                          />
++                        <button
++                          id={"remove-component-#{components_form.index}"}
++                          type="button"
++                          phx-click="remove_form"
++                          phx-target={@myself}
++                          phx-value-path={components_form.name}
++                          aria-label="Remove component"
++                          class="cursor-pointer"
++                        >
+                           <span class="font-semibold leading-6 text-stone-900 hover:text-stone-700">
+                             Remove
+                           </span>
+-                        </label>
++                        </button>
+                       <% end %>
+                     </div>
+                   </div>
+@@ -455,16 +457,17 @@ defmodule CraftplanWeb.ProductLive.FormComponentRecipe do
+ 
+                     <!-- Mobile Remove Button (positioned at top-right of card) -->
+                     <%= if latest_version(@boms) == @bom.version do %>
+-                      <label class="absolute top-3 right-2 cursor-pointer text-stone-400 hover:text-stone-700 md:hidden">
+-                        <input
+-                          type="checkbox"
+-                          phx-click="remove_form"
+-                          phx-target={@myself}
+-                          phx-value-path={labor_form.name}
+-                          class="hidden"
+-                        />
++                      <button
++                        id={"remove-labor-#{labor_form.index}-mobile"}
++                        type="button"
++                        phx-click="remove_form"
++                        phx-target={@myself}
++                        phx-value-path={labor_form.name}
++                        aria-label="Remove labor step"
++                        class="absolute top-3 right-2 cursor-pointer text-stone-400 hover:text-stone-700 md:hidden"
++                      >
+                         <.icon name="hero-x-mark" class="h-5 w-5" />
+-                      </label>
++                      </button>
+                     <% end %>
+ 
+                     <!-- 6. Remove (Desktop: Col 6) -->
+@@ -473,18 +476,19 @@ defmodule CraftplanWeb.ProductLive.FormComponentRecipe do
+                         <%= if latest_version(@boms) != @bom.version do %>
+                           <span class="text-stone-400">Read-only</span>
+                         <% else %>
+-                          <label class="cursor-pointer">
+-                            <input
+-                              type="checkbox"
+-                              phx-click="remove_form"
+-                              phx-target={@myself}
+-                              phx-value-path={labor_form.name}
+-                              class="hidden"
+-                            />
++                          <button
++                            id={"remove-labor-#{labor_form.index}"}
++                            type="button"
++                            phx-click="remove_form"
++                            phx-target={@myself}
++                            phx-value-path={labor_form.name}
++                            aria-label="Remove labor step"
++                            class="cursor-pointer"
++                          >
+                             <span class="font-semibold leading-6 text-stone-900 hover:text-stone-700">
+                               Remove
+                             </span>
+-                          </label>
++                          </button>
+                         <% end %>
+                       </div>
+                     </div>
+diff --git a/priv/repo/migrations/20260926174200_cascade_product_recipe_deletion.exs b/priv/repo/migrations/20260926174200_cascade_product_recipe_deletion.exs
+new file mode 100644
+index 00000000..88d25630
+--- /dev/null
++++ b/priv/repo/migrations/20260926174200_cascade_product_recipe_deletion.exs
+@@ -0,0 +1,134 @@
++defmodule Craftplan.Repo.Migrations.CascadeProductRecipeDeletion do
++  @moduledoc """
++  Updates resources based on their most recent snapshots.
++
++  This file was autogenerated with `mix ash_postgres.generate_migrations`
++  """
++
++  use Ecto.Migration
++
++  def up do
++    drop constraint(:catalog_labor_steps, "catalog_labor_steps_bom_id_fkey")
++
++    alter table(:catalog_labor_steps) do
++      modify :bom_id,
++             references(:catalog_boms,
++               column: :id,
++               name: "catalog_labor_steps_bom_id_fkey",
++               type: :uuid,
++               prefix: "public",
++               on_delete: :delete_all
++             )
++    end
++
++    drop constraint(:catalog_boms, "catalog_boms_product_id_fkey")
++
++    alter table(:catalog_boms) do
++      modify :product_id,
++             references(:catalog_products,
++               column: :id,
++               name: "catalog_boms_product_id_fkey",
++               type: :uuid,
++               prefix: "public",
++               on_delete: :delete_all
++             )
++    end
++
++    drop constraint(:catalog_bom_rollups, "catalog_bom_rollups_product_id_fkey")
++
++    drop constraint(:catalog_bom_rollups, "catalog_bom_rollups_bom_id_fkey")
++
++    alter table(:catalog_bom_rollups) do
++      modify :bom_id,
++             references(:catalog_boms,
++               column: :id,
++               name: "catalog_bom_rollups_bom_id_fkey",
++               type: :uuid,
++               prefix: "public",
++               on_delete: :delete_all
++             )
++
++      modify :product_id,
++             references(:catalog_products,
++               column: :id,
++               name: "catalog_bom_rollups_product_id_fkey",
++               type: :uuid,
++               prefix: "public",
++               on_delete: :delete_all
++             )
++    end
++
++    drop constraint(:catalog_bom_components, "catalog_bom_components_bom_id_fkey")
++
++    alter table(:catalog_bom_components) do
++      modify :bom_id,
++             references(:catalog_boms,
++               column: :id,
++               name: "catalog_bom_components_bom_id_fkey",
++               type: :uuid,
++               prefix: "public",
++               on_delete: :delete_all
++             )
++    end
++  end
++
++  def down do
++    drop constraint(:catalog_bom_components, "catalog_bom_components_bom_id_fkey")
++
++    alter table(:catalog_bom_components) do
++      modify :bom_id,
++             references(:catalog_boms,
++               column: :id,
++               name: "catalog_bom_components_bom_id_fkey",
++               type: :uuid,
++               prefix: "public"
++             )
++    end
++
++    drop constraint(:catalog_bom_rollups, "catalog_bom_rollups_bom_id_fkey")
++
++    drop constraint(:catalog_bom_rollups, "catalog_bom_rollups_product_id_fkey")
++
++    alter table(:catalog_bom_rollups) do
++      modify :product_id,
++             references(:catalog_products,
++               column: :id,
++               name: "catalog_bom_rollups_product_id_fkey",
++               type: :uuid,
++               prefix: "public"
++             )
++
++      modify :bom_id,
++             references(:catalog_boms,
++               column: :id,
++               name: "catalog_bom_rollups_bom_id_fkey",
++               type: :uuid,
++               prefix: "public"
++             )
++    end
++
++    drop constraint(:catalog_boms, "catalog_boms_product_id_fkey")
++
++    alter table(:catalog_boms) do
++      modify :product_id,
++             references(:catalog_products,
++               column: :id,
++               name: "catalog_boms_product_id_fkey",
++               type: :uuid,
++               prefix: "public"
++             )
++    end
++
++    drop constraint(:catalog_labor_steps, "catalog_labor_steps_bom_id_fkey")
++
++    alter table(:catalog_labor_steps) do
++      modify :bom_id,
++             references(:catalog_boms,
++               column: :id,
++               name: "catalog_labor_steps_bom_id_fkey",
++               type: :uuid,
++               prefix: "public"
++             )
++    end
++  end
++end
+diff --git a/priv/resource_snapshots/repo/catalog_bom_components/20260926174201.json b/priv/resource_snapshots/repo/catalog_bom_components/20260926174201.json
+new file mode 100644
+index 00000000..399b30f8
+--- /dev/null
++++ b/priv/resource_snapshots/repo/catalog_bom_components/20260926174201.json
+@@ -0,0 +1,209 @@
++{
++  "attributes": [
++    {
++      "allow_nil?": false,
++      "default": "fragment(\"gen_random_uuid()\")",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": true,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "id",
++      "type": "uuid"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"material\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "component_type",
++      "type": "text"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "quantity",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": false,
++      "default": "0",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "position",
++      "type": "bigint"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "waste_percent",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "notes",
++      "type": "text"
++    },
++    {
++      "allow_nil?": false,
++      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "inserted_at",
++      "type": "utc_datetime_usec"
++    },
++    {
++      "allow_nil?": false,
++      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "updated_at",
++      "type": "utc_datetime_usec"
++    },
++    {
++      "allow_nil?": false,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": {
++        "deferrable": false,
++        "destination_attribute": "id",
++        "destination_attribute_default": null,
++        "destination_attribute_generated": null,
++        "index?": false,
++        "match_type": null,
++        "match_with": null,
++        "multitenancy": {
++          "attribute": null,
++          "global": null,
++          "strategy": null
++        },
++        "name": "catalog_bom_components_bom_id_fkey",
++        "on_delete": "delete",
++        "on_update": null,
++        "primary_key?": true,
++        "schema": "public",
++        "table": "catalog_boms"
++      },
++      "scale": null,
++      "size": null,
++      "source": "bom_id",
++      "type": "uuid"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": {
++        "deferrable": false,
++        "destination_attribute": "id",
++        "destination_attribute_default": null,
++        "destination_attribute_generated": null,
++        "index?": false,
++        "match_type": null,
++        "match_with": null,
++        "multitenancy": {
++          "attribute": null,
++          "global": null,
++          "strategy": null
++        },
++        "name": "catalog_bom_components_material_id_fkey",
++        "on_delete": null,
++        "on_update": null,
++        "primary_key?": true,
++        "schema": "public",
++        "table": "inventory_materials"
++      },
++      "scale": null,
++      "size": null,
++      "source": "material_id",
++      "type": "uuid"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": {
++        "deferrable": false,
++        "destination_attribute": "id",
++        "destination_attribute_default": null,
++        "destination_attribute_generated": null,
++        "index?": false,
++        "match_type": null,
++        "match_with": null,
++        "multitenancy": {
++          "attribute": null,
++          "global": null,
++          "strategy": null
++        },
++        "name": "catalog_bom_components_product_id_fkey",
++        "on_delete": null,
++        "on_update": null,
++        "primary_key?": true,
++        "schema": "public",
++        "table": "catalog_products"
++      },
++      "scale": null,
++      "size": null,
++      "source": "product_id",
++      "type": "uuid"
++    }
++  ],
++  "base_filter": null,
++  "check_constraints": [],
++  "create_table_options": null,
++  "custom_indexes": [],
++  "custom_statements": [],
++  "has_create_action": true,
++  "hash": "202B579149009253765901E8F5D706ECCED05FC4AFEB28FADC4FC6B0653A45C4",
++  "identities": [],
++  "multitenancy": {
++    "attribute": null,
++    "global": null,
++    "strategy": null
++  },
++  "repo": "Elixir.Craftplan.Repo",
++  "schema": null,
++  "table": "catalog_bom_components"
++}
+\ No newline at end of file
+diff --git a/priv/resource_snapshots/repo/catalog_bom_rollups/20260926174202.json b/priv/resource_snapshots/repo/catalog_bom_rollups/20260926174202.json
+new file mode 100644
+index 00000000..f3f5c89c
+--- /dev/null
++++ b/priv/resource_snapshots/repo/catalog_bom_rollups/20260926174202.json
+@@ -0,0 +1,193 @@
++{
++  "attributes": [
++    {
++      "allow_nil?": false,
++      "default": "fragment(\"gen_random_uuid()\")",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": true,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "id",
++      "type": "uuid"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "material_cost",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "labor_cost",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "overhead_cost",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "unit_cost",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": false,
++      "default": "%{}",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "components_map",
++      "type": "map"
++    },
++    {
++      "allow_nil?": false,
++      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "inserted_at",
++      "type": "utc_datetime_usec"
++    },
++    {
++      "allow_nil?": false,
++      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "updated_at",
++      "type": "utc_datetime_usec"
++    },
++    {
++      "allow_nil?": false,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": {
++        "deferrable": false,
++        "destination_attribute": "id",
++        "destination_attribute_default": null,
++        "destination_attribute_generated": null,
++        "index?": false,
++        "match_type": null,
++        "match_with": null,
++        "multitenancy": {
++          "attribute": null,
++          "global": null,
++          "strategy": null
++        },
++        "name": "catalog_bom_rollups_bom_id_fkey",
++        "on_delete": "delete",
++        "on_update": null,
++        "primary_key?": true,
++        "schema": "public",
++        "table": "catalog_boms"
++      },
++      "scale": null,
++      "size": null,
++      "source": "bom_id",
++      "type": "uuid"
++    },
++    {
++      "allow_nil?": false,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": {
++        "deferrable": false,
++        "destination_attribute": "id",
++        "destination_attribute_default": null,
++        "destination_attribute_generated": null,
++        "index?": false,
++        "match_type": null,
++        "match_with": null,
++        "multitenancy": {
++          "attribute": null,
++          "global": null,
++          "strategy": null
++        },
++        "name": "catalog_bom_rollups_product_id_fkey",
++        "on_delete": "delete",
++        "on_update": null,
++        "primary_key?": true,
++        "schema": "public",
++        "table": "catalog_products"
++      },
++      "scale": null,
++      "size": null,
++      "source": "product_id",
++      "type": "uuid"
++    }
++  ],
++  "base_filter": null,
++  "check_constraints": [],
++  "create_table_options": null,
++  "custom_indexes": [],
++  "custom_statements": [],
++  "has_create_action": true,
++  "hash": "FC72D8D846234F2B1410F13D35148A0D92D59F207C491CD7EFA511854876B38C",
++  "identities": [
++    {
++      "all_tenants?": false,
++      "base_filter": null,
++      "index_name": "catalog_bom_rollups_unique_bom_index",
++      "keys": [
++        {
++          "type": "atom",
++          "value": "bom_id"
++        }
++      ],
++      "name": "unique_bom",
++      "nils_distinct?": true,
++      "where": null
++    }
++  ],
++  "multitenancy": {
++    "attribute": null,
++    "global": null,
++    "strategy": null
++  },
++  "repo": "Elixir.Craftplan.Repo",
++  "schema": null,
++  "table": "catalog_bom_rollups"
++}
+\ No newline at end of file
+diff --git a/priv/resource_snapshots/repo/catalog_boms/20260926174203.json b/priv/resource_snapshots/repo/catalog_boms/20260926174203.json
+new file mode 100644
+index 00000000..2e5b44a2
+--- /dev/null
++++ b/priv/resource_snapshots/repo/catalog_boms/20260926174203.json
+@@ -0,0 +1,189 @@
++{
++  "attributes": [
++    {
++      "allow_nil?": false,
++      "default": "fragment(\"gen_random_uuid()\")",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": true,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "id",
++      "type": "uuid"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "name",
++      "type": "text"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "notes",
++      "type": "text"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"draft\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "status",
++      "type": "text"
++    },
++    {
++      "allow_nil?": false,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "version",
++      "type": "bigint"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "published_at",
++      "type": "utc_datetime"
++    },
++    {
++      "allow_nil?": false,
++      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "inserted_at",
++      "type": "utc_datetime_usec"
++    },
++    {
++      "allow_nil?": false,
++      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "updated_at",
++      "type": "utc_datetime_usec"
++    },
++    {
++      "allow_nil?": false,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": {
++        "deferrable": false,
++        "destination_attribute": "id",
++        "destination_attribute_default": null,
++        "destination_attribute_generated": null,
++        "index?": false,
++        "match_type": null,
++        "match_with": null,
++        "multitenancy": {
++          "attribute": null,
++          "global": null,
++          "strategy": null
++        },
++        "name": "catalog_boms_product_id_fkey",
++        "on_delete": "delete",
++        "on_update": null,
++        "primary_key?": true,
++        "schema": "public",
++        "table": "catalog_products"
++      },
++      "scale": null,
++      "size": null,
++      "source": "product_id",
++      "type": "uuid"
++    }
++  ],
++  "base_filter": null,
++  "check_constraints": [],
++  "create_table_options": null,
++  "custom_indexes": [
++    {
++      "all_tenants?": false,
++      "concurrently": false,
++      "error_fields": [
++        "product_id"
++      ],
++      "fields": [
++        {
++          "type": "atom",
++          "value": "product_id"
++        }
++      ],
++      "include": null,
++      "message": null,
++      "name": "catalog_boms_one_active_per_product",
++      "nulls_distinct": true,
++      "prefix": null,
++      "table": null,
++      "unique": true,
++      "using": null,
++      "where": "status = 'active'"
++    }
++  ],
++  "custom_statements": [],
++  "has_create_action": true,
++  "hash": "9722B9AC1E3B7EFD3A44A25164CBD843CB1A8C5E7F248F59C309FEA9FCB71305",
++  "identities": [
++    {
++      "all_tenants?": false,
++      "base_filter": null,
++      "index_name": "catalog_boms_product_version_index",
++      "keys": [
++        {
++          "type": "atom",
++          "value": "product_id"
++        },
++        {
++          "type": "atom",
++          "value": "version"
++        }
++      ],
++      "name": "product_version",
++      "nils_distinct?": true,
++      "where": null
++    }
++  ],
++  "multitenancy": {
++    "attribute": null,
++    "global": null,
++    "strategy": null
++  },
++  "repo": "Elixir.Craftplan.Repo",
++  "schema": null,
++  "table": "catalog_boms"
++}
+\ No newline at end of file
+diff --git a/priv/resource_snapshots/repo/catalog_labor_steps/20260926174204.json b/priv/resource_snapshots/repo/catalog_labor_steps/20260926174204.json
+new file mode 100644
+index 00000000..c6a2a3ee
+--- /dev/null
++++ b/priv/resource_snapshots/repo/catalog_labor_steps/20260926174204.json
+@@ -0,0 +1,159 @@
++{
++  "attributes": [
++    {
++      "allow_nil?": false,
++      "default": "fragment(\"gen_random_uuid()\")",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": true,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "id",
++      "type": "uuid"
++    },
++    {
++      "allow_nil?": false,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "name",
++      "type": "text"
++    },
++    {
++      "allow_nil?": false,
++      "default": "0",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "sequence",
++      "type": "bigint"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "duration_minutes",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "rate_override",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"1\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "units_per_run",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "notes",
++      "type": "text"
++    },
++    {
++      "allow_nil?": false,
++      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "inserted_at",
++      "type": "utc_datetime_usec"
++    },
++    {
++      "allow_nil?": false,
++      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "updated_at",
++      "type": "utc_datetime_usec"
++    },
++    {
++      "allow_nil?": false,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": {
++        "deferrable": false,
++        "destination_attribute": "id",
++        "destination_attribute_default": null,
++        "destination_attribute_generated": null,
++        "index?": false,
++        "match_type": null,
++        "match_with": null,
++        "multitenancy": {
++          "attribute": null,
++          "global": null,
++          "strategy": null
++        },
++        "name": "catalog_labor_steps_bom_id_fkey",
++        "on_delete": "delete",
++        "on_update": null,
++        "primary_key?": true,
++        "schema": "public",
++        "table": "catalog_boms"
++      },
++      "scale": null,
++      "size": null,
++      "source": "bom_id",
++      "type": "uuid"
++    }
++  ],
++  "base_filter": null,
++  "check_constraints": [],
++  "create_table_options": null,
++  "custom_indexes": [],
++  "custom_statements": [],
++  "has_create_action": true,
++  "hash": "8AEB5241CB96775AF6629A5CCF33B8B7EE261D06F5733743CDE939FF1B35DB5A",
++  "identities": [],
++  "multitenancy": {
++    "attribute": null,
++    "global": null,
++    "strategy": null
++  },
++  "repo": "Elixir.Craftplan.Repo",
++  "schema": null,
++  "table": "catalog_labor_steps"
++}
+\ No newline at end of file
+diff --git a/test/craftplan/catalog/product_deletion_test.exs b/test/craftplan/catalog/product_deletion_test.exs
+new file mode 100644
+index 00000000..5be6f60f
+--- /dev/null
++++ b/test/craftplan/catalog/product_deletion_test.exs
+@@ -0,0 +1,81 @@
++defmodule Craftplan.Catalog.ProductDeletionTest do
++  use Craftplan.DataCase, async: true
++
++  import Craftplan.Test.Factory
++
++  alias Craftplan.Catalog.BOM
++  alias Craftplan.Catalog.Product
++  alias Craftplan.Inventory.Material
++
++  setup do
++    actor = staff_actor()
++
++    product =
++      create_product!(%{name: "Deletion product #{System.unique_integer([:positive])}"}, actor)
++
++    material =
++      create_material!(%{name: "Deletion material #{System.unique_integer([:positive])}"}, actor)
++
++    boms =
++      for status <- [:archived, :active, :draft] do
++        BOM
++        |> Ash.Changeset.for_create(:create, %{
++          product_id: product.id,
++          status: status,
++          components: [%{material_id: material.id, quantity: 2}],
++          labor_steps: [%{name: "Mix", duration_minutes: 10}]
++        })
++        |> Ash.create!(actor: actor)
++        |> Ash.load!([:components, :labor_steps, :rollup], actor: actor)
++      end
++
++    %{actor: actor, product: product, material: material, boms: boms}
++  end
++
++  test "deleting a product removes every recipe version and its owned records", context do
++    %{actor: actor, product: product, material: material, boms: boms} = context
++
++    assert :ok = Ash.destroy(product, actor: actor)
++    assert is_nil(Ash.get!(Product, product.id, actor: actor, not_found_error?: false))
++    assert Ash.get!(Material, material.id, actor: actor)
++
++    for bom <- boms, record <- [bom, bom.rollup] ++ bom.components ++ bom.labor_steps do
++      assert is_nil(Ash.get!(record.__struct__, record.id, actor: actor, not_found_error?: false))
++    end
++  end
++
++  test "a product used in another recipe cannot be deleted", context do
++    %{actor: actor, product: product, boms: boms} = context
++    parent = create_product!(%{name: "Parent product"}, actor)
++
++    BOM
++    |> Ash.Changeset.for_create(:create, %{
++      product_id: parent.id,
++      components: [%{component_type: :product, product_id: product.id, quantity: 1}]
++    })
++    |> Ash.create!(actor: actor)
++
++    assert {:error, _} = Ash.destroy(product, actor: actor)
++    assert Ash.get!(Product, product.id, actor: actor)
++
++    for bom <- boms, record <- [bom, bom.rollup] ++ bom.components ++ bom.labor_steps do
++      assert Ash.get!(record.__struct__, record.id, actor: actor)
++    end
++  end
++
++  test "a product used in an order cannot be deleted", context do
++    %{actor: actor, product: product} = context
++    customer = create_customer!()
++
++    order =
++      create_order_with_items!(
++        customer,
++        [%{product_id: product.id, quantity: 1, unit_price: product.price}],
++        actor: actor
++      )
++
++    assert {:error, _} = Ash.destroy(product, actor: actor)
++    assert Ash.get!(Product, product.id, actor: actor)
++    assert Ash.get!(Craftplan.Orders.OrderItem, hd(order.items).id, actor: actor)
++  end
++end
+diff --git a/test/craftplan_web/manage_products_recipe_simple_live_test.exs b/test/craftplan_web/manage_products_recipe_simple_live_test.exs
+index f3468e2b..860de92f 100644
+--- a/test/craftplan_web/manage_products_recipe_simple_live_test.exs
++++ b/test/craftplan_web/manage_products_recipe_simple_live_test.exs
+@@ -34,6 +34,50 @@ defmodule CraftplanWeb.ManageProductsRecipeSimpleLiveTest do
+     |> Ash.create!(actor: staff())
+   end
+ 
++  for suffix <- ["", "-mobile"] do
++    @tag role: :staff
++    test "removing recipe rows via #{if suffix == "", do: "desktop", else: "mobile"} controls persists",
++         %{conn: conn} do
++      m = material!()
++      p = product!()
++
++      original =
++        BOM
++        |> Ash.Changeset.for_create(:create, %{
++          product_id: p.id,
++          status: :active,
++          components: [%{material_id: m.id, quantity: 1}],
++          labor_steps: [%{name: "Mix", duration_minutes: 10}]
++        })
++        |> Ash.create!(actor: staff())
++
++      {:ok, view, _html} = live(conn, ~p"/manage/products/#{p.sku}/recipe")
++
++      view |> element("#remove-component-0#{unquote(suffix)}") |> render_click()
++      refute has_element?(view, "#recipe-form input[name$='[material_id]']")
++      assert has_element?(view, "#recipe-form button[type=submit]:not([disabled])")
++
++      view |> element("#remove-labor-0#{unquote(suffix)}") |> render_click()
++      refute has_element?(view, "#recipe-form input[name$='[duration_minutes]']")
++      view |> element("#recipe-form") |> render_submit()
++
++      {:ok, active} = Catalog.get_active_bom_for_product(%{product_id: p.id}, actor: staff())
++      active = Ash.load!(active, [:components, :labor_steps, :rollup], actor: staff())
++      assert active.id != original.id
++      assert active.components == []
++      assert active.labor_steps == []
++      assert Decimal.equal?(active.rollup.unit_cost, 0)
++
++      original = Ash.load!(original, [:components, :labor_steps], actor: staff())
++      assert length(original.components) == 1
++      assert length(original.labor_steps) == 1
++
++      {:ok, reloaded, _html} = live(conn, ~p"/manage/products/#{p.sku}/recipe")
++      refute has_element?(reloaded, "#remove-component-0")
++      refute has_element?(reloaded, "#remove-labor-0")
++    end
++  end
++
+   @tag role: :staff
+   test "simple mode: saving creates a new active version", %{conn: conn} do
+     m = material!()

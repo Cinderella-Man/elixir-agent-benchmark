@@ -1,0 +1,122 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4cca5abc70..2464fcfc0e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,7 @@
+ 
+ - feat: use Grafana 13.2.3 (#5803 - @swiffer)
+ - fix(docker): install the CA certificates, so Tzdata can verify TLS and download time zone updates (#5808 - @JakobLichterfeld)
++- fix: use the position's latitude when re-assigning drives and charges to geofences (#5820 - @JakobLichterfeld)
+ 
+ #### Build, CI, internal
+ 
+diff --git a/elixir/lib/teslamate/locations.ex b/elixir/lib/teslamate/locations.ex
+index 254f9fa768..93bce8d8b8 100644
+--- a/elixir/lib/teslamate/locations.ex
++++ b/elixir/lib/teslamate/locations.ex
+@@ -137,17 +137,17 @@ defmodule TeslaMate.Locations do
+           FROM geofences g
+           WHERE
+             earth_box(ll_to_earth(g.latitude, g.longitude), g.radius) @> ll_to_earth(p.latitude, p.longitude) AND
+-            earth_distance(ll_to_earth(g.latitude, g.longitude), ll_to_earth(latitude, p.longitude)) < g.radius AND
++            earth_distance(ll_to_earth(g.latitude, g.longitude), ll_to_earth(p.latitude, p.longitude)) < g.radius AND
+             g.id != $4
+           ORDER BY
+-            earth_distance(ll_to_earth(g.latitude, g.longitude), ll_to_earth(latitude, p.longitude)) ASC
++            earth_distance(ll_to_earth(g.latitude, g.longitude), ll_to_earth(p.latitude, p.longitude)) ASC
+           LIMIT 1
+         )
+         FROM positions p
+         WHERE
+           m.#{position_field} = p.id AND
+           earth_box(ll_to_earth($1::numeric, $2::numeric), $3) @> ll_to_earth(p.latitude, p.longitude) AND
+-          earth_distance(ll_to_earth($1::numeric, $2::numeric), ll_to_earth(latitude, p.longitude)) < $3
++          earth_distance(ll_to_earth($1::numeric, $2::numeric), ll_to_earth(p.latitude, p.longitude)) < $3
+       """
+     end
+ 
+diff --git a/elixir/test/teslamate/locations/geofences_test.exs b/elixir/test/teslamate/locations/geofences_test.exs
+index b97b0f66e1..45e6118742 100644
+--- a/elixir/test/teslamate/locations/geofences_test.exs
++++ b/elixir/test/teslamate/locations/geofences_test.exs
+@@ -464,6 +464,80 @@ defmodule TeslaMate.LocationsGeofencesTest do
+       assert %Drive{id: _drive_id, start_geofence_id: ^id, end_geofence_id: ^id} =
+                create_drive(car, position, position)
+     end
++
++    test "ignores geo-fences whose bounding box but not radius contains the position" do
++      car = car_fixture()
++
++      # ~80 m north and ~80 m east of the center of "outer", i.e. ~113 m away from it
++      position = %{latitude: 52.500719, longitude: 13.40118}
++
++      assert %ChargingProcess{id: c_id, geofence_id: nil} = create_charging_process(car, position)
++
++      assert %Drive{id: d_id, start_geofence_id: nil, end_geofence_id: nil} =
++               create_drive(car, position, position)
++
++      {:ok, inner = %GeoFence{id: i_id}} =
++        Locations.create_geofence(%{
++          name: "inner",
++          latitude: 52.500719,
++          longitude: 13.40118,
++          radius: 50
++        })
++
++      {:ok, %GeoFence{}} =
++        Locations.create_geofence(%{
++          name: "outer",
++          latitude: 52.5,
++          longitude: 13.4,
++          radius: 100
++        })
++
++      assert %ChargingProcess{geofence_id: ^i_id} = Repo.get!(ChargingProcess, c_id)
++      assert %Drive{start_geofence_id: ^i_id, end_geofence_id: ^i_id} = Repo.get!(Drive, d_id)
++
++      # the position lies within the bounding box of "outer", but outside its radius
++
++      assert {:ok, %GeoFence{}} = Locations.delete_geofence(inner)
++      assert %ChargingProcess{geofence_id: nil} = Repo.get!(ChargingProcess, c_id)
++      assert %Drive{start_geofence_id: nil, end_geofence_id: nil} = Repo.get!(Drive, d_id)
++    end
++
++    test "assigns the geo-fence whose center is closest to the position" do
++      car = car_fixture()
++
++      position = %{latitude: 52.5, longitude: 13.4}
++
++      assert %ChargingProcess{id: c_id, geofence_id: nil} = create_charging_process(car, position)
++
++      assert %Drive{id: d_id, start_geofence_id: nil, end_geofence_id: nil} =
++               create_drive(car, position, position)
++
++      # ~90 m north of the position
++
++      {:ok, %GeoFence{id: n_id}} =
++        Locations.create_geofence(%{
++          name: "north",
++          latitude: 52.500808,
++          longitude: 13.4,
++          radius: 200
++        })
++
++      assert %ChargingProcess{geofence_id: ^n_id} = Repo.get!(ChargingProcess, c_id)
++      assert %Drive{start_geofence_id: ^n_id, end_geofence_id: ^n_id} = Repo.get!(Drive, d_id)
++
++      # ~50 m east of the position, so closer than "north", but with a larger east-west offset
++
++      {:ok, %GeoFence{id: e_id}} =
++        Locations.create_geofence(%{
++          name: "east",
++          latitude: 52.5,
++          longitude: 13.400738,
++          radius: 200
++        })
++
++      assert %ChargingProcess{geofence_id: ^e_id} = Repo.get!(ChargingProcess, c_id)
++      assert %Drive{start_geofence_id: ^e_id, end_geofence_id: ^e_id} = Repo.get!(Drive, d_id)
++    end
+   end
+ 
+   defp geofence_fixture(attrs \\ %{}) do

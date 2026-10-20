@@ -1,0 +1,593 @@
+diff --git a/lib/pinchflat/settings/setting.ex b/lib/pinchflat/settings/setting.ex
+index d449ca006..8e63fc789 100644
+--- a/lib/pinchflat/settings/setting.ex
++++ b/lib/pinchflat/settings/setting.ex
+@@ -31,6 +31,7 @@ defmodule Pinchflat.Settings.Setting do
+     field :apprise_version, :string
+     field :apprise_server, :string
+     field :youtube_api_key, :string
++    field :route_token, :string
+ 
+     field :video_codec_preference, :string
+     field :audio_codec_preference, :string
+diff --git a/lib/pinchflat_web/controllers/sources/source_html.ex b/lib/pinchflat_web/controllers/sources/source_html.ex
+index 4692a043d..57a57b47b 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html.ex
++++ b/lib/pinchflat_web/controllers/sources/source_html.ex
+@@ -40,11 +40,13 @@ defmodule PinchflatWeb.Sources.SourceHTML do
+   end
+ 
+   def rss_feed_url(conn, source) do
++    # NOTE: The reason for this concatenation is to avoid what appears to be a bug in Phoenix
++    # See: https://github.com/phoenixframework/phoenix/issues/6033
+     url(conn, ~p"/sources/#{source.uuid}/feed") <> ".xml"
+   end
+ 
+   def opml_feed_url(conn) do
+-    url(conn, ~p"/sources/opml") <> ".xml"
++    url(conn, ~p"/sources/opml.xml?#{[route_token: Settings.get!(:route_token)]}")
+   end
+ 
+   def output_path_template_override_placeholders(media_profiles) do
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex b/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex
+index f2681c088..43d0e64c0 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex
+@@ -1,18 +1,16 @@
+ <.button_dropdown text="Actions" class="justify-center w-full sm:w-50">
+   <:option>
+-    <span
+-      x-data="{ copied: false }"
+-      x-on:click={"
+-        copyWithCallbacks(
+-          '#{rss_feed_url(@conn, @source)}', 
+-          () => copied = true, 
+-          () => copied = false
+-        )
+-      "}
+-    >
++    <.link href={rss_feed_url(@conn, @source)} x-data="{ copied: false }" x-on:click={~s"
++          $event.preventDefault();
++          copyWithCallbacks(
++            '#{rss_feed_url(@conn, @source)}',
++            () => copied = true,
++            () => copied = false
++          )
++        "}>
+       Copy RSS Feed
+       <span x-show="copied" x-transition.duration.150ms><.icon name="hero-check" class="ml-2 h-4 w-4" /></span>
+-    </span>
++    </.link>
+   </:option>
+   <:option>
+     <span x-data="{ copied: false }" x-on:click={~s"
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/index.html.heex b/lib/pinchflat_web/controllers/sources/source_html/index.html.heex
+index 6ace2bc97..1b23bc937 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/index.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/index.html.heex
+@@ -1,16 +1,17 @@
+ <div class="mb-6 flex gap-3 flex-row items-center justify-between">
+   <h2 class="text-title-md2 font-bold text-black dark:text-white">Sources</h2>
+-  <nav>
+-    <.button color="bg-transparent" x-data="{ copied: false }" x-on:click={~s"
++  <nav class="flex items-center justify-between gap-6">
++    <.link href={opml_feed_url(@conn)} x-data="{ copied: false }" x-on:click={~s"
++          $event.preventDefault();
+           copyWithCallbacks(
+             '#{opml_feed_url(@conn)}',
+             () => copied = true,
+             () => copied = false
+           )
+         "}>
+-      Copy OPML Feed
++      Copy OPML <span class="hidden sm:inline">Feed</span>
+       <span x-show="copied" x-transition.duration.150ms><.icon name="hero-check" class="ml-2 h-4 w-4" /></span>
+-    </.button>
++    </.link>
+     <.link href={~p"/sources/new"}>
+       <.button color="bg-primary" rounding="rounded-lg">
+         <span class="font-bold mx-2">+</span> New <span class="hidden sm:inline pl-1">Source</span>
+diff --git a/lib/pinchflat_web/endpoint.ex b/lib/pinchflat_web/endpoint.ex
+index bcf53c0c7..66ee1b62a 100644
+--- a/lib/pinchflat_web/endpoint.ex
++++ b/lib/pinchflat_web/endpoint.ex
+@@ -73,6 +73,13 @@ defmodule PinchflatWeb.Endpoint do
+     Phoenix.Controller.put_router_url(conn, new_base_url)
+   end
+ 
++  # Some podcast clients require file extensions, and others still will _add_
++  # file extensions to XML files if they don't have them. This plug removes
++  # the extension from the path so that the correct route is matched, regardless
++  # of the provided extension.
++  #
++  # This has the downside of in-app generated verified routes not working with
++  # extensions so this behaviour may change in the future.
+   defp strip_trailing_extension(%{path_info: []} = conn, _opts), do: conn
+ 
+   defp strip_trailing_extension(conn, _opts) do
+diff --git a/lib/pinchflat_web/plugs.ex b/lib/pinchflat_web/plugs.ex
+new file mode 100644
+index 000000000..f905d6fd8
+--- /dev/null
++++ b/lib/pinchflat_web/plugs.ex
+@@ -0,0 +1,66 @@
++defmodule PinchflatWeb.Plugs do
++  @moduledoc """
++  Custom plugs for PinchflatWeb.
++  """
++
++  use PinchflatWeb, :router
++  alias Pinchflat.Settings
++
++  @doc """
++  If the `expose_feed_endpoints` setting is true, this plug does nothing. Otherwise, it calls `basic_auth/2`.
++  """
++  def maybe_basic_auth(conn, opts) do
++    if Application.get_env(:pinchflat, :expose_feed_endpoints) do
++      conn
++    else
++      basic_auth(conn, opts)
++    end
++  end
++
++  @doc """
++  If the `basic_auth_username` and `basic_auth_password` settings are set, this plug calls `Plug.BasicAuth.basic_auth/3`.
++  """
++  def basic_auth(conn, _opts) do
++    username = Application.get_env(:pinchflat, :basic_auth_username)
++    password = Application.get_env(:pinchflat, :basic_auth_password)
++
++    if credential_set?(username) && credential_set?(password) do
++      Plug.BasicAuth.basic_auth(conn, username: username, password: password, realm: "Pinchflat")
++    else
++      conn
++    end
++  end
++
++  @doc """
++  Removes the `x-frame-options` header from the response to allow the page to be embedded in an iframe.
++  """
++  def allow_iframe_embed(conn, _opts) do
++    delete_resp_header(conn, "x-frame-options")
++  end
++
++  @doc """
++  If the `route_token` query parameter matches the `route_token` setting, this plug does nothing.
++  Otherwise, it sends a 401 response.
++  """
++  def token_protected_route(%{query_params: %{"route_token" => route_token}} = conn, _opts) do
++    if Settings.get!(:route_token) == route_token do
++      conn
++    else
++      send_unauthorized(conn)
++    end
++  end
++
++  def token_protected_route(conn, _opts) do
++    send_unauthorized(conn)
++  end
++
++  defp credential_set?(credential) do
++    credential && credential != ""
++  end
++
++  defp send_unauthorized(conn) do
++    conn
++    |> send_resp(:unauthorized, "Unauthorized")
++    |> halt()
++  end
++end
+diff --git a/lib/pinchflat_web/router.ex b/lib/pinchflat_web/router.ex
+index f7b7875f3..cef922068 100644
+--- a/lib/pinchflat_web/router.ex
++++ b/lib/pinchflat_web/router.ex
+@@ -1,5 +1,6 @@
+ defmodule PinchflatWeb.Router do
+   use PinchflatWeb, :router
++  import PinchflatWeb.Plugs
+   import Phoenix.LiveDashboard.Router
+ 
+   # IMPORTANT: `strip_trailing_extension` in endpoint.ex removes
+@@ -19,16 +20,18 @@ defmodule PinchflatWeb.Router do
+     plug :accepts, ["json"]
+   end
+ 
+-  pipeline :feeds do
+-    plug :maybe_basic_auth
++  scope "/", PinchflatWeb do
++    pipe_through [:maybe_basic_auth, :token_protected_route]
++
++    # has to match before /sources/:id
++    get "/sources/opml", Podcasts.PodcastController, :opml_feed
++    get "/sources/:foo/opml", Podcasts.PodcastController, :opml_feed
+   end
+ 
+   # Routes in here _may not be_ protected by basic auth. This is necessary for
+   # media streaming to work for RSS podcast feeds.
+   scope "/", PinchflatWeb do
+-    pipe_through :feeds
+-    # has to match before /sources/:id
+-    get "/sources/opml", Podcasts.PodcastController, :opml_feed
++    pipe_through :maybe_basic_auth
+ 
+     get "/sources/:uuid/feed", Podcasts.PodcastController, :rss_feed
+     get "/sources/:uuid/feed_image", Podcasts.PodcastController, :feed_image
+@@ -76,31 +79,4 @@ defmodule PinchflatWeb.Router do
+       metrics: PinchflatWeb.Telemetry,
+       ecto_repos: [Pinchflat.Repo]
+   end
+-
+-  defp maybe_basic_auth(conn, opts) do
+-    if Application.get_env(:pinchflat, :expose_feed_endpoints) do
+-      conn
+-    else
+-      basic_auth(conn, opts)
+-    end
+-  end
+-
+-  defp basic_auth(conn, _opts) do
+-    username = Application.get_env(:pinchflat, :basic_auth_username)
+-    password = Application.get_env(:pinchflat, :basic_auth_password)
+-
+-    if credential_set?(username) && credential_set?(password) do
+-      Plug.BasicAuth.basic_auth(conn, username: username, password: password, realm: "Pinchflat")
+-    else
+-      conn
+-    end
+-  end
+-
+-  defp credential_set?(credential) do
+-    credential && credential != ""
+-  end
+-
+-  defp allow_iframe_embed(conn, _opts) do
+-    delete_resp_header(conn, "x-frame-options")
+-  end
+ end
+diff --git a/priv/repo/erd.png b/priv/repo/erd.png
+index 74613c149..270eca50e 100644
+Binary files a/priv/repo/erd.png and b/priv/repo/erd.png differ
+diff --git a/priv/repo/migrations/20241230192618_add_route_token_to_settings.exs b/priv/repo/migrations/20241230192618_add_route_token_to_settings.exs
+new file mode 100644
+index 000000000..331c7d262
+--- /dev/null
++++ b/priv/repo/migrations/20241230192618_add_route_token_to_settings.exs
+@@ -0,0 +1,11 @@
++defmodule Pinchflat.Repo.Migrations.AddRouteTokenToSettings do
++  use Ecto.Migration
++
++  def change do
++    alter table(:settings) do
++      add :route_token, :string, null: false, default: "tmp-token"
++    end
++
++    execute "UPDATE settings SET route_token = gen_random_uuid();", "SELECT 1;"
++  end
++end
+diff --git a/test/pinchflat_web/controllers/podcast_controller_test.exs b/test/pinchflat_web/controllers/podcast_controller_test.exs
+index ada823d2c..91d31ede4 100644
+--- a/test/pinchflat_web/controllers/podcast_controller_test.exs
++++ b/test/pinchflat_web/controllers/podcast_controller_test.exs
+@@ -4,17 +4,34 @@ defmodule PinchflatWeb.PodcastControllerTest do
+   import Pinchflat.MediaFixtures
+   import Pinchflat.SourcesFixtures
+ 
++  alias Pinchflat.Settings
++
+   describe "opml_feed" do
+     test "renders the XML document", %{conn: conn} do
+       source = source_fixture()
++      route_token = Settings.get!(:route_token)
+ 
+-      conn = get(conn, ~p"/sources/opml" <> ".xml")
++      conn = get(conn, ~p"/sources/opml.xml?#{[route_token: route_token]}")
+ 
+       assert conn.status == 200
+       assert {"content-type", "application/opml+xml; charset=utf-8"} in conn.resp_headers
+       assert {"content-disposition", "inline"} in conn.resp_headers
+       assert conn.resp_body =~ ~s"http://www.example.com/sources/#{source.uuid}/feed.xml"
+-      assert conn.resp_body =~ "text=\"Cool and good internal name!\""
++      assert conn.resp_body =~ "text=\"#{source.custom_name}\""
++    end
++
++    test "returns 401 if the route token is incorrect", %{conn: conn} do
++      conn = get(conn, ~p"/sources/opml.xml?route_token=incorrect")
++
++      assert conn.status == 401
++      assert conn.resp_body == "Unauthorized"
++    end
++
++    test "returns 401 if the route token is missing", %{conn: conn} do
++      conn = get(conn, ~p"/sources/opml.xml")
++
++      assert conn.status == 401
++      assert conn.resp_body == "Unauthorized"
+     end
+   end
+ 
+diff --git a/test/pinchflat_web/plugs_test.exs b/test/pinchflat_web/plugs_test.exs
+new file mode 100644
+index 000000000..9a02eba2c
+--- /dev/null
++++ b/test/pinchflat_web/plugs_test.exs
+@@ -0,0 +1,166 @@
++defmodule PinchflatWeb.PlugsTest do
++  use PinchflatWeb.ConnCase
++
++  alias PinchflatWeb.Plugs
++  alias Pinchflat.Settings
++
++  describe "maybe_basic_auth/2" do
++    setup do
++      old_username = Application.get_env(:pinchflat, :basic_auth_username)
++      old_password = Application.get_env(:pinchflat, :basic_auth_password)
++      old_expose_feed_endpoints = Application.get_env(:pinchflat, :expose_feed_endpoints)
++
++      on_exit(fn ->
++        Application.put_env(:pinchflat, :basic_auth_username, old_username)
++        Application.put_env(:pinchflat, :basic_auth_password, old_password)
++        Application.put_env(:pinchflat, :expose_feed_endpoints, old_expose_feed_endpoints)
++      end)
++
++      :ok
++    end
++
++    test "uses basic auth when expose_feed_endpoints is false" do
++      Application.put_env(:pinchflat, :basic_auth_username, "user")
++      Application.put_env(:pinchflat, :basic_auth_password, "pass")
++      Application.put_env(:pinchflat, :expose_feed_endpoints, false)
++
++      conn = Plugs.maybe_basic_auth(build_conn(), [])
++
++      assert conn.status == 401
++      assert {"www-authenticate", "Basic realm=\"Pinchflat\""} in conn.resp_headers
++    end
++
++    test "supplying the correct username and password allows access" do
++      Application.put_env(:pinchflat, :basic_auth_username, "user")
++      Application.put_env(:pinchflat, :basic_auth_password, "pass")
++      Application.put_env(:pinchflat, :expose_feed_endpoints, false)
++
++      encoded_auth = Plug.BasicAuth.encode_basic_auth("user", "pass")
++
++      conn =
++        build_conn()
++        |> put_req_header("authorization", encoded_auth)
++        |> Plugs.maybe_basic_auth([])
++
++      # nil here means the response is unset, but that's good. It just means we're moving to the next stage
++      assert conn.status == nil
++    end
++
++    test "does not use basic auth when expose_feed_endpoints is true" do
++      Application.put_env(:pinchflat, :basic_auth_username, "user")
++      Application.put_env(:pinchflat, :basic_auth_password, "pass")
++      Application.put_env(:pinchflat, :expose_feed_endpoints, true)
++
++      conn = Plugs.maybe_basic_auth(build_conn(), [])
++
++      assert conn.status == nil
++    end
++
++    test "does not use basic auth when username/password aren't set" do
++      Application.put_env(:pinchflat, :basic_auth_username, nil)
++      Application.put_env(:pinchflat, :basic_auth_password, nil)
++      Application.put_env(:pinchflat, :expose_feed_endpoints, false)
++
++      conn = Plugs.maybe_basic_auth(build_conn(), [])
++
++      # nil here means the response is unset, but that's good. It just means we're moving to the next stage
++      assert conn.status == nil
++    end
++  end
++
++  describe "basic_auth/2" do
++    setup do
++      old_username = Application.get_env(:pinchflat, :basic_auth_username)
++      old_password = Application.get_env(:pinchflat, :basic_auth_password)
++
++      on_exit(fn ->
++        Application.put_env(:pinchflat, :basic_auth_username, old_username)
++        Application.put_env(:pinchflat, :basic_auth_password, old_password)
++      end)
++
++      :ok
++    end
++
++    test "uses basic auth when both username and password are set", %{conn: conn} do
++      Application.put_env(:pinchflat, :basic_auth_username, "user")
++      Application.put_env(:pinchflat, :basic_auth_password, "pass")
++
++      conn = Plugs.basic_auth(conn, [])
++
++      assert conn.status == 401
++      assert {"www-authenticate", "Basic realm=\"Pinchflat\""} in conn.resp_headers
++    end
++
++    test "providing the username and password allows access", %{conn: conn} do
++      Application.put_env(:pinchflat, :basic_auth_username, "user")
++      Application.put_env(:pinchflat, :basic_auth_password, "pass")
++
++      conn =
++        conn
++        |> put_req_header("authorization", Plug.BasicAuth.encode_basic_auth("user", "pass"))
++        |> Plugs.basic_auth([])
++
++      # nil here means the response is unset, but that's good. It just means we're moving to the next stage
++      assert conn.status == nil
++    end
++
++    test "does not use basic auth when either username or password is not set", %{conn: conn} do
++      Application.put_env(:pinchflat, :basic_auth_username, nil)
++      Application.put_env(:pinchflat, :basic_auth_password, "pass")
++
++      conn = Plugs.basic_auth(conn, [])
++
++      assert conn.status == nil
++    end
++
++    test "treats empty strings as not being set when using basic auth", %{conn: conn} do
++      Application.put_env(:pinchflat, :basic_auth_username, "")
++      Application.put_env(:pinchflat, :basic_auth_password, "pass")
++
++      conn = Plugs.basic_auth(conn, [])
++
++      assert conn.status == nil
++    end
++  end
++
++  describe "allow_iframe_embed/2" do
++    test "deletes the x-frame-options header", %{conn: conn} do
++      conn = put_resp_header(conn, "x-frame-options", "DENY")
++      assert ["DENY"] = get_resp_header(conn, "x-frame-options")
++
++      conn = Plugs.allow_iframe_embed(conn, [])
++
++      assert [] = get_resp_header(conn, "x-frame-options")
++    end
++  end
++
++  describe "token_protected_route/2" do
++    test "allows access when the route token is correct", %{conn: conn} do
++      route_token = Settings.get!(:route_token)
++      conn = %{conn | query_params: %{"route_token" => route_token}}
++
++      conn = Plugs.token_protected_route(conn, [])
++
++      # nil here means the response is unset, but that's good. It just means we're moving to the next stage
++      assert conn.status == nil
++    end
++
++    test "does not allow access when the route token is incorrect", %{conn: conn} do
++      conn = %{conn | query_params: %{"route_token" => "incorrect"}}
++
++      conn = Plugs.token_protected_route(conn, [])
++
++      assert conn.status == 401
++      assert conn.resp_body == "Unauthorized"
++    end
++
++    test "does not allow access when the route token is missing", %{conn: conn} do
++      conn = %{conn | query_params: %{}}
++
++      conn = Plugs.token_protected_route(conn, [])
++
++      assert conn.status == 401
++      assert conn.resp_body == "Unauthorized"
++    end
++  end
++end
+diff --git a/test/pinchflat_web/routing_test.exs b/test/pinchflat_web/routing_test.exs
+deleted file mode 100644
+index cbe4dd855..000000000
+--- a/test/pinchflat_web/routing_test.exs
++++ /dev/null
+@@ -1,108 +0,0 @@
+-defmodule PinchflatWeb.RoutingTest do
+-  use PinchflatWeb.ConnCase
+-
+-  import Pinchflat.SourcesFixtures
+-
+-  describe "basic_auth plug" do
+-    setup do
+-      old_username = Application.get_env(:pinchflat, :basic_auth_username)
+-      old_password = Application.get_env(:pinchflat, :basic_auth_password)
+-
+-      on_exit(fn ->
+-        Application.put_env(:pinchflat, :basic_auth_username, old_username)
+-        Application.put_env(:pinchflat, :basic_auth_password, old_password)
+-      end)
+-
+-      :ok
+-    end
+-
+-    test "it uses basic auth when both username and password are set", %{conn: conn} do
+-      Application.put_env(:pinchflat, :basic_auth_username, "user")
+-      Application.put_env(:pinchflat, :basic_auth_password, "pass")
+-
+-      conn = get(conn, "/")
+-
+-      assert conn.status == 401
+-      assert {"www-authenticate", "Basic realm=\"Pinchflat\""} in conn.resp_headers
+-    end
+-
+-    test "providing the username and password allows access", %{conn: conn} do
+-      Application.put_env(:pinchflat, :basic_auth_username, "user")
+-      Application.put_env(:pinchflat, :basic_auth_password, "pass")
+-
+-      conn =
+-        conn
+-        |> put_req_header("authorization", Plug.BasicAuth.encode_basic_auth("user", "pass"))
+-        |> get("/")
+-
+-      assert conn.status == 200
+-    end
+-
+-    test "it does not use basic auth when either username or password is not set", %{conn: conn} do
+-      Application.put_env(:pinchflat, :basic_auth_username, nil)
+-      Application.put_env(:pinchflat, :basic_auth_password, "pass")
+-
+-      conn = get(conn, "/")
+-
+-      assert conn.status == 200
+-    end
+-
+-    test "it treats empty strings as not being set when using basic auth", %{conn: conn} do
+-      Application.put_env(:pinchflat, :basic_auth_username, "")
+-      Application.put_env(:pinchflat, :basic_auth_password, "pass")
+-
+-      conn = get(conn, "/")
+-
+-      assert conn.status == 200
+-    end
+-  end
+-
+-  describe "maybe_basic_auth plug" do
+-    setup do
+-      old_username = Application.get_env(:pinchflat, :basic_auth_username)
+-      old_password = Application.get_env(:pinchflat, :basic_auth_password)
+-      old_expose_feed_endpoints = Application.get_env(:pinchflat, :expose_feed_endpoints)
+-
+-      source = source_fixture()
+-
+-      on_exit(fn ->
+-        Application.put_env(:pinchflat, :basic_auth_username, old_username)
+-        Application.put_env(:pinchflat, :basic_auth_password, old_password)
+-        Application.put_env(:pinchflat, :expose_feed_endpoints, old_expose_feed_endpoints)
+-      end)
+-
+-      {:ok, source: source}
+-    end
+-
+-    test "uses basic auth when expose_feed_endpoints is false", %{source: source} do
+-      Application.put_env(:pinchflat, :basic_auth_username, "user")
+-      Application.put_env(:pinchflat, :basic_auth_password, "pass")
+-      Application.put_env(:pinchflat, :expose_feed_endpoints, false)
+-
+-      conn = get(build_conn(), "/sources/#{source.uuid}/feed")
+-
+-      assert conn.status == 401
+-      assert {"www-authenticate", "Basic realm=\"Pinchflat\""} in conn.resp_headers
+-    end
+-
+-    test "does not use basic auth when expose_feed_endpoints is true", %{source: source} do
+-      Application.put_env(:pinchflat, :basic_auth_username, "user")
+-      Application.put_env(:pinchflat, :basic_auth_password, "pass")
+-      Application.put_env(:pinchflat, :expose_feed_endpoints, true)
+-
+-      conn = get(build_conn(), "/sources/#{source.uuid}/feed")
+-
+-      assert conn.status == 200
+-    end
+-
+-    test "does not use basic auth when username/password aren't set", %{source: source} do
+-      Application.put_env(:pinchflat, :basic_auth_username, nil)
+-      Application.put_env(:pinchflat, :basic_auth_password, nil)
+-      Application.put_env(:pinchflat, :expose_feed_endpoints, false)
+-
+-      conn = get(build_conn(), "/sources/#{source.uuid}/feed")
+-
+-      assert conn.status == 200
+-    end
+-  end
+-end

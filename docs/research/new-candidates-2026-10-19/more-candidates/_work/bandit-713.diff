@@ -1,0 +1,128 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e5a4206b..43929206 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,11 @@
+ 
+ ### Fixes
+ 
++* Return a 400 for HTTP/1 requests whose request target (path, query or absolute-form authority)
++  contains control bytes (CR, NUL, DEL and the rest of 0x00-0x1F), instead of passing them
++  through to `conn.request_path`, `conn.query_string` and `conn.host` where they could be used
++  to forge log lines (#711). The HTTP/2 equivalent was fixed by the completed HTTP/2 field
++  validation (see #680)
+ * Drain all queued HTTP/2 request DATA frames of an unread body once a response has been sent,
+   rather than falsely raising `Received END_STREAM with byte still pending`
+ * Bound HTTP/2 sends blocked on a connection or stream send window by progress rather than
+diff --git a/lib/bandit/http1/socket.ex b/lib/bandit/http1/socket.ex
+index a27e60ad..24b32f2f 100644
+--- a/lib/bandit/http1/socket.ex
++++ b/lib/bandit/http1/socket.ex
+@@ -106,6 +106,7 @@ defmodule Bandit.HTTP1.Socket do
+           # decode_packet is inconsistent about atom/string method returns
+           method = to_string(method)
+           request_target = resolve_request_target!(request_target, method)
++          validate_request_line!(method, request_target)
+           socket = %{socket | buffer: rest, version: version}
+           {method, request_target, socket}
+ 
+@@ -125,6 +126,28 @@ defmodule Bandit.HTTP1.Socket do
+       end
+     end
+ 
++    # RFC9112§3.2 - the request-target may not contain CTLs or whitespace. We check the method
++    # and every component of the request-target, since all of them reach the Plug.Conn
++    defp validate_request_line!(method, {scheme, host, port, path}) do
++      [method, scheme, host, port, path]
++      |> Enum.all?(&request_line_component_valid?/1)
++      |> if do
++        :ok
++      else
++        request_error!("Request line contains invalid characters (RFC9112§3.2)")
++      end
++    end
++
++    defp request_line_component_valid?(<<>>), do: true
++
++    defp request_line_component_valid?(<<char, rest::binary>>) when char > 0x20 and char != 0x7F,
++      do: request_line_component_valid?(rest)
++
++    defp request_line_component_valid?(<<_char, _rest::binary>>), do: false
++
++    # Request line components which are not binaries (ports, the :* path) cannot contain bytes
++    defp request_line_component_valid?(_component), do: true
++
+     defp get_version!({1, 1}), do: :"HTTP/1.1"
+     defp get_version!({1, 0}), do: :"HTTP/1.0"
+     defp get_version!(other), do: request_error!("Invalid HTTP version: #{inspect(other)}")
+diff --git a/test/bandit/http1/protocol_test.exs b/test/bandit/http1/protocol_test.exs
+index e703cfc6..51be2088 100644
+--- a/test/bandit/http1/protocol_test.exs
++++ b/test/bandit/http1/protocol_test.exs
+@@ -504,6 +504,66 @@ defmodule HTTP1ProtocolTest do
+     end
+   end
+ 
++  describe "request line (RFC9112§3.2)" do
++    @tag :capture_log
++    test "rejects a request target containing a bare CR", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++      Transport.send(client, "GET /a\rb HTTP/1.1\r\nhost: localhost\r\n\r\n")
++
++      assert {:ok, "400 Bad Request", _headers, _body} = SimpleHTTP1Client.recv_reply(client)
++    end
++
++    @tag :capture_log
++    test "rejects a request target containing a NUL byte", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++      Transport.send(client, "GET /a\0b HTTP/1.1\r\nhost: localhost\r\n\r\n")
++
++      assert {:ok, "400 Bad Request", _headers, _body} = SimpleHTTP1Client.recv_reply(client)
++    end
++
++    @tag :capture_log
++    test "rejects an absolute-form host containing a control character", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++      Transport.send(client, "GET http://a\rb/ HTTP/1.1\r\nhost: localhost\r\n\r\n")
++
++      assert {:ok, "400 Bad Request", _headers, _body} = SimpleHTTP1Client.recv_reply(client)
++    end
++
++    for {name, target} <- [
++          {"a DEL byte in the path", "/a\x7Fb"},
++          {"another control byte in the path", "/a\x01b"},
++          {"a bare CR in the query", "/a?x=\r1"},
++          {"a NUL byte in the query", "/a?x=\0"},
++          {"a bare CR in an absolute-form path", "http://localhost/a\rb"}
++        ] do
++      @target target
++
++      @tag :capture_log
++      test "rejects a request target containing #{name}", context do
++        client = SimpleHTTP1Client.tcp_client(context)
++        Transport.send(client, "GET #{@target} HTTP/1.1\r\nhost: localhost\r\n\r\n")
++
++        assert {:ok, "400 Bad Request", _headers, _body} = SimpleHTTP1Client.recv_reply(client)
++
++        assert_receive {:log, %{level: :error, msg: {:string, msg}}}, 500
++
++        assert msg ==
++                 "** (Bandit.HTTPError) Request line contains invalid characters (RFC9112§3.2)"
++      end
++    end
++
++    test "still accepts non-ASCII bytes in the request target", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      SimpleHTTP1Client.send(client, "GET", "/echo_components/caf\xC3\xA9?q=\xC3\xA9", [
++        "host: localhost"
++      ])
++
++      assert {:ok, "200 OK", _headers, body} = SimpleHTTP1Client.recv_reply(client)
++      assert Jason.decode!(body)["query_string"] == "q=\u00E9"
++    end
++  end
++
+   describe "request headers (RFC9112§5)" do
+     @tag :capture_log
+     test "rejects a header value containing a bare CR (RFC9110§5.5)", context do

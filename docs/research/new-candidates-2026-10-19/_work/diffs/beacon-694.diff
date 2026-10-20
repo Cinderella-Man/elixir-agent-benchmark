@@ -1,0 +1,508 @@
+diff --git a/config/test.exs b/config/test.exs
+index 74d10d0b5..74a1de426 100644
+--- a/config/test.exs
++++ b/config/test.exs
+@@ -16,6 +16,34 @@ config :beacon, Beacon.BeaconTest.Repo,
+   stacktrace: true,
+   show_sensitive_data_on_connection_error: true
+ 
++config :beacon,
++  session_options: [
++    store: :cookie,
++    key: "_beacon_test_key",
++    signing_salt: "LKBurgGF",
++    same_site: "Lax"
++  ]
++
++config :beacon, Beacon.BeaconTest.ProxyEndpoint, live_view: [signing_salt: "LKBurgGF"]
++
++config :beacon, Beacon.BeaconTest.Endpoint,
++  url: [host: "localhost", port: 4000],
++  secret_key_base: "dVxFbSNspBVvkHPN5m6FE6iqNtMnhrmPNw7mO57CJ6beUADllH0ux3nhAI1ic65X",
++  live_view: [signing_salt: "LKBurgGF"],
++  render_errors: [view: Beacon.BeaconTest.ErrorView],
++  pubsub_server: Beacon.BeaconTest.PubSub,
++  check_origin: false,
++  debug_errors: true
++
++config :beacon, Beacon.BeaconTest.EndpointSite,
++  url: [host: "localhost", port: 4000],
++  secret_key_base: "dVxFbSNspBVvkHPN5m6FE6iqNtMnhrmPNw7mO57CJ6beUADllH0ux3nhAI1ic65X",
++  live_view: [signing_salt: "LKBurgGF"],
++  render_errors: [view: Beacon.BeaconTest.ErrorView],
++  pubsub_server: Beacon.BeaconTest.PubSub,
++  check_origin: false,
++  debug_errors: true
++
+ # Fake Key Values. We're not putting real creds here.
+ config :ex_aws,
+   access_key_id: "AKIAIOSFODNN7EXAMPLE",
+diff --git a/guides/deployment/deployment-topologies.md b/guides/deployment/deployment-topologies.md
+index 3a5c9efa4..8f85e8537 100644
+--- a/guides/deployment/deployment-topologies.md
++++ b/guides/deployment/deployment-topologies.md
+@@ -77,16 +77,6 @@ which is not a big problem when you have a couple of small sites, but that becom
+ 
+ To avoid this problem, Beacon will selectively boot only the sites that are reachable in the current host, so in the example above,
+ only `:site_a` will be booted in the node hosting `sitea.com` and only `:site_b` in the node hosting `siteb.com`.
+-This behavior also applies to route conflicts as well, for example:
+-
+-```elixir
+-scope do
+-  get "/", PageController, :hello
+-  beacon_site "/", site: :site_a
+-end
+-```
+-
+-Two routes in the same prefix will cause a conflict.
+ 
+ Or this other example:
+ 
+@@ -105,7 +95,7 @@ So Beacon won't try to boot sites that can't be reached, but a warning will be d
+ 
+ ### Admin Sites Discovery
+ 
+-BeaconLiveAdmin is designed to scan the all apps connected in the same cluster to find running sites
++[BeaconLiveAdmin](https://hex.pm/packages/beacon_live_admin) is designed to scan the all apps connected in the same cluster to find running sites
+ and make them available in the admin interface as displayed below:
+ 
+ ```mermaid
+@@ -160,8 +150,11 @@ With these constraints in mind, let's check some deployment strategies.
+ 
+ ## Strategies
+ 
+-### Single application
+-The most simple strategy is a single project with one or more sites and the admin interface in the same project.
++Below we'll describe some common deployment strategies but Beacon is not limited to the strategies below,
++you can adapt to your needs.
++
++### 1. Single application on same host
++The most simple strategy is a single project with one or more sites and the admin interface in the same host.
+ 
+ ```elixir
+ # endpoint
+@@ -197,7 +190,7 @@ flowchart TD
+     r3["mysite.com/admin"] --> Admin
+ ```
+ 
+-### Clustered single applications
++### 2. Clustered single applications
+ Same project as the previous strategy but with multiple nodes deployed in the same cluster.
+ 
+ ```mermaid
+@@ -235,7 +228,7 @@ flowchart TD
+     r3["mysite.com/admin"] --> Node2Admin
+ ```
+ 
+-### Clustered applications with separated admin
++### 3. Clustered applications with separated admin
+ You can observe the previous strategy duplicates the admin interface in each node, which works fairly well when you have
+ no more than a couple of sites, but that setup tends to become harder to manage and also become a waste of resources
+ if you start booting more site and more nodes.
+@@ -288,16 +281,26 @@ flowchart TD
+ 
+ A huge benefit of this topology is the flexibility to protect the Admin interface behind a VPN or scale it independently from the main applications.
+ 
+-### Multiple hosts in single project, separated hosting apps
++### 4. Multiple hosts in single project, separated hosting apps
+ Still a single project but now serving multiple sites at the root path for different dynamic hosts.
+ 
+-In this example let's assume the most simple scenario where you'd create a new app in the hosting platform
+-to serve each domain:
++In this case we're still deploying just one application but serving multiple domains for each site:
++
++- :campaigns -> campaigns.mysite.com
++- :root -> mysite.com
++
++TODO: diagram
++
++TODO: gen task and constraints
++
++### 5. Multiple hosts in single project, separated hosting apps
++Similar to the previous strategy but this time we're splitting each domain into its own app:
+ 
+ - App1 -> mysite.com
+ - App2 -> campaigns.mysite.com
+ 
+-That means isolated apps not connected to each other, just sharing the same codebase.
++That means deploying isolated apps for each domain/site, not connected to each other,
++but still sharing the same codebase.
+ 
+ ```elixir
+ # endpoint
+@@ -349,7 +352,7 @@ flowchart TD
+     r4["campaigns.mysite.com/admin"] --> Node2Admin
+ ```
+ 
+-### Multiple hosts in single project, connected hosting apps
++### 6. Multiple hosts in single project, connected hosting apps
+ Similar setup as the previous strategy but now connecting the apps in the same cluster with a separated admin interface.
+ 
+ ```elixir
+@@ -400,4 +403,4 @@ flowchart TD
+     r1["mysite.com/campaigns/christmas"] --> n2_site
+     r2["mysite.com/contact"] --> n1_site
+     r3["admin.mysite.com"] --> Admin
+-```
+\ No newline at end of file
++```
+diff --git a/lib/beacon/igniter.ex b/lib/beacon/igniter.ex
+new file mode 100644
+index 000000000..81ed161c1
+--- /dev/null
++++ b/lib/beacon/igniter.ex
+@@ -0,0 +1,36 @@
++defmodule Beacon.Igniter do
++  @moduledoc false
++
++  def select_router!(igniter, opts \\ []) do
++    label = Keyword.get(opts, :label)
++    raise_msg = Keyword.get(opts, :raise_msg, "No router found.")
++
++    case Igniter.Libs.Phoenix.select_router(igniter, label) do
++      {_igniter, nil} -> Mix.raise(raise_msg)
++      found -> found
++    end
++  end
++
++  def select_endpoint(igniter, router, label \\ "Which endpoint should be modified?") do
++    case Igniter.Libs.Phoenix.endpoints_for_router(igniter, router) do
++      {igniter, []} ->
++        {igniter, nil}
++
++      {igniter, [endpoint]} ->
++        {igniter, endpoint}
++
++      {igniter, endpoints} ->
++        {igniter, Igniter.Util.IO.select(label, endpoints, display: &inspect/1)}
++    end
++  end
++
++  def select_endpoint!(igniter, router, opts \\ []) do
++    label = Keyword.get(opts, :label)
++    raise_msg = Keyword.get(opts, :raise_msg, "No endpoint found.")
++
++    case select_endpoint(igniter, router, label) do
++      {_igniter, nil} -> Mix.raise(raise_msg)
++      found -> found
++    end
++  end
++end
+diff --git a/lib/beacon/proxy_endpoint.ex b/lib/beacon/proxy_endpoint.ex
+new file mode 100644
+index 000000000..01cb3a654
+--- /dev/null
++++ b/lib/beacon/proxy_endpoint.ex
+@@ -0,0 +1,49 @@
++defmodule Beacon.ProxyEndpoint do
++  @moduledoc false
++
++  # Proxy Endpoint to redirect requests to each site endpoint in a multiple domains setup.
++  #
++  #     TODO: beacon.deploy.add_domain fobar
++  #
++  #     TODO: use Beacon.ProxyEndpoint, otp_app: :my_app, endpoints: [MyAppWeb.EndpointSiteA, MyAppWeb.EndpointSiteB]
++
++  defmacro __using__(opts) do
++    quote location: :keep, generated: true do
++      otp_app = Keyword.get(unquote(opts), :otp_app) || raise Beacon.RuntimeError, "missing required option :otp_app in Beacon.ProxyEndpoint"
++
++      session_options =
++        Keyword.get(unquote(opts), :session_options) || raise Beacon.RuntimeError, "missing required option :session_options in Beacon.ProxyEndpoint"
++
++      Module.put_attribute(__MODULE__, :session_options, session_options)
++
++      fallback = Keyword.get(unquote(opts), :fallback) || raise Beacon.RuntimeError, "missing required option :fallback in Beacon.ProxyEndpoint"
++      Module.put_attribute(__MODULE__, :__beacon_proxy_fallback__, fallback)
++
++      use Phoenix.Endpoint, otp_app: otp_app
++
++      socket "/live", Phoenix.LiveView.Socket,
++        websocket: [connect_info: [session: @session_options]],
++        longpoll: [connect_info: [session: @session_options]]
++
++      plug :proxy
++
++      def proxy(conn, opts) do
++        %{host: host} = conn
++
++        # TODO: cache endpoint resolver
++        endpoint =
++          Enum.reduce_while(Beacon.Registry.running_sites(), @__beacon_proxy_fallback__, fn site, default ->
++            %{endpoint: endpoint} = Beacon.Config.fetch!(site)
++
++            if endpoint.host() == host do
++              {:halt, endpoint}
++            else
++              {:cont, default}
++            end
++          end)
++
++        endpoint.call(conn, endpoint.init(opts))
++      end
++    end
++  end
++end
+diff --git a/lib/mix/tasks/beacon.gen.proxy_endpoint.ex b/lib/mix/tasks/beacon.gen.proxy_endpoint.ex
+new file mode 100644
+index 000000000..c7325b7e0
+--- /dev/null
++++ b/lib/mix/tasks/beacon.gen.proxy_endpoint.ex
+@@ -0,0 +1,113 @@
++defmodule Mix.Tasks.Beacon.Gen.ProxyEndpoint do
++  use Igniter.Mix.Task
++
++  @example "mix beacon.gen.proxy_endpoint"
++  @shortdoc "TODO"
++
++  @moduledoc """
++  #{@shortdoc}
++
++  ## Example
++
++  ```bash
++  #{@example}
++  ```
++  """
++
++  @doc false
++  def info(_argv, _composing_task) do
++    %Igniter.Mix.Task.Info{
++      group: :beacon,
++      example: @example,
++      schema: [key: :string, signing_salt: :string, same_site: :string],
++      defaults: [same_site: "Lax"]
++    }
++  end
++
++  @doc false
++  def igniter(igniter) do
++    otp_app = Igniter.Project.Application.app_name(igniter)
++    {igniter, router} = Beacon.Igniter.select_router!(igniter)
++    {igniter, fallback_endpoint} = Beacon.Igniter.select_endpoint(igniter, router, "Select a fallback endpoint (default app Endpoint):")
++    proxy_endpoint_module_name = Igniter.Libs.Phoenix.web_module_name(igniter, "ProxyEndpoint")
++    signing_salt = Keyword.get_lazy(igniter.args.options, :signing_salt, fn -> random_string(8) end)
++
++    igniter
++    |> create_proxy_endpoint_module(otp_app, fallback_endpoint, proxy_endpoint_module_name)
++    |> add_session_options_config(otp_app, signing_salt, igniter.args.options)
++    |> add_proxy_endpoint_config(otp_app, proxy_endpoint_module_name, signing_salt)
++    |> update_fallback_endpoint_signing_salt(otp_app, fallback_endpoint, signing_salt)
++    |> Igniter.add_notice("""
++    TODO
++    """)
++  end
++
++  defp create_proxy_endpoint_module(igniter, otp_app, fallback_endpoint, proxy_endpoint_module_name) do
++    if Igniter.Project.Module.module_exists(igniter, proxy_endpoint_module_name) do
++      Igniter.add_notice(igniter, """
++      Module #{inspect(proxy_endpoint_module_name)} already exists. Skipping.
++      """)
++    else
++      Igniter.Project.Module.create_module(igniter, proxy_endpoint_module_name, """
++        use Beacon.ProxyEndpoint,
++          otp_app: #{inspect(otp_app)},
++          session_options: Application.compile_env!(#{inspect(otp_app)}, :session_options),
++          fallback: #{inspect(fallback_endpoint)}
++      """)
++    end
++  end
++
++  def add_session_options_config(igniter, otp_app, signing_salt, options) do
++    key = Keyword.get_lazy(options, :key, fn -> "_#{otp_app}_key" end)
++    same_site = Keyword.get(options, :same_site, "Lax")
++
++    Igniter.Project.Config.configure(
++      igniter,
++      "config.exs",
++      otp_app,
++      [:session_options],
++      {:code,
++       Sourceror.parse_string!("""
++       [
++         store: :cookie,
++         key: "#{key}",
++         signing_salt: "#{signing_salt}",
++         same_site: "#{same_site}"
++       ]
++       """)}
++    )
++  end
++
++  def add_proxy_endpoint_config(igniter, otp_app, proxy_endpoint_module_name, signing_salt) do
++    igniter
++    |> Igniter.Project.Config.configure(
++      "config.exs",
++      otp_app,
++      [proxy_endpoint_module_name, :adapter],
++      {:code, Sourceror.parse_string!("Bandit.PhoenixAdapter")}
++    )
++    |> Igniter.Project.Config.configure(
++      "config.exs",
++      otp_app,
++      [proxy_endpoint_module_name, :live_view, :signing_salt],
++      signing_salt
++    )
++  end
++
++  defp update_fallback_endpoint_signing_salt(igniter, otp_app, fallback_endpoint, signing_salt) do
++    fallback_endpoint = String.to_atom("#{fallback_endpoint}")
++    dbg(fallback_endpoint)
++
++    Igniter.Project.Config.configure(
++      igniter,
++      "config.exs",
++      otp_app,
++      [fallback_endpoint, :live_view, :signing_salt],
++      signing_salt
++    )
++  end
++
++  # https://github.com/phoenixframework/phoenix/blob/c9b431f3a5d3bdc6a1d0ff3c29a229226e991195/installer/lib/phx_new/generator.ex#L451
++  defp random_string(length),
++    do: :crypto.strong_rand_bytes(length) |> Base.encode64() |> binary_part(0, length)
++end
+diff --git a/lib/mix/tasks/beacon.gen.site.ex b/lib/mix/tasks/beacon.gen.site.ex
+index 9def96811..1be5e7a50 100644
+--- a/lib/mix/tasks/beacon.gen.site.ex
++++ b/lib/mix/tasks/beacon.gen.site.ex
+@@ -44,8 +44,8 @@ defmodule Mix.Tasks.Beacon.Gen.Site do
+     path = Keyword.fetch!(options, :path)
+     validate_options!(site, path)
+ 
+-    {igniter, router} = Igniter.Libs.Phoenix.select_router(igniter)
+-    {igniter, [endpoint]} = Igniter.Libs.Phoenix.endpoints_for_router(igniter, router)
++    {igniter, router} = Beacon.Igniter.select_router!(igniter)
++    {igniter, endpoint} = Beacon.Igniter.select_endpoint!(igniter, router)
+     repo = Igniter.Project.Module.module_name(igniter, "Repo")
+ 
+     igniter
+diff --git a/lib/mix/tasks/beacon.gen.tailwind_config.ex b/lib/mix/tasks/beacon.gen.tailwind_config.ex
+index e28e42d98..ff1ba14c3 100644
+--- a/lib/mix/tasks/beacon.gen.tailwind_config.ex
++++ b/lib/mix/tasks/beacon.gen.tailwind_config.ex
+@@ -35,8 +35,8 @@ defmodule Mix.Tasks.Beacon.Gen.TailwindConfig do
+     site = Keyword.fetch!(options, :site) |> String.to_atom()
+ 
+     app_name = Igniter.Project.Application.app_name(igniter)
+-    {igniter, router} = Igniter.Libs.Phoenix.select_router(igniter)
+-    {igniter, [endpoint]} = Igniter.Libs.Phoenix.endpoints_for_router(igniter, router)
++    {igniter, router} = Beacon.Igniter.select_router!(igniter)
++    {igniter, endpoint} = Beacon.Igniter.select_endpoint!(igniter, router)
+ 
+     igniter
+     |> create_tailwind_config()
+diff --git a/lib/mix/tasks/beacon.install.ex b/lib/mix/tasks/beacon.install.ex
+index 96abe454b..963a3f465 100644
+--- a/lib/mix/tasks/beacon.install.ex
++++ b/lib/mix/tasks/beacon.install.ex
+@@ -49,7 +49,7 @@ defmodule Mix.Tasks.Beacon.Install do
+     argv = igniter.args.argv
+     options = igniter.args.options
+ 
+-    {igniter, router} = Igniter.Libs.Phoenix.select_router(igniter)
++    {igniter, router} = Beacon.Igniter.select_router!(igniter)
+ 
+     igniter
+     |> add_beacon_plugin_formatter()
+@@ -64,7 +64,7 @@ defmodule Mix.Tasks.Beacon.Install do
+   defp replace_error_html(igniter, router) do
+     app_name = Igniter.Project.Application.app_name(igniter)
+ 
+-    {igniter, [endpoint]} = Igniter.Libs.Phoenix.endpoints_for_router(igniter, router)
++    {igniter, endpoint} = Beacon.Igniter.select_endpoint!(igniter, router)
+ 
+     Igniter.Project.Config.configure(
+       igniter,
+diff --git a/test/support/endpoint.ex b/test/support/endpoint.ex
+index f8826879a..20e5e88f8 100644
+--- a/test/support/endpoint.ex
++++ b/test/support/endpoint.ex
+@@ -4,13 +4,6 @@ defmodule Beacon.BeaconTest.Endpoint do
+   # which expects that a real "application" is settled.
+   use Phoenix.Endpoint, otp_app: :beacon
+ 
+-  @session_options [store: :cookie, key: "_beacon_test_key", signing_salt: "LKBurgGF"]
+-
+-  socket "/live", Phoenix.LiveView.Socket, websocket: [connect_info: [session: @session_options]]
+-
+-  socket "/custom_live", Phoenix.LiveView.Socket, websocket: [connect_info: [session: @session_options]]
+-
+-  plug Plug.Session, store: :cookie, key: "_beacon_app_key", signing_salt: "5Ude+fet"
+-
++  plug Plug.Session, Application.compile_env!(:beacon, :session_options)
+   plug Beacon.BeaconTest.Router
+ end
+diff --git a/test/support/endpoint_site.ex b/test/support/endpoint_site.ex
+new file mode 100644
+index 000000000..ff435499b
+--- /dev/null
++++ b/test/support/endpoint_site.ex
+@@ -0,0 +1,9 @@
++defmodule Beacon.BeaconTest.EndpointSite do
++  # The otp app needs to be beacon otherwise Phoenix LiveView will not be
++  # able to build the static path since it tries to get from `Application.app_dir`
++  # which expects that a real "application" is settled.
++  use Phoenix.Endpoint, otp_app: :beacon
++
++  plug Plug.Session, Application.compile_env!(:beacon, :session_options)
++  plug Beacon.BeaconTest.Router
++end
+diff --git a/test/support/proxy_endpoint.ex b/test/support/proxy_endpoint.ex
+new file mode 100644
+index 000000000..a37182b6b
+--- /dev/null
++++ b/test/support/proxy_endpoint.ex
+@@ -0,0 +1,6 @@
++defmodule Beacon.BeaconTest.ProxyEndpoint do
++  use Beacon.ProxyEndpoint,
++    otp_app: :beacon,
++    session_options: Application.compile_env!(:beacon, :session_options),
++    fallback: Beacon.BeaconTest.Endpoint
++end
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index 078d69b12..6cf01cc88 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -2,19 +2,12 @@ Application.ensure_all_started(:postgrex)
+ 
+ Beacon.BeaconTest.Repo.start_link()
+ 
+-Application.put_env(:beacon, Beacon.BeaconTest.Endpoint,
+-  url: [host: "localhost", port: 4000],
+-  secret_key_base: "dVxFbSNspBVvkHPN5m6FE6iqNtMnhrmPNw7mO57CJ6beUADllH0ux3nhAI1ic65X",
+-  live_view: [signing_salt: "ykjYicLHN3EuW0FO"],
+-  render_errors: [view: Beacon.BeaconTest.ErrorView],
+-  pubsub_server: Beacon.BeaconTest.PubSub,
+-  check_origin: false,
+-  debug_errors: true
+-)
+-
+ Supervisor.start_link(
+   [
+     {Phoenix.PubSub, name: Beacon.BeaconTest.PubSub},
++    Beacon.BeaconTest.Endpoint,
++    Beacon.BeaconTest.EndpointSite,
++    Beacon.BeaconTest.ProxyEndpoint,
+     {Beacon,
+      sites: [
+        [
+@@ -46,7 +39,7 @@ Supervisor.start_link(
+        [
+          site: :host_test,
+          mode: :testing,
+-         endpoint: Beacon.BeaconTest.Endpoint,
++         endpoint: Beacon.BeaconTest.EndpointSite,
+          router: Beacon.BeaconTest.Router,
+          repo: Beacon.BeaconTest.Repo
+        ],
+@@ -166,8 +159,7 @@ Supervisor.start_link(
+            ]
+          ]
+        ]
+-     ]},
+-    Beacon.BeaconTest.Endpoint
++     ]}
+   ],
+   strategy: :one_for_one
+ )

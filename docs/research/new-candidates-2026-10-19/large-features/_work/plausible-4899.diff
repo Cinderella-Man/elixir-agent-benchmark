@@ -1,0 +1,1370 @@
+diff --git a/lib/plausible/segment.ex b/lib/plausible/segment.ex
+index fc5809e15b19..d85ba0a6f5fa 100644
+--- a/lib/plausible/segment.ex
++++ b/lib/plausible/segment.ex
+@@ -44,14 +44,16 @@ defmodule Plausible.Segment do
+       :owner_id
+     ])
+     |> validate_required([:name, :segment_data, :site_id, :type, :owner_id])
++    |> validate_length(:name, count: :bytes, min: 1, max: 255)
+     |> foreign_key_constraint(:site_id)
+     |> foreign_key_constraint(:owner_id)
+     |> validate_only_known_properties_present()
+     |> validate_segment_data_filters()
+     |> validate_segment_data_labels()
++    |> validate_json_byte_length(:segment_data, max: 5 * 1024)
+   end
+ 
+-  defp validate_only_known_properties_present(changeset) do
++  defp validate_only_known_properties_present(%Ecto.Changeset{} = changeset) do
+     case get_field(changeset, :segment_data) do
+       segment_data when is_map(segment_data) ->
+         if Enum.any?(Map.keys(segment_data) -- ["filters", "labels"]) do
+@@ -69,7 +71,7 @@ defmodule Plausible.Segment do
+     end
+   end
+ 
+-  defp validate_segment_data_filters(changeset) do
++  defp validate_segment_data_filters(%Ecto.Changeset{} = changeset) do
+     case get_field(changeset, :segment_data) do
+       %{"filters" => filters} when is_list(filters) and length(filters) > 0 ->
+         changeset
+@@ -83,7 +85,7 @@ defmodule Plausible.Segment do
+     end
+   end
+ 
+-  defp validate_segment_data_labels(changeset) do
++  defp validate_segment_data_labels(%Ecto.Changeset{} = changeset) do
+     case get_field(changeset, :segment_data) do
+       %{"labels" => labels} when not is_map(labels) ->
+         add_error(changeset, :segment_data, "property \"labels\" must be map or nil")
+@@ -92,4 +94,112 @@ defmodule Plausible.Segment do
+         changeset
+     end
+   end
++
++  defp validate_json_byte_length(%Ecto.Changeset{} = changeset, field_key, opts) do
++    field = get_field(changeset, field_key)
++    max = Keyword.get(opts, :max, 0)
++
++    if :erlang.byte_size(Jason.encode!(field)) > max do
++      add_error(changeset, field_key, "should be at most %{count} byte(s)", count: max)
++    else
++      changeset
++    end
++  end
++
++  def validate_segment_data_if_exists(
++        %Plausible.Site{} = _site,
++        nil = _segment_data,
++        _restricted_depth?
++      ),
++      do: :ok
++
++  def validate_segment_data_if_exists(%Plausible.Site{} = site, segment_data, restricted_depth?),
++    do: validate_segment_data(site, segment_data, restricted_depth?)
++
++  def validate_segment_data(
++        %Plausible.Site{} = site,
++        %{"filters" => filters},
++        restricted_depth?
++      ) do
++    with {:ok, %Plausible.Stats.Query{filters: parsed_filters}} <-
++           build_naive_query_from_segment_data(site, filters),
++         :ok <- maybe_validate_filters_depth(parsed_filters, restricted_depth?) do
++      :ok
++    else
++      {:error, message} ->
++        reformat_filters_errors(message)
++
++      :error_deep_filters_not_supported ->
++        reformat_filters_errors("Invalid filters. Deep filters are not supported.")
++    end
++  end
++
++  @doc """
++    This function builds a simple query using the filters from Plausibe.Segment.segment_data
++    to test whether the filters used in the segment stand as legitimate query filters.
++    If they don't, it indicates an error with the filters that must be passed to the client,
++    so they could reconfigure the filters.
++  """
++  def build_naive_query_from_segment_data(%Plausible.Site{} = site, filters),
++    do:
++      Plausible.Stats.Query.build(
++        site,
++        :internal,
++        %{
++          "site_id" => site.domain,
++          "metrics" => ["visitors"],
++          "date_range" => "7d",
++          "filters" => filters
++        },
++        %{}
++      )
++
++  @doc """
++    This function handles the error from building the naive query that is used to validate segment filters,
++    collecting filter related errors into a list.
++    If the error is not only about filters, the client can't do anything about the situation,
++    and the error message is returned as-is.
++
++    ### Examples
++    iex> reformat_filters_errors(~s(#/metrics/0 Invalid metric "Visitors"\\n#/filters/0 Invalid filter "A"))
++    {:error, ~s(#/metrics/0 Invalid metric "Visitors"\\n#/filters/0 Invalid filter "A")}
++
++    iex> reformat_filters_errors(~s(#/filters/0 Invalid filter "A"\\n#/filters/1 Invalid filter "B"))
++    {:error, {:invalid_filters, ~s(#/filters/0 Invalid filter "A"\\n#/filters/1 Invalid filter "B")}}
++
++    iex> reformat_filters_errors("Invalid filters. Dimension `event:goal` can only be filtered at the top level.")
++    {:error, {:invalid_filters, "Invalid filters. Dimension `event:goal` can only be filtered at the top level."}}
++  """
++  def reformat_filters_errors(message) do
++    lines = String.split(message, "\n")
++
++    if Enum.all?(lines, fn line ->
++         String.starts_with?(line, "#/filters/") or String.starts_with?(line, "Invalid filters.")
++       end) do
++      {:error, {:invalid_filters, message}}
++    else
++      {:error, message}
++    end
++  end
++
++  @spec maybe_validate_filters_depth([any()], boolean()) ::
++          :ok | :error_deep_filters_not_supported
++  defp maybe_validate_filters_depth(filters, restricted_depth?)
++
++  defp maybe_validate_filters_depth(_filters, false), do: :ok
++
++  defp maybe_validate_filters_depth(filters, true) do
++    if Enum.all?(filters, &dashboard_compatible_filter?/1) do
++      :ok
++    else
++      :error_deep_filters_not_supported
++    end
++  end
++
++  defp dashboard_compatible_filter?(filter) do
++    is_list(filter) and length(filter) === 3 and
++      is_atom(Enum.at(filter, 0)) and
++      is_binary(Enum.at(filter, 1)) and
++      is_list(Enum.at(filter, 2))
++  end
+ end
+diff --git a/lib/plausible_web/controllers/api/helpers.ex b/lib/plausible_web/controllers/api/helpers.ex
+index 1c3a9e98bc59..109e3a1263dc 100644
+--- a/lib/plausible_web/controllers/api/helpers.ex
++++ b/lib/plausible_web/controllers/api/helpers.ex
+@@ -8,6 +8,13 @@ defmodule PlausibleWeb.Api.Helpers do
+     |> halt()
+   end
+ 
++  def not_enough_permissions(conn, msg) do
++    conn
++    |> put_status(403)
++    |> Phoenix.Controller.json(%{error: msg})
++    |> halt()
++  end
++
+   def bad_request(conn, msg) do
+     conn
+     |> put_status(400)
+diff --git a/lib/plausible_web/controllers/api/internal/segments_controller.ex b/lib/plausible_web/controllers/api/internal/segments_controller.ex
+new file mode 100644
+index 000000000000..bcc65b972c5f
+--- /dev/null
++++ b/lib/plausible_web/controllers/api/internal/segments_controller.ex
+@@ -0,0 +1,333 @@
++defmodule PlausibleWeb.Api.Internal.SegmentsController do
++  use Plausible
++  use PlausibleWeb, :controller
++  use Plausible.Repo
++  use PlausibleWeb.Plugs.ErrorHandler
++  alias PlausibleWeb.Api.Helpers, as: H
++
++  @fields_in_index_query [
++    :id,
++    :name,
++    :type,
++    :inserted_at,
++    :updated_at,
++    :owner_id
++  ]
++
++  def get_all_segments(
++        %Plug.Conn{
++          assigns: %{
++            site: site,
++            site_role: site_role,
++            current_user: current_user
++          }
++        } = conn,
++        %{} = _params
++      ) do
++    site_segments_available? =
++      site_segments_available?(site)
++
++    cond do
++      site_role in roles_with_personal_segments() and
++          site_segments_available? ->
++        result =
++          Repo.all(
++            get_personal_and_site_segments_query(current_user.id, site.id, @fields_in_index_query)
++          )
++
++        json(conn, result)
++
++      site_role in roles_with_personal_segments() ->
++        result =
++          Repo.all(
++            get_personal_segments_only_query(current_user.id, site.id, @fields_in_index_query)
++          )
++
++        json(conn, result)
++
++      site_role in [:public] and site_segments_available? ->
++        result =
++          Repo.all(
++            get_site_segments_only_query(
++              site.id,
++              @fields_in_index_query -- [:owner_id]
++            )
++          )
++
++        json(conn, result)
++
++      true ->
++        H.not_enough_permissions(conn, "Not enough permissions to get segments")
++    end
++  end
++
++  def get_segment(
++        %Plug.Conn{
++          assigns: %{
++            site: site,
++            current_user: current_user,
++            site_role: site_role
++          }
++        } = conn,
++        %{} = params
++      ) do
++    segment_id = normalize_segment_id_param(params["segment_id"])
++
++    if site_role in roles_with_personal_segments() do
++      result = get_one_segment(current_user.id, site.id, segment_id)
++
++      case result do
++        nil -> H.not_found(conn, "Segment not found with ID #{inspect(params["segment_id"])}")
++        result when is_map(result) -> json(conn, result)
++      end
++    else
++      H.not_enough_permissions(conn, "Not enough permissions to get segment data")
++    end
++  end
++
++  def create_segment(
++        %Plug.Conn{
++          assigns: %{
++            site: site,
++            site_role: site_role
++          }
++        } = conn,
++        %{} = params
++      ) do
++    site_segments_available? = site_segments_available?(site)
++
++    cond do
++      params["type"] == Atom.to_string(:personal) and
++          site_role in roles_with_personal_segments() ->
++        do_insert_segment(conn, params)
++
++      params["type"] == Atom.to_string(:site) and site_segments_available? and
++          site_role in roles_with_maybe_site_segments() ->
++        do_insert_segment(conn, params)
++
++      true ->
++        H.not_enough_permissions(conn, "Not enough permissions to create segment")
++    end
++  end
++
++  def create_segment(%Plug.Conn{} = conn, _params), do: H.bad_request(conn, "Invalid request")
++
++  def update_segment(
++        %Plug.Conn{
++          assigns: %{
++            site: site,
++            current_user: %{id: user_id},
++            site_role: site_role
++          }
++        } =
++          conn,
++        %{} = params
++      ) do
++    site_segments_available? = site_segments_available?(site)
++
++    segment_id = normalize_segment_id_param(params["segment_id"])
++
++    existing_segment = get_one_segment(user_id, site.id, segment_id)
++
++    cond do
++      is_nil(existing_segment) ->
++        H.not_found(conn, "Segment not found with ID #{inspect(params["segment_id"])}")
++
++      existing_segment.type == :personal and params["type"] != "site" and
++          site_role in roles_with_personal_segments() ->
++        do_update_segment(conn, params, existing_segment, user_id)
++
++      existing_segment.type == :personal and params["type"] == "site" and site_segments_available? and
++          site_role in roles_with_maybe_site_segments() ->
++        do_update_segment(conn, params, existing_segment, user_id)
++
++      existing_segment.type == :site and site_segments_available? and
++          site_role in roles_with_maybe_site_segments() ->
++        do_update_segment(conn, params, existing_segment, user_id)
++
++      true ->
++        H.not_enough_permissions(conn, "Not enough permissions to edit segment")
++    end
++  end
++
++  def update_segment(%Plug.Conn{} = conn, _params), do: H.bad_request(conn, "Invalid request")
++
++  def delete_segment(
++        %Plug.Conn{
++          assigns: %{
++            site: site,
++            current_user: %{id: user_id},
++            site_role: site_role
++          }
++        } =
++          conn,
++        %{} = params
++      ) do
++    site_segments_available? = site_segments_available?(site)
++
++    segment_id = normalize_segment_id_param(params["segment_id"])
++
++    existing_segment = get_one_segment(user_id, site.id, segment_id)
++
++    cond do
++      is_nil(existing_segment) ->
++        H.not_found(conn, "Segment not found with ID #{inspect(params["segment_id"])}")
++
++      existing_segment.type == :personal and
++          site_role in roles_with_personal_segments() ->
++        do_delete_segment(conn, existing_segment)
++
++      existing_segment.type == :site and
++        site_segments_available? and
++          site_role in roles_with_maybe_site_segments() ->
++        do_delete_segment(conn, existing_segment)
++
++      true ->
++        H.not_enough_permissions(conn, "Not enough permissions to delete segment")
++    end
++  end
++
++  def delete_segment(%Plug.Conn{} = conn, _params), do: H.bad_request(conn, "Invalid request")
++
++  @spec get_site_segments_only_query(pos_integer(), list(atom())) :: Ecto.Query.t()
++  defp get_site_segments_only_query(site_id, fields) do
++    from(segment in Plausible.Segment,
++      select: ^fields,
++      where: segment.site_id == ^site_id,
++      where: segment.type == :site,
++      order_by: [desc: segment.updated_at, desc: segment.id]
++    )
++  end
++
++  @spec get_personal_segments_only_query(pos_integer(), pos_integer(), list(atom())) ::
++          Ecto.Query.t()
++  defp get_personal_segments_only_query(user_id, site_id, fields) do
++    from(segment in Plausible.Segment,
++      select: ^fields,
++      where: segment.site_id == ^site_id,
++      where: segment.type == :personal and segment.owner_id == ^user_id,
++      order_by: [desc: segment.updated_at, desc: segment.id]
++    )
++  end
++
++  @spec get_personal_and_site_segments_query(pos_integer(), pos_integer(), list(atom())) ::
++          Ecto.Query.t()
++  defp get_personal_and_site_segments_query(user_id, site_id, fields) do
++    from(segment in Plausible.Segment,
++      select: ^fields,
++      where: segment.site_id == ^site_id,
++      where:
++        segment.type == :site or (segment.type == :personal and segment.owner_id == ^user_id),
++      order_by: [desc: segment.updated_at, desc: segment.id]
++    )
++  end
++
++  @spec normalize_segment_id_param(any()) :: nil | pos_integer()
++  defp normalize_segment_id_param(input) do
++    case Integer.parse(input) do
++      {int_value, ""} when int_value > 0 -> int_value
++      _ -> nil
++    end
++  end
++
++  defp get_one_segment(_user_id, _site_id, nil) do
++    nil
++  end
++
++  defp get_one_segment(user_id, site_id, segment_id) do
++    query =
++      from(segment in Plausible.Segment,
++        where: segment.site_id == ^site_id,
++        where: segment.id == ^segment_id,
++        where: segment.type == :site or segment.owner_id == ^user_id
++      )
++
++    Repo.one(query)
++  end
++
++  defp do_insert_segment(
++         %Plug.Conn{
++           assigns: %{
++             site: site,
++             current_user: %{id: user_id}
++           }
++         } = conn,
++         %{} = params
++       ) do
++    segment_definition = Map.merge(params, %{"site_id" => site.id, "owner_id" => user_id})
++
++    with %{valid?: true} = changeset <-
++           Plausible.Segment.changeset(
++             %Plausible.Segment{},
++             segment_definition
++           ),
++         :ok <- Plausible.Segment.validate_segment_data(site, params["segment_data"], true) do
++      segment = Repo.insert!(changeset)
++      json(conn, segment)
++    else
++      %{valid?: false, errors: errors} ->
++        conn
++        |> put_status(400)
++        |> json(%{
++          errors: Enum.map(errors, fn {field_key, {message, _}} -> [field_key, message] end)
++        })
++
++      {:error, {:invalid_filters, message}} ->
++        conn |> put_status(400) |> json(%{errors: [["segment_data", message]]})
++    end
++  end
++
++  defp do_update_segment(
++         %Plug.Conn{} = conn,
++         %{} = params,
++         %Plausible.Segment{} = existing_segment,
++         owner_override
++       ) do
++    partial_segment_definition = Map.merge(params, %{"owner_id" => owner_override})
++
++    with %{valid?: true} = changeset <-
++           Plausible.Segment.changeset(
++             existing_segment,
++             partial_segment_definition
++           ),
++         :ok <-
++           Plausible.Segment.validate_segment_data_if_exists(
++             conn.assigns.site,
++             params["segment_data"],
++             true
++           ) do
++      json(
++        conn,
++        Repo.update!(
++          changeset,
++          returning: true
++        )
++      )
++    else
++      %{valid?: false, errors: errors} ->
++        conn
++        |> put_status(400)
++        |> json(%{
++          errors:
++            Enum.map(errors, fn {field_key, {message, opts}} -> [field_key, message, opts] end)
++        })
++
++      {:error, {:invalid_filters, message}} ->
++        conn |> put_status(400) |> json(%{errors: [["segment_data", message, []]]})
++    end
++  end
++
++  defp do_delete_segment(
++         %Plug.Conn{} = conn,
++         %Plausible.Segment{} = existing_segment
++       ) do
++    Repo.delete!(existing_segment)
++    json(conn, existing_segment)
++  end
++
++  defp roles_with_personal_segments(), do: [:viewer, :editor, :admin, :owner, :super_admin]
++  defp roles_with_maybe_site_segments(), do: [:editor, :admin, :owner, :super_admin]
++
++  defp site_segments_available?(site),
++    do: Plausible.Billing.Feature.Props.check_availability(site.team) == :ok
++end
+diff --git a/lib/plausible_web/plugs/feature_flag_check_plug.ex b/lib/plausible_web/plugs/feature_flag_check_plug.ex
+new file mode 100644
+index 000000000000..75698da0848c
+--- /dev/null
++++ b/lib/plausible_web/plugs/feature_flag_check_plug.ex
+@@ -0,0 +1,28 @@
++defmodule PlausibleWeb.Plugs.FeatureFlagCheckPlug do
++  @moduledoc """
++  plug(PlausibleWeb.Plugs.FeatureFlagCheckPlug, [:flag_foo, :flag_bar])
++  to halt any API connections with 404 where conn.assigns.current_user or conn.assigns.site
++  don't have both feature flags true.
++  """
++  def init(feature_flags) when is_list(feature_flags) and length(feature_flags) > 0 do
++    feature_flags
++  end
++
++  def init(_),
++    do: raise(ArgumentError, "The first argument must be a non-empty list of feature flags")
++
++  def call(%Plug.Conn{} = conn, flags) do
++    if validate(conn.assigns.current_user, conn.assigns.site, flags) do
++      conn
++    else
++      PlausibleWeb.Api.Helpers.not_found(conn, "Not found")
++    end
++  end
++
++  defp validate(current_user, site, flags),
++    do:
++      Enum.all?(flags, fn flag ->
++        FunWithFlags.enabled?(flag, for: current_user) ||
++          FunWithFlags.enabled?(flag, for: site)
++      end)
++end
+diff --git a/lib/plausible_web/router.ex b/lib/plausible_web/router.ex
+index c1006ce232f6..c457d422545e 100644
+--- a/lib/plausible_web/router.ex
++++ b/lib/plausible_web/router.ex
+@@ -120,16 +120,16 @@ defmodule PlausibleWeb.Router do
+       scope [] do
+         pipe_through :browser
+ 
+-        get("/basic", TestController, :browser)
+-        get("/:domain/shared-link/:slug", TestController, :browser)
+-        get("/:domain/with-domain", TestController, :browser)
++        get("/basic", TestController, :browser_basic)
++        get("/:domain/shared-link/:slug", TestController, :browser_basic)
++        get("/:domain/with-domain", TestController, :browser_basic)
+       end
+ 
+       scope [] do
+         pipe_through :api
+ 
+-        get("/api-basic", TestController, :api)
+-        get("/:domain/api-with-domain", TestController, :api)
++        get("/api-basic", TestController, :api_basic)
++        get("/:domain/api-with-domain", TestController, :api_basic)
+       end
+     end
+   end
+@@ -180,42 +180,56 @@ defmodule PlausibleWeb.Router do
+     end
+   end
+ 
+-  scope "/api/stats", PlausibleWeb.Api do
++  scope "/api" do
+     pipe_through :internal_stats_api
+ 
+-    on_ee do
+-      get "/:domain/funnels/:id", StatsController, :funnel
++    scope "/stats", PlausibleWeb.Api do
++      on_ee do
++        get "/:domain/funnels/:id", StatsController, :funnel
++      end
++
++      get "/:domain/current-visitors", StatsController, :current_visitors
++      get "/:domain/main-graph", StatsController, :main_graph
++      get "/:domain/top-stats", StatsController, :top_stats
++      get "/:domain/sources", StatsController, :sources
++      get "/:domain/channels", StatsController, :channels
++      get "/:domain/utm_mediums", StatsController, :utm_mediums
++      get "/:domain/utm_sources", StatsController, :utm_sources
++      get "/:domain/utm_campaigns", StatsController, :utm_campaigns
++      get "/:domain/utm_contents", StatsController, :utm_contents
++      get "/:domain/utm_terms", StatsController, :utm_terms
++      get "/:domain/referrers/:referrer", StatsController, :referrer_drilldown
++      get "/:domain/pages", StatsController, :pages
++      get "/:domain/entry-pages", StatsController, :entry_pages
++      get "/:domain/exit-pages", StatsController, :exit_pages
++      get "/:domain/countries", StatsController, :countries
++      get "/:domain/regions", StatsController, :regions
++      get "/:domain/cities", StatsController, :cities
++      get "/:domain/browsers", StatsController, :browsers
++      get "/:domain/browser-versions", StatsController, :browser_versions
++      get "/:domain/operating-systems", StatsController, :operating_systems
++      get "/:domain/operating-system-versions", StatsController, :operating_system_versions
++      get "/:domain/screen-sizes", StatsController, :screen_sizes
++      get "/:domain/conversions", StatsController, :conversions
++      get "/:domain/custom-prop-values/:prop_key", StatsController, :custom_prop_values
++      get "/:domain/suggestions/:filter_name", StatsController, :filter_suggestions
++
++      get "/:domain/suggestions/custom-prop-values/:prop_key",
++          StatsController,
++          :custom_prop_value_filter_suggestions
+     end
+ 
+-    get "/:domain/current-visitors", StatsController, :current_visitors
+-    get "/:domain/main-graph", StatsController, :main_graph
+-    get "/:domain/top-stats", StatsController, :top_stats
+-    get "/:domain/sources", StatsController, :sources
+-    get "/:domain/channels", StatsController, :channels
+-    get "/:domain/utm_mediums", StatsController, :utm_mediums
+-    get "/:domain/utm_sources", StatsController, :utm_sources
+-    get "/:domain/utm_campaigns", StatsController, :utm_campaigns
+-    get "/:domain/utm_contents", StatsController, :utm_contents
+-    get "/:domain/utm_terms", StatsController, :utm_terms
+-    get "/:domain/referrers/:referrer", StatsController, :referrer_drilldown
+-    get "/:domain/pages", StatsController, :pages
+-    get "/:domain/entry-pages", StatsController, :entry_pages
+-    get "/:domain/exit-pages", StatsController, :exit_pages
+-    get "/:domain/countries", StatsController, :countries
+-    get "/:domain/regions", StatsController, :regions
+-    get "/:domain/cities", StatsController, :cities
+-    get "/:domain/browsers", StatsController, :browsers
+-    get "/:domain/browser-versions", StatsController, :browser_versions
+-    get "/:domain/operating-systems", StatsController, :operating_systems
+-    get "/:domain/operating-system-versions", StatsController, :operating_system_versions
+-    get "/:domain/screen-sizes", StatsController, :screen_sizes
+-    get "/:domain/conversions", StatsController, :conversions
+-    get "/:domain/custom-prop-values/:prop_key", StatsController, :custom_prop_values
+-    get "/:domain/suggestions/:filter_name", StatsController, :filter_suggestions
+-
+-    get "/:domain/suggestions/custom-prop-values/:prop_key",
+-        StatsController,
+-        :custom_prop_value_filter_suggestions
++    scope "/:domain/segments", PlausibleWeb.Api.Internal do
++      pipeline :segments_endpoints,
++        do: plug(PlausibleWeb.Plugs.FeatureFlagCheckPlug, [:saved_segments])
++
++      pipe_through :segments_endpoints
++      get "/", SegmentsController, :get_all_segments
++      post "/", SegmentsController, :create_segment
++      get "/:segment_id", SegmentsController, :get_segment
++      patch "/:segment_id", SegmentsController, :update_segment
++      delete "/:segment_id", SegmentsController, :delete_segment
++    end
+   end
+ 
+   scope "/api/v1/stats", PlausibleWeb.Api, assigns: %{api_scope: "stats:read:*"} do
+diff --git a/test/plausible/segment_schema_test.exs b/test/plausible/segment_schema_test.exs
+index 93622b631eca..104fbf160cfb 100644
+--- a/test/plausible/segment_schema_test.exs
++++ b/test/plausible/segment_schema_test.exs
+@@ -1,5 +1,6 @@
+ defmodule Plausible.SegmentSchemaTest do
+   use ExUnit.Case
++  doctest Plausible.Segment, import: true
+ 
+   setup do
+     segment = %Plausible.Segment{
+@@ -36,6 +37,33 @@ defmodule Plausible.SegmentSchemaTest do
+            ]
+   end
+ 
++  test "changeset forbids too long name", %{segment: valid_segment} do
++    assert Plausible.Segment.changeset(
++             valid_segment,
++             %{
++               name: String.duplicate("a", 256)
++             }
++           ).errors == [
++             name:
++               {"should be at most %{count} byte(s)",
++                [{:count, 255}, {:validation, :length}, {:kind, :max}, {:type, :binary}]}
++           ]
++  end
++
++  test "changeset forbids too large segment_data", %{segment: valid_segment} do
++    assert Plausible.Segment.changeset(
++             valid_segment,
++             %{
++               segment_data:
++                 Jason.decode!(
++                   ~s({"filters": ["is", "visit:exit_page", [#{Enum.map_join(1..(5 * 1024), ",", fn i -> "#{i}" end)}]]})
++                 )
++             }
++           ).errors == [
++             segment_data: {"should be at most %{count} byte(s)", [{:count, 5120}]}
++           ]
++  end
++
+   test "changeset allows setting nil owner_id to a user id (to be able to recover dangling site segments)",
+        %{segment: valid_segment} do
+     assert Plausible.Segment.changeset(
+diff --git a/test/plausible_web/controllers/api/internal_controller/segments_controller_test.exs b/test/plausible_web/controllers/api/internal_controller/segments_controller_test.exs
+new file mode 100644
+index 000000000000..5d355c13cd75
+--- /dev/null
++++ b/test/plausible_web/controllers/api/internal_controller/segments_controller_test.exs
+@@ -0,0 +1,579 @@
++defmodule PlausibleWeb.Api.Internal.SegmentsControllerTest do
++  use PlausibleWeb.ConnCase, async: true
++  use Plausible.Repo
++  use Plausible.Teams.Test
++
++  describe "GET /api/:domain/segments" do
++    setup [:create_user, :log_in, :create_site]
++
++    test "returns empty list when no segments", %{conn: conn, site: site} do
++      conn =
++        get(conn, "/api/#{site.domain}/segments")
++
++      assert json_response(conn, 200) == []
++    end
++
++    test "returns site segments list when looking at a public dashboard", %{conn: conn} do
++      other_user = new_user()
++      site = new_site(owner: other_user, public: true)
++
++      site_segments =
++        insert_list(2, :segment,
++          site: site,
++          owner: other_user,
++          type: :site,
++          name: "other site segment"
++        )
++
++      insert_list(10, :segment,
++        site: site,
++        owner: other_user,
++        type: :personal,
++        name: "other user personal segment"
++      )
++
++      conn = get(conn, "/api/#{site.domain}/segments")
++
++      assert json_response(conn, 200) ==
++               Enum.reverse(
++                 Enum.map(site_segments, fn s ->
++                   %{
++                     "id" => s.id,
++                     "name" => s.name,
++                     "type" => Atom.to_string(s.type),
++                     "owner_id" => nil,
++                     "inserted_at" => NaiveDateTime.to_iso8601(s.inserted_at),
++                     "updated_at" => NaiveDateTime.to_iso8601(s.updated_at),
++                     "segment_data" => nil
++                   }
++                 end)
++               )
++    end
++
++    test "forbids owners on growth plan from seeing site segments", %{
++      conn: conn,
++      user: user,
++      site: site
++    } do
++      user |> subscribe_to_growth_plan()
++
++      insert_list(2, :segment,
++        site: site,
++        owner: user,
++        type: :site,
++        name: "site segment"
++      )
++
++      conn =
++        get(conn, "/api/#{site.domain}/segments")
++
++      assert json_response(conn, 200) == []
++    end
++
++    for role <- [:viewer, :owner] do
++      test "returns list with personal and site segments for #{role}, avoiding segments from other site",
++           %{conn: conn, user: user, site: site} do
++        other_user = new_user()
++        other_site = new_site(owner: other_user, team: team_of(user))
++
++        insert_list(2, :segment,
++          site: other_site,
++          owner: user,
++          type: :site,
++          name: "other site segment"
++        )
++
++        insert_list(10, :segment,
++          site: site,
++          owner: other_user,
++          type: :personal,
++          name: "other user personal segment"
++        )
++
++        personal_segment =
++          insert(:segment,
++            site: site,
++            owner: user,
++            type: :personal,
++            name: "a personal segment"
++          )
++
++        emea_site_segment =
++          insert(:segment,
++            site: site,
++            owner: other_user,
++            type: :site,
++            name: "EMEA region"
++          )
++
++        apac_site_segment =
++          insert(:segment,
++            site: site,
++            owner: user,
++            type: :site,
++            name: "APAC region"
++          )
++
++        conn =
++          get(conn, "/api/#{site.domain}/segments")
++
++        assert json_response(conn, 200) ==
++                 Enum.map([apac_site_segment, emea_site_segment, personal_segment], fn s ->
++                   %{
++                     "id" => s.id,
++                     "name" => s.name,
++                     "type" => Atom.to_string(s.type),
++                     "owner_id" => s.owner_id,
++                     "inserted_at" => NaiveDateTime.to_iso8601(s.inserted_at),
++                     "updated_at" => NaiveDateTime.to_iso8601(s.updated_at),
++                     "segment_data" => nil
++                   }
++                 end)
++      end
++    end
++  end
++
++  describe "GET /api/:domain/segments/:segment_id" do
++    setup [:create_user, :create_site, :log_in]
++
++    test "serves 404 when invalid segment key used", %{conn: conn, site: site} do
++      conn =
++        get(conn, "/api/#{site.domain}/segments/any-id")
++
++      assert json_response(conn, 404) == %{"error" => "Segment not found with ID \"any-id\""}
++    end
++
++    test "serves 404 when no segment found", %{conn: conn, site: site} do
++      conn =
++        get(conn, "/api/#{site.domain}/segments/100100")
++
++      assert json_response(conn, 404) == %{"error" => "Segment not found with ID \"100100\""}
++    end
++
++    test "serves 404 when segment is for another site", %{conn: conn, site: site, user: user} do
++      other_site = new_site(owner: user)
++
++      segment =
++        insert(:segment,
++          site: other_site,
++          owner: user,
++          type: :site,
++          name: "any"
++        )
++
++      conn =
++        get(conn, "/api/#{site.domain}/segments/#{segment.id}")
++
++      assert json_response(conn, 404) == %{
++               "error" => "Segment not found with ID \"#{segment.id}\""
++             }
++    end
++
++    test "serves 404 for viewing contents of site segments for viewers of public dashboards",
++         %{
++           conn: conn
++         } do
++      site = new_site(public: true)
++      other_user = add_guest(site, user: new_user(), role: :editor)
++
++      segment =
++        insert(:segment,
++          type: :site,
++          owner: other_user,
++          site: site,
++          name: "any"
++        )
++
++      conn =
++        get(conn, "/api/#{site.domain}/segments/#{segment.id}")
++
++      assert json_response(conn, 403) == %{
++               "error" => "Not enough permissions to get segment data"
++             }
++    end
++
++    test "serves 404 when user is not the segment owner and segment is personal",
++         %{
++           conn: conn,
++           site: site
++         } do
++      other_user = add_guest(site, role: :editor)
++
++      segment =
++        insert(:segment,
++          type: :personal,
++          owner: other_user,
++          site: site,
++          name: "any"
++        )
++
++      conn =
++        get(conn, "/api/#{site.domain}/segments/#{segment.id}")
++
++      assert json_response(conn, 404) == %{
++               "error" => "Segment not found with ID \"#{segment.id}\""
++             }
++    end
++
++    test "serves 200 with segment when user is not the segment owner and segment is not personal",
++         %{
++           conn: conn,
++           site: site
++         } do
++      other_user = add_guest(site, role: :editor)
++
++      segment =
++        insert(:segment,
++          type: :site,
++          owner: other_user,
++          site: site,
++          name: "any",
++          inserted_at: "2024-09-01T10:00:00",
++          updated_at: "2024-09-01T10:00:00"
++        )
++
++      conn =
++        get(conn, "/api/#{site.domain}/segments/#{segment.id}")
++
++      assert json_response(conn, 200) == %{
++               "id" => segment.id,
++               "owner_id" => other_user.id,
++               "name" => segment.name,
++               "type" => Atom.to_string(segment.type),
++               "segment_data" => segment.segment_data,
++               "inserted_at" => NaiveDateTime.to_iso8601(segment.inserted_at),
++               "updated_at" => NaiveDateTime.to_iso8601(segment.updated_at)
++             }
++    end
++
++    test "serves 200 with segment when user is segment owner", %{
++      conn: conn,
++      site: site,
++      user: user
++    } do
++      segment =
++        insert(:segment,
++          site: site,
++          name: "any",
++          owner: user,
++          type: :personal
++        )
++
++      conn =
++        get(conn, "/api/#{site.domain}/segments/#{segment.id}")
++
++      assert json_response(conn, 200) == %{
++               "id" => segment.id,
++               "owner_id" => user.id,
++               "name" => segment.name,
++               "type" => Atom.to_string(segment.type),
++               "segment_data" => segment.segment_data,
++               "inserted_at" => NaiveDateTime.to_iso8601(segment.inserted_at),
++               "updated_at" => NaiveDateTime.to_iso8601(segment.updated_at)
++             }
++    end
++  end
++
++  describe "POST /api/:domain/segments" do
++    setup [:create_user, :log_in, :create_site]
++
++    test "forbids viewers from creating site segments", %{conn: conn, user: user} do
++      site = new_site()
++      add_guest(site, user: user, role: :viewer)
++
++      conn =
++        post(conn, "/api/#{site.domain}/segments", %{
++          "type" => "site",
++          "segment_data" => %{"filters" => [["is", "visit:entry_page", ["/blog"]]]},
++          "name" => "any name"
++        })
++
++      assert json_response(conn, 403) == %{
++               "error" => "Not enough permissions to create segment"
++             }
++    end
++
++    test "forbids owners on growth plan from creating site segments", %{
++      conn: conn,
++      user: user,
++      site: site
++    } do
++      user |> subscribe_to_growth_plan()
++
++      conn =
++        post(conn, "/api/#{site.domain}/segments", %{
++          "type" => "site",
++          "segment_data" => %{"filters" => [["is", "visit:entry_page", ["/blog"]]]},
++          "name" => "any name"
++        })
++
++      assert json_response(conn, 403) == %{
++               "error" => "Not enough permissions to create segment"
++             }
++    end
++
++    test "forbids users from creating segments with invalid filters",
++         %{
++           conn: conn,
++           site: site
++         } do
++      conn =
++        post(conn, "/api/#{site.domain}/segments", %{
++          "type" => "site",
++          "segment_data" => %{
++            "filters" => [["is", "entry_page", ["/blog"]]]
++          },
++          "name" => "any name"
++        })
++
++      assert json_response(conn, 400) == %{
++               "errors" => [
++                 [
++                   "segment_data",
++                   "#/filters/0: Invalid filter [\"is\", \"entry_page\", [\"/blog\"]]"
++                 ]
++               ]
++             }
++    end
++
++    for %{role: role, type: type} <- [
++          %{role: :viewer, type: :personal},
++          %{role: :editor, type: :personal},
++          %{role: :editor, type: :site}
++        ] do
++      test "#{role} can create segment with type \"#{type}\" successfully",
++           %{conn: conn, user: user} do
++        site = new_site()
++        add_guest(site, user: user, role: unquote(role))
++
++        response =
++          post(conn, "/api/#{site.domain}/segments", %{
++            "name" => "Some segment",
++            "type" => "#{unquote(type)}",
++            "segment_data" => %{"filters" => [["is", "visit:entry_page", ["/blog"]]]}
++          })
++          |> json_response(200)
++
++        assert %{
++                 "name" => "Some segment",
++                 "type" => "#{unquote(type)}",
++                 "segment_data" => %{"filters" => [["is", "visit:entry_page", ["/blog"]]]},
++                 "owner_id" => user.id
++               } == Map.drop(response, ["id", "inserted_at", "updated_at"])
++
++        assert is_integer(response["id"])
++        assert is_binary(response["inserted_at"])
++        assert is_binary(response["updated_at"])
++        assert response["inserted_at"] == response["updated_at"]
++
++        verify_segment_in_db(%Plausible.Segment{
++          id: response["id"],
++          name: response["name"],
++          type: String.to_existing_atom(response["type"]),
++          segment_data: response["segment_data"],
++          owner_id: response["owner_id"],
++          site_id: site.id,
++          inserted_at: NaiveDateTime.from_iso8601!(response["inserted_at"]),
++          updated_at: NaiveDateTime.from_iso8601!(response["updated_at"])
++        })
++      end
++    end
++  end
++
++  describe "PATCH /api/:domain/segments/:segment_id" do
++    setup [:create_user, :create_site, :log_in]
++
++    for {current_type, patch_type} <- [
++          {:personal, :site},
++          {:site, :personal}
++        ] do
++      test "prevents viewers from updating segments with current type #{current_type} with #{patch_type}",
++           %{
++             conn: conn,
++             user: user
++           } do
++        site = new_site()
++        add_guest(site, user: user, role: :viewer)
++
++        %{id: segment_id} =
++          insert(:segment,
++            site: site,
++            name: "any",
++            type: unquote(current_type),
++            owner: user
++          )
++
++        conn =
++          patch(conn, "/api/#{site.domain}/segments/#{segment_id}", %{
++            "name" => "updated name",
++            "type" => "#{unquote(patch_type)}"
++          })
++
++        assert json_response(conn, 403) == %{
++                 "error" => "Not enough permissions to edit segment"
++               }
++      end
++    end
++
++    for {filters, expected_errors} <- [
++          {[],
++           [
++             [
++               "segment_data",
++               "property \"filters\" must be an array with at least one member",
++               []
++             ]
++           ]},
++          {[["foo", "bar"]],
++           [["segment_data", "#/filters/0: Invalid filter [\"foo\", \"bar\"]", []]]},
++          {[["not", ["is", "visit:entry_page", ["/campaigns/:campaign_name"]]]],
++           [["segment_data", "Invalid filters. Deep filters are not supported.", []]]},
++          {[
++             [
++               "or",
++               [
++                 ["is", "event:goal", ["any goal"]],
++                 ["is", "visit:entry_page", ["/campaigns/:campaign_name"]]
++               ]
++             ]
++           ],
++           [
++             [
++               "segment_data",
++               "Invalid filters. Dimension `event:goal` can only be filtered at the top level.",
++               []
++             ]
++           ]}
++        ] do
++      test "prevents owners from updating segments to invalid filters #{inspect(filters)} with error 400",
++           %{
++             conn: conn,
++             user: user,
++             site: site
++           } do
++        segment =
++          insert(:segment,
++            site: site,
++            name: "any name",
++            type: :personal,
++            owner: user
++          )
++
++        conn =
++          patch(conn, "/api/#{site.domain}/segments/#{segment.id}", %{
++            "segment_data" => %{"filters" => unquote(filters)}
++          })
++
++        assert json_response(conn, 400) == %{
++                 "errors" => unquote(expected_errors)
++               }
++      end
++    end
++
++    test "editors can update a segment", %{conn: conn, user: user} do
++      site = new_site()
++      add_guest(site, user: user, role: :editor)
++
++      segment =
++        insert(:segment,
++          site: site,
++          name: "original name",
++          type: :site,
++          owner: user,
++          inserted_at: "2024-09-01T10:00:00",
++          updated_at: "2024-09-01T10:00:00"
++        )
++
++      response =
++        patch(conn, "/api/#{site.domain}/segments/#{segment.id}", %{
++          "name" => "updated name",
++          "type" => Atom.to_string(:personal)
++        })
++        |> json_response(200)
++
++      assert %{
++               "id" => segment.id,
++               "name" => "updated name",
++               "type" => Atom.to_string(:personal),
++               "owner_id" => user.id,
++               "segment_data" => segment.segment_data,
++               "inserted_at" => NaiveDateTime.to_iso8601(segment.inserted_at)
++             } == Map.drop(response, ["updated_at"])
++
++      assert response["updated_at"] > response["inserted_at"]
++    end
++  end
++
++  describe "DELETE /api/:domain/segments/:segment_id" do
++    setup [:create_user, :create_site, :log_in]
++
++    test "forbids viewers from deleting site segments", %{conn: conn, user: user} do
++      site = new_site()
++      add_guest(site, user: user, role: :viewer)
++
++      segment =
++        insert(:segment,
++          site: site,
++          name: "any",
++          type: :site,
++          owner_id: user.id
++        )
++
++      conn =
++        delete(conn, "/api/#{site.domain}/segments/#{segment.id}")
++
++      assert json_response(conn, 403) == %{
++               "error" => "Not enough permissions to delete segment"
++             }
++
++      verify_segment_in_db(segment)
++    end
++
++    for %{role: role, type: type} <- [
++          %{role: :viewer, type: :personal},
++          %{role: :editor, type: :personal},
++          %{role: :editor, type: :site}
++        ] do
++      test "#{role} can delete segment with type \"#{type}\" successfully",
++           %{conn: conn, user: user} do
++        site = new_site()
++        add_guest(site, user: user, role: unquote(role))
++
++        segment =
++          insert(:segment,
++            site: site,
++            name: "any",
++            type: unquote(type),
++            owner: user
++          )
++
++        response =
++          delete(conn, "/api/#{site.domain}/segments/#{segment.id}")
++          |> json_response(200)
++
++        assert %{
++                 "owner_id" => user.id,
++                 "id" => segment.id,
++                 "name" => segment.name,
++                 "segment_data" => segment.segment_data,
++                 "type" => "#{unquote(type)}",
++                 "inserted_at" => NaiveDateTime.to_iso8601(segment.inserted_at),
++                 "updated_at" => NaiveDateTime.to_iso8601(segment.updated_at)
++               } == response
++
++        verify_no_segment_in_db(segment)
++      end
++    end
++  end
++
++  defp verify_segment_in_db(segment) do
++    uncomparable_keys = [:__meta__, :site]
++
++    assert Map.drop(Repo.get(Plausible.Segment, segment.id), uncomparable_keys) ==
++             Map.drop(segment, uncomparable_keys)
++  end
++
++  defp verify_no_segment_in_db(segment) do
++    assert Repo.get(Plausible.Segment, segment.id) == nil
++  end
++end
+diff --git a/test/plausible_web/plugs/feature_flag_check_plug_test.exs b/test/plausible_web/plugs/feature_flag_check_plug_test.exs
+new file mode 100644
+index 000000000000..97aaaf6bbede
+--- /dev/null
++++ b/test/plausible_web/plugs/feature_flag_check_plug_test.exs
+@@ -0,0 +1,46 @@
++defmodule PlausibleWeb.Plugs.FeatureFlagCheckPlugTest do
++  use PlausibleWeb.ConnCase, async: true
++  use Plausible.Teams.Test
++  alias PlausibleWeb.Plugs.{AuthorizeSiteAccess, FeatureFlagCheckPlug}
++
++  setup [:create_user, :log_in, :create_site]
++
++  test "returns 404 when any of the expected feature flags is not enabled", %{
++    conn: conn,
++    site: site
++  } do
++    # currently enabled flags are defined test/test_helper.exs
++    required_flags =
++      FeatureFlagCheckPlug.init([:missing_feature_flag, :channels, :saved_segments])
++
++    conn =
++      conn
++      |> get_conn_with_current_user_and_site(site)
++      |> FeatureFlagCheckPlug.call(required_flags)
++
++    assert conn.halted
++    assert %{"error" => "Not found"} == json_response(conn, 404)
++  end
++
++  test "passes conn when required flags are enabled", %{
++    conn: conn,
++    site: site
++  } do
++    # currently enabled flags are defined test/test_helper.exs
++    required_flags = FeatureFlagCheckPlug.init([:channels, :saved_segments])
++
++    conn =
++      conn
++      |> get_conn_with_current_user_and_site(site)
++      |> FeatureFlagCheckPlug.call(required_flags)
++
++    assert !conn.halted
++  end
++
++  defp get_conn_with_current_user_and_site(%Plug.Conn{} = conn, %Plausible.Site{} = site) do
++    conn
++    |> bypass_through(PlausibleWeb.Router)
++    |> get("/plug-tests/api-basic?site=#{site.domain}")
++    |> AuthorizeSiteAccess.call(AuthorizeSiteAccess.init({:all_roles, "site"}))
++  end
++end
+diff --git a/test/support/factory.ex b/test/support/factory.ex
+index 30165d7075a1..b74ef7929565 100644
+--- a/test/support/factory.ex
++++ b/test/support/factory.ex
+@@ -378,6 +378,12 @@ defmodule Plausible.Factory do
+     }
+   end
+ 
++  def segment_factory do
++    %Plausible.Segment{
++      segment_data: %{"filters" => [["is", "visit:entry_page", ["/blog"]]]}
++    }
++  end
++
+   defp hash_key() do
+     Keyword.fetch!(
+       Application.get_env(:plausible, PlausibleWeb.Endpoint),
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index fef0ce84c6b1..f2114ce256ff 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -9,6 +9,7 @@ Application.ensure_all_started(:double)
+ FunWithFlags.enable(:channels)
+ FunWithFlags.enable(:scroll_depth)
+ FunWithFlags.enable(:teams)
++FunWithFlags.enable(:saved_segments)
+ 
+ Ecto.Adapters.SQL.Sandbox.mode(Plausible.Repo, :manual)
+ 

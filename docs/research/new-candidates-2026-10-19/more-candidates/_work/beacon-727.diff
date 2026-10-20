@@ -1,0 +1,368 @@
+diff --git a/dev.exs b/dev.exs
+index 679178837..121520be2 100644
+--- a/dev.exs
++++ b/dev.exs
+@@ -44,7 +44,7 @@ Demo.Repo.stop()
+ 
+ Application.put_env(:beacon, DemoWeb.Endpoint,
+   adapter: Bandit.PhoenixAdapter,
+-  http: [ip: {127, 0, 0, 1}, port: 4001],
++  http: [ip: {0, 0, 0, 0}, port: 4001],
+   server: true,
+   live_view: [signing_salt: "aaaaaaaa"],
+   secret_key_base: String.duplicate("a", 64),
+diff --git a/lib/beacon/runtime_css.ex b/lib/beacon/runtime_css.ex
+index bfb09cba8..ceafc69aa 100644
+--- a/lib/beacon/runtime_css.ex
++++ b/lib/beacon/runtime_css.ex
+@@ -44,17 +44,13 @@ defmodule Beacon.RuntimeCSS do
+   end
+ 
+   @doc false
+-  def fetch(site, version \\ :compressed)
++  def fetch(site, version \\ :brotli)
++  def fetch(site, :brotli), do: do_fetch(site, {:_, :_, :"$1", :_})
++  def fetch(site, :gzip), do: do_fetch(site, {:_, :_, :_, :"$1"})
++  def fetch(site, :deflate), do: do_fetch(site, {:_, :"$1", :_, :_})
+ 
+-  def fetch(site, :compressed) do
+-    case :ets.match(:beacon_assets, {{site, :css}, {:_, :_, :"$1"}}) do
+-      [[css]] -> css
+-      _ -> "/* CSS not found for site #{inspect(site)} */"
+-    end
+-  end
+-
+-  def fetch(site, :uncompressed) do
+-    case :ets.match(:beacon_assets, {{site, :css}, {:_, :"$1", :_}}) do
++  defp do_fetch(site, guard) do
++    case :ets.match(:beacon_assets, {{site, :css}, guard}) do
+       [[css]] -> css
+       _ -> "/* CSS not found for site #{inspect(site)} */"
+     end
+@@ -62,22 +58,32 @@ defmodule Beacon.RuntimeCSS do
+ 
+   @doc false
+   def load!(site) do
+-    {:ok, css} = compile(site)
+-
+-    case ExBrotli.compress(css) do
+-      {:ok, compressed} ->
+-        hash = Base.encode16(:crypto.hash(:md5, css), case: :lower)
+-        true = :ets.insert(:beacon_assets, {{site, :css}, {hash, css, compressed}})
+-        :ok
+-
+-      error ->
+-        raise Beacon.LoaderError, "failed to compress css: #{inspect(error)}"
++    css =
++      case compile(site) do
++        {:ok, css} -> css
++        {:error, error} -> raise Beacon.LoaderError, "failed to compile css: #{inspect(error)}"
++      end
++
++    hash = Base.encode16(:crypto.hash(:md5, css), case: :lower)
++
++    brotli =
++      case ExBrotli.compress(css) do
++        {:ok, content} -> content
++        _ -> nil
++      end
++
++    gzip = :zlib.gzip(css)
++
++    if :ets.insert(:beacon_assets, {{site, :css}, {hash, css, brotli, gzip}}) do
++      :ok
++    else
++      raise Beacon.LoaderError, "failed to compress css"
+     end
+   end
+ 
+   @doc false
+   def current_hash(site) do
+-    case :ets.match(:beacon_assets, {{site, :css}, {:"$1", :_, :_}}) do
++    case :ets.match(:beacon_assets, {{site, :css}, {:"$1", :_, :_, :_}}) do
+       [[hash]] ->
+         hash
+ 
+diff --git a/lib/beacon/runtime_js.ex b/lib/beacon/runtime_js.ex
+index f0bf7a69f..594fda3e3 100644
+--- a/lib/beacon/runtime_js.ex
++++ b/lib/beacon/runtime_js.ex
+@@ -33,8 +33,13 @@ defmodule Beacon.RuntimeJS do
+     |> IO.iodata_to_binary()
+   end
+ 
+-  def fetch do
+-    case :ets.match(:beacon_assets, {:js, {:_, :_, :"$1"}}) do
++  def fetch(version \\ :brotli)
++  def fetch(:brotli), do: do_fetch({:_, :_, :"$1", :_})
++  def fetch(:gzip), do: do_fetch({:_, :_, :_, :"$1"})
++  def fetch(:deflate), do: do_fetch({:_, :"$1", :_, :_})
++
++  defp do_fetch(guard) do
++    case :ets.match(:beacon_assets, {:js, guard}) do
+       [[js]] -> js
+       _ -> "// JS not found"
+     end
+@@ -43,19 +48,25 @@ defmodule Beacon.RuntimeJS do
+   def load! do
+     js = build()
+ 
+-    case ExBrotli.compress(js) do
+-      {:ok, compressed} ->
+-        hash = Base.encode16(:crypto.hash(:md5, js), case: :lower)
+-        true = :ets.insert(:beacon_assets, {:js, {hash, js, compressed}})
+-        :ok
++    hash = Base.encode16(:crypto.hash(:md5, js), case: :lower)
++
++    brotli =
++      case ExBrotli.compress(js) do
++        {:ok, content} -> content
++        _ -> nil
++      end
++
++    gzip = :zlib.gzip(js)
+ 
+-      error ->
+-        raise Beacon.LoaderError, "failed to compress js: #{inspect(error)}"
++    if :ets.insert(:beacon_assets, {:js, {hash, js, brotli, gzip}}) do
++      :ok
++    else
++      raise Beacon.LoaderError, "failed to compress js"
+     end
+   end
+ 
+   def current_hash do
+-    case :ets.match(:beacon_assets, {:js, {:"$1", :_, :_}}) do
++    case :ets.match(:beacon_assets, {:js, {:"$1", :_, :_, :_}}) do
+       [[hash]] -> hash
+       _ -> nil
+     end
+diff --git a/lib/beacon/web/components/layouts.ex b/lib/beacon/web/components/layouts.ex
+index 8e98d2922..b3469d7f0 100644
+--- a/lib/beacon/web/components/layouts.ex
++++ b/lib/beacon/web/components/layouts.ex
+@@ -22,7 +22,8 @@ defmodule Beacon.Web.Layouts do
+   # TODO: style nonce
+   def asset_path(conn, asset) when asset in [:css, :js] do
+     site = site(conn)
+-    prefix = router(conn).__beacon_scoped_prefix_for_site__(site)
++    router = router(conn)
++    prefix = router.__beacon_scoped_prefix_for_site__(site)
+ 
+     hash =
+       cond do
+@@ -31,7 +32,7 @@ defmodule Beacon.Web.Layouts do
+       end
+ 
+     path = Beacon.Router.sanitize_path("#{prefix}/__beacon_assets__/#{asset}-#{hash}")
+-    Phoenix.VerifiedRoutes.unverified_path(conn, conn.private.phoenix_router, path)
++    Phoenix.VerifiedRoutes.unverified_path(conn, router, path)
+   end
+ 
+   defp site(%{assigns: %{beacon: %{site: site}}}), do: site
+diff --git a/lib/beacon/web/controllers/assets_controller.ex b/lib/beacon/web/controllers/assets_controller.ex
+index 560401022..f047b0ee3 100644
+--- a/lib/beacon/web/controllers/assets_controller.ex
++++ b/lib/beacon/web/controllers/assets_controller.ex
+@@ -4,10 +4,24 @@ defmodule Beacon.Web.AssetsController do
+ 
+   import Plug.Conn
+ 
++  @brotli "br"
++  @gzip "gzip"
++
+   def init(asset) when asset in [:css_config, :css, :js], do: asset
+ 
+   def call(%{assigns: %{site: site}, params: %{"md5" => hash}} = conn, asset) when asset in [:css, :js] when is_binary(hash) do
+-    {content, content_type} = content_and_type(site, asset)
++    accept_encoding =
++      case get_req_header(conn, "accept-encoding") do
++        [] -> []
++        [value] -> Plug.Conn.Utils.list(value)
++      end
++
++    content =
++      cond do
++        @brotli in accept_encoding -> content_and_type(site, asset, :brotli)
++        @gzip in accept_encoding -> content_and_type(site, asset, :gzip)
++        :else -> content_and_type(site, asset, :deflate)
++      end
+ 
+     # The static files are served for sites,
+     # and we need to disable csrf protection because
+@@ -15,16 +29,22 @@ defmodule Beacon.Web.AssetsController do
+     conn = put_private(conn, :plug_skip_csrf_protection, true)
+ 
+     conn
+-    |> put_resp_header("content-type", content_type)
++    |> then(fn conn ->
++      if content.encoding do
++        put_resp_header(conn, "content-encoding", content.encoding)
++      else
++        conn
++      end
++    end)
++    |> put_resp_header("content-type", content.type)
+     |> put_resp_header("cache-control", "public, max-age=31536000, immutable")
+-    |> put_resp_header("content-encoding", "br")
+-    |> send_resp(200, content)
++    |> send_resp(200, content.body)
+     |> halt()
+   end
+ 
+   # TODO: encoding (compress) and caching
+   def call(%{assigns: %{site: site}} = conn, :css_config) do
+-    {content, content_type} = content_and_type(site, :css_config)
++    content = content_and_type(site, :css_config)
+ 
+     # The static files are served for sites,
+     # and we need to disable csrf protection because
+@@ -32,9 +52,9 @@ defmodule Beacon.Web.AssetsController do
+     conn = put_private(conn, :plug_skip_csrf_protection, true)
+ 
+     conn
+-    |> put_resp_header("content-type", content_type)
++    |> put_resp_header("content-type", content.type)
+     |> put_resp_header("access-control-allow-origin", "*")
+-    |> send_resp(200, content)
++    |> send_resp(200, content.body)
+     |> halt()
+   end
+ 
+@@ -42,15 +62,43 @@ defmodule Beacon.Web.AssetsController do
+     raise Beacon.Web.ServerError, "failed to serve asset #{asset}"
+   end
+ 
+-  defp content_and_type(site, :css) do
+-    {Beacon.RuntimeCSS.fetch(site), "text/css"}
++  defp content_and_type(site, :css, :brotli) do
++    body = Beacon.RuntimeCSS.fetch(site, :brotli)
++
++    if body do
++      %{body: body, type: "text/css", encoding: @brotli}
++    else
++      content_and_type(site, :css, :gzip)
++    end
++  end
++
++  defp content_and_type(site, :css, :gzip) do
++    %{body: Beacon.RuntimeCSS.fetch(site, :gzip), type: "text/css", encoding: @gzip}
++  end
++
++  defp content_and_type(site, :css, :deflate) do
++    %{body: Beacon.RuntimeCSS.fetch(site, :deflate), type: "text/css", encoding: nil}
++  end
++
++  defp content_and_type(site, :js, :brotli) do
++    body = Beacon.RuntimeJS.fetch(:brotli)
++
++    if body do
++      %{body: body, type: "text/javascript", encoding: @brotli}
++    else
++      content_and_type(site, :js, :gzip)
++    end
++  end
++
++  defp content_and_type(_site, :js, :gzip) do
++    %{body: Beacon.RuntimeJS.fetch(:gzip), type: "text/javascript", encoding: @gzip}
+   end
+ 
+-  defp content_and_type(_site, :js) do
+-    {Beacon.RuntimeJS.fetch(), "text/javascript"}
++  defp content_and_type(_site, :js, :deflate) do
++    %{body: Beacon.RuntimeJS.fetch(:deflate), type: "text/javascript", encoding: nil}
+   end
+ 
+   defp content_and_type(site, :css_config) do
+-    {Beacon.RuntimeCSS.config(site), "text/javascript"}
++    %{body: Beacon.RuntimeCSS.config(site), type: "text/javascript"}
+   end
+ end
+diff --git a/test/beacon/runtime_css_test.exs b/test/beacon/runtime_css_test.exs
+index 55e2bea8d..11e1aa88a 100644
+--- a/test/beacon/runtime_css_test.exs
++++ b/test/beacon/runtime_css_test.exs
+@@ -7,7 +7,15 @@ defmodule Beacon.RuntimeCSSTest do
+ 
+   test "load!" do
+     assert RuntimeCSS.load!(@site) == :ok
++  end
++
++  test "fetch defaults to compressed" do
++    RuntimeCSS.load!(@site)
+     assert @site |> RuntimeCSS.fetch() |> :erlang.size() > 100
+-    assert RuntimeCSS.fetch(@site, :uncompressed) =~ "/* tailwind"
++  end
++
++  test "fetch uncompressed deflate" do
++    RuntimeCSS.load!(@site)
++    assert RuntimeCSS.fetch(@site, :deflate) =~ "/* tailwind"
+   end
+ end
+diff --git a/test/beacon/runtime_js_test.exs b/test/beacon/runtime_js_test.exs
+index f97f487ea..918a133d3 100644
+--- a/test/beacon/runtime_js_test.exs
++++ b/test/beacon/runtime_js_test.exs
+@@ -5,6 +5,15 @@ defmodule Beacon.RuntimeJSTest do
+ 
+   test "load" do
+     assert RuntimeJS.load!() == :ok
++  end
++
++  test "fetch defaults to compressed" do
++    RuntimeJS.load!()
+     assert RuntimeJS.fetch() |> :erlang.size() > 100
+   end
++
++  test "fetch uncompressed deflate" do
++    RuntimeJS.load!()
++    assert RuntimeJS.fetch(:deflate) =~ "Beacon"
++  end
+ end
+diff --git a/test/beacon_web/controllers/assets_controller_test.exs b/test/beacon_web/controllers/assets_controller_test.exs
+new file mode 100644
+index 000000000..85e62de96
+--- /dev/null
++++ b/test/beacon_web/controllers/assets_controller_test.exs
+@@ -0,0 +1,41 @@
++defmodule Beacon.Web.Controllers.AssetsControllerTest do
++  use Beacon.Web.ConnCase, async: true
++
++  setup %{conn: conn} do
++    conn =
++      conn
++      |> Plug.Conn.assign(:beacon, %{site: :my_site})
++      |> Plug.Conn.put_private(:phoenix_router, Beacon.BeaconTest.Router)
++
++    path = Beacon.Web.Layouts.asset_path(conn, :js)
++
++    [conn: conn, path: path]
++  end
++
++  test "brotli has preference", %{conn: conn, path: path} do
++    conn =
++      conn
++      |> put_req_header("accept-encoding", "deflate, gzip, br")
++      |> get(path)
++
++    assert get_resp_header(conn, "content-encoding") == ["br"]
++  end
++
++  test "fallback to gzip when brotli is not accepted", %{conn: conn, path: path} do
++    conn =
++      conn
++      |> put_req_header("accept-encoding", "gzip, deflate")
++      |> get(path)
++
++    assert get_resp_header(conn, "content-encoding") == ["gzip"]
++  end
++
++  test "fallback to deflate when compression is not accepted", %{conn: conn, path: path} do
++    conn =
++      conn
++      |> put_req_header("accept-encoding", "")
++      |> get(path)
++
++    assert get_resp_header(conn, "content-encoding") == []
++  end
++end

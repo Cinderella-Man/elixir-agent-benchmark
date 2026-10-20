@@ -1,0 +1,266 @@
+diff --git a/lib/absinthe/phase/document/validation/arguments_of_correct_type.ex b/lib/absinthe/phase/document/validation/arguments_of_correct_type.ex
+index 5640742b18..7ae4d9b53e 100644
+--- a/lib/absinthe/phase/document/validation/arguments_of_correct_type.ex
++++ b/lib/absinthe/phase/document/validation/arguments_of_correct_type.ex
+@@ -3,7 +3,7 @@ defmodule Absinthe.Phase.Document.Validation.ArgumentsOfCorrectType do
+ 
+   # Validates document to ensure that all arguments are of the correct type.
+ 
+-  alias Absinthe.{Blueprint, Phase, Schema, Type}
++  alias Absinthe.{Blueprint, Phase, Phase.Document.Validation.Utils, Schema, Type}
+ 
+   use Absinthe.Phase
+ 
+@@ -79,7 +79,14 @@ defmodule Absinthe.Phase.Document.Validation.ArgumentsOfCorrectType do
+     node.fields
+     |> Enum.flat_map(fn
+       %{flags: %{invalid: _}, schema_node: nil} = child ->
+-        [unknown_field_error_message(child.name)]
++        field_suggestions =
++          case Type.unwrap(node.schema_node) do
++            %Type.Scalar{} -> []
++            %Type.Enum{} -> []
++            _ -> suggested_field_names(node.schema_node, child.name)
++          end
++
++        [unknown_field_error_message(child.name, field_suggestions)]
+ 
+       %{flags: %{invalid: _}} = child ->
+         child_type_name =
+@@ -113,6 +120,13 @@ defmodule Absinthe.Phase.Document.Validation.ArgumentsOfCorrectType do
+     []
+   end
+ 
++  defp suggested_field_names(schema_node, name) do
++    schema_node.fields
++    |> Map.values()
++    |> Enum.map(& &1.name)
++    |> Absinthe.Utils.Suggestion.sort_list(name)
++  end
++
+   # Generate the error for the node
+   @spec error(Blueprint.node_t(), String.t()) :: Phase.Error.t()
+   defp error(node, message) do
+@@ -142,10 +156,17 @@ defmodule Absinthe.Phase.Document.Validation.ArgumentsOfCorrectType do
+     ~s(In field "#{id}": ) <> expected_type_error_message(expected_type_name, inspected_value)
+   end
+ 
+-  def unknown_field_error_message(field_name) do
++  def unknown_field_error_message(field_name, suggestions \\ [])
++
++  def unknown_field_error_message(field_name, []) do
+     ~s(In field "#{field_name}": Unknown field.)
+   end
+ 
++  def unknown_field_error_message(field_name, suggestions) do
++    ~s(In field "#{field_name}": Unknown field.) <>
++      Utils.MessageSuggestions.suggest_message(suggestions)
++  end
++
+   defp expected_type_error_message(expected_type_name, inspected_value) do
+     ~s(Expected type "#{expected_type_name}", found #{inspected_value}.)
+   end
+diff --git a/lib/absinthe/phase/document/validation/fields_on_correct_type.ex b/lib/absinthe/phase/document/validation/fields_on_correct_type.ex
+index ff09776095..9d36d59107 100644
+--- a/lib/absinthe/phase/document/validation/fields_on_correct_type.ex
++++ b/lib/absinthe/phase/document/validation/fields_on_correct_type.ex
+@@ -3,7 +3,7 @@ defmodule Absinthe.Phase.Document.Validation.FieldsOnCorrectType do
+ 
+   # Validates document to ensure that all fields are provided on the correct type.
+ 
+-  alias Absinthe.{Blueprint, Phase, Schema, Type}
++  alias Absinthe.{Blueprint, Phase, Phase.Document.Validation.Utils, Schema, Type}
+ 
+   use Absinthe.Phase
+ 
+@@ -152,8 +152,6 @@ defmodule Absinthe.Phase.Document.Validation.FieldsOnCorrectType do
+     }
+   end
+ 
+-  @suggest 5
+-
+   @doc """
+   Generate an error for a field
+   """
+@@ -166,13 +164,12 @@ defmodule Absinthe.Phase.Document.Validation.FieldsOnCorrectType do
+ 
+   def error_message(field_name, type_name, [], field_suggestions) do
+     error_message(field_name, type_name) <>
+-      " Did you mean " <> to_quoted_or_list(field_suggestions |> Enum.take(@suggest)) <> "?"
++      Utils.MessageSuggestions.suggest_message(field_suggestions)
+   end
+ 
+   def error_message(field_name, type_name, type_suggestions, []) do
+     error_message(field_name, type_name) <>
+-      " Did you mean to use an inline fragment on " <>
+-      to_quoted_or_list(type_suggestions |> Enum.take(@suggest)) <> "?"
++      Utils.MessageSuggestions.suggest_fragment_message(type_suggestions)
+   end
+ 
+   def error_message(field_name, type_name, type_suggestions, _) do
+@@ -268,21 +265,4 @@ defmodule Absinthe.Phase.Document.Validation.FieldsOnCorrectType do
+   defp type_with_field?(_, _) do
+     false
+   end
+-
+-  defp to_quoted_or_list([a]), do: ~s("#{a}")
+-  defp to_quoted_or_list([a, b]), do: ~s("#{a}" or "#{b}")
+-  defp to_quoted_or_list(other), do: to_longer_quoted_or_list(other)
+-
+-  defp to_longer_quoted_or_list(list, acc \\ "")
+-  defp to_longer_quoted_or_list([word], acc), do: acc <> ~s(, or "#{word}")
+-
+-  defp to_longer_quoted_or_list([word | rest], "") do
+-    rest
+-    |> to_longer_quoted_or_list(~s("#{word}"))
+-  end
+-
+-  defp to_longer_quoted_or_list([word | rest], acc) do
+-    rest
+-    |> to_longer_quoted_or_list(acc <> ~s(, "#{word}"))
+-  end
+ end
+diff --git a/lib/absinthe/phase/document/validation/utils/message_suggestions.ex b/lib/absinthe/phase/document/validation/utils/message_suggestions.ex
+new file mode 100644
+index 0000000000..37a113acdf
+--- /dev/null
++++ b/lib/absinthe/phase/document/validation/utils/message_suggestions.ex
+@@ -0,0 +1,32 @@
++defmodule Absinthe.Phase.Document.Validation.Utils.MessageSuggestions do
++  @suggest 5
++
++  @doc """
++  Generate an suggestions message for a incorrect field
++  """
++  def suggest_message(suggestions) do
++    " Did you mean " <> to_quoted_or_list(suggestions |> Enum.take(@suggest)) <> "?"
++  end
++
++  def suggest_fragment_message(suggestions) do
++    " Did you mean to use an inline fragment on " <>
++      to_quoted_or_list(suggestions |> Enum.take(@suggest)) <> "?"
++  end
++
++  defp to_quoted_or_list([a]), do: ~s("#{a}")
++  defp to_quoted_or_list([a, b]), do: ~s("#{a}" or "#{b}")
++  defp to_quoted_or_list(other), do: to_longer_quoted_or_list(other)
++
++  defp to_longer_quoted_or_list(list, acc \\ "")
++  defp to_longer_quoted_or_list([word], acc), do: acc <> ~s(, or "#{word}")
++
++  defp to_longer_quoted_or_list([word | rest], "") do
++    rest
++    |> to_longer_quoted_or_list(~s("#{word}"))
++  end
++
++  defp to_longer_quoted_or_list([word | rest], acc) do
++    rest
++    |> to_longer_quoted_or_list(acc <> ~s(, "#{word}"))
++  end
++end
+diff --git a/test/absinthe/execution/arguments/input_object_test.exs b/test/absinthe/execution/arguments/input_object_test.exs
+index 8bba00615f..882cffef0c 100644
+--- a/test/absinthe/execution/arguments/input_object_test.exs
++++ b/test/absinthe/execution/arguments/input_object_test.exs
+@@ -155,4 +155,52 @@ defmodule Absinthe.Execution.Arguments.InputObjectTest do
+       run(@graphql, @schema)
+     )
+   end
++
++  @graphql """
++  query ($contact: ContactInput!) {
++    user(contact: $contact)
++  }
++  """
++
++  test "return field error with suggestion" do
++    assert_error_message_lines(
++      [
++        ~s(Argument "contact" has invalid value $contact.),
++        ~s(In field "default_with_stream": Unknown field. Did you mean "default_with_string"?)
++      ],
++      run(@graphql, @schema,
++        variables: %{"contact" => %{"email" => "bubba@joe.com", "default_with_stream" => "asdf"}}
++      )
++    )
++  end
++
++  test "return field error with multiple suggestions" do
++    assert_error_message_lines(
++      [
++        ~s(Argument "contact" has invalid value $contact.),
++        ~s(In field "contact_typo": Unknown field. Did you mean "contact_type"?),
++        ~s(In field "default_with_stream": Unknown field. Did you mean "default_with_string"?)
++      ],
++      run(@graphql, @schema,
++        variables: %{
++          "contact" => %{
++            "email" => "bubba@joe.com",
++            "default_with_stream" => "asdf",
++            "contact_typo" => "foo"
++          }
++        }
++      )
++    )
++  end
++
++  test "return field error with suggestion for non-null field" do
++    assert_error_message_lines(
++      [
++        ~s(Argument "contact" has invalid value $contact.),
++        ~s(In field "email": Expected type "String!", found null.),
++        ~s(In field "mail": Unknown field. Did you mean "email"?)
++      ],
++      run(@graphql, @schema, variables: %{"contact" => %{"mail" => "bubba@joe.com"}})
++    )
++  end
+ end
+diff --git a/test/absinthe/phase/document/validation/arguments_of_correct_type_test.exs b/test/absinthe/phase/document/validation/arguments_of_correct_type_test.exs
+index e8e4e48ae0..83a6bffa3b 100644
+--- a/test/absinthe/phase/document/validation/arguments_of_correct_type_test.exs
++++ b/test/absinthe/phase/document/validation/arguments_of_correct_type_test.exs
+@@ -919,7 +919,7 @@ defmodule Absinthe.Phase.Document.Validation.ArgumentsOfCorrectTypeTest do
+       )
+     end
+ 
+-    test "Partial object, unknown field arg" do
++    test "Partial object, unknown field arg without suggestion" do
+       assert_fails_validation(
+         """
+         {
+@@ -943,6 +943,35 @@ defmodule Absinthe.Phase.Document.Validation.ArgumentsOfCorrectTypeTest do
+         )
+       )
+     end
++
++    test "Partial object, unknown field arg with suggestion" do
++      assert_fails_validation(
++        """
++        {
++          complicatedArgs {
++            complexArgField(complexArg: {
++              requiredField: true,
++              strinField: "value"
++            })
++          }
++        }
++        """,
++        [],
++        bad_argument(
++          "complexArg",
++          "ComplexInput",
++          ~s({requiredField: true, strinField: "value"}),
++          3,
++          [
++            @phase.unknown_field_error_message("strinField", [
++              "string_list_field",
++              "int_field",
++              "string_field"
++            ])
++          ]
++        )
++      )
++    end
+   end
+ 
+   describe "Directive arguments" do

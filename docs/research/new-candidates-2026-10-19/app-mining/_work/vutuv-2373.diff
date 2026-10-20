@@ -1,0 +1,311 @@
+diff --git a/docs/architecture/profiles.md b/docs/architecture/profiles.md
+index 9444a6dfe..b492cd10b 100644
+--- a/docs/architecture/profiles.md
++++ b/docs/architecture/profiles.md
+@@ -599,14 +599,16 @@ and a display-only verification `url` (scheme-validated to http(s), **never
+ fetched server-side** — SSRF). A nullable `education_id` FK is reserved for issue
+ #857 (folding degrees into this table) and is always NULL today.
+ 
+-**Expired credentials are hidden from the public and shown to the owner.**
+-`Qualification.visible_to(owner?)` is the single SQL scope for this: the profile
+-preload (through `owner?`), the public `/:slug/qualifications` page, the CV and
+-the agent docs all compose it, so they hide the same lapsed entries; the owner's
+-own profile card and the `/settings/qualifications` editor show all of theirs and
+-mark the lapsed ones with an "Expired" badge (`Qualification.expired?/2`, the
+-per-entry twin of the scope — keep the two in sync). Entries display most
+-recently awarded first (`Qualification.ordered/1`).
++**Visitors see every credential the owner sees, expired ones included**: a
++lapsed certificate still counts for a CV. Every surface reads
++`Qualification.valid_first/1 |> Qualification.ordered/1` (valid first, then most
++recently awarded) and splits the list with `QualificationHTML.split_expired/1`:
++the profile card folds the expired ones under "Previously held", the section
++page gives them their own heading, the CV labels them "expired 2017", the agent
++docs flag them `expired`, and JSON-LD names only the valid ones. Two entries of
++the same name stay two entries: a member who renewed a certificate and kept the
++old period on record wants both shown. `Qualification.expired?/2` is the
++per-entry twin of the SQL order; keep the two in sync.
+ 
+ The **profile card** carries an All / Certificates / Licenses tabber (a
+ `phx-click` filter on `UserProfileLive`, shown only when the member holds both
+@@ -646,8 +648,8 @@ which silently drops.
+ the "Mit Qualifikation: …" line (naming and linking the credential), shared by
+ the profile Experience card, the section page and the entry show page. The
+ display policy lives in `WorkExperience.cited_qualification/1`: a lapsed
+-credential keeps showing on the jobs it earned (deliberately not scoped by
+-`Qualification.visible_to/2`), and every rendering surface preloads through
++credential keeps showing on the jobs it earned, and every rendering surface
++preloads through
+ `WorkExperience.display_preloads/0`. The
+ agent formats carry it too (`SectionDocs.work_entry/1` adds a
+ `qualification: {id, name, kind}` ref; md/txt show a bracketed "With
+diff --git a/lib/vutuv/profiles/qualification.ex b/lib/vutuv/profiles/qualification.ex
+index 577f81246..c1c4ab5ef 100644
+--- a/lib/vutuv/profiles/qualification.ex
++++ b/lib/vutuv/profiles/qualification.ex
+@@ -239,9 +239,8 @@ defmodule Vutuv.Profiles.Qualification do
+   the whole of that year.
+ 
+   The per-entry predicate that sorts an entry into the "Previously held" group;
+-  `expired_dynamic/0` is its SQL twin behind `visible_to/2` and
+-  `valid_first/1`. Keep the two in sync: they must agree on when a credential
+-  is still valid.
++  `expired_dynamic/0` is its SQL twin behind `valid_first/1`. Keep the two in
++  sync: they must agree on when a credential is still valid.
+   """
+   def expired?(qualification, today \\ BerlinTime.today())
+   def expired?(%__MODULE__{expires_year: nil}, _today), do: false
+@@ -264,41 +263,6 @@ defmodule Vutuv.Profiles.Qualification do
+     )
+   end
+ 
+-  @doc """
+-  Scopes the query to the entries a visitor may see. The owner (`true`) sees
+-  every entry. Everyone else sees expired credentials too, since a lapsed
+-  certificate still tells a CV something, but not one a renewal replaced: an
+-  expired entry is dropped when the member holds another entry of the same
+-  name (case and outer spaces ignored) that expires later or never. Of a chain
+-  that lapsed entirely, the latest entry stays. Kept in SQL so the profile
+-  card, the public section page, the CV and the agent formats agree.
+-  """
+-  def visible_to(query \\ __MODULE__, owner?)
+-  def visible_to(query, true), do: query
+-
+-  def visible_to(query, false) do
+-    renewals =
+-      from(r in __MODULE__,
+-        where:
+-          r.user_id == parent_as(:qualification).user_id and
+-            r.id != parent_as(:qualification).id and
+-            fragment("lower(btrim(?))", r.name) ==
+-              fragment("lower(btrim(?))", parent_as(:qualification).name) and
+-            (is_nil(r.expires_year) or
+-               fragment(
+-                 "(?, coalesce(?, 12)) > (?, coalesce(?, 12))",
+-                 r.expires_year,
+-                 r.expires_month,
+-                 parent_as(:qualification).expires_year,
+-                 parent_as(:qualification).expires_month
+-               ))
+-      )
+-
+-    shown = dynamic(not (^expired_dynamic()) or not exists(subquery(renewals)))
+-
+-    from(q in query, as: :qualification, where: ^shown)
+-  end
+-
+   @doc """
+   Orders valid entries before expired ones, so a list read in this order splits
+   into the two groups the pages show, and a preview cut keeps the valid ones.
+diff --git a/lib/vutuv_web/agent_docs/profile_doc.ex b/lib/vutuv_web/agent_docs/profile_doc.ex
+index dc9dc81a1..bbfaccd4c 100644
+--- a/lib/vutuv_web/agent_docs/profile_doc.ex
++++ b/lib/vutuv_web/agent_docs/profile_doc.ex
+@@ -252,13 +252,12 @@ defmodule VutuvWeb.AgentDocs.ProfileDoc do
+       work_experiences:
+         {WorkExperience.order_by_date(WorkExperience), WorkExperience.display_preloads()},
+       educations: Education.order_by_date(Education),
+-      # The anonymous public view: valid credentials first, then the expired
+-      # ones a renewal did not replace, each flagged `expired`. The citing
++      # Valid credentials first, then the expired ones, each flagged
++      # `expired`. The citing
+       # jobs ride along for the usage facts (issue #1005).
+       qualifications:
+-        {Qualification.visible_to(false)
+-         |> Qualification.valid_first()
+-         |> Qualification.ordered(), Qualification.citing_jobs_preload()},
++        {Qualification.valid_first() |> Qualification.ordered(),
++         Qualification.citing_jobs_preload()},
+       # The same scope the profile card reads (`UserProfileLive`), so the doc
+       # and the page cannot disagree about which Zeugnisse are public.
+       job_references: {JobReference.public_scope(), :links},
+diff --git a/lib/vutuv_web/controllers/qualification_controller.ex b/lib/vutuv_web/controllers/qualification_controller.ex
+index 8a4438b02..f56df4f07 100644
+--- a/lib/vutuv_web/controllers/qualification_controller.ex
++++ b/lib/vutuv_web/controllers/qualification_controller.ex
+@@ -25,16 +25,15 @@ defmodule VutuvWeb.QualificationController do
+   # Index and show are also served as Markdown / text / JSON / XML via
+   # VutuvWeb.AgentDocs.SectionDocs (keep the templates and the doc builder in
+   # sync, see agent_docs_drift_test.exs). Both show the anonymous public view:
+-  # valid credentials first, then the expired ones a renewal did not replace.
++  # valid credentials first, then the expired ones.
+   def index(conn, _params) do
+     # citing_jobs_preload: the jobs earned with each credential ride along for
+     # the usage badges (issue #1005).
+     user =
+       Repo.preload(conn.assigns[:user],
+         qualifications:
+-          {Qualification.visible_to(false)
+-           |> Qualification.valid_first()
+-           |> Qualification.ordered(), Qualification.citing_jobs_preload()}
++          {Qualification.valid_first() |> Qualification.ordered(),
++           Qualification.citing_jobs_preload()}
+       )
+ 
+     AgentDocs.respond(conn,
+diff --git a/lib/vutuv_web/cv/cv.ex b/lib/vutuv_web/cv/cv.ex
+index c0975017e..98ced5156 100644
+--- a/lib/vutuv_web/cv/cv.ex
++++ b/lib/vutuv_web/cv/cv.ex
+@@ -253,12 +253,8 @@ defmodule VutuvWeb.CV do
+       # with (issue #858).
+       work_experiences: {WorkExperience.order_by_date(WorkExperience), [:qualification]},
+       educations: Education.order_by_date(Education),
+-      # A CV is a public document, so it reads the visitor scope: valid
+-      # credentials first, then the expired ones a renewal did not replace.
+-      qualifications:
+-        Qualification.visible_to(false)
+-        |> Qualification.valid_first()
+-        |> Qualification.ordered(),
++      # Valid credentials first, then the expired ones.
++      qualifications: Qualification.valid_first() |> Qualification.ordered(),
+       languages: Language.ordered(),
+       social_media_accounts: SocialMediaAccount.ordered(),
+       phone_numbers: PhoneNumber.ordered(),
+diff --git a/lib/vutuv_web/live/user_profile_live.ex b/lib/vutuv_web/live/user_profile_live.ex
+index fc801526f..17f597b60 100644
+--- a/lib/vutuv_web/live/user_profile_live.ex
++++ b/lib/vutuv_web/live/user_profile_live.ex
+@@ -874,7 +874,7 @@ defmodule VutuvWeb.UserProfileLive do
+     # runs — and one engagement read serves both.
+     [user, pinned_post, entries, press, cv_page | count_rows] =
+       Concurrent.run([
+-        fn -> preload_user_for_show(base_user, owner?) end,
++        fn -> preload_user_for_show(base_user) end,
+         fn -> Vutuv.Posts.pinned_post(base_user, current_user) end,
+         fn -> Vutuv.Posts.profile_posts(base_user, current_user, type: :all) end,
+         # The press kit (#2086). Not a preload and not a count arm: both shelves
+@@ -999,8 +999,7 @@ defmodule VutuvWeb.UserProfileLive do
+     |> assign(:education, user.educations)
+     |> assign(:education_groups, EducationHTML.profile_groups(user.educations))
+     |> assign(:languages, user.languages)
+-    # The preload already applied Qualification.visible_to(owner?) and put the
+-    # valid entries first; the card shows the expired ones folded away under
++    # The preload put the valid entries first; the card shows the expired ones folded away under
+     # "Previously held". JSON-LD reads :qualifications alone, so a search
+     # engine is never told a lapsed credential is held.
+     |> assign_qualifications(user.qualifications)
+@@ -1391,7 +1390,7 @@ defmodule VutuvWeb.UserProfileLive do
+   """
+   def preview_limit(section), do: Map.fetch!(@preview_limits, section)
+ 
+-  defp preload_user_for_show(user, owner?) do
++  defp preload_user_for_show(user) do
+     user
+     |> Repo.preload(
+       social_media_accounts: SocialMediaAccount.ordered(),
+@@ -1411,14 +1410,12 @@ defmodule VutuvWeb.UserProfileLive do
+       # its own in memory — a cut before the grouping drops whole categories.
+       educations: Education.order_by_date(Education),
+       languages: Language.ordered() |> limit(^preview_limit(:languages)),
+-      # visible_to(owner?) drops renewed credentials for visitors in SQL (the
+-      # same scope the section page, CV and agent docs use), so limit-after-
+-      # filter is correct; valid_first keeps the valid ones inside the preview
+-      # cut. citing_jobs_preload: the jobs earned with each credential ride
+-      # along for the usage badges (issue #1005).
++      # valid_first keeps the valid ones inside the preview cut (the same
++      # order the section page, CV and agent docs use). citing_jobs_preload:
++      # the jobs earned with each credential ride along for the usage badges
++      # (issue #1005).
+       qualifications:
+-        {Qualification.visible_to(owner?)
+-         |> Qualification.valid_first()
++        {Qualification.valid_first()
+          |> Qualification.ordered()
+          |> limit(^preview_limit(:qualifications)), Qualification.citing_jobs_preload()},
+       # Published Arbeitszeugnisse. No limit: a member holds a handful, and the
+diff --git a/lib/vutuv_web/templates/qualification/manage.html.heex b/lib/vutuv_web/templates/qualification/manage.html.heex
+index db019e806..b8a5dd78f 100644
+--- a/lib/vutuv_web/templates/qualification/manage.html.heex
++++ b/lib/vutuv_web/templates/qualification/manage.html.heex
+@@ -1,6 +1,6 @@
+ <%!-- The owner's editor for this section — the user-agnostic /settings URL
+ (whoever opens it edits their own data). The public twin at /:slug/qualifications
+-shows the plain showcase view (and hides credentials a renewal replaced). --%>
++shows the plain showcase view. --%>
+ <.settings_shell user={@user} active={:qualifications} title={gettext("Certificates & licenses")}>
+   <.card_section
+     empty={Enum.empty?(@qualifications)}
+diff --git a/test/vutuv/profiles/qualification_test.exs b/test/vutuv/profiles/qualification_test.exs
+index 24c6f1bea..cc0bed06c 100644
+--- a/test/vutuv/profiles/qualification_test.exs
++++ b/test/vutuv/profiles/qualification_test.exs
+@@ -284,41 +284,6 @@ defmodule Vutuv.Profiles.QualificationTest do
+     end
+   end
+ 
+-  describe "visible_to/2" do
+-    defp names(query, user),
+-      do: query |> where(user_id: ^user.id) |> Repo.all() |> Enum.map(& &1.name)
+-
+-    test "a visitor sees expired entries too; they still count for a CV" do
+-      user = insert(:user)
+-      insert(:qualification, user: user, name: "Current", expires_year: nil)
+-      insert(:qualification, user: user, name: "Lapsed", awarded_year: 2015, expires_year: 2018)
+-
+-      assert Enum.sort(names(Qualification.visible_to(false), user)) == ["Current", "Lapsed"]
+-    end
+-
+-    test "a visitor does not see an expired entry its renewal replaced; the owner does" do
+-      user = insert(:user)
+-      insert(:qualification, user: user, name: "AWS Pro", awarded_year: 2019, expires_year: 2022)
+-      insert(:qualification, user: user, name: "aws pro ", awarded_year: 2022, expires_year: 2040)
+-
+-      assert names(Qualification.visible_to(false), user) == ["aws pro "]
+-      assert length(names(Qualification.visible_to(true), user)) == 2
+-    end
+-
+-    test "of a chain that lapsed entirely, only the latest entry stays" do
+-      user = insert(:user)
+-      insert(:qualification, user: user, name: "CCNA", awarded_year: 2011, expires_year: 2014)
+-
+-      latest =
+-        insert(:qualification, user: user, name: "CCNA", awarded_year: 2014, expires_year: 2017)
+-
+-      assert [%{id: id}] =
+-               Qualification.visible_to(false) |> where(user_id: ^user.id) |> Repo.all()
+-
+-      assert id == latest.id
+-    end
+-  end
+-
+   describe "valid_first/1" do
+     test "puts every valid entry before the expired ones, newest first within each" do
+       user = insert(:user)
+diff --git a/test/vutuv_web/controllers/qualification_controller_test.exs b/test/vutuv_web/controllers/qualification_controller_test.exs
+index 121372509..210852cda 100644
+--- a/test/vutuv_web/controllers/qualification_controller_test.exs
++++ b/test/vutuv_web/controllers/qualification_controller_test.exs
+@@ -110,7 +110,17 @@ defmodule VutuvWeb.QualificationControllerTest do
+       assert former =~ "Lapsed cert"
+     end
+ 
+-    test "a renewed credential shows once on the public page", %{owner: owner} do
++    # A member who enters the same name twice wants both periods on the
++    # record (two CCNA terms from 2001 and 2009); a visitor sees what the
++    # owner sees.
++    test "a visitor sees every entry of a renewed credential", %{owner: owner} do
++      insert(:qualification,
++        user: owner,
++        name: "lapsed cert ",
++        awarded_year: 2010,
++        expires_year: 2012
++      )
++
+       insert(:qualification,
+         user: owner,
+         name: "Lapsed cert",
+@@ -119,9 +129,12 @@ defmodule VutuvWeb.QualificationControllerTest do
+       )
+ 
+       html = build_conn() |> get(~p"/#{owner}/qualifications") |> html_response(200)
++      [valid, former] = String.split(html, "data-former-qualifications", parts: 2)
+ 
+-      refute html =~ "data-former-qualifications"
+-      assert length(String.split(html, "Lapsed cert")) == 2
++      assert valid =~ "Lapsed cert"
++      assert former =~ "lapsed cert"
++      assert former =~ "2015"
++      assert former =~ "2010"
+     end
+ 
+     test "the CV lists expired credentials last, marked as expired", %{owner: owner} do

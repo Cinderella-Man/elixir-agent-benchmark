@@ -1,0 +1,125 @@
+diff --git a/lib/pinchflat/settings/setting.ex b/lib/pinchflat/settings/setting.ex
+index 2d6875477..c366ff024 100644
+--- a/lib/pinchflat/settings/setting.ex
++++ b/lib/pinchflat/settings/setting.ex
+@@ -15,7 +15,8 @@ defmodule Pinchflat.Settings.Setting do
+     :video_codec_preference,
+     :audio_codec_preference,
+     :youtube_api_key,
+-    :extractor_sleep_interval_seconds
++    :extractor_sleep_interval_seconds,
++    :download_throughput_limit
+   ]
+ 
+   @required_fields [
+@@ -35,6 +36,8 @@ defmodule Pinchflat.Settings.Setting do
+     field :youtube_api_key, :string
+     field :route_token, :string
+     field :extractor_sleep_interval_seconds, :integer, default: 0
++    # This is a string because it accepts values like "100K" or "4.2M"
++    field :download_throughput_limit, :string
+ 
+     field :video_codec_preference, :string
+     field :audio_codec_preference, :string
+diff --git a/lib/pinchflat/yt_dlp/command_runner.ex b/lib/pinchflat/yt_dlp/command_runner.ex
+index c90511bb0..80c4c98c6 100644
+--- a/lib/pinchflat/yt_dlp/command_runner.ex
++++ b/lib/pinchflat/yt_dlp/command_runner.ex
+@@ -35,7 +35,7 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+ 
+     output_filepath = generate_output_filepath(addl_opts)
+     print_to_file_opts = [{:print_to_file, output_template}, output_filepath]
+-    user_configured_opts = cookie_file_options(addl_opts) ++ sleep_interval_opts(addl_opts)
++    user_configured_opts = cookie_file_options(addl_opts) ++ rate_limit_opts(addl_opts)
+     # These must stay in exactly this order, hence why I'm giving it its own variable.
+     all_opts = command_opts ++ print_to_file_opts ++ user_configured_opts ++ global_options()
+     formatted_command_opts = [url] ++ CliUtils.parse_options(all_opts)
+@@ -116,6 +116,14 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+     end
+   end
+ 
++  defp rate_limit_opts(addl_opts) do
++    throughput_limit = Settings.get!(:download_throughput_limit)
++    sleep_interval_opts = sleep_interval_opts(addl_opts)
++    throughput_option = if throughput_limit, do: [limit_rate: throughput_limit], else: []
++
++    throughput_option ++ sleep_interval_opts
++  end
++
+   defp sleep_interval_opts(addl_opts) do
+     sleep_interval = Settings.get!(:extractor_sleep_interval_seconds)
+ 
+diff --git a/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex b/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
+index b75e58b20..9fb55cc7f 100644
+--- a/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
++++ b/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
+@@ -47,7 +47,14 @@
+         placeholder="0"
+         type="number"
+         label="Sleep Interval (seconds)"
+-        help="Sleep interval in seconds between each extractor request. Must be a positive whole number (or set to 0 to disable)"
++        help="Sleep interval in seconds between each extractor request. Must be a positive whole number. Set to 0 to disable"
++      />
++
++      <.input
++        field={f[:download_throughput_limit]}
++        placeholder="4.2M"
++        label="Download Throughput"
++        help="Sets the max throughput when downloading media. Examples: '50K' or '4.2M'. Leave blank to disable"
+       />
+     </section>
+   </section>
+diff --git a/priv/repo/erd.png b/priv/repo/erd.png
+index 4b1088605..207379363 100644
+Binary files a/priv/repo/erd.png and b/priv/repo/erd.png differ
+diff --git a/priv/repo/migrations/20250311222451_add_rate_limit_speed_to_settings.exs b/priv/repo/migrations/20250311222451_add_rate_limit_speed_to_settings.exs
+new file mode 100644
+index 000000000..fd7cc82b5
+--- /dev/null
++++ b/priv/repo/migrations/20250311222451_add_rate_limit_speed_to_settings.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddRateLimitSpeedToSettings do
++  use Ecto.Migration
++
++  def change do
++    alter table(:settings) do
++      add :download_throughput_limit, :string
++    end
++  end
++end
+diff --git a/test/pinchflat/yt_dlp/command_runner_test.exs b/test/pinchflat/yt_dlp/command_runner_test.exs
+index 4c55972ff..ddbc77fec 100644
+--- a/test/pinchflat/yt_dlp/command_runner_test.exs
++++ b/test/pinchflat/yt_dlp/command_runner_test.exs
+@@ -96,7 +96,7 @@ defmodule Pinchflat.YtDlp.CommandRunnerTest do
+     end
+   end
+ 
+-  describe "run/4 when testing sleep interval options" do
++  describe "run/4 when testing rate limit options" do
+     test "includes sleep interval options by default" do
+       Settings.set(extractor_sleep_interval_seconds: 5)
+ 
+@@ -124,6 +124,22 @@ defmodule Pinchflat.YtDlp.CommandRunnerTest do
+       refute String.contains?(output, "--sleep-requests")
+       refute String.contains?(output, "--sleep-subtitles")
+     end
++
++    test "includes limit_rate option when specified" do
++      Settings.set(download_throughput_limit: "100K")
++
++      assert {:ok, output} = Runner.run(@media_url, :foo, [], "")
++
++      assert String.contains?(output, "--limit-rate 100K")
++    end
++
++    test "doesn't include limit_rate option when download_throughput_limit is nil" do
++      Settings.set(download_throughput_limit: nil)
++
++      assert {:ok, output} = Runner.run(@media_url, :foo, [], "")
++
++      refute String.contains?(output, "--limit-rate")
++    end
+   end
+ 
+   describe "run/4 when testing global options" do

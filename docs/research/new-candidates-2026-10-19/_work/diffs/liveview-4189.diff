@@ -1,0 +1,296 @@
+diff --git a/lib/phoenix_component.ex b/lib/phoenix_component.ex
+index 63c365bc9d..e6469cb9ed 100644
+--- a/lib/phoenix_component.ex
++++ b/lib/phoenix_component.ex
+@@ -1216,6 +1216,7 @@ defmodule Phoenix.Component do
+   * `:not_accepted` - The entry does not match the `:accept` MIME types
+   * `:external_client_failure` - When external upload fails
+   * `{:writer_failure, reason}` - When the custom writer fails with `reason`
++  * `reason` - When the custom validator fails with `reason`
+ 
+   ## Examples
+ 
+@@ -1223,6 +1224,7 @@ defmodule Phoenix.Component do
+   defp upload_error_to_string(:too_large), do: "The file is too large"
+   defp upload_error_to_string(:not_accepted), do: "You have selected an unacceptable file type"
+   defp upload_error_to_string(:external_client_failure), do: "Something went terribly wrong"
++  defp upload_error_to_string(:custom_validator_error), do: "Custom validation error"
+   ```
+ 
+   ```heex
+diff --git a/lib/phoenix_live_view.ex b/lib/phoenix_live_view.ex
+index a319b2fba7..bd10c41864 100644
+--- a/lib/phoenix_live_view.ex
++++ b/lib/phoenix_live_view.ex
+@@ -851,6 +851,11 @@ defmodule Phoenix.LiveView do
+       temporary file for consumption. See the `Phoenix.LiveView.UploadWriter` docs
+       for custom usage.
+ 
++    * `:validator` - An optional 1-arity function for performing custom validation
++      on each upload entry. The function receives the upload entry and must return
++      either `:ok` or `{:error, reason}`. When an error tuple is returned, the
++      entry is marked as failed and the error is exposed as `reason` via `upload_errors/2`.
++
+   Raises when a previously allowed upload under the same name is still active.
+ 
+   ## Examples
+@@ -858,6 +863,14 @@ defmodule Phoenix.LiveView do
+       allow_upload(socket, :avatar, accept: ~w(.jpg .jpeg), max_entries: 2)
+       allow_upload(socket, :avatar, accept: :any)
+ 
++      allow_upload(socket, :avatar, validator: fn entry ->
++        if String.length(entry.client_name) > 100 do
++          {:error, :filename_too_long}
++        else
++          :ok
++        end
++      end)
++
+   For consuming files automatically as they are uploaded, you can pair `auto_upload: true` with
+   a custom progress function to consume the entries as they are completed. For example:
+ 
+diff --git a/lib/phoenix_live_view/upload_config.ex b/lib/phoenix_live_view/upload_config.ex
+index b8b684fa92..c7e88244eb 100644
+--- a/lib/phoenix_live_view/upload_config.ex
++++ b/lib/phoenix_live_view/upload_config.ex
+@@ -77,7 +77,8 @@ defmodule Phoenix.LiveView.UploadConfig do
+              :errors,
+              :auto_upload?,
+              :progress_event,
+-             :writer
++             :writer,
++             :validator
+            ]}
+ 
+   defstruct name: nil,
+@@ -99,7 +100,8 @@ defmodule Phoenix.LiveView.UploadConfig do
+             errors: [],
+             auto_upload?: false,
+             progress_event: nil,
+-            writer: nil
++            writer: nil,
++            validator: nil
+ 
+   @type t :: %__MODULE__{
+           name: atom() | String.t(),
+@@ -124,6 +126,7 @@ defmodule Phoenix.LiveView.UploadConfig do
+           auto_upload?: boolean(),
+           writer: (name :: atom() | String.t(), UploadEntry.t(), Phoenix.LiveView.Socket.t() ->
+                      {module(), term()}),
++          validator: (UploadEntry.t() -> :ok | {:error, atom()}) | nil,
+           progress_event:
+             (name :: atom() | String.t(), UploadEntry.t(), Phoenix.LiveView.Socket.t() ->
+                {:noreply, Phoenix.LiveView.Socket.t()})
+@@ -294,6 +297,24 @@ defmodule Phoenix.LiveView.UploadConfig do
+           fn _name, _entry, _socket -> {Phoenix.LiveView.UploadTmpFileWriter, []} end
+       end
+ 
++    validator =
++      case Keyword.fetch(opts, :validator) do
++        {:ok, func} when is_function(func, 1) ->
++          func
++
++        {:ok, other} ->
++          raise ArgumentError, """
++          invalid :validator value provided to allow_upload.
++
++          Only a 1-arity anonymous function is supported. Got:
++
++          #{inspect(other)}
++          """
++
++        :error ->
++          fn _entry -> :ok end
++      end
++
+     %UploadConfig{
+       ref: random_ref,
+       name: name,
+@@ -309,6 +330,7 @@ defmodule Phoenix.LiveView.UploadConfig do
+       chunk_timeout: chunk_timeout,
+       progress_event: progress_event,
+       writer: writer,
++      validator: validator,
+       auto_upload?: Keyword.get(opts, :auto_upload, false),
+       allowed?: true
+     }
+@@ -558,6 +580,7 @@ defmodule Phoenix.LiveView.UploadConfig do
+     {:ok, entry}
+     |> validate_max_file_size(conf)
+     |> validate_accepted(conf)
++    |> call_validator(conf)
+     |> case do
+       {:ok, entry} ->
+         {:ok, put_valid_entry(conf, entry)}
+@@ -632,6 +655,15 @@ defmodule Phoenix.LiveView.UploadConfig do
+     end
+   end
+ 
++  defp call_validator({:ok, entry}, %UploadConfig{validator: validator_fun}) do
++    case validator_fun.(entry) do
++      {:error, reason} -> {:error, reason}
++      _ -> {:ok, entry}
++    end
++  end
++
++  defp call_validator({:error, _} = error, _conf), do: error
++
+   defp recalculate_computed_fields(%UploadConfig{} = conf) do
+     recalculate_errors(conf)
+   end
+diff --git a/test/phoenix_live_view/upload/channel_test.exs b/test/phoenix_live_view/upload/channel_test.exs
+index bf77595698..5f014c42b2 100644
+--- a/test/phoenix_live_view/upload/channel_test.exs
++++ b/test/phoenix_live_view/upload/channel_test.exs
+@@ -179,14 +179,20 @@ defmodule Phoenix.LiveView.UploadChannelTest do
+   end
+ 
+   defp opts_for_allow_upload(opts) do
+-    case Keyword.fetch(opts, :progress) do
+-      {:ok, progress} ->
+-        Keyword.put(opts, :progress, fn _, entry, socket ->
+-          apply(__MODULE__, progress, [entry, socket])
+-        end)
++    opts =
++      case Keyword.fetch(opts, :progress) do
++        {:ok, progress} ->
++          Keyword.put(opts, :progress, fn _, entry, socket ->
++            apply(__MODULE__, progress, [entry, socket])
++          end)
++
++        :error ->
++          opts
++      end
+ 
+-      :error ->
+-        opts
++    case Keyword.fetch(opts, :validator_response) do
++      {:ok, response} -> Keyword.put(opts, :validator, fn _ -> response end)
++      :error -> opts
+     end
+   end
+ 
+@@ -406,6 +412,25 @@ defmodule Phoenix.LiveView.UploadChannelTest do
+         assert {:error, [[_ref, :too_large]]} = render_upload(avatar, "foo.jpeg")
+       end
+ 
++      @tag allow: [
++             max_entries: 1,
++             chunk_size: 20,
++             accept: :any,
++             max_file_size: 100,
++             validator_response: {:error, :custom_validation_error}
++           ]
++      test "render_change error with validator failure upload", %{lv: lv} do
++        avatar = file_input(lv, "form", :avatar, [%{name: "foo.jpeg", content: "ok"}])
++
++        assert lv
++               |> form("form", user: %{})
++               |> render_change(avatar) =~
++                 "entry_error::custom_validation_error"
++
++        assert {:error, [[_ref, :custom_validation_error]]} =
++                 render_upload(avatar, "foo.jpeg")
++      end
++
+       @tag allow: [max_entries: 1, chunk_size: 20, accept: :any, auto_upload: true]
+       test "render_upload too many files with auto_upload", %{lv: lv} do
+         avatar =
+diff --git a/test/phoenix_live_view/upload/config_test.exs b/test/phoenix_live_view/upload/config_test.exs
+index 81eb2ebb9c..cb1ae55c49 100644
+--- a/test/phoenix_live_view/upload/config_test.exs
++++ b/test/phoenix_live_view/upload/config_test.exs
+@@ -153,6 +153,32 @@ defmodule Phoenix.LiveView.UploadConfigTest do
+ 
+       assert %UploadConfig{max_file_size: 10_000_000} = socket.assigns.uploads.avatar
+     end
++
++    test "raises when invalid :validator provided" do
++      assert_raise ArgumentError, ~r/invalid :validator value provided to allow_upload/, fn ->
++        LiveView.allow_upload(build_socket(), :avatar, accept: :any, validator: 0)
++      end
++
++      assert_raise ArgumentError, ~r/invalid :validator value provided to allow_upload/, fn ->
++        LiveView.allow_upload(build_socket(), :avatar, accept: :any, validator: "bad")
++      end
++
++      assert_raise ArgumentError, ~r/invalid :validator value provided to allow_upload/, fn ->
++        wrong_arity_fun = fn _, _ -> :ok end
++        LiveView.allow_upload(build_socket(), :avatar, accept: :any, validator: wrong_arity_fun)
++      end
++    end
++
++    test "supports optional :validator" do
++      socket =
++        LiveView.allow_upload(build_socket(), :avatar,
++          accept: :any,
++          validator: fn _ -> :ok end
++        )
++
++      %UploadConfig{validator: validator_fun} = socket.assigns.uploads.avatar
++      assert is_function(validator_fun, 1)
++    end
+   end
+ 
+   describe "disallow_upload/2" do
+diff --git a/test/phoenix_live_view/upload/external_test.exs b/test/phoenix_live_view/upload/external_test.exs
+index 4e17718c7e..254800554d 100644
+--- a/test/phoenix_live_view/upload/external_test.exs
++++ b/test/phoenix_live_view/upload/external_test.exs
+@@ -45,6 +45,12 @@ defmodule Phoenix.LiveView.UploadExternalTest do
+           opts
+       end
+ 
++    opts =
++      case Keyword.fetch(opts, :validator_response) do
++        {:ok, response} -> Keyword.put(opts, :validator, fn _ -> response end)
++        :error -> opts
++      end
++
+     {:ok, lv} = mount_lv(fn socket -> Phoenix.LiveView.allow_upload(socket, :avatar, opts) end)
+ 
+     {:ok, lv: lv}
+@@ -81,7 +87,13 @@ defmodule Phoenix.LiveView.UploadExternalTest do
+     assert render_upload(avatar, "foo1.jpeg", 1) =~ "relative path:some/path/to/foo1.jpeg"
+   end
+ 
+-  @tag allow: [max_entries: 2, chunk_size: 20, accept: :any, external: :preflight]
++  @tag allow: [
++         max_entries: 2,
++         chunk_size: 20,
++         accept: :any,
++         external: :preflight,
++         validator_response: :ok
++       ]
+   test "external upload invokes preflight per entry", %{lv: lv} do
+     avatar =
+       file_input(lv, "form", :avatar, [
+@@ -165,6 +177,28 @@ defmodule Phoenix.LiveView.UploadExternalTest do
+     assert {:error, :not_allowed} = render_upload(avatar, "foo2.jpeg", 1)
+   end
+ 
++  @tag allow: [
++         max_entries: 1,
++         max_file_size: 100,
++         auto_upload: true,
++         accept: :any,
++         external: :preflight,
++         validator_response: {:error, :custom_validation_error}
++       ]
++  test "custom validator returns error", %{lv: lv} do
++    avatar = file_input(lv, "form", :avatar, [%{name: "foo.jpeg", content: "ok"}])
++
++    html =
++      lv
++      |> form("form", user: %{})
++      |> render_change(avatar)
++
++    assert html =~ "foo.jpeg:0%"
++
++    assert {:error, [[_, %{reason: :custom_validation_error}]]} =
++             render_upload(avatar, "foo.jpeg", 1)
++  end
++
+   def bad_preflight(%LiveView.UploadEntry{} = _entry, socket), do: {:ok, %{}, socket}
+ 
+   @tag allow: [max_entries: 1, chunk_size: 20, accept: :any, external: :bad_preflight]

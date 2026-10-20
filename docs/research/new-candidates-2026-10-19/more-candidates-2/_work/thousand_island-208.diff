@@ -1,0 +1,224 @@
+diff --git a/lib/thousand_island/acceptor.ex b/lib/thousand_island/acceptor.ex
+index 7354689..b165a32 100644
+--- a/lib/thousand_island/acceptor.ex
++++ b/lib/thousand_island/acceptor.ex
+@@ -3,6 +3,27 @@ defmodule ThousandIsland.Acceptor do
+ 
+   use Task, restart: :transient
+ 
++  # Transient errors which accept(2) documents as retryable: on Linux, accept()
++  # passes network errors already pending on the new socket back through the
++  # accept call itself, and instructs applications to "treat them like EAGAIN
++  # by retrying" (:etimedout is from the man page's adjacent list of errors
++  # that various kernels can also return). These are conditions of a single
++  # incoming connection, not of the listener, so we retry rather than crash
++  # the acceptor. :econnaborted and :einval are the same kind of condition,
++  # already handled in their own clause below with their own long-standing
++  # telemetry events
++  @transient_accept_errors [
++    :enetdown,
++    :enetunreach,
++    :ehostdown,
++    :ehostunreach,
++    :enonet,
++    :eproto,
++    :enoprotoopt,
++    :eopnotsupp,
++    :etimedout
++  ]
++
+   # How long to pause the accept loop when the system reports file descriptor
+   # exhaustion (:emfile / :enfile). We cannot accept while out of descriptors, so
+   # we back off briefly to let the situation resolve rather than spinning or
+@@ -89,6 +110,22 @@ defmodule ThousandIsland.Acceptor do
+           count + 1
+         )
+ 
++      {:error, reason} when reason in @transient_accept_errors ->
++        # A transient error on the incoming connection which accept(2) tells us
++        # to treat like EAGAIN. Emit an event for observability and keep
++        # accepting rather than crashing the acceptor (and, through restart
++        # escalation, the acceptor's supervisor and its live connections)
++        ThousandIsland.Telemetry.span_event(span, :accept_error, %{error: reason})
++
++        accept(
++          listener_socket,
++          connection_sup_pid,
++          server_config,
++          handler_config,
++          span,
++          count + 1
++        )
++
+       {:error, reason} when reason in [:emfile, :enfile] ->
+         # File descriptors are exhausted, so nothing can be accepted right now.
+         # Back off briefly to let the situation resolve rather than crashing the
+diff --git a/lib/thousand_island/logger.ex b/lib/thousand_island/logger.ex
+index c31fe09..3423a77 100644
+--- a/lib/thousand_island/logger.ex
++++ b/lib/thousand_island/logger.ex
+@@ -24,6 +24,7 @@ defmodule ThousandIsland.Logger do
+     events = [
+       [:thousand_island, :acceptor, :spawn_error],
+       [:thousand_island, :acceptor, :econnaborted],
++      [:thousand_island, :acceptor, :accept_error],
+       [:thousand_island, :acceptor, :emfile]
+     ]
+ 
+diff --git a/lib/thousand_island/telemetry.ex b/lib/thousand_island/telemetry.ex
+index ddad1a0..ce86cd1 100644
+--- a/lib/thousand_island/telemetry.ex
++++ b/lib/thousand_island/telemetry.ex
+@@ -115,6 +115,23 @@ defmodule ThousandIsland.Telemetry do
+ 
+       * `telemetry_span_context`: A unique identifier for this span
+ 
++  * `[:thousand_island, :acceptor, :accept_error]`
++
++      Thousand Island encountered a transient network error while accepting a connection, of the
++      kind that `accept(2)` documents as retryable (an error already pending on the incoming
++      connection, such as `:ehostunreach` or `:enetdown`). These reflect a condition on one
++      incoming connection rather than a problem with the listener, so the acceptor retries and
++      keeps running rather than crashing.
++
++      This event contains the following measurements:
++
++      * `monotonic_time`: The time of this event, in `:native` units
++      * `error`: The transient error reason that was retried
++
++      This event contains the following metadata:
++
++      * `telemetry_span_context`: A unique identifier for this span
++
+   * `[:thousand_island, :acceptor, :emfile]`
+ 
+       Thousand Island was unable to accept a connection because the system is out of file
+@@ -326,6 +343,7 @@ defmodule ThousandIsland.Telemetry do
+           :ready
+           | :spawn_error
+           | :econnaborted
++          | :accept_error
+           | :emfile
+           | :recv_error
+           | :send_error
+diff --git a/test/support/telemetry_helpers.ex b/test/support/telemetry_helpers.ex
+index 19588bd..a59c560 100644
+--- a/test/support/telemetry_helpers.ex
++++ b/test/support/telemetry_helpers.ex
+@@ -8,6 +8,7 @@ defmodule TelemetryHelpers do
+     [:thousand_island, :acceptor, :stop],
+     [:thousand_island, :acceptor, :spawn_error],
+     [:thousand_island, :acceptor, :econnaborted],
++    [:thousand_island, :acceptor, :accept_error],
+     [:thousand_island, :acceptor, :emfile],
+     [:thousand_island, :connection, :start],
+     [:thousand_island, :connection, :stop],
+diff --git a/test/thousand_island/acceptor_test.exs b/test/thousand_island/acceptor_test.exs
+index 6622934..6b729cf 100644
+--- a/test/thousand_island/acceptor_test.exs
++++ b/test/thousand_island/acceptor_test.exs
+@@ -5,7 +5,8 @@ defmodule ThousandIsland.AcceptorTest do
+ 
+   # A transport that delegates to gen_tcp but lets the test inject a queue of
+   # accept/1 results via :persistent_term, so we can simulate the OS reporting
+-  # file descriptor exhaustion. Once the queue is drained, real accepts resume.
++  # transient network errors or file descriptor exhaustion. Once the queue is
++  # drained, real accepts resume.
+   defmodule FlakyTransport do
+     @behaviour ThousandIsland.Transport
+ 
+@@ -106,6 +107,21 @@ defmodule ThousandIsland.AcceptorTest do
+     end)
+   end
+ 
++  # The accept(2) retry list, plus :etimedout (same man page, "various kernels"
++  # note) and :einval (retried by Thousand Island since 1.3.12)
++  @transient [
++    :enetdown,
++    :enetunreach,
++    :ehostdown,
++    :ehostunreach,
++    :enonet,
++    :eproto,
++    :enoprotoopt,
++    :eopnotsupp,
++    :etimedout,
++    :einval
++  ]
++
+   test "descriptor exhaustion does not take down the acceptor or its in-flight connections" do
+     key = make_ref()
+     :persistent_term.put({FlakyTransport, :key}, key)
+@@ -174,6 +190,72 @@ defmodule ThousandIsland.AcceptorTest do
+     assert metadata ~> %{handler: Echo, telemetry_span_context: reference()}
+   end
+ 
++  test "transient accept(2) network errors are retried rather than crashing the acceptor" do
++    key = make_ref()
++    :persistent_term.put({FlakyTransport, :key}, key)
++    FlakyTransport.set_accept_results(key, [])
++
++    {:ok, server_pid} =
++      start_supervised(
++        {ThousandIsland,
++         port: 0, handler_module: Echo, transport_module: FlakyTransport, num_acceptors: 1}
++      )
++
++    {:ok, {_ip, port}} = ThousandIsland.listener_info(server_pid)
++    [acceptor_sup] = acceptor_sup_pids(server_pid)
++
++    # Open a connection before any trouble starts
++    {:ok, existing} = :gen_tcp.connect(:localhost, port, [:binary, active: false])
++    :ok = :gen_tcp.send(existing, "FIRST")
++    assert :gen_tcp.recv(existing, 0, 1000) == {:ok, "FIRST"}
++
++    # Now have accept return every transient error in the set, back to back.
++    # Ten in a row is far past the acceptor's restart budget (3 restarts in 5
++    # seconds): if these crash the acceptor, its supervisor comes down too,
++    # taking the acceptor's in-flight connections with it
++    FlakyTransport.set_accept_results(key, @transient)
++
++    # A new client unblocks the pending accept; the acceptor then works
++    # through the injected errors
++    {:ok, fresh} = :gen_tcp.connect(:localhost, port, [:binary, active: false])
++    Process.sleep(300)
++
++    # The in-flight connections survived the errors
++    :ok = :gen_tcp.send(existing, "STILL HERE")
++    assert :gen_tcp.recv(existing, 0, 1000) == {:ok, "STILL HERE"}
++    :ok = :gen_tcp.send(fresh, "HELLO")
++    assert :gen_tcp.recv(fresh, 0, 1000) == {:ok, "HELLO"}
++
++    # Nothing under the server was restarted, and new connections still flow
++    assert acceptor_sup_pids(server_pid) == [acceptor_sup]
++    {:ok, late} = :gen_tcp.connect(:localhost, port, [:binary, active: false])
++    :ok = :gen_tcp.send(late, "LATE")
++    assert :gen_tcp.recv(late, 0, 1000) == {:ok, "LATE"}
++
++    Enum.each([existing, fresh, late], &:gen_tcp.close/1)
++  end
++
++  test "a transient accept error emits an :accept_error telemetry event carrying the reason" do
++    on_exit(TelemetryHelpers.attach_all_events(Echo))
++
++    key = make_ref()
++    :persistent_term.put({FlakyTransport, :key}, key)
++    FlakyTransport.set_accept_results(key, [:ehostunreach])
++
++    {:ok, _server_pid} =
++      start_supervised(
++        {ThousandIsland,
++         port: 0, handler_module: Echo, transport_module: FlakyTransport, num_acceptors: 1}
++      )
++
++    assert_receive {:telemetry, [:thousand_island, :acceptor, :accept_error], measurements,
++                    metadata},
++                   1000
++
++    assert measurements ~> %{monotonic_time: integer(), error: :ehostunreach}
++    assert metadata ~> %{handler: Echo, telemetry_span_context: reference()}
++  end
++
+   for mode <- [:stop, :ignore] do
+     test "a handler whose init returns #{inspect(mode)} does not crash the acceptor, and the socket is closed" do
+       {:ok, server_pid} =

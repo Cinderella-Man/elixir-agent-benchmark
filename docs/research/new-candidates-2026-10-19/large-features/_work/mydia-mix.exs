@@ -1,0 +1,412 @@
+# Build-time quality helper for mix_unused. Defined here (not under lib/) so it
+# ships nowhere, is not itself dead-code analysed, and is always present when
+# mix.exs is evaluated - including the Docker `mix deps.get --only prod` layer,
+# which copies only mix.exs/mix.lock.
+defmodule MydiaQuality do
+  @moduledoc false
+
+  @doc """
+  True when `{module, fun, arity}` is a behaviour callback implemented by
+  `module` - that is, `module` declares `@behaviour B` and `{fun, arity}` is
+  one of `B`'s callbacks.
+
+  Behaviour callbacks are dispatched by the framework that owns the behaviour
+  (Guardian, Plug, telemetry, the app's own `@behaviour`s), so static export
+  analysis cannot see the call site and flags them as unused. This predicate is
+  a rule about tool blindness: it auto-covers every current and future callback
+  implementation rather than enumerating individual findings.
+  """
+  @spec behaviour_callback?({module(), atom(), arity()}) :: boolean()
+  def behaviour_callback?({module, fun, arity}) do
+    module
+    |> implemented_behaviours()
+    |> Enum.any?(&callback?(&1, fun, arity))
+  end
+
+  defp implemented_behaviours(module) do
+    if Code.ensure_loaded?(module) do
+      module.module_info(:attributes)
+      |> Keyword.get_values(:behaviour)
+      |> List.flatten()
+    else
+      []
+    end
+  rescue
+    _ -> []
+  end
+
+  defp callback?(behaviour, fun, arity) do
+    Code.ensure_loaded?(behaviour) and
+      function_exported?(behaviour, :behaviour_info, 1) and
+      {fun, arity} in behaviour.behaviour_info(:callbacks)
+  rescue
+    _ -> false
+  end
+end
+
+defmodule Mydia.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :mydia,
+      version: version(),
+      elixir: "~> 1.20",
+      elixirc_paths: elixirc_paths(Mix.env()),
+      start_permanent: Mix.env() == :prod,
+      aliases: aliases(),
+      deps: deps(),
+      licenses: ["AGPL-3.0-or-later"],
+      compilers: compilers(),
+      unused: [ignore: unused_ignore()],
+      # No ignore list: findings are fixed, not listed. See "Dialyzer" in
+      # CONTRIBUTING.md.
+      dialyzer: [
+        plt_add_apps: [:mix, :ex_unit, :wallaby],
+        plt_core_path: "priv/plts",
+        plt_local_path: "priv/plts"
+      ],
+      listeners: [Phoenix.CodeReloader],
+      # Mix reads warnings_as_errors from :elixirc_options, not from the top
+      # level of project/0. Set at the top level it silently did nothing, so a
+      # plain `mix compile` exited 0 with warnings while CI, which passes
+      # --warnings-as-errors explicitly, went red.
+      elixirc_options: [warnings_as_errors: Mix.env() != :prod],
+      # test/fixtures/**/*.exs are data (corpora the tests load with
+      # Code.eval_file/1), not test modules. Without this, `mix test` warns
+      # that they match no load filter, and --warnings-as-errors aborts.
+      test_ignore_filters: [&String.starts_with?(&1, "test/fixtures/")],
+      # Disable coverage threshold for now - will improve coverage later
+      test_coverage: [summary: false]
+    ]
+  end
+
+  # The mix_unused `:unused` compiler adds tracing overhead and prints a large
+  # advisory report, so it only runs when UNUSED_CHECK=true (set by the
+  # dead-code CI step). Normal dev/CI compiles are unaffected. It is gated to
+  # dev/test because mix_unused is a dev/test-only dependency, and prepended
+  # because that is the order under which it actually emits its analysis in
+  # this version (appending it after Mix.compilers/0 yields no report).
+  defp compilers do
+    # `:plugins` builds the bundled WASM guests under plugins/*/ into
+    # priv/plugins/ during mix compile (see Mix.Tasks.Compile.Plugins). It is
+    # APPENDED, not prepended: the compiler task module lives in lib/ and is only
+    # loadable after the `:elixir` compiler has run, so a fresh build can't find
+    # `compile.plugins` if it runs first. Appending also still places the build
+    # inside `mix compile`, so the artifact exists before `mix release` bundles
+    # priv/. Unlike `:unused` (which must wrap elixir, hence prepended) `:plugins`
+    # is independent. It runs on every compile in every env, including the
+    # test-env --warnings-as-errors compile.
+    base = [:phoenix_live_view] ++ Mix.compilers() ++ [:plugins]
+
+    if System.get_env("UNUSED_CHECK") == "true" and Mix.env() in [:dev, :test] do
+      [:unused | base]
+    else
+      base
+    end
+  end
+
+  # Patterns excluded from mix_unused's unused-export analysis.
+  #
+  # Every entry here is a RULE describing a place static export analysis is
+  # structurally blind (dynamic dispatch, macro-generated references, framework
+  # callbacks) - never a list of specific dead functions we want to keep. A
+  # rule auto-covers future code; a finding-list is grandfathering. Real dead
+  # code is deleted, not listed here.
+  #
+  # Module regexes match against `inspect(module)`, e.g. "Mydia.Repo.Migrations.Foo".
+  defp unused_ignore do
+    [
+      # Ecto migration callbacks (change/0, up/0, down/0) run by the migrator
+      {~r/^Mydia\.Repo\.Migrations\./, :_, :_},
+      # Generated reflection/introspection helpers (__absinthe_*__, __schema__, ...)
+      {:_, ~r/^__/, :_},
+      # Absinthe schema + resolvers referenced inside `field`/`resolve` macros
+      {~r/^MydiaWeb\.Schema\./, :_, :_},
+      # Phoenix Router generated route helpers and pipelines
+      {~r/^MydiaWeb\.Router/, :_, :_},
+      # Plug callbacks invoked by the Plug pipeline
+      {:_, :init, 1},
+      {:_, :call, 2},
+      # Phoenix controller actions: dispatched by Phoenix.Controller's action
+      # plug via apply(controller, action, [conn, params]) - the router names
+      # the action as an atom, so the call site is invisible to static analysis.
+      {~r/Controller$/, :_, 2},
+      # `use MydiaWeb, :live_view | :controller | :html | ...` entrypoints,
+      # invoked as MydiaWeb.<which>() by the using macro.
+      {MydiaWeb, :_, 0},
+      # OTP dispatch: supervisors call child_spec/1, which calls start_link/1
+      {:_, :child_spec, 1},
+      {:_, :start_link, 1},
+      # Behaviour callbacks dispatched by the owning framework (Guardian, Plug,
+      # telemetry, the app's own @behaviours). Predicate, not a name list, so it
+      # auto-covers every current and future implementation.
+      &MydiaQuality.behaviour_callback?/1
+    ]
+  end
+
+  # Configuration for the OTP application.
+  #
+  # Type `mix help compile.app` for more information.
+  def application do
+    [
+      mod: {Mydia.Application, []},
+      extra_applications: [:logger, :runtime_tools, :ssh]
+    ]
+  end
+
+  def cli do
+    [
+      # dialyzer runs in test so local runs and CI see the same compile-time
+      # Mix.env() branches and share CI's _build/test cache.
+      preferred_envs: [precommit: :test, dialyzer: :test]
+    ]
+  end
+
+  defp version do
+    case System.get_env("BUILD_VERSION") do
+      nil -> "0.0.0-dev"
+      "" -> "0.0.0-dev"
+      v -> v
+    end
+  end
+
+  # Specifies which paths to compile per environment.
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
+
+  # Specifies your project dependencies.
+  #
+  # Type `mix help deps` for examples and options.
+  defp deps do
+    [
+      # Phoenix Framework
+      {:phoenix, "~> 1.8.1"},
+      {:phoenix_ecto, "~> 4.5"},
+      {:ecto_sql, "~> 3.13"},
+      {:ecto_sqlite3, ">= 0.0.0"},
+      {:postgrex, ">= 0.0.0"},
+      {:phoenix_html, "~> 4.1"},
+      {:phoenix_live_reload, "~> 1.2", only: :dev},
+      {:phoenix_live_view, "~> 1.2.0"},
+      {:lazy_html, ">= 0.1.0", only: :test},
+      {:phoenix_live_dashboard, "~> 0.9.1"},
+      {:esbuild, "~> 0.10", runtime: Mix.env() == :dev},
+      {:tailwind, "~> 0.3", runtime: Mix.env() == :dev},
+      {:heroicons,
+       github: "tailwindlabs/heroicons",
+       tag: "v2.2.0",
+       sparse: "optimized",
+       app: false,
+       compile: false,
+       depth: 1},
+
+      # Background Jobs
+      {:oban, "~> 2.17"},
+      {:crontab, "~> 1.1"},
+
+      # Authentication (will be configured in task-5)
+      {:ueberauth, "~> 0.10"},
+      {:ueberauth_oidcc, "~> 0.4"},
+      {:guardian, "~> 2.3"},
+      # Password hashing for users
+      {:bcrypt_elixir, "~> 3.0"},
+      {:nimble_totp, "~> 1.0"},
+      {:wax_, "~> 0.7.0"},
+      # Password hashing for API keys
+      {:argon2_elixir, "~> 4.0"},
+
+      # HTTP Clients
+      {:finch, "~> 0.22"},
+      {:req, "~> 0.6"},
+      # WebSocket client for the Flutter dev-server proxy (PlayerDevSocket)
+      {:websockex, "~> 0.5"},
+
+      # WASM plugin runtime (wasmtime via Rustler NIF) + pooling
+      {:wasmex, "~> 0.14"},
+      {:nimble_pool, "~> 1.1"},
+
+      # Utilities
+      {:timex, "~> 3.7"},
+      {:yaml_elixir, "~> 2.9"},
+      {:ymlr, "~> 5.1"},
+      {:sweet_xml, "~> 0.7"},
+      {:floki, "~> 0.36"},
+      {:nimble_parsec, "~> 1.4"},
+      {:eqrcode, "~> 0.2.1"},
+      {:earmark, "~> 1.4"},
+      {:file_system, "~> 1.0", only: [:dev, :test]},
+
+      # Telemetry & Monitoring
+      {:peep, "~> 5.0"},
+      {:telemetry_metrics, "~> 1.0"},
+      {:telemetry_poller, "~> 1.0"},
+      {:error_tracker, "~> 0.5"},
+      # Vendor-neutral exception tracker; captures genuine exceptions/exits/throws
+      # (Phoenix, Bandit, Oban, OTP crashes) and feeds Mydia.CrashReporter.TowerReporter.
+      {:tower, "~> 0.8"},
+
+      # Core
+      {:gettext, "~> 0.26"},
+      {:jason, "~> 1.2"},
+      {:nimble_csv, "~> 1.2"},
+      {:dns_cluster, "~> 0.3.0"},
+      {:bandit, "~> 1.5"},
+
+      # CORS support for cross-origin API requests (standalone player)
+      {:corsica, "~> 2.1"},
+
+      # Rustler for the p2p NIF (native crate is on rustler 0.38.0; wasmex 0.15 needs ~> 0.38)
+      {:rustler, "~> 0.38", runtime: false},
+
+      # GraphQL
+      {:absinthe, "~> 1.7"},
+      {:absinthe_plug, "~> 1.5"},
+      {:dataloader, "~> 2.0"},
+      {:absinthe_relay, "~> 1.5"},
+
+      # Development & Testing
+      {:ex_machina, "~> 2.8", only: :test},
+      {:bypass, "~> 2.1", only: :test},
+      {:wallaby, "~> 0.30", only: :test, runtime: false},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:mix_unused, "~> 0.4", only: [:dev, :test], runtime: false}
+    ]
+  end
+
+  # Aliases are shortcuts or tasks specific to the current project.
+  # For example, to install project dependencies and perform other setup tasks, run:
+  #
+  #     $ mix setup
+  #
+  # See the documentation for `Mix` for more info on aliases.
+  defp aliases do
+    [
+      # Every fetch re-applies the local dependency patches; see patch_deps/1.
+      "deps.get": ["deps.get", "deps.patch"],
+      "deps.patch": &patch_deps/1,
+      setup: ["deps.get", "ecto.setup", "assets.setup", "assets.build"],
+      "ecto.setup": ["ecto.create", "ecto.migrate", "run priv/repo/seeds.exs"],
+      "ecto.reset": ["ecto.drop", "ecto.setup"],
+      # Delegates to Mix.Tasks.Mydia.Graphql, which writes
+      # priv/graphql/schema.graphql (the player path is a symlink to it).
+      "schema.export": ["mydia.graphql export"],
+      # The Library API is a separate schema with its own contract, so it has its
+      # own export. `schema.export` above writes the player SDL and must not be
+      # repointed: the Rust parity gate reads that file.
+      "library_schema.export": [
+        "absinthe.schema.sdl --schema MydiaWeb.LibrarySchema priv/graphql/library.graphql"
+      ],
+      test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"],
+      "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
+      "assets.build": ["compile", "tailwind mydia", "esbuild mydia"],
+      "assets.deploy": [
+        "tailwind mydia --minify",
+        "esbuild mydia --minify",
+        "phx.digest"
+      ],
+      precommit: [
+        "compile",
+        "deps.unlock --unused",
+        "format --check-formatted",
+        "credo --strict",
+        "mydia.ratchet",
+        "test --warnings-as-errors"
+      ]
+    ]
+  end
+
+  # Dependencies built from locally patched source, as {app, version, patch}.
+  # A version bump stops at the pin rather than silently dropping the fix:
+  # whoever bumps rebases the patch or retires it. patches/exqlite/ explains
+  # its patch, and how to tell whether upstream still needs it.
+  @dep_patches [
+    {:exqlite, "0.41.0", "patches/exqlite/statement-destructor-never-blocks.patch"}
+  ]
+
+  # Runs after every `mix deps.get`, so dev, CI and the Docker image all build
+  # the same patched source, and is safe to repeat. The Dockerfile's
+  # `mix deps.get` layer copies only mix.exs and mix.lock, so the patch file is
+  # absent there and this skips; the Dockerfile runs `mix deps.patch` itself
+  # once patches/ is copied in.
+  defp patch_deps(_args), do: Enum.each(@dep_patches, &patch_dep/1)
+
+  defp patch_dep({app, version, patch}) do
+    dir = Path.join(Mix.Project.deps_path(), Atom.to_string(app))
+    patch = Path.expand(patch)
+
+    cond do
+      not File.regular?(patch) or not File.dir?(dir) ->
+        :ok
+
+      patch_applies?(dir, patch, ["-R"]) ->
+        :ok
+
+      true ->
+        fetched = hex_version(dir)
+
+        if fetched != version do
+          Mix.raise(
+            "deps/#{app} is #{fetched}, but #{Path.relative_to_cwd(patch)} targets #{version}. " <>
+              "Rebase the patch onto #{fetched} and update @dep_patches in mix.exs, " <>
+              "or retire it if upstream fixed the bug."
+          )
+        end
+
+        # A dependency carrying an older revision of the patch takes neither
+        # direction, so fetch it clean once before giving up. CI restores deps/
+        # from a cache, which makes that the normal case after a patch edit.
+        unless patch_applies?(dir, patch, []) do
+          File.rm_rf!(dir)
+          Mix.Tasks.Deps.Get.run([])
+        end
+
+        unless patch_applies?(dir, patch, []) do
+          Mix.raise("#{Path.relative_to_cwd(patch)} does not apply to deps/#{app}")
+        end
+
+        run_patch!(dir, patch, [])
+
+        # A build from the unpatched source would otherwise be kept, and
+        # Exqlite's may be the precompiled NIF the patch exists to replace.
+        Mix.Project.build_path()
+        |> Path.dirname()
+        |> Path.join("*/lib/#{app}")
+        |> Path.wildcard()
+        |> Enum.each(&File.rm_rf!/1)
+
+        Mix.shell().info("* patched #{app} with #{Path.relative_to_cwd(patch)}")
+    end
+  end
+
+  defp patch_applies?(dir, patch, flags) do
+    match?({_, 0}, patch_cmd(dir, patch, ["--dry-run" | flags]))
+  end
+
+  defp run_patch!(dir, patch, flags) do
+    case patch_cmd(dir, patch, flags) do
+      {_, 0} -> :ok
+      {output, _} -> Mix.raise("patch failed on #{dir}:\n#{output}")
+    end
+  end
+
+  # --force stops patch asking whether a patch that looks reversed should be
+  # applied anyway, which would hang a non-interactive run.
+  defp patch_cmd(dir, patch, flags) do
+    executable = System.find_executable("patch") || Mix.raise("patching deps needs `patch`")
+
+    System.cmd(executable, ["-p1", "--force", "-d", dir, "-i", patch | flags],
+      stderr_to_stdout: true
+    )
+  end
+
+  defp hex_version(dir) do
+    with {:ok, metadata} <- :file.consult(Path.join(dir, "hex_metadata.config")),
+         {_, version} <- List.keyfind(metadata, "version", 0) do
+      version
+    else
+      _ -> "an unknown version"
+    end
+  end
+end

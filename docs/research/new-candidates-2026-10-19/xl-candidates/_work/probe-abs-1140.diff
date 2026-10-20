@@ -1,0 +1,1017 @@
+diff --git a/.formatter.exs b/.formatter.exs
+index 60e5d98769..834739349d 100644
+--- a/.formatter.exs
++++ b/.formatter.exs
+@@ -8,6 +8,8 @@ locals_without_parens = [
+   config: 1,
+   deprecate: 1,
+   description: 1,
++  directive: 1,
++  directive: 2,
+   directive: 3,
+   enum: 2,
+   enum: 3,
+diff --git a/lib/absinthe/blueprint/input/value.ex b/lib/absinthe/blueprint/input/value.ex
+index e41724152f..c35e4fcb6e 100644
+--- a/lib/absinthe/blueprint/input/value.ex
++++ b/lib/absinthe/blueprint/input/value.ex
+@@ -38,4 +38,14 @@ defmodule Absinthe.Blueprint.Input.Value do
+   def valid?(%{normalized: %Absinthe.Blueprint.Input.Null{}}), do: true
+   def valid?(%{normalized: nil}), do: false
+   def valid?(%{normalized: _}), do: true
++
++  def build(value) do
++    %Absinthe.Blueprint.Input.Value{
++      data: value,
++      normalized: nil,
++      raw: %Absinthe.Blueprint.Input.RawValue{
++        content: Absinthe.Blueprint.Input.parse(value)
++      }
++    }
++  end
+ end
+diff --git a/lib/absinthe/blueprint/schema.ex b/lib/absinthe/blueprint/schema.ex
+index bb8787366f..f3a8c40c1b 100644
+--- a/lib/absinthe/blueprint/schema.ex
++++ b/lib/absinthe/blueprint/schema.ex
+@@ -129,6 +129,11 @@ defmodule Absinthe.Blueprint.Schema do
+     build_types(rest, [field | stack], buff)
+   end
+ 
++  defp build_types([{:directive, trigger} | rest], [field | stack], buff) do
++    field = Map.update!(field, :directives, &[trigger | &1])
++    build_types(rest, [field | stack], buff)
++  end
++
+   defp build_types([{:trigger, trigger} | rest], [field | stack], buff) do
+     field = Map.update!(field, :triggers, &[trigger | &1])
+     build_types(rest, [field | stack], buff)
+diff --git a/lib/absinthe/middleware.ex b/lib/absinthe/middleware.ex
+index 608f175473..fb9272cf4c 100644
+--- a/lib/absinthe/middleware.ex
++++ b/lib/absinthe/middleware.ex
+@@ -310,6 +310,9 @@ defmodule Absinthe.Middleware do
+       [{:ref, Absinthe.Type.BuiltIns.Introspection, _}] ->
+         expanded
+ 
++      [{:ref, Absinthe.Phase.Schema.DeprecatedDirectiveFields, _}] ->
++        expanded
++
+       _ ->
+         schema.middleware(expanded, field, object)
+     end
+diff --git a/lib/absinthe/phase/schema/deprecated_directive_fields.ex b/lib/absinthe/phase/schema/deprecated_directive_fields.ex
+new file mode 100644
+index 0000000000..40b69633e4
+--- /dev/null
++++ b/lib/absinthe/phase/schema/deprecated_directive_fields.ex
+@@ -0,0 +1,58 @@
++defmodule Absinthe.Phase.Schema.DeprecatedDirectiveFields do
++  @moduledoc false
++  # The spec of Oct 2015 has the onOperation, onFragment and onField
++  # fields for directives (https://spec.graphql.org/October2015/#sec-Schema-Introspection)
++  # See https://github.com/graphql/graphql-spec/pull/152 for the rationale.
++  # These fields are deprecated and can be removed in the future.
++  alias Absinthe.Blueprint
++
++  use Absinthe.Schema.Notation
++
++  @behaviour Absinthe.Phase
++
++  def run(input, _options \\ []) do
++    blueprint = Blueprint.prewalk(input, &handle_node/1)
++
++    {:ok, blueprint}
++  end
++
++  defp handle_node(%Blueprint.Schema.ObjectTypeDefinition{identifier: :__directive} = node) do
++    [types] = __MODULE__.__absinthe_blueprint__().schema_definitions
++
++    new_node = Enum.find(types.type_definitions, &(&1.identifier == :deprecated_directive_fields))
++
++    fields = node.fields ++ new_node.fields
++
++    %{node | fields: fields}
++  end
++
++  defp handle_node(node) do
++    node
++  end
++
++  object :deprecated_directive_fields do
++    field :on_operation, :boolean do
++      deprecate "Check `locations` field for enum value OPERATION"
++
++      resolve fn _, %{source: source} ->
++        {:ok, Enum.any?(source.locations, &Enum.member?([:query, :mutation, :subscription], &1))}
++      end
++    end
++
++    field :on_fragment, :boolean do
++      deprecate "Check `locations` field for enum value FRAGMENT_SPREAD"
++
++      resolve fn _, %{source: source} ->
++        {:ok, Enum.member?(source.locations, :fragment_spread)}
++      end
++    end
++
++    field :on_field, :boolean do
++      deprecate "Check `locations` field for enum value FIELD"
++
++      resolve fn _, %{source: source} ->
++        {:ok, Enum.member?(source.locations, :field)}
++      end
++    end
++  end
++end
+diff --git a/lib/absinthe/pipeline.ex b/lib/absinthe/pipeline.ex
+index 2260ca5780..31bb263b75 100644
+--- a/lib/absinthe/pipeline.ex
++++ b/lib/absinthe/pipeline.ex
+@@ -124,6 +124,7 @@ defmodule Absinthe.Pipeline do
+ 
+     [
+       Phase.Schema.TypeImports,
++      Phase.Schema.DeprecatedDirectiveFields,
+       Phase.Schema.ApplyDeclaration,
+       Phase.Schema.Introspection,
+       {Phase.Schema.Hydrate, options},
+diff --git a/lib/absinthe/schema/notation.ex b/lib/absinthe/schema/notation.ex
+index 102058a9a8..cf61b25605 100644
+--- a/lib/absinthe/schema/notation.ex
++++ b/lib/absinthe/schema/notation.ex
+@@ -195,6 +195,13 @@ defmodule Absinthe.Schema.Notation do
+   end
+ 
+   defmacro object(identifier, attrs, do: block) do
++    block =
++      for {identifier, args} <- build_directives(attrs) do
++        quote do
++          directive(unquote(identifier), unquote(args))
++        end
++      end ++ block
++
+     {attrs, block} =
+       case Keyword.pop(attrs, :meta) do
+         {nil, attrs} ->
+@@ -380,6 +387,13 @@ defmodule Absinthe.Schema.Notation do
+         end
+       end
+ 
++    block =
++      for {identifier, args} <- build_directives(attrs) do
++        quote do
++          directive(unquote(identifier), unquote(args))
++        end
++      end ++ block
++
+     block =
+       case Keyword.get(attrs, :meta) do
+         nil ->
+@@ -410,31 +424,16 @@ defmodule Absinthe.Schema.Notation do
+     attrs =
+       attrs
+       |> expand_ast(caller)
++      |> Keyword.delete(:deprecate)
++      |> Keyword.delete(:directives)
+       |> Keyword.delete(:args)
+       |> Keyword.delete(:meta)
+       |> Keyword.update(:description, nil, &wrap_in_unquote/1)
+       |> Keyword.update(:default_value, nil, &wrap_in_unquote/1)
+-      |> handle_deprecate
+ 
+     {attrs, block}
+   end
+ 
+-  defp handle_deprecate(attrs) do
+-    deprecation = build_deprecation(attrs[:deprecate])
+-
+-    attrs
+-    |> Keyword.delete(:deprecate)
+-    |> Keyword.put(:deprecation, deprecation)
+-  end
+-
+-  defp build_deprecation(msg) do
+-    case msg do
+-      true -> %Absinthe.Type.Deprecation{reason: nil}
+-      reason when is_binary(reason) -> %Absinthe.Type.Deprecation{reason: reason}
+-      _ -> nil
+-    end
+-  end
+-
+   # FIELDS
+   @placement {:field, [under: [:input_object, :interface, :object]]}
+   @doc """
+@@ -675,11 +674,11 @@ defmodule Absinthe.Schema.Notation do
+   ```
+   """
+   defmacro arg(identifier, type, attrs) do
+-    attrs = handle_arg_attrs(identifier, type, attrs)
++    {attrs, block} = handle_arg_attrs(identifier, type, attrs)
+ 
+     __CALLER__
+     |> recordable!(:arg, @placement[:arg])
+-    |> record!(Schema.InputValueDefinition, identifier, attrs, nil)
++    |> record!(Schema.InputValueDefinition, identifier, attrs, block)
+   end
+ 
+   @doc """
+@@ -688,19 +687,19 @@ defmodule Absinthe.Schema.Notation do
+   See `arg/3`
+   """
+   defmacro arg(identifier, attrs) when is_list(attrs) do
+-    attrs = handle_arg_attrs(identifier, nil, attrs)
++    {attrs, block} = handle_arg_attrs(identifier, nil, attrs)
+ 
+     __CALLER__
+     |> recordable!(:arg, @placement[:arg])
+-    |> record!(Schema.InputValueDefinition, identifier, attrs, nil)
++    |> record!(Schema.InputValueDefinition, identifier, attrs, block)
+   end
+ 
+   defmacro arg(identifier, type) do
+-    attrs = handle_arg_attrs(identifier, type, [])
++    {attrs, block} = handle_arg_attrs(identifier, type, [])
+ 
+     __CALLER__
+     |> recordable!(:arg, @placement[:arg])
+-    |> record!(Schema.InputValueDefinition, identifier, attrs, nil)
++    |> record!(Schema.InputValueDefinition, identifier, attrs, block)
+   end
+ 
+   # SCALARS
+@@ -857,20 +856,34 @@ defmodule Absinthe.Schema.Notation do
+   # DIRECTIVES
+ 
+   @placement {:directive, [toplevel: true]}
++  @placement {:applied_directive,
++              [
++                under: [
++                  :arg,
++                  :enum,
++                  :field,
++                  :input_object,
++                  :interface,
++                  :object,
++                  :scalar,
++                  :union,
++                  :value
++                ]
++              ]}
++
+   @doc """
+-  Defines a directive
++  Defines or applies a directive
+ 
+-  ## Placement
++  ## Defining a directive
++  ### Placement
+ 
+-  #{Utils.placement_docs(@placement)}
++  #{Utils.placement_docs(@placement, :directive)}
+ 
+-  ## Examples
++  ### Examples
+ 
+-  ```
++  ```elixir
+   directive :mydirective do
+-
+     arg :if, non_null(:boolean), description: "Skipped when true."
+-
+     on [:field, :fragment_spread, :inline_fragment]
+ 
+     expand fn
+@@ -879,16 +892,65 @@ defmodule Absinthe.Schema.Notation do
+       _, node ->
+         node
+     end
++  end
++  ```
++
++  ## Applying a type system directive
++  Directives can be applied in your schema. E.g. by default the `@deprecated`
++  directive is available to be applied to fields and enum values.
++
++  You can define your own type system directives. See `Absinthe.Schema.Prototype`
++  for more information.
++
++  ### Placement
++
++  #{Utils.placement_docs(@placement, :applied_directive)}
+ 
++  ### Examples
++
++  When you have a type system directive named `:feature` it can be applied as
++  follows:
++
++  ```elixir
++  object :post do
++    directive :feature, name: ":object"
++
++    field :name, :string do
++      deprecate "Bye"
++    end
++  end
++
++  scalar :sweet_scalar do
++    directive :feature, name: ":scalar"
++    parse &Function.identity/1
++    serialize &Function.identity/1
+   end
+   ```
+   """
+-  defmacro directive(identifier, attrs \\ [], do: block) do
++  defmacro directive(identifier, attrs, do: block) when is_list(attrs) when not is_nil(block) do
+     __CALLER__
+     |> recordable!(:directive, @placement[:directive])
+     |> record_directive!(identifier, attrs, block)
+   end
+ 
++  defmacro directive(identifier, do: block) when not is_nil(block) do
++    __CALLER__
++    |> recordable!(:directive, @placement[:directive])
++    |> record_directive!(identifier, [], block)
++  end
++
++  defmacro directive(identifier, attrs) when is_list(attrs) do
++    __CALLER__
++    |> recordable!(:directive, @placement[:applied_directive])
++    |> record_applied_directive!(identifier, attrs)
++  end
++
++  defmacro directive(identifier) do
++    __CALLER__
++    |> recordable!(:directive, @placement[:applied_directive])
++    |> record_applied_directive!(identifier, [])
++  end
++
+   @placement {:on, [under: [:directive]]}
+   @doc """
+   Declare a directive as operating an a AST node type
+@@ -1328,13 +1390,39 @@ defmodule Absinthe.Schema.Notation do
+     scoped_def(env, type, identifier, attrs, block)
+   end
+ 
++  defp build_directives(attrs) do
++    if attrs[:deprecate] do
++      directive = {:deprecated, reason(attrs[:deprecate])}
++
++      directives = Keyword.get(attrs, :directives, [])
++      [directive | directives]
++    else
++      Keyword.get(attrs, :directives, [])
++    end
++  end
++
++  defp reason(true), do: []
++  defp reason(msg) when is_binary(msg), do: [reason: msg]
++  defp reason(msg), do: raise(ArgumentError, "Invalid reason: #{msg}")
++
+   def handle_arg_attrs(identifier, type, raw_attrs) do
+-    raw_attrs
+-    |> Keyword.put_new(:name, to_string(identifier))
+-    |> Keyword.put_new(:type, type)
+-    |> Keyword.update(:description, nil, &wrap_in_unquote/1)
+-    |> Keyword.update(:default_value, nil, &wrap_in_unquote/1)
+-    |> handle_deprecate
++    block =
++      for {identifier, args} <- build_directives(raw_attrs) do
++        quote do
++          directive(unquote(identifier), unquote(args))
++        end
++      end
++
++    attrs =
++      raw_attrs
++      |> Keyword.put_new(:name, to_string(identifier))
++      |> Keyword.put_new(:type, type)
++      |> Keyword.delete(:directives)
++      |> Keyword.delete(:deprecate)
++      |> Keyword.update(:description, nil, &wrap_in_unquote/1)
++      |> Keyword.update(:default_value, nil, &wrap_in_unquote/1)
++
++    {attrs, block}
+   end
+ 
+   @doc false
+@@ -1421,8 +1509,8 @@ defmodule Absinthe.Schema.Notation do
+   # Record a deprecation in the current scope
+   def record_deprecate!(env, msg) do
+     msg = expand_ast(msg, env)
+-    deprecation = build_deprecation(msg)
+-    put_attr(env.module, {:deprecation, deprecation})
++
++    record_applied_directive!(env, :deprecated, reason: msg)
+   end
+ 
+   @doc false
+@@ -1468,21 +1556,32 @@ defmodule Absinthe.Schema.Notation do
+   def handle_enum_value_attrs(identifier, raw_attrs, env) do
+     value = Keyword.get(raw_attrs, :as, identifier)
+ 
+-    raw_attrs
+-    |> expand_ast(env)
+-    |> Keyword.put(:identifier, identifier)
+-    |> Keyword.put(:value, wrap_in_unquote(value))
+-    |> Keyword.put_new(:name, String.upcase(to_string(identifier)))
+-    |> Keyword.delete(:as)
+-    |> Keyword.update(:description, nil, &wrap_in_unquote/1)
+-    |> handle_deprecate
++    block =
++      for {identifier, args} <- build_directives(raw_attrs) do
++        quote do
++          directive(unquote(identifier), unquote(args))
++        end
++      end
++
++    attrs =
++      raw_attrs
++      |> expand_ast(env)
++      |> Keyword.delete(:directives)
++      |> Keyword.put(:identifier, identifier)
++      |> Keyword.put(:value, wrap_in_unquote(value))
++      |> Keyword.put_new(:name, String.upcase(to_string(identifier)))
++      |> Keyword.delete(:as)
++      |> Keyword.delete(:deprecate)
++      |> Keyword.update(:description, nil, &wrap_in_unquote/1)
++
++    {attrs, block}
+   end
+ 
+   @doc false
+   # Record an enum value in the current scope
+   def record_value!(env, identifier, raw_attrs) do
+-    attrs = handle_enum_value_attrs(identifier, raw_attrs, env)
+-    record!(env, Schema.EnumValueDefinition, identifier, attrs, [])
++    {attrs, block} = handle_enum_value_attrs(identifier, raw_attrs, env)
++    record!(env, Schema.EnumValueDefinition, identifier, attrs, block)
+   end
+ 
+   @doc false
+@@ -1506,6 +1605,39 @@ defmodule Absinthe.Schema.Notation do
+     end
+   end
+ 
++  def record_applied_directive!(env, name, attrs) do
++    name = Atom.to_string(name)
++
++    attrs =
++      attrs
++      |> expand_ast(env)
++      |> build_directive_arguments(env)
++      |> Keyword.put(:name, name)
++      |> put_reference(env)
++
++    directive = struct!(Absinthe.Blueprint.Directive, attrs)
++    put_attr(env.module, {:directive, directive})
++  end
++
++  defp build_directive_arguments(attrs, env) do
++    arguments =
++      attrs
++      |> Enum.map(fn {name, value} ->
++        value = expand_ast(value, env)
++
++        attrs = [
++          name: Atom.to_string(name),
++          value: value,
++          input_value: Absinthe.Blueprint.Input.Value.build(value),
++          source_location: Absinthe.Blueprint.SourceLocation.at(env.line, 0)
++        ]
++
++        struct!(Absinthe.Blueprint.Input.Argument, attrs)
++      end)
++
++    [arguments: arguments]
++  end
++
+   def record_middleware!(env, new_middleware, opts) do
+     new_middleware =
+       case expand_ast(new_middleware, env) do
+@@ -1941,7 +2073,7 @@ defmodule Absinthe.Schema.Notation do
+     [scope | _] = Module.get_attribute(env.module, :absinthe_scope_stack)
+ 
+     unless recordable?(placement, scope) do
+-      raise Absinthe.Schema.Notation.Error, invalid_message(placement, usage)
++      raise Absinthe.Schema.Notation.Error, invalid_message(placement, usage, scope)
+     end
+ 
+     env
+@@ -1951,16 +2083,22 @@ defmodule Absinthe.Schema.Notation do
+   defp recordable?([toplevel: true], scope), do: scope == :schema
+   defp recordable?([toplevel: false], scope), do: scope != :schema
+ 
+-  defp invalid_message([under: under], usage) do
++  defp invalid_message([under: under], usage, scope) do
+     allowed = under |> Enum.map(&"`#{&1}`") |> Enum.join(", ")
+-    "Invalid schema notation: `#{usage}` must only be used within #{allowed}"
++
++    "Invalid schema notation: `#{usage}` must only be used within #{allowed}. #{used_in(scope)}"
++  end
++
++  defp invalid_message([toplevel: true], usage, scope) do
++    "Invalid schema notation: `#{usage}` must only be used toplevel. #{used_in(scope)}"
+   end
+ 
+-  defp invalid_message([toplevel: true], usage) do
+-    "Invalid schema notation: `#{usage}` must only be used toplevel"
++  defp invalid_message([toplevel: false], usage, scope) do
++    "Invalid schema notation: `#{usage}` must not be used toplevel. #{used_in(scope)}"
+   end
+ 
+-  defp invalid_message([toplevel: false], usage) do
+-    "Invalid schema notation: `#{usage}` must not be used toplevel"
++  defp used_in(scope) do
++    scope = Atom.to_string(scope)
++    "Was used in `#{scope}`."
+   end
+ end
+diff --git a/lib/absinthe/schema/prototype/notation.ex b/lib/absinthe/schema/prototype/notation.ex
+index cf3b6e3d92..21bd02033b 100644
+--- a/lib/absinthe/schema/prototype/notation.ex
++++ b/lib/absinthe/schema/prototype/notation.ex
+@@ -34,6 +34,7 @@ defmodule Absinthe.Schema.Prototype.Notation do
+       def pipeline(pipeline) do
+         pipeline
+         |> Absinthe.Pipeline.without(Absinthe.Phase.Schema.Validation.QueryTypeMustBeObject)
++        |> Absinthe.Pipeline.without(Absinthe.Phase.Schema.DeprecatedDirectiveFields)
+       end
+ 
+       @doc """
+diff --git a/lib/absinthe/type/built_ins/introspection.ex b/lib/absinthe/type/built_ins/introspection.ex
+index 6c785eb34d..2ff90d1c2b 100644
+--- a/lib/absinthe/type/built_ins/introspection.ex
++++ b/lib/absinthe/type/built_ins/introspection.ex
+@@ -74,27 +74,6 @@ defmodule Absinthe.Type.BuiltIns.Introspection do
+         {:ok, args}
+       end
+ 
+-    field :on_operation,
+-      deprecate: "Check `locations` field for enum value OPERATION",
+-      type: :boolean,
+-      resolve: fn _, %{source: source} ->
+-        {:ok, Enum.any?(source.locations, &Enum.member?([:query, :mutation, :subscription], &1))}
+-      end
+-
+-    field :on_fragment,
+-      deprecate: "Check `locations` field for enum value FRAGMENT_SPREAD",
+-      type: :boolean,
+-      resolve: fn _, %{source: source} ->
+-        {:ok, Enum.member?(source.locations, :fragment_spread)}
+-      end
+-
+-    field :on_field,
+-      type: :boolean,
+-      deprecate: "Check `locations` field for enum value FIELD",
+-      resolve: fn _, %{source: source} ->
+-        {:ok, Enum.member?(source.locations, :field)}
+-      end
+-
+     field :locations, non_null(list_of(non_null(:__directive_location)))
+   end
+ 
+diff --git a/lib/absinthe/utils.ex b/lib/absinthe/utils.ex
+index 3281edaac1..c18a51012a 100644
+--- a/lib/absinthe/utils.ex
++++ b/lib/absinthe/utils.ex
+@@ -64,6 +64,11 @@ defmodule Absinthe.Utils do
+   end
+ 
+   @doc false
++  def placement_docs(placements, name) do
++    placement = Enum.find(placements, &match?({^name, _}, &1))
++    placement_docs([placement])
++  end
++
+   def placement_docs([{_, placement} | _]) do
+     placement
+     |> do_placement_docs
+diff --git a/test/absinthe/introspection_test.exs b/test/absinthe/introspection_test.exs
+index e4626d3614..5600489221 100644
+--- a/test/absinthe/introspection_test.exs
++++ b/test/absinthe/introspection_test.exs
+@@ -3,6 +3,58 @@ defmodule Absinthe.IntrospectionTest do
+ 
+   alias Absinthe.Schema
+ 
++  describe "introspection of directives" do
++    test "builtin" do
++      result =
++        """
++        query IntrospectionQuery {
++          __schema {
++            directives {
++              name
++              description
++              locations
++              isRepeatable
++              onOperation
++              onFragment
++              onField
++            }
++          }
++        }
++        """
++        |> run(Absinthe.Fixtures.ColorSchema)
++
++      assert {:ok,
++              %{
++                data: %{
++                  "__schema" => %{
++                    "directives" => [
++                      %{
++                        "description" =>
++                          "Directs the executor to include this field or fragment only when the `if` argument is true.",
++                        "isRepeatable" => false,
++                        "locations" => ["FIELD", "FRAGMENT_SPREAD", "INLINE_FRAGMENT"],
++                        "name" => "include",
++                        "onField" => true,
++                        "onFragment" => true,
++                        "onOperation" => false
++                      },
++                      %{
++                        "description" =>
++                          "Directs the executor to skip this field or fragment when the `if` argument is true.",
++                        "isRepeatable" => false,
++                        "locations" => ["FIELD", "FRAGMENT_SPREAD", "INLINE_FRAGMENT"],
++                        "name" => "skip",
++                        "onField" => true,
++                        "onFragment" => true,
++                        "onOperation" => false
++                      }
++                    ]
++                  }
++                }
++              }} = result
++    end
++  end
++
+   describe "introspection of an enum type" do
+     test "can use __type and value information with deprecations" do
+       result =
+diff --git a/test/absinthe/schema/notation_test.exs b/test/absinthe/schema/notation_test.exs
+index 56d486ba2e..6f7a0602c7 100644
+--- a/test/absinthe/schema/notation_test.exs
++++ b/test/absinthe/schema/notation_test.exs
+@@ -28,7 +28,7 @@ defmodule Absinthe.Schema.NotationTest do
+         """
+         arg :name, :string
+         """,
+-        "Invalid schema notation: `arg` must only be used within `directive`, `field`"
++        "Invalid schema notation: `arg` must only be used within `directive`, `field`. Was used in `schema`."
+       )
+     end
+   end
+@@ -51,7 +51,7 @@ defmodule Absinthe.Schema.NotationTest do
+           end
+         end
+         """,
+-        "Invalid schema notation: `directive` must only be used toplevel"
++        "Invalid schema notation: `directive` must only be used toplevel. Was used in `directive`."
+       )
+     end
+   end
+@@ -73,7 +73,7 @@ defmodule Absinthe.Schema.NotationTest do
+           end
+         end
+         """,
+-        "Invalid schema notation: `enum` must only be used toplevel"
++        "Invalid schema notation: `enum` must only be used toplevel. Was used in `enum`."
+       )
+     end
+   end
+@@ -109,7 +109,7 @@ defmodule Absinthe.Schema.NotationTest do
+         """
+         field :foo, :string
+         """,
+-        "Invalid schema notation: `field` must only be used within `input_object`, `interface`, `object`"
++        "Invalid schema notation: `field` must only be used within `input_object`, `interface`, `object`. Was used in `schema`."
+       )
+     end
+   end
+@@ -131,7 +131,7 @@ defmodule Absinthe.Schema.NotationTest do
+           end
+         end
+         """,
+-        "Invalid schema notation: `input_object` must only be used toplevel"
++        "Invalid schema notation: `input_object` must only be used toplevel. Was used in `input_object`."
+       )
+     end
+   end
+@@ -152,7 +152,7 @@ defmodule Absinthe.Schema.NotationTest do
+         """
+         expand fn _, _ -> :ok end
+         """,
+-        "Invalid schema notation: `expand` must only be used within `directive`"
++        "Invalid schema notation: `expand` must only be used within `directive`. Was used in `schema`."
+       )
+     end
+ 
+@@ -164,7 +164,7 @@ defmodule Absinthe.Schema.NotationTest do
+           expand fn _, _ -> :ok end
+         end
+         """,
+-        "Invalid schema notation: `expand` must only be used within `directive`"
++        "Invalid schema notation: `expand` must only be used within `directive`. Was used in `object`."
+       )
+     end
+   end
+@@ -204,7 +204,7 @@ defmodule Absinthe.Schema.NotationTest do
+           interface :foo
+         end
+         """,
+-        "Invalid schema notation: `interface_attribute` must only be used within `object`, `interface`"
++        "Invalid schema notation: `interface_attribute` must only be used within `object`, `interface`. Was used in `input_object`."
+       )
+     end
+   end
+@@ -245,7 +245,7 @@ defmodule Absinthe.Schema.NotationTest do
+         end
+         interfaces [:bar]
+         """,
+-        "Invalid schema notation: `interfaces` must only be used within `object`, `interface`"
++        "Invalid schema notation: `interfaces` must only be used within `object`, `interface`. Was used in `schema`."
+       )
+     end
+   end
+@@ -265,7 +265,7 @@ defmodule Absinthe.Schema.NotationTest do
+         """
+         is_type_of fn _, _ -> true end
+         """,
+-        "Invalid schema notation: `is_type_of` must only be used within `object`"
++        "Invalid schema notation: `is_type_of` must only be used within `object`. Was used in `schema`."
+       )
+     end
+ 
+@@ -277,7 +277,7 @@ defmodule Absinthe.Schema.NotationTest do
+           is_type_of fn _, _ -> :bar end
+         end
+         """,
+-        "Invalid schema notation: `is_type_of` must only be used within `object`"
++        "Invalid schema notation: `is_type_of` must only be used within `object`. Was used in `interface`."
+       )
+     end
+   end
+@@ -299,7 +299,7 @@ defmodule Absinthe.Schema.NotationTest do
+           end
+         end
+         """,
+-        "Invalid schema notation: `object` must only be used toplevel"
++        "Invalid schema notation: `object` must only be used toplevel. Was used in `object`."
+       )
+     end
+ 
+@@ -348,7 +348,7 @@ defmodule Absinthe.Schema.NotationTest do
+         """
+         on [:fragment_spread, :mutation]
+         """,
+-        "Invalid schema notation: `on` must only be used within `directive`"
++        "Invalid schema notation: `on` must only be used within `directive`. Was used in `schema`."
+       )
+     end
+   end
+@@ -368,7 +368,7 @@ defmodule Absinthe.Schema.NotationTest do
+         """
+         parse &(&1)
+         """,
+-        "Invalid schema notation: `parse` must only be used within `scalar`"
++        "Invalid schema notation: `parse` must only be used within `scalar`. Was used in `schema`."
+       )
+     end
+   end
+@@ -390,7 +390,7 @@ defmodule Absinthe.Schema.NotationTest do
+         """
+         resolve fn _, _ -> {:ok, 1} end
+         """,
+-        "Invalid schema notation: `resolve` must only be used within `field`"
++        "Invalid schema notation: `resolve` must only be used within `field`. Was used in `schema`."
+       )
+     end
+ 
+@@ -402,7 +402,7 @@ defmodule Absinthe.Schema.NotationTest do
+           resolve fn _, _ -> {:ok, 1} end
+         end
+         """,
+-        "Invalid schema notation: `resolve` must only be used within `field`"
++        "Invalid schema notation: `resolve` must only be used within `field`. Was used in `object`."
+       )
+     end
+   end
+@@ -430,7 +430,7 @@ defmodule Absinthe.Schema.NotationTest do
+         """
+         resolve_type fn _, _ -> :bar end
+         """,
+-        "Invalid schema notation: `resolve_type` must only be used within `interface`, `union`"
++        "Invalid schema notation: `resolve_type` must only be used within `interface`, `union`. Was used in `schema`."
+       )
+     end
+ 
+@@ -442,7 +442,7 @@ defmodule Absinthe.Schema.NotationTest do
+           resolve_type fn _, _ -> :bar end
+         end
+         """,
+-        "Invalid schema notation: `resolve_type` must only be used within `interface`, `union`"
++        "Invalid schema notation: `resolve_type` must only be used within `interface`, `union`. Was used in `object`."
+       )
+     end
+   end
+@@ -464,7 +464,7 @@ defmodule Absinthe.Schema.NotationTest do
+           end
+         end
+         """,
+-        "Invalid schema notation: `scalar` must only be used toplevel"
++        "Invalid schema notation: `scalar` must only be used toplevel. Was used in `scalar`."
+       )
+     end
+   end
+@@ -484,7 +484,7 @@ defmodule Absinthe.Schema.NotationTest do
+         """
+         serialize &(&1)
+         """,
+-        "Invalid schema notation: `serialize` must only be used within `scalar`"
++        "Invalid schema notation: `serialize` must only be used within `scalar`. Was used in `schema`."
+       )
+     end
+   end
+@@ -506,7 +506,7 @@ defmodule Absinthe.Schema.NotationTest do
+       assert_notation_error(
+         "TypesInvalid",
+         "types [:foo]",
+-        "Invalid schema notation: `types` must only be used within `union`"
++        "Invalid schema notation: `types` must only be used within `union`. Was used in `schema`."
+       )
+     end
+   end
+@@ -526,7 +526,7 @@ defmodule Absinthe.Schema.NotationTest do
+       assert_notation_error(
+         "ValueInvalid",
+         "value :b",
+-        "Invalid schema notation: `value` must only be used within `enum`"
++        "Invalid schema notation: `value` must only be used within `enum`. Was used in `schema`."
+       )
+     end
+   end
+@@ -546,7 +546,7 @@ defmodule Absinthe.Schema.NotationTest do
+       assert_notation_error(
+         "DescriptionInvalid",
+         ~s(description "test"),
+-        "Invalid schema notation: `description` must not be used toplevel"
++        "Invalid schema notation: `description` must not be used toplevel. Was used in `schema`."
+       )
+     end
+   end
+diff --git a/test/absinthe/schema/type_system_directive_test.exs b/test/absinthe/schema/type_system_directive_test.exs
+index 60e5347d97..6251d6a25a 100644
+--- a/test/absinthe/schema/type_system_directive_test.exs
++++ b/test/absinthe/schema/type_system_directive_test.exs
+@@ -31,7 +31,7 @@ defmodule Absinthe.Schema.TypeSystemDirectiveTest do
+     end
+   end
+ 
+-  defmodule TypeSystemDirectivesSchema do
++  defmodule TypeSystemDirectivesSdlSchema do
+     use Absinthe.Schema
+ 
+     @prototype_schema WithTypeSystemDirective
+@@ -91,8 +91,137 @@ defmodule Absinthe.Schema.TypeSystemDirectiveTest do
+     def resolve_type(_), do: false
+   end
+ 
+-  test "Render SDL with Type System Directives applied" do
+-    assert Absinthe.Schema.to_sdl(TypeSystemDirectivesSchema) ==
+-             TypeSystemDirectivesSchema.sdl()
++  defmodule TypeSystemDirectivesMacroSchema do
++    use Absinthe.Schema
++
++    @prototype_schema WithTypeSystemDirective
++
++    query do
++      field :post, :post do
++        directive :feature, name: ":field_definition"
++      end
++
++      field :sweet, :sweet_scalar
++      field :which, :category
++      field :pet, :dog
++
++      field :search, :search_result do
++        arg :filter, :search_filter, directives: [{:feature, name: ":argument_definition"}]
++        directive :feature, name: ":argument_definition"
++      end
++    end
++
++    object :post do
++      directive :feature, name: ":object", number: 3
++
++      field :name, :string do
++        deprecate "Bye"
++      end
++    end
++
++    scalar :sweet_scalar do
++      directive :feature, name: ":scalar"
++      parse &Function.identity/1
++      serialize &Function.identity/1
++    end
++
++    enum :category do
++      directive :feature, name: ":enum"
++      value :this
++      value :that, directives: [feature: [name: ":enum_value"]]
++      value :the_other, directives: [deprecated: [reason: "It's old"]]
++    end
++
++    interface :animal do
++      directive :feature, name: ":interface"
++
++      field :leg_count, non_null(:integer) do
++        directive :feature,
++          name: """
++          Multiline here?
++          Second line
++          """
++      end
++    end
++
++    object :dog do
++      is_type_of fn _ -> true end
++      interface :animal
++      field :leg_count, non_null(:integer)
++      field :name, non_null(:string)
++    end
++
++    input_object :search_filter do
++      directive :feature, name: ":input_object"
++
++      field :query, :string, default_value: "default" do
++        directive :feature, name: ":input_field_definition"
++      end
++    end
++
++    union :search_result do
++      directive :feature, name: ":union"
++      types [:dog, :post]
++
++      resolve_type fn %{type: type}, _ -> type end
++    end
++  end
++
++  describe "with SDL schema" do
++    test "Render SDL with Type System Directives applied" do
++      assert Absinthe.Schema.to_sdl(TypeSystemDirectivesSdlSchema) ==
++               TypeSystemDirectivesSdlSchema.sdl()
++    end
++  end
++
++  @macro_schema_sdl """
++  "Represents a schema"
++  schema {
++    query: RootQueryType
++  }
++
++  interface Animal @feature(name: ":interface") {
++    legCount: Int! @feature(name: \"\"\"
++      Multiline here?
++      Second line
++    \"\"\")
++  }
++
++  input SearchFilter @feature(name: ":input_object") {
++    query: String @feature(name: ":input_field_definition")
++  }
++
++  type Post @feature(name: ":object", number: 3) {
++    name: String @deprecated(reason: "Bye")
++  }
++
++  scalar SweetScalar @feature(name: ":scalar")
++
++  type RootQueryType {
++    post: Post @feature(name: ":field_definition")
++    sweet: SweetScalar
++    which: Category
++    pet: Dog
++    search(filter: SearchFilter @feature(name: ":argument_definition")): SearchResult @feature(name: ":argument_definition")
++  }
++
++  type Dog implements Animal {
++    legCount: Int!
++    name: String!
++  }
++
++  enum Category @feature(name: ":enum") {
++    THIS
++    THAT @feature(name: ":enum_value")
++    THE_OTHER @deprecated(reason: "It's old")
++  }
++
++  union SearchResult @feature(name: ":union") = Dog | Post
++  """
++  describe "with macro schema" do
++    test "Render SDL with Type System Directives applied" do
++      assert Absinthe.Schema.to_sdl(TypeSystemDirectivesMacroSchema) ==
++               @macro_schema_sdl
++    end
+   end
+ end

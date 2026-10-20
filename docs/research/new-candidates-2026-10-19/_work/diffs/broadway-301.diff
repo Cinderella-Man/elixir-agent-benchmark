@@ -1,0 +1,163 @@
+diff --git a/lib/broadway.ex b/lib/broadway.ex
+index 6be19640..e7265397 100644
+--- a/lib/broadway.ex
++++ b/lib/broadway.ex
+@@ -1301,7 +1301,8 @@ defmodule Broadway do
+ 
+   @update_rate_limiting_options_schema NimbleOptions.new!(
+                                          allowed_messages: [type: :pos_integer],
+-                                         interval: [type: :pos_integer]
++                                         interval: [type: :pos_integer],
++                                         reset: [type: :boolean]
+                                        )
+ 
+   @doc """
+@@ -1312,10 +1313,15 @@ defmodule Broadway do
+ 
+     * `:allowed_messages`
+     * `:interval`
++    * `:reset`
+ 
+   Returns an `{:error, reason}` tuple if the given `broadway` pipeline doesn't
+   have rate limiting enabled.
+ 
++  The option `:reset` defaults to `false`. This means the rate limit will reset
++  to the new rate limit at the end of the current interval. When `:reset` is `true`,
++  the new rate limit takes effect immediately.
++
+   ## Examples
+ 
+       Broadway.update_rate_limiting(broadway, allowed_messages: 100)
+diff --git a/lib/broadway/topology/rate_limiter.ex b/lib/broadway/topology/rate_limiter.ex
+index 84131da3..d15143d5 100644
+--- a/lib/broadway/topology/rate_limiter.ex
++++ b/lib/broadway/topology/rate_limiter.ex
+@@ -49,13 +49,14 @@ defmodule Broadway.Topology.RateLimiter do
+     counter = :atomics.new(@atomics_index, [])
+     :atomics.put(counter, @atomics_index, allowed)
+ 
+-    _ = schedule_next_reset(interval)
++    timer = schedule_next_reset(interval)
+ 
+     state = %{
+       interval: interval,
+       allowed: allowed,
+       producers_names: producers_names,
+-      counter: counter
++      counter: counter,
++      reset_timer: timer
+     }
+ 
+     {:ok, state}
+@@ -63,15 +64,19 @@ defmodule Broadway.Topology.RateLimiter do
+ 
+   @impl true
+   def handle_call({:update_rate_limiting, opts}, _from, state) do
+-    %{interval: interval, allowed: allowed} = state
+-
+-    state = %{
+-      state
+-      | interval: Keyword.get(opts, :interval, interval),
+-        allowed: Keyword.get(opts, :allowed_messages, allowed)
+-    }
+-
+-    {:reply, :ok, state}
++    %{interval: interval, allowed: allowed, reset_timer: prev_timer} = state
++    new_interval = Keyword.get(opts, :interval, interval)
++    new_allowed = Keyword.get(opts, :allowed_messages, allowed)
++
++    state = %{state | interval: new_interval, allowed: new_allowed}
++
++    if Keyword.get(opts, :reset, false) do
++      cancel_reset_limit_timer(prev_timer)
++      timer = schedule_next_reset(0)
++      {:reply, :ok, %{state | reset_timer: timer}}
++    else
++      {:reply, :ok, state}
++    end
+   end
+ 
+   def handle_call(:get_rate_limiting, _from, state) do
+@@ -95,12 +100,26 @@ defmodule Broadway.Topology.RateLimiter do
+         is_pid(pid),
+         do: send(pid, {__MODULE__, :reset_rate_limiting})
+ 
+-    _ = schedule_next_reset(interval)
++    timer = schedule_next_reset(interval)
+ 
+-    {:noreply, state}
++    {:noreply, %{state | reset_timer: timer}}
+   end
+ 
+   defp schedule_next_reset(interval) do
+-    _ref = Process.send_after(self(), :reset_limit, interval)
++    Process.send_after(self(), :reset_limit, interval)
++  end
++
++  defp cancel_reset_limit_timer(timer) do
++    case Process.cancel_timer(timer) do
++      false ->
++        receive do
++          :reset_limit -> :ok
++        after
++          0 -> raise "unknown timer #{inspect(timer)}"
++        end
++
++      _ ->
++        :ok
++    end
+   end
+ end
+diff --git a/test/broadway_test.exs b/test/broadway_test.exs
+index d1fca855..59d6df33 100644
+--- a/test/broadway_test.exs
++++ b/test/broadway_test.exs
+@@ -2451,10 +2451,11 @@ defmodule BroadwayTest do
+         get_producer(broadway_name),
+         {:push_messages,
+          [
+-           %Message{data: 1, acknowledger: CallerAcknowledger.init({self(), :ref}, :unused)},
+-           %Message{data: 2, acknowledger: CallerAcknowledger.init({self(), :ref}, :unused)},
+-           %Message{data: 3, acknowledger: CallerAcknowledger.init({self(), :ref}, :unused)},
+-           %Message{data: 4, acknowledger: CallerAcknowledger.init({self(), :ref}, :unused)}
++           %Message{data: 1, acknowledger: {CallerAcknowledger, {self(), :ref}, :unused}},
++           %Message{data: 2, acknowledger: {CallerAcknowledger, {self(), :ref}, :unused}},
++           %Message{data: 3, acknowledger: {CallerAcknowledger, {self(), :ref}, :unused}},
++           %Message{data: 4, acknowledger: {CallerAcknowledger, {self(), :ref}, :unused}},
++           %Message{data: 5, acknowledger: {CallerAcknowledger, {self(), :ref}, :unused}}
+          ]}
+       )
+ 
+@@ -2462,16 +2463,20 @@ defmodule BroadwayTest do
+ 
+       refute_received {:handle_message_called, _message, _timestamp}
+ 
+-      assert :ok = Broadway.update_rate_limiting(broadway_name, allowed_messages: 3)
++      # pass `reset` flag to force rate limiting to reset immediately
++      assert :ok = Broadway.update_rate_limiting(broadway_name, allowed_messages: 3, reset: true)
+ 
+       assert Broadway.get_rate_limiting(broadway_name) ==
+                {:ok, %{allowed_messages: 3, interval: 5000}}
+ 
+-      send(get_rate_limiter(broadway_name), :reset_limit)
+-
+       assert_receive {:handle_message_called, %Message{data: 2}, _timestamp}
+       assert_receive {:handle_message_called, %Message{data: 3}, _timestamp}
+       assert_receive {:handle_message_called, %Message{data: 4}, _timestamp}
++
++      assert :ok = Broadway.update_rate_limiting(broadway_name, allowed_messages: 5)
++
++      # without the `reset` flag, rate limiting resets at the end of the current interval
++      refute_receive {:handle_message_called, %Message{data: 5}, _timestamp}
+     end
+ 
+     test "invalid options" do
+@@ -2483,7 +2488,7 @@ defmodule BroadwayTest do
+         )
+ 
+       assert_raise ArgumentError,
+-                   "invalid options, unknown options [:invalid_option], valid options are: [:allowed_messages, :interval]",
++                   "invalid options, unknown options [:invalid_option], valid options are: [:allowed_messages, :interval, :reset]",
+                    fn -> Broadway.update_rate_limiting(broadway_name, invalid_option: 3) end
+     end
+   end

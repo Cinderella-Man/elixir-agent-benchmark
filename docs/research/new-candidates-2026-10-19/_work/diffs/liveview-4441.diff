@@ -1,0 +1,943 @@
+diff --git a/lib/phoenix_live_view.ex b/lib/phoenix_live_view.ex
+index c1c2959c99..668dd69e51 100644
+--- a/lib/phoenix_live_view.ex
++++ b/lib/phoenix_live_view.ex
+@@ -2506,4 +2506,166 @@ defmodule Phoenix.LiveView do
+   def cancel_async(socket, async_or_keys, reason \\ {:shutdown, :cancel}) do
+     Async.cancel_async(socket, async_or_keys, reason)
+   end
++
++  @doc """
++  Subscribes to `Phoenix.PubSub` messages on the given topic.
++
++  This works with both LiveViews and LiveComponents. LiveView tracks each
++  subscription and globally subscribes once. It automatically unsubscribes after
++  the last subscriber unsubscribed or - in case of components - the last subscribed
++  component is removed from the page.
++
++  Calling `subscribe` again with the same callback is a no-op, so it does not lead
++  to duplicate callback invocations. A LiveView or LiveComponent can only have one
++  callback per topic: subscribing to the same topic with a different callback raises.
++  Call `unsubscribe/2` first if you want to replace it.
++
++  `callback` is invoked with the broadcast message and the socket, mirroring
++  `c:handle_info/2`, and must return the updated socket. For components, it
++  receives the component's own socket. Messages delivered to the callback do not
++  go through `c:handle_info/2`, so `:handle_info` hooks attached with `attach_hook/4`
++  do not see them.
++
++  If the LiveView and some of its components subscribe to the same topic, each of
++  their callbacks is invoked for every message. The order in which they are invoked
++  is not guaranteed.
++
++  On the initial disconnected render there is no process to deliver messages to,
++  so this is a no-op. It must be called from the LiveView process itself and
++  raises otherwise, for example when called from a task started by `assign_async/4`.
++
++  By default, the endpoint's configured `:pubsub_server` is used:
++
++      socket.endpoint.config(:pubsub_server)
++
++  If the endpoint has no `:pubsub_server` configured, this raises an `ArgumentError`.
++  If you need to pass a different one, use `subscribe/4`.
++
++  > #### Captured variables {: .warning}
++  >
++  > The callback is kept for as long as the subscription is active. If it is an
++  > anonymous function, every variable it references from the surrounding scope
++  > is kept alive with it. In particular, do not reference the `socket` from
++  > `mount/3` inside the callback: it keeps the assigns from subscription time in
++  > memory, and reading them gives you stale data. To avoid running into such pitfalls,
++  > prefer using function captures:
++  >
++  >     # bad: socket.assigns.items is the value from mount
++  >     subscribe(socket, MyApp.PubSub, "topic", fn message, new_socket ->
++  >       assign(new_socket, :items, [message | socket.assigns.items])
++  >     end)
++  >
++  >     # good
++  >     subscribe(socket, MyApp.PubSub, "topic", &handle_message/2)
++
++  > #### Code reloading {: .info}
++  >
++  > Anonymous functions and local captures such as `&handle_message/2` point to the
++  > version of the module that was loaded when `subscribe` was called. If the module
++  > is recompiled while the LiveView keeps running, for example when LiveView
++  > re-renders in place after a code change in development, the callback keeps
++  > running the old code. Once the module is recompiled a second time, invoking the
++  > callback raises, and the LiveView crashes and remounts. Remote captures of public
++  > functions, such as `&__MODULE__.handle_message/2`, always call the latest version
++  > of the module.
++
++  ## Examples
++
++      def mount(%{"id" => id}, _session, socket) do
++        subscribe(socket, "room:\#{id}", &handle_room_update/2)
++
++        {:ok, socket}
++      end
++
++      defp handle_room_update({:updated, room}, socket) do
++        stream_insert(socket, :rooms, room)
++      end
++
++  """
++  @spec subscribe(
++          socket :: Socket.t(),
++          topic :: binary(),
++          callback :: (message :: term(), socket :: Socket.t() -> Socket.t())
++        ) :: :ok
++  def subscribe(socket, topic, callback)
++      when is_struct(socket, Socket) and is_binary(topic) and is_function(callback, 2) do
++    subscribe(socket, endpoint_pubsub_server!(socket), topic, callback)
++  end
++
++  @doc """
++  Subscribes to `Phoenix.PubSub` messages using the given pubsub server.
++
++  See `subscribe/3`.
++  """
++  @spec subscribe(
++          socket :: Socket.t(),
++          pubsub :: module(),
++          topic :: binary(),
++          callback :: (message :: term(), socket :: Socket.t() -> Socket.t())
++        ) :: :ok
++  defdelegate subscribe(socket, pubsub, topic, callback), to: Phoenix.LiveView.PubSub
++
++  @doc """
++  Unsubscribes from `Phoenix.PubSub` messages on the given topic.
++
++  Only the subscription of the calling LiveView or LiveComponent is removed. Like
++  `subscribe/3`, this uses the endpoint's configured `:pubsub_server` and raises an
++  `ArgumentError` if there is none. If you need to pass a different one, use
++  `unsubscribe/3`.
++
++  ## Examples
++
++      def handle_event("toggle-live-updates", %{"enabled" => enabled}, socket) do
++        topic = "room:\#{socket.assigns.room_id}"
++
++        if enabled == "true" do
++          subscribe(socket, topic, &handle_room_update/2)
++        else
++          unsubscribe(socket, topic)
++        end
++
++        {:noreply, socket}
++      end
++
++  """
++  @spec unsubscribe(
++          socket :: Socket.t(),
++          topic :: binary()
++        ) :: :ok
++  def unsubscribe(socket, topic) when is_struct(socket, Socket) and is_binary(topic) do
++    unsubscribe(socket, endpoint_pubsub_server!(socket), topic)
++  end
++
++  defp endpoint_pubsub_server!(%Socket{endpoint: nil}) do
++    raise ArgumentError, """
++    cannot look up the :pubsub_server because the socket has no endpoint.
++
++    This usually happens when rendering a component with render_component/3
++    in a test module that does not set @endpoint. Either set @endpoint or pass
++    the pubsub server explicitly to Phoenix.LiveView.subscribe/4 and
++    Phoenix.LiveView.unsubscribe/3.
++    """
++  end
++
++  defp endpoint_pubsub_server!(%Socket{endpoint: endpoint}) do
++    endpoint.config(:pubsub_server) ||
++      raise ArgumentError, """
++      no :pubsub_server configured for #{inspect(endpoint)}.
++
++      Either configure a :pubsub_server for your endpoint or pass the pubsub
++      server explicitly to Phoenix.LiveView.subscribe/4 and Phoenix.LiveView.unsubscribe/3.
++      """
++  end
++
++  @doc """
++  Unsubscribes from `Phoenix.PubSub` messages using the given pubsub server.
++
++  See `unsubscribe/2`.
++  """
++  @spec unsubscribe(
++          socket :: Socket.t(),
++          pubsub :: module(),
++          topic :: binary()
++        ) :: :ok
++  defdelegate unsubscribe(socket, pubsub, topic), to: Phoenix.LiveView.PubSub
+ end
+diff --git a/lib/phoenix_live_view/channel.ex b/lib/phoenix_live_view/channel.ex
+index 0c90fd861a..20fa99d48e 100644
+--- a/lib/phoenix_live_view/channel.ex
++++ b/lib/phoenix_live_view/channel.ex
+@@ -380,6 +380,18 @@ defmodule Phoenix.LiveView.Channel do
+     handle_changed(state, new_socket, nil)
+   end
+ 
++  def handle_info({Phoenix.LiveView.PubSub, ref, message}, state) when is_reference(ref) do
++    subscribers = Phoenix.LiveView.PubSub.subscribers(ref)
++
++    Enum.reduce_while(subscribers, {:noreply, state}, fn
++      {cid_or_root, callback}, {:noreply, state} ->
++        case handle_pubsub_callback(cid_or_root, callback, message, state) do
++          {:noreply, _state} = result -> {:cont, result}
++          result -> {:halt, result}
++        end
++    end)
++  end
++
+   def handle_info(msg, %{socket: socket} = state) do
+     msg
+     |> view_handle_info(socket)
+@@ -1292,6 +1304,7 @@ defmodule Phoenix.LiveView.Channel do
+     } = phx_socket
+ 
+     Process.put(:"$initial_call", {view, :mount, 3})
++    Phoenix.LiveView.PubSub.init()
+ 
+     case params do
+       %{"caller" => {pid, _}} when is_pid(pid) -> Process.put(:"$callers", [pid])
+@@ -1708,6 +1721,7 @@ defmodule Phoenix.LiveView.Channel do
+             })
+ 
+             cancel_asyncs(c_socket)
++            Phoenix.LiveView.PubSub.unsubscribe_cid(deleted_cid)
+ 
+             if deleted_cid in upload_cids do
+               {_new_c_socket, canceled_confs} = Upload.maybe_cancel_uploads(c_socket)
+@@ -1851,4 +1865,41 @@ defmodule Phoenix.LiveView.Channel do
+         pids
+     end
+   end
++
++  defp handle_pubsub_callback(:root, callback, msg, %{socket: socket} = state) do
++    case callback.(msg, socket) do
++      %Socket{} = new_socket ->
++        handle_changed(state, new_socket, nil)
++
++      result ->
++        raise ArgumentError, """
++        expected pubsub subscription callback to return a %Socket{}, got:
++
++        #{inspect(result)}
++        """
++    end
++  end
++
++  defp handle_pubsub_callback(cid, callback, msg, state) when is_integer(cid) do
++    component_handle(state, cid, nil, fn component_socket, _component ->
++      case callback.(msg, component_socket) do
++        %Socket{redirected: redirected, assigns: assigns} = new_component_socket ->
++          new_component_socket =
++            if redirected do
++              Utils.clear_flash(new_component_socket)
++            else
++              new_component_socket
++            end
++
++          {new_component_socket, {redirected, assigns.flash}}
++
++        result ->
++          raise ArgumentError, """
++          expected LiveComponent pubsub subscription callback to return a %Socket{}, got:
++
++          #{inspect(result)}
++          """
++      end
++    end)
++  end
+ end
+diff --git a/lib/phoenix_live_view/pubsub.ex b/lib/phoenix_live_view/pubsub.ex
+new file mode 100644
+index 0000000000..2e04b89915
+--- /dev/null
++++ b/lib/phoenix_live_view/pubsub.ex
+@@ -0,0 +1,155 @@
++defmodule Phoenix.LiveView.PubSub do
++  @moduledoc false
++
++  @behaviour Phoenix.PubSub.Sender
++
++  # We use the process dictionary because pubsub subscriptions
++  # are side effects by design.
++  #
++  # If someone does
++  #
++  #   def mount(...) do
++  #     subscribe(socket, "items", ...)
++  #     assign(socket, ..., load_items(...))
++  #
++  # the expectation is that the subscription happens before loading
++  # items. Otherwise there is a gap where updates can be missed.
++  #
++  # If this implementation deferred subscriptions by looking at the
++  # socket after mount returns (or used the process mailbox), this
++  # immediate subscription behavior could not be achieved.
++  @key {__MODULE__, :__subscriptions__}
++
++  @impl true
++  def send(pid, ref, message, state) do
++    send(pid, {__MODULE__, ref, message})
++    state
++  end
++
++  def init do
++    Process.put(@key, %{})
++  end
++
++  def subscribe(%Phoenix.LiveView.Socket{} = socket, pubsub, topic, callback)
++      when is_atom(pubsub) and is_binary(topic) and is_function(callback, 2) do
++    if Phoenix.LiveView.connected?(socket) do
++      verify_called_from_liveview!(:subscribe)
++      do_subscribe(pubsub, topic, subscriber(socket), callback)
++    end
++
++    :ok
++  end
++
++  defp do_subscribe(pubsub, topic, cid_or_root, callback) do
++    pubsub_subscriptions = pubsub_subscriptions()
++
++    updated_subscriptions =
++      case pubsub_subscriptions do
++        %{{^pubsub, ^topic} => {_ref, %{^cid_or_root => ^callback}}} ->
++          pubsub_subscriptions
++
++        %{{^pubsub, ^topic} => {_ref, %{^cid_or_root => _other_callback}}} ->
++          raise ArgumentError, """
++          already subscribed to #{inspect(topic)} on #{inspect(pubsub)} with a different callback.
++
++          A LiveView or LiveComponent can only have one callback per topic. \
++          Call Phoenix.LiveView.unsubscribe first if you want to replace it.
++          """
++
++        %{{^pubsub, ^topic} => {ref, subscribers}} ->
++          Map.put(
++            pubsub_subscriptions,
++            {pubsub, topic},
++            {ref, Map.put(subscribers, cid_or_root, callback)}
++          )
++
++        %{} ->
++          ref = make_ref()
++          Phoenix.PubSub.subscribe(pubsub, topic, sender: {Phoenix.LiveView.PubSub, ref})
++
++          pubsub_subscriptions
++          |> Map.put({pubsub, topic}, {ref, %{cid_or_root => callback}})
++          |> Map.put(ref, {pubsub, topic})
++      end
++
++    Process.put(@key, updated_subscriptions)
++  end
++
++  def unsubscribe(%Phoenix.LiveView.Socket{} = socket, pubsub, topic)
++      when is_atom(pubsub) and is_binary(topic) do
++    if Phoenix.LiveView.connected?(socket) do
++      verify_called_from_liveview!(:unsubscribe)
++      do_unsubscribe(pubsub, topic, subscriber(socket))
++    end
++
++    :ok
++  end
++
++  defp do_unsubscribe(pubsub, topic, cid_or_root) do
++    pubsub_subscriptions = pubsub_subscriptions()
++
++    updated_subscriptions =
++      case pubsub_subscriptions do
++        %{{^pubsub, ^topic} => {ref, subscribers}} when is_map_key(subscribers, cid_or_root) ->
++          case Map.delete(subscribers, cid_or_root) do
++            empty when map_size(empty) == 0 ->
++              # unsubscribe/2 would also drop subscriptions the user made on the same topic
++              Phoenix.PubSub.unsubscribe_sender(pubsub, topic, {__MODULE__, ref})
++
++              pubsub_subscriptions
++              |> Map.delete({pubsub, topic})
++              |> Map.delete(ref)
++
++            subscribers ->
++              Map.put(pubsub_subscriptions, {pubsub, topic}, {ref, subscribers})
++          end
++
++        %{} ->
++          pubsub_subscriptions
++      end
++
++    Process.put(@key, updated_subscriptions)
++  end
++
++  defp pubsub_subscriptions do
++    Process.get(@key, %{})
++  end
++
++  def subscribers(ref) do
++    case pubsub_subscriptions() do
++      %{^ref => key} = subscriptions ->
++        {^ref, subscribers} = Map.fetch!(subscriptions, key)
++        subscribers
++
++      %{} ->
++        # we might still have stale messages in the mailbox
++        # so we ignore those silently
++        []
++    end
++  end
++
++  def unsubscribe_cid(cid) do
++    for {{pubsub, topic}, {_ref, subscribers}} <- pubsub_subscriptions(),
++        Map.has_key?(subscribers, cid) do
++      do_unsubscribe(pubsub, topic, cid)
++    end
++  end
++
++  defp subscriber(%{assigns: %{myself: %Phoenix.LiveComponent.CID{cid: cid}}}), do: cid
++  defp subscriber(_socket), do: :root
++
++  defp verify_called_from_liveview!(fun) do
++    # we use the process dictionary so to prevent cases where a user calls
++    # subscribe in assign_async or a custom Task, we check and raise
++    # if this process is not demonstrably a LiveView. The channel always
++    # initializes the pdict key to an empty map.
++    case Process.get(@key, :not_set) do
++      :not_set ->
++        raise ArgumentError,
++              "Phoenix.LiveView.#{fun} can only be called from the LiveView process itself"
++
++      %{} ->
++        :ok
++    end
++  end
++end
+diff --git a/mix.exs b/mix.exs
+index b8258d9a26..2e354d4f64 100644
+--- a/mix.exs
++++ b/mix.exs
+@@ -50,6 +50,7 @@ defmodule Phoenix.LiveView.MixProject do
+       {:plug, "~> 1.15"},
+       {:phoenix_template, "~> 1.0"},
+       {:phoenix_html, "~> 3.3 or ~> 4.0 or ~> 4.1"},
++      {:phoenix_pubsub, "~> 2.4"},
+       {:telemetry, "~> 0.4.2 or ~> 1.0"},
+       {:esbuild, "~> 0.2", only: :dev},
+       {:phoenix_view, "~> 2.0", optional: true},
+diff --git a/mix.lock b/mix.lock
+index ef7d6996b0..c1217b6162 100644
+--- a/mix.lock
++++ b/mix.lock
+@@ -34,7 +34,7 @@
+   "phoenix_html": {:hex, :phoenix_html, "4.3.0", "d3577a5df4b6954cd7890c84d955c470b5310bb49647f0a114a6eeecc850f7ad", [:mix], [], "hexpm", "3eaa290a78bab0f075f791a46a981bbe769d94bc776869f4f3063a14f30497ad"},
+   "phoenix_html_helpers": {:hex, :phoenix_html_helpers, "1.0.1", "7eed85c52eff80a179391036931791ee5d2f713d76a81d0d2c6ebafe1e11e5ec", [:mix], [{:phoenix_html, "~> 4.0", [hex: :phoenix_html, repo: "hexpm", optional: false]}, {:plug, "~> 1.5", [hex: :plug, repo: "hexpm", optional: true]}], "hexpm", "cffd2385d1fa4f78b04432df69ab8da63dc5cf63e07b713a4dcf36a3740e3090"},
+   "phoenix_live_reload": {:hex, :phoenix_live_reload, "1.7.0", "fb1e429f6d8778ce3a6962debdc5e555428a05a6e7b058d6dbad13d281a2c31f", [:mix], [{:file_system, "~> 0.2.10 or ~> 1.0", [hex: :file_system, repo: "hexpm", optional: false]}, {:phoenix, "~> 1.4", [hex: :phoenix, repo: "hexpm", optional: false]}], "hexpm", "dc9f44271aa6fc4ab7797f2aa374ba096ef2c87520586280eb095626b7387a68"},
+-  "phoenix_pubsub": {:hex, :phoenix_pubsub, "2.3.0", "03916bfbc31a5121945b3cfffe5aec647a5c97fe1dc172a319b94428562359c9", [:mix], [], "hexpm", "eec7be6e9cf02e2551d389b558402d6c637cd3973796326e7ba4bb03c6b2e91d"},
++  "phoenix_pubsub": {:hex, :phoenix_pubsub, "2.4.0", "be29b070ec9298df8c3c90a2ae0712d4c9e37c214f6a6ca81341bd19f1bde00b", [:mix], [], "hexpm", "80776f727460ed104c95ecddcacc5098d3cd31f40e5f05741e1219abfb20f4a8"},
+   "phoenix_template": {:hex, :phoenix_template, "1.0.4", "e2092c132f3b5e5b2d49c96695342eb36d0ed514c5b252a77048d5969330d639", [:mix], [{:phoenix_html, "~> 2.14.2 or ~> 3.0 or ~> 4.0", [hex: :phoenix_html, repo: "hexpm", optional: true]}], "hexpm", "2c0c81f0e5c6753faf5cca2f229c9709919aba34fab866d3bc05060c9c444206"},
+   "phoenix_view": {:hex, :phoenix_view, "2.0.4", "b45c9d9cf15b3a1af5fb555c674b525391b6a1fe975f040fb4d913397b31abf4", [:mix], [{:phoenix_html, "~> 2.14.2 or ~> 3.0 or ~> 4.0", [hex: :phoenix_html, repo: "hexpm", optional: true]}, {:phoenix_template, "~> 1.0", [hex: :phoenix_template, repo: "hexpm", optional: false]}], "hexpm", "4e992022ce14f31fe57335db27a28154afcc94e9983266835bb3040243eb620b"},
+   "plug": {:hex, :plug, "1.20.3", "56c480c633ec2ce10140e236e15233bf576e1d323887d7c96711bd02ab5160db", [:mix], [{:mime, "~> 1.0 or ~> 2.0", [hex: :mime, repo: "hexpm", optional: false]}, {:plug_crypto, "~> 1.1.1 or ~> 1.2 or ~> 2.0", [hex: :plug_crypto, repo: "hexpm", optional: false]}, {:telemetry, "~> 0.4.3 or ~> 1.0", [hex: :telemetry, repo: "hexpm", optional: false]}], "hexpm", "be266aee1b8536ef6409d58cf39a3121319f0ec47cfa1b24024485aa0e76ad76"},
+diff --git a/test/phoenix_live_view/integrations/pubsub_test.exs b/test/phoenix_live_view/integrations/pubsub_test.exs
+new file mode 100644
+index 0000000000..79f657e5a2
+--- /dev/null
++++ b/test/phoenix_live_view/integrations/pubsub_test.exs
+@@ -0,0 +1,436 @@
++defmodule Phoenix.LiveViewTest.Support.PubSubLive do
++  use Phoenix.LiveView
++
++  alias Phoenix.LiveView
++
++  @pubsub Phoenix.LiveViewTest.PubSubTest.PubSub
++
++  defmodule Child do
++    use Phoenix.LiveComponent
++
++    alias Phoenix.LiveView
++
++    @pubsub Phoenix.LiveViewTest.PubSubTest.PubSub
++
++    def mount(socket) do
++      socket = assign(socket, :messages, [])
++      LiveView.subscribe(socket, @pubsub, "lv-pubsub-test", &receive_message/2)
++      {:ok, socket}
++    end
++
++    def receive_message(message, socket) do
++      assign(socket, :messages, socket.assigns.messages ++ [message])
++    end
++
++    def render(assigns) do
++      ~H"""
++      <div id={@id}>{@id}: {inspect(@messages)}</div>
++      """
++    end
++
++    def handle_event("unsubscribe", _params, socket) do
++      LiveView.unsubscribe(socket, @pubsub, "lv-pubsub-test")
++      {:noreply, socket}
++    end
++  end
++
++  def mount(_params, _session, socket) do
++    socket = assign(socket, messages: [], direct_messages: [], children: [])
++    LiveView.subscribe(socket, @pubsub, "lv-pubsub-test", &receive_message/2)
++    {:ok, socket}
++  end
++
++  def receive_message(message, socket) do
++    assign(socket, :messages, socket.assigns.messages ++ [message])
++  end
++
++  def render(assigns) do
++    ~H"""
++    <div id="root">root: {inspect(@messages)}</div>
++    <div id="direct">direct: {inspect(@direct_messages)}</div>
++    <.live_component :for={id <- @children} module={Child} id={id} />
++    """
++  end
++
++  def handle_event("unsubscribe", _params, socket) do
++    LiveView.unsubscribe(socket, @pubsub, "lv-pubsub-test")
++    {:noreply, socket}
++  end
++
++  def handle_event("subscribe-again", _params, socket) do
++    LiveView.subscribe(socket, @pubsub, "lv-pubsub-test", &receive_message/2)
++    {:noreply, socket}
++  end
++
++  def handle_event("subscribe-other-callback", _params, socket) do
++    LiveView.subscribe(socket, @pubsub, "lv-pubsub-test", fn _message, socket -> socket end)
++    {:noreply, socket}
++  end
++
++  def handle_event("subscribe-directly", _params, socket) do
++    :ok = Phoenix.PubSub.subscribe(@pubsub, "lv-pubsub-test")
++    {:noreply, socket}
++  end
++
++  def handle_event("add-child", %{"id" => id}, socket) do
++    {:noreply, assign(socket, :children, socket.assigns.children ++ [id])}
++  end
++
++  def handle_event("remove-child", %{"id" => id}, socket) do
++    {:noreply, assign(socket, :children, socket.assigns.children -- [id])}
++  end
++
++  def handle_info(message, socket) do
++    {:noreply, assign(socket, :direct_messages, socket.assigns.direct_messages ++ [message])}
++  end
++end
++
++defmodule Phoenix.LiveViewTest.Support.PubSubBadCallbackLive do
++  use Phoenix.LiveView
++
++  alias Phoenix.LiveView
++
++  @pubsub Phoenix.LiveViewTest.PubSubTest.PubSub
++
++  def mount(_params, _session, socket) do
++    LiveView.subscribe(socket, @pubsub, "lv-pubsub-test", fn _message, _socket -> :boom end)
++
++    {:ok, socket}
++  end
++
++  def render(assigns) do
++    ~H"""
++    <div>bad callback</div>
++    """
++  end
++end
++
++defmodule Phoenix.LiveViewTest.Support.PubSubDefaultLive do
++  use Phoenix.LiveView
++
++  alias Phoenix.LiveView
++
++  def mount(_params, _session, socket) do
++    socket = assign(socket, :messages, [])
++    LiveView.subscribe(socket, "lv-pubsub-default-test", &receive_message/2)
++    {:ok, socket}
++  end
++
++  def receive_message(message, socket) do
++    assign(socket, :messages, socket.assigns.messages ++ [message])
++  end
++
++  def render(assigns) do
++    ~H"""
++    <div id="root">root: {inspect(@messages)}</div>
++    """
++  end
++
++  def handle_event("unsubscribe", _params, socket) do
++    LiveView.unsubscribe(socket, "lv-pubsub-default-test")
++    {:noreply, socket}
++  end
++end
++
++defmodule Phoenix.LiveViewTest.Support.PubSubNoServerEndpoint do
++  def config(:pubsub_server), do: nil
++end
++
++defmodule Phoenix.LiveViewTest.Support.PubSubOutsideLive do
++  use Phoenix.LiveView
++
++  alias Phoenix.LiveView
++
++  @pubsub Phoenix.LiveViewTest.PubSubTest.PubSub
++
++  def mount(_params, session, socket) do
++    {:ok, assign(socket, :test_pid, session["test_pid"])}
++  end
++
++  def render(assigns) do
++    ~H"""
++    <div>outside</div>
++    """
++  end
++
++  def handle_event("subscribe-from-task", _params, socket) do
++    task =
++      Task.async(fn ->
++        try do
++          LiveView.subscribe(socket, @pubsub, "lv-pubsub-test", fn _msg, socket -> socket end)
++          :no_raise
++        rescue
++          e in ArgumentError -> {:raised, e.message}
++        end
++      end)
++
++    send(self(), {:task_result, Task.await(task)})
++    {:noreply, socket}
++  end
++
++  def handle_info({:task_result, result}, socket) do
++    send(socket.assigns.test_pid, {:task_result, result})
++    {:noreply, socket}
++  end
++end
++
++defmodule Phoenix.LiveViewTest.PubSubTest do
++  use ExUnit.Case, async: true
++
++  import Phoenix.ConnTest
++  import Phoenix.LiveViewTest
++
++  alias Phoenix.LiveViewTest.Support.{
++    PubSubBadCallbackLive,
++    PubSubDefaultLive,
++    PubSubLive,
++    PubSubNoServerEndpoint,
++    PubSubOutsideLive
++  }
++
++  @endpoint Phoenix.LiveViewTest.Support.Endpoint
++  @pubsub Phoenix.LiveViewTest.PubSubTest.PubSub
++
++  setup do
++    start_supervised!({Phoenix.PubSub, name: @pubsub})
++    %{conn: Plug.Test.init_test_session(Phoenix.ConnTest.build_conn(), %{})}
++  end
++
++  defp subscriptions do
++    Registry.lookup(@pubsub, "lv-pubsub-test")
++  end
++
++  # the registry cleans up after a DOWN and the client sends "cids_destroyed"
++  # asynchronously, so unsubscription is not observable right away
++  defp eventually(fun, retries \\ 100) do
++    fun.()
++  rescue
++    error ->
++      if retries > 0 do
++        Process.sleep(10)
++        eventually(fun, retries - 1)
++      else
++        reraise(error, __STACKTRACE__)
++      end
++  end
++
++  describe "LiveView" do
++    test "receives messages through the callback", %{conn: conn} do
++      {:ok, lv, html} = live_isolated(conn, PubSubLive)
++      assert html =~ "root: []"
++
++      Phoenix.PubSub.broadcast(@pubsub, "lv-pubsub-test", :hello)
++      assert render(lv) =~ "root: [:hello]"
++
++      Phoenix.PubSub.broadcast(@pubsub, "lv-pubsub-test", :world)
++      assert render(lv) =~ "root: [:hello, :world]"
++    end
++
++    test "is a no-op on the dead render", %{conn: conn} do
++      conn =
++        conn
++        |> put_in([Access.key!(:private), :phoenix_endpoint], @endpoint)
++        |> Phoenix.LiveView.Router.fetch_live_flash([])
++        |> Phoenix.LiveView.Controller.live_render(PubSubLive, [])
++
++      assert conn.resp_body =~ "root: []"
++      assert [] = subscriptions()
++    end
++
++    test "subscribing again with the same callback is a no-op", %{conn: conn} do
++      {:ok, lv, _html} = live_isolated(conn, PubSubLive)
++      render_click(lv, "subscribe-again", %{})
++      assert [_] = subscriptions()
++
++      Phoenix.PubSub.broadcast(@pubsub, "lv-pubsub-test", :hello)
++      assert render(lv) =~ "root: [:hello]"
++    end
++
++    test "raises when subscribing again with a different callback", %{conn: conn} do
++      Process.flag(:trap_exit, true)
++      {:ok, lv, _html} = live_isolated(conn, PubSubLive)
++
++      ref = Process.monitor(lv.pid)
++      catch_exit(render_click(lv, "subscribe-other-callback", %{}))
++
++      assert_receive {:DOWN, ^ref, :process, _, {%ArgumentError{message: message}, _}}
++      assert message =~ ~s(already subscribed to "lv-pubsub-test")
++    end
++
++    test "unsubscribe stops delivery and removes the global subscription", %{conn: conn} do
++      {:ok, lv, _html} = live_isolated(conn, PubSubLive)
++      assert [_] = subscriptions()
++
++      render_click(lv, "unsubscribe", %{})
++      assert [] = subscriptions()
++
++      Phoenix.PubSub.broadcast(@pubsub, "lv-pubsub-test", :hello)
++      assert render(lv) =~ "root: []"
++    end
++
++    test "unsubscribe keeps subscriptions made directly through Phoenix.PubSub", %{conn: conn} do
++      {:ok, lv, _html} = live_isolated(conn, PubSubLive)
++      render_click(lv, "subscribe-directly", %{})
++      assert [_, _] = subscriptions()
++
++      render_click(lv, "unsubscribe", %{})
++      assert [_] = subscriptions()
++
++      Phoenix.PubSub.broadcast(@pubsub, "lv-pubsub-test", :hello)
++
++      html = render(lv)
++      assert html =~ "root: []"
++      assert html =~ "direct: [:hello]"
++    end
++
++    test "unsubscribes when the LiveView terminates", %{conn: conn} do
++      {:ok, lv, _html} = live_isolated(conn, PubSubLive)
++      assert [_] = subscriptions()
++
++      ref = Process.monitor(lv.pid)
++      GenServer.stop(lv.pid)
++      assert_receive {:DOWN, ^ref, :process, _, _}
++
++      eventually(fn -> assert [] = subscriptions() end)
++    end
++
++    test "raises when the callback does not return a socket", %{conn: conn} do
++      Process.flag(:trap_exit, true)
++      {:ok, lv, _html} = live_isolated(conn, PubSubBadCallbackLive)
++
++      ref = Process.monitor(lv.pid)
++      Phoenix.PubSub.broadcast(@pubsub, "lv-pubsub-test", :hello)
++
++      assert_receive {:DOWN, ^ref, :process, _, {%ArgumentError{message: message}, _}}
++      assert message =~ "expected pubsub subscription callback to return a %Socket{}"
++    end
++
++    test "raises when called outside of the LiveView process", %{conn: conn} do
++      {:ok, lv, _html} =
++        live_isolated(conn, PubSubOutsideLive, session: %{"test_pid" => self()})
++
++      render_click(lv, "subscribe-from-task", %{})
++
++      assert_receive {:task_result, {:raised, message}}
++      assert message =~ "Phoenix.LiveView.subscribe can only be called from the LiveView process"
++    end
++  end
++
++  describe "LiveComponent" do
++    test "receives messages through the callback", %{conn: conn} do
++      {:ok, lv, _html} = live_isolated(conn, PubSubLive)
++      render_click(lv, "add-child", %{"id" => "child-1"})
++
++      Phoenix.PubSub.broadcast(@pubsub, "lv-pubsub-test", :hello)
++
++      html = render(lv)
++      assert html =~ "root: [:hello]"
++      assert html =~ "child-1: [:hello]"
++    end
++
++    test "subscribes globally only once for multiple subscribers", %{conn: conn} do
++      {:ok, lv, _html} = live_isolated(conn, PubSubLive)
++      render_click(lv, "add-child", %{"id" => "child-1"})
++      render_click(lv, "add-child", %{"id" => "child-2"})
++
++      assert [_] = subscriptions()
++
++      Phoenix.PubSub.broadcast(@pubsub, "lv-pubsub-test", :hello)
++
++      html = render(lv)
++      assert html =~ "root: [:hello]"
++      assert html =~ "child-1: [:hello]"
++      assert html =~ "child-2: [:hello]"
++    end
++
++    test "a component unsubscribing keeps the other subscribers", %{conn: conn} do
++      {:ok, lv, _html} = live_isolated(conn, PubSubLive)
++      render_click(lv, "add-child", %{"id" => "child-1"})
++
++      lv |> with_target("#child-1") |> render_click("unsubscribe", %{})
++      assert [_] = subscriptions()
++
++      Phoenix.PubSub.broadcast(@pubsub, "lv-pubsub-test", :hello)
++
++      html = render(lv)
++      assert html =~ "root: [:hello]"
++      assert html =~ "child-1: []"
++    end
++
++    test "redirecting from the callback moves the flash to the LiveView", %{conn: conn} do
++      {:ok, lv, _html} = live(conn, "/pubsub-flash")
++
++      Phoenix.PubSub.broadcast(@pubsub, "lv-pubsub-test", {:patch, "/pubsub-flash?patched"})
++      assert_patch(lv, "/pubsub-flash?patched")
++
++      html = render(lv)
++      assert html =~ ~s(root flash: %{&quot;info&quot; =&gt; &quot;patched&quot;})
++      assert html =~ "child flash: %{}"
++    end
++
++    test "unsubscribes when the last component is removed from the page", %{conn: conn} do
++      {:ok, lv, _html} = live_isolated(conn, PubSubLive)
++      render_click(lv, "unsubscribe", %{})
++      render_click(lv, "add-child", %{"id" => "child-1"})
++
++      assert [_] = subscriptions()
++
++      render_click(lv, "remove-child", %{"id" => "child-1"})
++
++      eventually(fn -> assert [] = subscriptions() end)
++    end
++  end
++
++  describe "endpoint pubsub server" do
++    setup do
++      # the test endpoint's pubsub server is not started globally
++      pubsub = @endpoint.config(:pubsub_server)
++      start_supervised!(Supervisor.child_spec({Phoenix.PubSub, name: pubsub}, id: pubsub))
++      %{pubsub: pubsub}
++    end
++
++    test "subscribe/3 receives messages through the callback", %{conn: conn, pubsub: pubsub} do
++      {:ok, lv, _html} = live_isolated(conn, PubSubDefaultLive)
++      assert [_] = Registry.lookup(pubsub, "lv-pubsub-default-test")
++
++      Phoenix.PubSub.broadcast(pubsub, "lv-pubsub-default-test", :hello)
++      assert render(lv) =~ "root: [:hello]"
++    end
++
++    test "unsubscribe/2 stops delivery and removes the global subscription",
++         %{conn: conn, pubsub: pubsub} do
++      {:ok, lv, _html} = live_isolated(conn, PubSubDefaultLive)
++      assert [_] = Registry.lookup(pubsub, "lv-pubsub-default-test")
++
++      render_click(lv, "unsubscribe", %{})
++      assert [] = Registry.lookup(pubsub, "lv-pubsub-default-test")
++
++      Phoenix.PubSub.broadcast(pubsub, "lv-pubsub-default-test", :hello)
++      assert render(lv) =~ "root: []"
++    end
++
++    test "raises when the endpoint has no pubsub server configured" do
++      socket = %Phoenix.LiveView.Socket{endpoint: PubSubNoServerEndpoint}
++
++      assert_raise ArgumentError, ~r/no :pubsub_server configured/, fn ->
++        Phoenix.LiveView.subscribe(socket, "lv-pubsub-default-test", fn _msg, socket -> socket end)
++      end
++
++      assert_raise ArgumentError, ~r/no :pubsub_server configured/, fn ->
++        Phoenix.LiveView.unsubscribe(socket, "lv-pubsub-default-test")
++      end
++    end
++
++    test "raises when the socket has no endpoint" do
++      socket = %Phoenix.LiveView.Socket{endpoint: nil}
++
++      assert_raise ArgumentError, ~r/the socket has no endpoint/, fn ->
++        Phoenix.LiveView.subscribe(socket, "lv-pubsub-default-test", fn _msg, socket -> socket end)
++      end
++
++      assert_raise ArgumentError, ~r/the socket has no endpoint/, fn ->
++        Phoenix.LiveView.unsubscribe(socket, "lv-pubsub-default-test")
++      end
++    end
++  end
++end
+diff --git a/test/support/live_views/pubsub.ex b/test/support/live_views/pubsub.ex
+new file mode 100644
+index 0000000000..7f2ae648be
+--- /dev/null
++++ b/test/support/live_views/pubsub.ex
+@@ -0,0 +1,43 @@
++defmodule Phoenix.LiveViewTest.Support.PubSubFlashLive do
++  use Phoenix.LiveView
++
++  defmodule Child do
++    use Phoenix.LiveComponent
++
++    alias Phoenix.LiveView
++
++    @pubsub Phoenix.LiveViewTest.PubSubTest.PubSub
++
++    def mount(socket) do
++      LiveView.subscribe(socket, @pubsub, "lv-pubsub-test", &receive_message/2)
++      {:ok, socket}
++    end
++
++    def receive_message({:patch, to}, socket) do
++      socket
++      |> put_flash(:info, "patched")
++      |> push_patch(to: to)
++    end
++
++    def render(assigns) do
++      ~H"""
++      <div id="child">child flash: {inspect(@flash)}</div>
++      """
++    end
++  end
++
++  def mount(_params, _session, socket) do
++    {:ok, socket}
++  end
++
++  def handle_params(_params, _uri, socket) do
++    {:noreply, socket}
++  end
++
++  def render(assigns) do
++    ~H"""
++    <div id="root">root flash: {inspect(@flash)}</div>
++    <.live_component module={Child} id="child" />
++    """
++  end
++end
+diff --git a/test/support/router.ex b/test/support/router.ex
+index 5da0e0fdda..9772d40290 100644
+--- a/test/support/router.ex
++++ b/test/support/router.ex
+@@ -105,6 +105,9 @@ defmodule Phoenix.LiveViewTest.Support.Router do
+     live "/flash-root", FlashLive
+     live "/flash-child", FlashChildLive
+ 
++    # integration pubsub
++    live "/pubsub-flash", PubSubFlashLive
++
+     # integration events
+     live "/events", EventsLive
+     live "/events-in-mount", EventsInMountLive

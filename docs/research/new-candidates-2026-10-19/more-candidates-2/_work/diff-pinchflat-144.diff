@@ -1,0 +1,248 @@
+diff --git a/lib/pinchflat/downloading/download_option_builder.ex b/lib/pinchflat/downloading/download_option_builder.ex
+index b9233d17e..8c1af5201 100644
+--- a/lib/pinchflat/downloading/download_option_builder.ex
++++ b/lib/pinchflat/downloading/download_option_builder.ex
+@@ -22,6 +22,7 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+         thumbnail_options(media_item_with_preloads) ++
+         metadata_options(media_profile) ++
+         quality_options(media_profile) ++
++        sponsorblock_options(media_profile) ++
+         output_options(media_item_with_preloads)
+ 
+     {:ok, built_options}
+@@ -116,6 +117,17 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+     end
+   end
+ 
++  defp sponsorblock_options(media_profile) do
++    categories = media_profile.sponsorblock_categories
++    behaviour = media_profile.sponsorblock_behaviour
++
++    case {behaviour, categories} do
++      {_, []} -> []
++      {:remove, _} -> [sponsorblock_remove: Enum.join(categories, ",")]
++      {:disabled, _} -> []
++    end
++  end
++
+   defp output_options(media_item_with_preloads) do
+     [
+       output: build_output_path_for(media_item_with_preloads.source)
+diff --git a/lib/pinchflat/profiles/media_profile.ex b/lib/pinchflat/profiles/media_profile.ex
+index e33568c85..57a3b7ffb 100644
+--- a/lib/pinchflat/profiles/media_profile.ex
++++ b/lib/pinchflat/profiles/media_profile.ex
+@@ -21,6 +21,8 @@ defmodule Pinchflat.Profiles.MediaProfile do
+     download_metadata
+     embed_metadata
+     download_nfo
++    sponsorblock_behaviour
++    sponsorblock_categories
+     shorts_behaviour
+     livestream_behaviour
+     preferred_resolution
+@@ -47,6 +49,8 @@ defmodule Pinchflat.Profiles.MediaProfile do
+     field :embed_metadata, :boolean, default: false
+ 
+     field :download_nfo, :boolean, default: false
++    field :sponsorblock_behaviour, Ecto.Enum, values: [:disabled, :remove], default: :disabled
++    field :sponsorblock_categories, {:array, :string}, default: []
+     # NOTE: these do NOT speed up indexing - the indexer still has to go
+     # through the entire collection to determine if a media is a short or
+     # a livestream.
+diff --git a/lib/pinchflat_web/components/core_components.ex b/lib/pinchflat_web/components/core_components.ex
+index 1b9e05a06..f124b1629 100644
+--- a/lib/pinchflat_web/components/core_components.ex
++++ b/lib/pinchflat_web/components/core_components.ex
+@@ -251,7 +251,7 @@ defmodule PinchflatWeb.CoreComponents do
+   attr :type, :string,
+     default: "text",
+     values: ~w(checkbox color date datetime-local email file hidden month number password
+-               toggle range radio search select tel text textarea time url week)
++            checkbox_group toggle range radio search select tel text textarea time url week)
+ 
+   attr :field, Phoenix.HTML.FormField, doc: "a form field struct retrieved from the form, for example: @form[:email]"
+ 
+@@ -304,6 +304,33 @@ defmodule PinchflatWeb.CoreComponents do
+     """
+   end
+ 
++  def input(%{type: "checkbox_group"} = assigns) do
++    ~H"""
++    <div phx-feedback-for={@name}>
++      <.label for={@id}>
++        <%= @label %><span :if={@label_suffix} class="text-xs text-bodydark"><%= @label_suffix %></span>
++      </.label>
++      <section class="grid grid-cols-1 gap-2 md:grid-cols-2 max-w-prose mb-4 ml-1">
++        <div :for={{option_name, option_value} <- @options} class="flex items-center">
++          <input
++            type="checkbox"
++            id={"#{@id}-#{option_value}"}
++            name={"#{@name}[]"}
++            value={option_value}
++            checked={option_value in @value}
++            class={["rounded focus:ring-offset-0 ring-offset-0 focus:ring-0 h-5 w-5 ", @inputclass]}
++          />
++          <label for={"#{@id}-#{option_value}"} class="ml-2 cursor-pointer select-none">
++            <%= option_name %>
++          </label>
++        </div>
++      </section>
++      <.help :if={@help}><%= @help %></.help>
++      <.error :for={msg <- @errors}><%= msg %></.error>
++    </div>
++    """
++  end
++
+   def input(%{type: "toggle"} = assigns) do
+     assigns =
+       assign_new(assigns, :checked, fn ->
+@@ -601,6 +628,10 @@ defmodule PinchflatWeb.CoreComponents do
+         _ ->
+           true
+       end)
++      |> Enum.map(fn
++        {k, v} when is_list(v) -> {k, Enum.join(v, ", ")}
++        rest -> rest
++      end)
+ 
+     assigns = assign(assigns, iterable_attributes: attrs)
+ 
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html.ex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html.ex
+index 159af46ac..8f4a67ab8 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html.ex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html.ex
+@@ -32,6 +32,26 @@ defmodule PinchflatWeb.MediaProfiles.MediaProfileHTML do
+     ]
+   end
+ 
++  def friendly_sponsorblock_options do
++    [
++      {"Disabled (default)", "disabled"},
++      {"Remove Segments", "remove"}
++    ]
++  end
++
++  def frieldly_sponsorblock_categories do
++    [
++      {"Sponsor", "sponsor"},
++      {"Intro/Intermission", "intro"},
++      {"Outro/Credits", "outro"},
++      {"Self Promotion", "selfpromo"},
++      {"Preview/Recap", "preview"},
++      {"Filler Tangent", "filler"},
++      {"Interaction Reminder", "interaction"},
++      {"Non-music Section", "music_offtopic"}
++    ]
++  end
++
+   def custom_output_template_options do
+     %{
+       upload_day: nil,
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
+index 66073ddfa..36d99cc7f 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
+@@ -238,6 +238,36 @@
+       />
+     </section>
+ 
++    <h3 class="mt-10 text-2xl text-black dark:text-white">
++      SponsorBlock Options
++    </h3>
++
++    <section x-data="{ sponsorblockBehaviour: null }">
++      <section x-data="{ presets: { default: 'disabled', media_center: 'disabled', audio: 'disabled', archiving: 'disabled' } }">
++        <.input
++          field={f[:sponsorblock_behaviour]}
++          options={friendly_sponsorblock_options()}
++          type="select"
++          label="SponsorBlock Behaviour"
++          help="Action to take when SponsorBlock segments are found. 'Disabled' won't take any action"
++          x-model="sponsorblockBehaviour"
++          x-init="
++            sponsorblockBehaviour = $el.value
++            $watch('selectedPreset', p => p && ($el.value = presets[p]))
++          "
++        />
++      </section>
++
++      <section x-show="sponsorblockBehaviour !== 'disabled'" x-transition>
++        <.input
++          field={f[:sponsorblock_categories]}
++          options={frieldly_sponsorblock_categories()}
++          type="checkbox_group"
++          label="SponsorBlock Categories"
++        />
++      </section>
++    </section>
++
+     <.button class="my-10 sm:mb-7.5 w-full sm:w-auto" rounding="rounded-lg">Save Media profile</.button>
+   </section>
+ 
+diff --git a/priv/repo/migrations/20240328160057_add_sponsorblock_to_media_profiles.exs b/priv/repo/migrations/20240328160057_add_sponsorblock_to_media_profiles.exs
+new file mode 100644
+index 000000000..606a6cfc8
+--- /dev/null
++++ b/priv/repo/migrations/20240328160057_add_sponsorblock_to_media_profiles.exs
+@@ -0,0 +1,10 @@
++defmodule Pinchflat.Repo.Migrations.AddSponsorblockToMediaProfiles do
++  use Ecto.Migration
++
++  def change do
++    alter table(:media_profiles) do
++      add :sponsorblock_behaviour, :string, default: "disabled"
++      add :sponsorblock_categories, {:array, :string}, default: []
++    end
++  end
++end
+diff --git a/test/pinchflat/downloading/download_option_builder_test.exs b/test/pinchflat/downloading/download_option_builder_test.exs
+index e08eb8012..d7bc63197 100644
+--- a/test/pinchflat/downloading/download_option_builder_test.exs
++++ b/test/pinchflat/downloading/download_option_builder_test.exs
+@@ -222,6 +222,45 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilderTest do
+     end
+   end
+ 
++  describe "build/1 when testing sponsorblock options" do
++    test "includes :sponsorblock_remove option when specified", %{media_item: media_item} do
++      media_item =
++        update_media_profile_attribute(media_item, %{
++          sponsorblock_behaviour: :remove,
++          sponsorblock_categories: ["sponsor", "intro"]
++        })
++
++      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
++
++      assert {:sponsorblock_remove, "sponsor,intro"} in res
++    end
++
++    test "does not include :sponsorblock_remove option without categories", %{media_item: media_item} do
++      media_item =
++        update_media_profile_attribute(media_item, %{
++          sponsorblock_behaviour: :remove,
++          sponsorblock_categories: []
++        })
++
++      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
++
++      refute {:sponsorblock_remove, ""} in res
++      refute {:sponsorblock_remove, []} in res
++      refute :sponsorblock_remove in res
++    end
++
++    test "does not include any sponsorblock options when disabled", %{media_item: media_item} do
++      media_item =
++        update_media_profile_attribute(media_item, %{sponsorblock_behaviour: :disabled})
++
++      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
++
++      refute {:sponsorblock_remove, ""} in res
++      refute {:sponsorblock_remove, []} in res
++      refute :sponsorblock_remove in res
++    end
++  end
++
+   describe "build_output_path_for/1" do
+     test "builds an output path for a source", %{media_item: media_item} do
+       path = DownloadOptionBuilder.build_output_path_for(media_item.source)

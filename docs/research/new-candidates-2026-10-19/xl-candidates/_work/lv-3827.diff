@@ -1,0 +1,865 @@
+diff --git a/guides/server/assigns-eex.md b/guides/server/assigns-eex.md
+index 0ec353a2fa..7216eefcbe 100644
+--- a/guides/server/assigns-eex.md
++++ b/guides/server/assigns-eex.md
+@@ -267,8 +267,15 @@ in `@posts` changes, all posts are sent again.
+ 
+ There are two common solutions to this problem.
+ 
+-The first one is to use `Phoenix.LiveComponent` for each item in the
+-comprehension:
++The first one is to also provide a `:key` expression:
++
++```heex
++<section :for={post <- @posts} :key={post.id}>
++  <h1>{expand_title(post.title)}</h1>
++</section>
++```
++
++This is functionally equivalent to doing:
+ 
+ ```heex
+ <section :for={post <- @posts}>
+@@ -280,8 +287,9 @@ Since LiveComponents have their own assigns, LiveComponents would allow
+ you to perform change tracking for each item. If the `@posts` variable
+ changes, the client will simply send a list of component IDs (which are
+ integers) and only the data for the posts that actually changed.
++You can read more about `:key` in the [documentation for `sigil_H/2`](Phoenix.Component.html#sigil_H/2-special-attributes).
+ 
+-Another solution is to use `Phoenix.LiveView.stream/4`, which gives you
++The second solution is to use `Phoenix.LiveView.stream/4`, which gives you
+ precise control over how elements are added, removed, and updated. Streams
+ are particularly useful when you don't need to keep the collection in memory,
+ allowing you to reduce the data sent over the wire and the server memory
+diff --git a/lib/phoenix_component.ex b/lib/phoenix_component.ex
+index 5b88465de3..f7ea6a4f3b 100644
+--- a/lib/phoenix_component.ex
++++ b/lib/phoenix_component.ex
+@@ -831,6 +831,35 @@ defmodule Phoenix.Component do
+   Note that unlike Elixir's regular `for`, HEEx' `:for` does not support multiple
+   generators in one expression. In such cases, you must use `EEx`'s blocks.
+ 
++  #### `:key`ed comprehensions
++
++  When using `:for`, you can optionally provide a `:key` expression to also perform
++  change-tracking inside the comprehension:
++
++  ```heex
++  <ul>
++    <li :for={%{id: id, name: name} <- @items} :key={id}>
++      Count: <span>{@count}</span>,
++      item: {name}
++    </li>
++  </ul>
++  ```
++
++  Internally, this works by turning the tag where the comprehension is defined on
++  into the template of a `Phoenix.LiveComponent`. Because of this, the following limitations
++  apply to comprehensions defined with `:key`:
++
++    1. A `:key` can only be defined on regular HTML tags, not on components or slots.
++    2. The diff over the wire is optimized to only send changes for each item,
++       but it will always include a list of component IDs (integers) specifying
++       the overall order of items.
++    3. Removing an entry involves separate round-trips with the client to confirm
++       the component removal.
++
++  We recommend to use `:key`ed comprehensions only if you already determined that you need
++  to optimize the diff over the write and [streams](`Phoenix.LiveView.stream/4`)
++  are not an option.
++
+   ### Function components
+ 
+   Function components are stateless components implemented as pure functions
+diff --git a/lib/phoenix_live_view/engine.ex b/lib/phoenix_live_view/engine.ex
+index 84d36c76e6..611c9c5e7c 100644
+--- a/lib/phoenix_live_view/engine.ex
++++ b/lib/phoenix_live_view/engine.ex
+@@ -297,7 +297,8 @@ defmodule Phoenix.LiveView.Engine do
+   mind the collection itself is not "diffed" across renders.
+   If one entry in the comprehension changes, the whole collection
+   is sent again. Consider using `Phoenix.LiveComponent` and
+-  `Phoenix.LiveView.stream/4` to optimize those cases.
++  `Phoenix.LiveView.stream/4` to optimize those cases, or see the
++  [`:key` attribute when using :for`](Phoenix.Component.html#sigil_H/2-special-attributes).
+ 
+   The list of dynamics is always a list of iodatas or components,
+   as we don't perform change tracking inside the comprehensions
+@@ -422,6 +423,8 @@ defmodule Phoenix.LiveView.Engine do
+           end
+         end
+ 
++      root = Keyword.get(opts, :root, meta[:root])
++
+       {:ok,
+        quote do
+          dynamic = fn track_changes? ->
+@@ -434,7 +437,7 @@ defmodule Phoenix.LiveView.Engine do
+            static: unquote(static),
+            dynamic: dynamic,
+            fingerprint: unquote(fingerprint),
+-           root: unquote(opts[:root])
++           root: unquote(root)
+          }
+        end}
+     else
+@@ -618,20 +621,34 @@ defmodule Phoenix.LiveView.Engine do
+ 
+   defp changed_assigns(assigns) do
+     checks =
+-      for {key, _} <- assigns, not nested_and_parent_is_checked?(key, assigns) do
++      for {{changed_var, key}, _} <- assigns, not nested_and_parent_is_checked?(key, assigns) do
++        changed = Macro.var(changed_var, __MODULE__)
++
+         case key do
+           [assign] ->
+             quote do
+-              unquote(__MODULE__).changed_assign?(changed, unquote(assign))
++              unquote(__MODULE__).changed_assign?(unquote(changed), unquote(assign))
+             end
+ 
+           [assign | tail] ->
++            assigns_var =
++              case changed_var do
++                :changed ->
++                  @assigns_var
++
++                :vars_changed ->
++                  # we pass a map %{var: var} for nested change tracking
++                  quote do
++                    %{unquote(assign) => unquote(Macro.var(assign, nil))}
++                  end
++              end
++
+             quote do
+               unquote(__MODULE__).nested_changed_assign?(
+                 unquote(tail),
+                 unquote(assign),
+-                unquote(@assigns_var),
+-                changed
++                unquote(assigns_var),
++                unquote(changed)
+               )
+             end
+         end
+@@ -700,8 +717,25 @@ defmodule Phoenix.LiveView.Engine do
+               keys != %{},
+               do: {key, to_component_keys(keys)}
+ 
++        has_vars_changed? =
++          Enum.any?(keys, fn {_name, entries} ->
++            is_list(entries) and Enum.any?(entries, &match?({:vars_changed, _}, &1))
++          end)
++
++        vars_changed =
++          if has_vars_changed? do
++            Macro.var(:vars_changed, __MODULE__)
++          else
++            []
++          end
++
+         quote do
+-          unquote(__MODULE__).to_component_static(unquote(keys), unquote(@assigns_var), changed)
++          unquote(__MODULE__).to_component_static(
++            unquote(keys),
++            unquote(@assigns_var),
++            changed,
++            unquote(vars_changed)
++          )
+         end
+       else
+         Macro.escape(%{})
+@@ -733,6 +767,15 @@ defmodule Phoenix.LiveView.Engine do
+       true ->
+         {_, keys, _} = analyze_and_return_tainted_keys(dynamic, vars, %{}, caller)
+ 
++        has_vars_changed? = keys != :all and Enum.any?(keys, &match?({:vars_changed, _}, &1))
++
++        vars_changed =
++          if has_vars_changed? do
++            Macro.var(:vars_changed, __MODULE__)
++          else
++            []
++          end
++
+         quote do
+           unquote(__MODULE__).to_component_dynamic(
+             %{unquote_splicing(static)},
+@@ -740,7 +783,8 @@ defmodule Phoenix.LiveView.Engine do
+             unquote(static_changed),
+             unquote(to_component_keys(keys)),
+             unquote(@assigns_var),
+-            changed
++            changed,
++            unquote(vars_changed)
+           )
+         end
+     end
+@@ -750,25 +794,25 @@ defmodule Phoenix.LiveView.Engine do
+   defp to_component_keys(map), do: Map.keys(map)
+ 
+   @doc false
+-  def to_component_static(_keys, _assigns, nil) do
++  def to_component_static(_keys, _assigns, nil, []) do
+     nil
+   end
+ 
+-  def to_component_static(keys, assigns, changed) do
++  def to_component_static(keys, assigns, changed, vars_changed) do
+     for {assign, entries} <- keys,
+-        changed = component_changed(entries, assigns, changed),
++        changed = component_changed(entries, assigns, changed, vars_changed),
+         into: %{},
+         do: {assign, changed}
+   end
+ 
+   @doc false
+-  def to_component_dynamic(static, dynamic, _static_changed, _keys, _assigns, nil) do
++  def to_component_dynamic(static, dynamic, _static_changed, _keys, _assigns, nil, []) do
+     merge_dynamic_static_changed(dynamic, static, nil)
+   end
+ 
+-  def to_component_dynamic(static, dynamic, static_changed, keys, assigns, changed) do
++  def to_component_dynamic(static, dynamic, static_changed, keys, assigns, changed, vars_changed) do
+     component_changed =
+-      if component_changed(keys, assigns, changed) do
++      if component_changed(keys, assigns, changed, vars_changed) do
+         Enum.reduce(dynamic, static_changed, fn {k, _}, acc -> Map.put(acc, k, true) end)
+       else
+         static_changed
+@@ -781,19 +825,23 @@ defmodule Phoenix.LiveView.Engine do
+     dynamic |> Map.merge(static) |> Map.put(:__changed__, changed)
+   end
+ 
+-  defp component_changed(:all, _assigns, _changed), do: true
++  defp component_changed(:all, _assigns, _changed, _vars_changed), do: true
+ 
+-  defp component_changed([path], assigns, changed) do
++  defp component_changed([path], assigns, changed, vars_changed) do
+     case path do
+-      [key] -> changed_assign(changed, key)
+-      [key | tail] -> nested_changed_assign(tail, key, assigns, changed)
++      {:changed, [key]} -> changed_assign(changed, key)
++      {:changed, [key | tail]} -> nested_changed_assign(tail, key, assigns, changed)
++      {:vars_changed, [key]} -> changed_assign(vars_changed, key)
++      {:vars_changed, [key | tail]} -> nested_changed_assign(tail, key, assigns, vars_changed)
+     end
+   end
+ 
+-  defp component_changed(entries, assigns, changed) do
++  defp component_changed(entries, assigns, changed, vars_changed) do
+     Enum.any?(entries, fn
+-      [key] -> changed_assign?(changed, key)
+-      [key | tail] -> nested_changed_assign?(tail, key, assigns, changed)
++      {:changed, [key]} -> changed_assign?(changed, key)
++      {:changed, [key | tail]} -> nested_changed_assign?(tail, key, assigns, changed)
++      {:vars_changed, [key]} -> changed_assign?(vars_changed, key)
++      {:vars_changed, [key | tail]} -> nested_changed_assign?(tail, key, assigns, vars_changed)
+     end)
+   end
+ 
+@@ -887,11 +935,29 @@ defmodule Phoenix.LiveView.Engine do
+     {ast, keys, vars}
+   end
+ 
++  # if we find a variable (or something more complex handled by the other clauses)
++  # like foo[:bar][:baz] and foo is marked as :change_track in vars, we consider it
++  # as an assign, but look into vars_changed instead of changed
++  defp analyze_assign(
++         {name, _, context} = expr,
++         {type, map} = vars,
++         assigns,
++         _caller,
++         nest
++       )
++       when is_atom(name) and is_atom(context) and is_map_key(map, name) and type != :tainted do
++    if map[name] == :change_track do
++      {expr, vars, Map.put(assigns, {:vars_changed, [name | nest]}, true)}
++    else
++      {expr, vars, assigns}
++    end
++  end
++
+   # @name
+   defp analyze_assign({:@, meta, [{name, _, context}]}, vars, assigns, _caller, nest)
+        when is_atom(name) and is_atom(context) do
+     expr = {{:., meta, [@assigns_var, name]}, [no_parens: true] ++ meta, []}
+-    {expr, vars, Map.put(assigns, [name | nest], true)}
++    {expr, vars, Map.put(assigns, {:changed, [name | nest]}, true)}
+   end
+ 
+   # assigns.name
+@@ -903,7 +969,7 @@ defmodule Phoenix.LiveView.Engine do
+          nest
+        )
+        when is_atom(name) and args in [[], nil] do
+-    {expr, vars, Map.put(assigns, [name | nest], true)}
++    {expr, vars, Map.put(assigns, {:changed, [name | nest]}, true)}
+   end
+ 
+   # assigns[:name]
+@@ -915,7 +981,7 @@ defmodule Phoenix.LiveView.Engine do
+          nest
+        )
+        when is_atom(name) and is_access(access) do
+-    {expr, vars, Map.put(assigns, [name | nest], true)}
++    {expr, vars, Map.put(assigns, {:changed, [name | nest]}, true)}
+   end
+ 
+   # Maybe: assigns.foo[:bar]
+@@ -984,20 +1050,39 @@ defmodule Phoenix.LiveView.Engine do
+     {expr, vars, assigns}
+   end
+ 
+-  # Vars always taint unless we are in restricted mode.
+-  defp analyze({name, meta, nil} = expr, {:restricted, map}, assigns, caller)
++  # Vars always taint unless we are in restricted mode
++  # or the variable is marked as `:change_track` for vars_changed.
++  defp analyze({name, meta, nil} = expr, {:restricted, map} = vars, assigns, caller)
+        when is_atom(name) do
+-    if Map.has_key?(map, name) do
+-      maybe_warn_taint(name, meta, caller)
+-      {expr, {:tainted, map}, assigns}
+-    else
+-      {expr, {:restricted, map}, assigns}
++    case map do
++      %{^name => :tainted} ->
++        maybe_warn_taint(name, meta, caller)
++        {expr, {:tainted, map}, assigns}
++
++      %{^name => :change_track} ->
++        {expr, vars, Map.put(assigns, {:vars_changed, [name]}, true)}
++
++      _ ->
++        {expr, {:restricted, map}, assigns}
+     end
+   end
+ 
+-  defp analyze({name, meta, nil} = expr, {_, map}, assigns, caller) when is_atom(name) do
+-    maybe_warn_taint(name, meta, caller)
+-    {expr, {:tainted, Map.put(map, name, true)}, assigns}
++  defp analyze({name, meta, nil} = expr, {type, map}, assigns, caller)
++       when is_atom(name) do
++    cond do
++      Map.get(map, name) == :change_track ->
++        {expr, {type, map}, Map.put(assigns, {:vars_changed, [name]}, true)}
++
++      Keyword.get(meta, :change_track) ->
++        # this is a variable inside the left-hand side of a keyed for expression;
++        # we mark it as change_track in the vars map so that we treat it as change-tracked
++        # when we see it used again later (see the previous analyze clause above)
++        {expr, {type, Map.put(map, name, :change_track)}, assigns}
++
++      true ->
++        maybe_warn_taint(name, meta, caller)
++        {expr, {:tainted, Map.put(map, name, :tainted)}, assigns}
++    end
+   end
+ 
+   # Quoted vars are ignored as they come from engine code.
+@@ -1334,8 +1419,11 @@ defmodule Phoenix.LiveView.Engine do
+   defp classify_taint(:with, [_ | _]), do: :live
+   defp classify_taint(:for, [_ | _]), do: :live
+ 
+-  # Constructs from Phoenix and TagEngine
++  # Constructs from TagEngine
+   defp classify_taint(:inner_block, [_, [do: _]]), do: :live
++  defp classify_taint(:keyed_comprehension, [_, _, [do: _]]), do: :live
++
++  # Constructs from Phoenix.View
+   defp classify_taint(:render_layout, [_, _, _, [do: _]]), do: :live
+ 
+   # Special forms are forbidden and raise.
+diff --git a/lib/phoenix_live_view/keyed_comprehension.ex b/lib/phoenix_live_view/keyed_comprehension.ex
+new file mode 100644
+index 0000000000..87c6824b82
+--- /dev/null
++++ b/lib/phoenix_live_view/keyed_comprehension.ex
+@@ -0,0 +1,26 @@
++defmodule Phoenix.LiveView.KeyedComprehension do
++  @moduledoc false
++
++  use Phoenix.LiveComponent
++
++  @impl true
++  def update(assigns, socket) do
++    # we assign all entries from vars_changed to change-track them inside
++    # the LiveComponent
++    socket =
++      Enum.reduce(assigns.vars_changed, socket, fn {key, value}, socket ->
++        assign(socket, key, value)
++      end)
++
++    socket
++    |> assign(:render, assigns.render)
++    |> assign(:keys, Map.keys(assigns.vars_changed))
++    |> then(&{:ok, &1})
++  end
++
++  @impl true
++  def render(assigns) do
++    vars_changed = Map.take(assigns.__changed__, assigns.keys)
++    assigns.render.(vars_changed)
++  end
++end
+diff --git a/lib/phoenix_live_view/tag_engine.ex b/lib/phoenix_live_view/tag_engine.ex
+index 1e2f41dca0..69cb148859 100644
+--- a/lib/phoenix_live_view/tag_engine.ex
++++ b/lib/phoenix_live_view/tag_engine.ex
+@@ -167,6 +167,22 @@ defmodule Phoenix.LiveView.TagEngine do
+     end
+   end
+ 
++  @doc false
++  defmacro keyed_comprehension(id, vars_changed, do: do_block) do
++    quote do
++      %Phoenix.LiveView.Component{
++        id: unquote(id),
++        component: Phoenix.LiveView.KeyedComprehension,
++        assigns: %{
++          vars_changed: unquote(vars_changed),
++          render: fn unquote(Macro.var(:vars_changed, Phoenix.LiveView.Engine)) ->
++            unquote(do_block)
++          end
++        }
++      }
++    end
++  end
++
+   @doc false
+   def __assigns__(assigns, key, parent_changed) do
+     # If the component is in its initial render (parent_changed == nil)
+@@ -534,7 +550,7 @@ defmodule Phoenix.LiveView.TagEngine do
+         |> set_root_on_not_tag()
+         |> maybe_anno_caller(meta, state.file, line)
+         |> update_subengine(:handle_expr, ["=", ast])
+-        |> handle_special_expr(new_meta)
++        |> handle_special_expr(:remote_component, new_meta)
+         |> continue(tokens)
+     end
+   end
+@@ -597,7 +613,7 @@ defmodule Phoenix.LiveView.TagEngine do
+     |> pop_substate_from_stack()
+     |> maybe_anno_caller(meta, state.file, line)
+     |> update_subengine(:handle_expr, ["=", ast])
+-    |> handle_special_expr(tag_meta)
++    |> handle_special_expr(:remote_component, tag_meta)
+     |> continue(tokens)
+   end
+ 
+@@ -704,7 +720,7 @@ defmodule Phoenix.LiveView.TagEngine do
+         |> set_root_on_not_tag()
+         |> maybe_anno_caller(meta, state.file, line)
+         |> update_subengine(:handle_expr, ["=", ast])
+-        |> handle_special_expr(new_meta)
++        |> handle_special_expr(:local_component, new_meta)
+         |> continue(tokens)
+     end
+   end
+@@ -766,7 +782,7 @@ defmodule Phoenix.LiveView.TagEngine do
+     |> pop_substate_from_stack()
+     |> maybe_anno_caller(meta, state.file, line)
+     |> update_subengine(:handle_expr, ["=", ast])
+-    |> handle_special_expr(tag_meta)
++    |> handle_special_expr(:local_component, tag_meta)
+     |> continue(tokens)
+   end
+ 
+@@ -791,7 +807,7 @@ defmodule Phoenix.LiveView.TagEngine do
+         |> update_subengine(:handle_begin, [])
+         |> set_root_on_not_tag()
+         |> handle_tag_and_attrs(name, new_attrs, suffix, to_location(new_meta))
+-        |> handle_special_expr(new_meta)
++        |> handle_special_expr(:tag, new_meta)
+         |> continue(tokens)
+     end
+   end
+@@ -834,7 +850,7 @@ defmodule Phoenix.LiveView.TagEngine do
+ 
+     state
+     |> update_subengine(:handle_text, [to_location(tag_meta), "</#{name}>"])
+-    |> handle_special_expr(tag_open_meta)
++    |> handle_special_expr(:tag, tag_open_meta)
+     |> continue(tokens)
+   end
+ 
+@@ -986,7 +1002,7 @@ defmodule Phoenix.LiveView.TagEngine do
+   #   pop_special_attrs!(state, ":for", attrs, %{}, state)
+   #   => {%{}, []}
+   defp pop_special_attrs!(attrs, tag_meta, state) do
+-    Enum.reduce([for: ":for", if: ":if"], {false, tag_meta, attrs}, fn
++    Enum.reduce([for: ":for", if: ":if", key: ":key"], {false, tag_meta, attrs}, fn
+       {attr, string_attr}, {special_acc, meta_acc, attrs_acc} ->
+         attrs_acc
+         |> List.keytake(string_attr, 0)
+@@ -1128,18 +1144,21 @@ defmodule Phoenix.LiveView.TagEngine do
+   defp literal_keys?([]), do: true
+   defp literal_keys?(_other), do: false
+ 
+-  defp handle_special_expr(state, tag_meta) do
++  defp handle_special_expr(state, type, tag_meta) do
+     ast =
+       case tag_meta do
+-        %{for: for_expr, if: if_expr} ->
++        %{for: _for_expr, if: if_expr} ->
++          {for_expr, ast} = maybe_keyed(state, type, tag_meta)
++
+           quote do
+-            for unquote(for_expr), unquote(if_expr),
+-              do: unquote(invoke_subengine(state, :handle_end, []))
++            for unquote(for_expr), unquote(if_expr), do: unquote(ast)
+           end
+ 
+-        %{for: for_expr} ->
++        %{for: _for_expr} ->
++          {for_expr, ast} = maybe_keyed(state, type, tag_meta)
++
+           quote do
+-            for unquote(for_expr), do: unquote(invoke_subengine(state, :handle_end, []))
++            for unquote(for_expr), do: unquote(ast)
+           end
+ 
+         %{if: if_expr} ->
+@@ -1147,6 +1166,9 @@ defmodule Phoenix.LiveView.TagEngine do
+             if unquote(if_expr), do: unquote(invoke_subengine(state, :handle_end, []))
+           end
+ 
++        %{key: _} ->
++          raise_syntax_error!("cannot use :key without :for", tag_meta, state)
++
+         %{} ->
+           nil
+       end
+@@ -1160,6 +1182,105 @@ defmodule Phoenix.LiveView.TagEngine do
+     end
+   end
+ 
++  defp maybe_keyed(state, type, %{key: key_expr, for: for_expr} = tag_meta) do
++    # for now, we only support plain tags because we don't know if a function component
++    # renders to a single tag which is required by live components
++    if type != :tag do
++      raise_syntax_error!(
++        "keyed :for comprehensions only supported on regular tags, not for #{tag_meta.tag_name}",
++        tag_meta,
++        state
++      )
++    end
++
++    # we already validated that the for expression has the correct shape in
++    # validate_quoted_special_attr
++    {:<-, for_meta, [lhs, rhs]} = for_expr
++    # now we mark all eligible variables in the left-hand side as `:change_track`able
++    {lhs, variables} = mark_variables_as_change_tracked(lhs)
++    for_expr = {:<-, for_meta, [lhs, rhs]}
++
++    # now we build the new ast that we pass to the engine
++    ast =
++      quote do
++        Phoenix.LiveView.TagEngine.keyed_comprehension(
++          {unquote(state.caller.module), unquote(tag_meta.line), unquote(tag_meta.column),
++           unquote(key_expr)},
++          %{unquote_splicing(variables)},
++          do: unquote(invoke_subengine(state, :handle_end, [[meta: [root: true]]]))
++        )
++      end
++
++    state = pop_substate_from_stack(state)
++
++    keyed_ast =
++      state
++      |> push_substate_to_stack()
++      |> update_subengine(:handle_begin, [])
++      |> update_subengine(:handle_expr, ["=", ast])
++      |> invoke_subengine(:handle_end, [])
++
++    {for_expr, keyed_ast}
++  end
++
++  defp maybe_keyed(state, _type, %{for: for_expr}) do
++    {for_expr, invoke_subengine(state, :handle_end, [])}
++  end
++
++  @doc false
++  def mark_variables_as_change_tracked(ast) do
++    # we traverse the AST and mark elements that should not considered
++    # to be variables as "skip";
++    # we need to handle both the pre and post phases to properly unmark
++    # the skip after we handled an expression
++    {ast, {_, vars}} =
++      Macro.traverse(
++        ast,
++        # we start in collect mode (true) and an empty list of vars
++        {true, []},
++        fn
++          # skip pinned expressions, marking the pin expression and setting
++          # collect to false
++          {:^, meta, [expr]}, {true, vars} ->
++            {{:^, Keyword.put(meta, :skip_mark, true), [expr]}, {false, vars}}
++
++          # skip the right hand side in something like <<foo::binary>>
++          {:"::", meta, [left, right]}, {true, vars} ->
++            # we need to return a list for prewalk to walk the left hand side
++            {new_left, inner_vars} = mark_variables_as_change_tracked(left)
++
++            {{:"::", Keyword.put(meta, :skip_mark, true), [new_left, right]},
++             {false, vars ++ inner_vars}}
++
++          # collect mode -> mark the variable as change_track and collect
++          # it for passing it to the KeyedComprehension component
++          {name, meta, context}, {true, vars}
++          when is_atom(name) and is_list(meta) and is_atom(context) ->
++            var = {name, Keyword.put(meta, :change_track, true), context}
++            {var, {true, [{name, var} | vars]}}
++
++          other, acc ->
++            {other, acc}
++        end,
++        fn
++          {op, meta, args}, {false, vars} when is_atom(op) and is_list(meta) and is_list(args) ->
++            case Keyword.pop(meta, :skip_mark) do
++              {nil, meta} ->
++                {{op, meta, args}, {false, vars}}
++
++              {true, meta} ->
++                # reset the collect mode
++                {{op, meta, args}, {true, vars}}
++            end
++
++          other, acc ->
++            {other, acc}
++        end
++      )
++
++    {ast, vars}
++  end
++
+   ## build_self_close_component_assigns/build_component_assigns
+ 
+   defp build_self_close_component_assigns(type_component, attrs, line, state) do
+@@ -1576,7 +1697,7 @@ defmodule Phoenix.LiveView.TagEngine do
+   end
+ 
+   defp validate_phx_attrs!([{":" <> name, _, attr_meta} | _], _meta, state, _attr, _id?)
+-       when name not in ~w(if for) do
++       when name not in ~w(if for key) do
+     message = "unsupported attribute :#{name} in tags"
+     raise_syntax_error!(message, attr_meta, state)
+   end
+diff --git a/test/phoenix_live_view/diff_test.exs b/test/phoenix_live_view/diff_test.exs
+index 413d07a328..e7bb24cddb 100644
+--- a/test/phoenix_live_view/diff_test.exs
++++ b/test/phoenix_live_view/diff_test.exs
+@@ -1689,4 +1689,183 @@ defmodule Phoenix.LiveView.DiffTest do
+              }
+     end
+   end
++
++  describe "keyed comprehensions" do
++    defp keyed_comprehension_with_pattern(assigns) do
++      ~H"""
++      <ul>
++        <li :for={%{id: id, name: name} <- @items} :key={id}>
++          Outside assign: {@count} Inside assign: {name}
++        </li>
++      </ul>
++      """
++    end
++
++    defp keyed_comprehension_with_nested_access(assigns) do
++      ~H"""
++      <ul>
++        <li :for={{id, entry} <- @items} :key={id}>
++          <span>Count: {@count}</span>
++          <span>Dot: {entry.foo.bar}</span>
++          <span>Access: {entry[:foo][:bar]}</span>
++        </li>
++      </ul>
++      """
++    end
++
++    test "renders as live component with minimal diff updates" do
++      items = [
++        %{id: 1, name: "First"},
++        %{id: 2, name: "Second"}
++      ]
++
++      assigns = %{socket: %Socket{}, items: items, count: 0, __changed__: %{}}
++      {full_render, fingerprints, components} = render(keyed_comprehension_with_pattern(assigns))
++
++      assert full_render == %{
++               0 => %{s: ["", ""], d: [[1], [2]]},
++               :c => %{
++                 1 => %{
++                   0 => "0",
++                   1 => "First",
++                   :r => 1,
++                   :s => ["<li>\n    Outside assign: ", " Inside assign: ", "\n  </li>"]
++                 },
++                 2 => %{0 => "0", 1 => "Second", :s => 1}
++               },
++               :s => ["<ul>\n  ", "\n</ul>"],
++               :r => 1
++             }
++
++      assert {%{
++                1 =>
++                  {Phoenix.LiveView.KeyedComprehension, {Phoenix.LiveView.DiffTest, _, _, 1},
++                   %{
++                     id: 1,
++                     name: "First",
++                     __changed__: %{},
++                     flash: %{},
++                     myself: %Phoenix.LiveComponent.CID{cid: 1}
++                   }, %{}, _},
++                2 =>
++                  {Phoenix.LiveView.KeyedComprehension, {Phoenix.LiveView.DiffTest, _, _, 2},
++                   %{
++                     id: 2,
++                     name: "Second",
++                     __changed__: %{},
++                     flash: %{},
++                     myself: %Phoenix.LiveComponent.CID{cid: 2}
++                   }, %{}, _}
++              }, %{Phoenix.LiveView.KeyedComprehension => %{}}, 3} = components
++
++      # change order of items
++      assigns =
++        assigns
++        |> Map.put(:__changed__, %{})
++        |> Phoenix.Component.assign(:items, Enum.reverse(assigns.items))
++
++      {second_render, fingerprints, components} =
++        render(keyed_comprehension_with_pattern(assigns), fingerprints, components)
++
++      assert second_render == %{0 => %{d: [[2], [1]]}}
++
++      # update count
++      assigns =
++        assigns
++        |> Map.put(:__changed__, %{})
++        |> Phoenix.Component.assign(:count, 1)
++
++      {third_render, fingerprints, components} =
++        render(keyed_comprehension_with_pattern(assigns), fingerprints, components)
++
++      assert third_render == %{0 => %{d: [[2], [1]]}, :c => %{1 => %{0 => "1"}, 2 => %{0 => "1"}}}
++
++      # replace item
++      assigns =
++        assigns
++        |> Map.put(:__changed__, %{})
++        |> Phoenix.Component.assign(:items, [
++          %{id: 1, name: "First"},
++          %{id: 3, name: "Third"}
++        ])
++
++      {fourth_render, _fingerprints, _components} =
++        render(keyed_comprehension_with_pattern(assigns), fingerprints, components)
++
++      assert fourth_render == %{
++               0 => %{d: [[1], [3]]},
++               :c => %{3 => %{0 => "1", 1 => "Third", :s => -1}}
++             }
++    end
++
++    test "change-tracking for complex access" do
++      items = [
++        {1, %{foo: %{bar: "First", baz: "1"}, other: "hey"}},
++        {2, %{foo: %{bar: "Second", baz: "1"}, other: "hey"}}
++      ]
++
++      assigns = %{socket: %Socket{}, items: items, count: 0, __changed__: %{}}
++
++      {full_render, fingerprints, components} =
++        render(keyed_comprehension_with_nested_access(assigns))
++
++      assert full_render == %{
++               0 => %{d: [[1], [2]], s: ["", ""]},
++               :c => %{
++                 1 => %{
++                   0 => "0",
++                   1 => "First",
++                   :r => 1,
++                   :s => [
++                     "<li>\n    <span>Count: ",
++                     "</span>\n    <span>Dot: ",
++                     "</span>\n    <span>Access: ",
++                     "</span>\n  </li>"
++                   ],
++                   2 => "First"
++                 },
++                 2 => %{0 => "0", 1 => "Second", :s => 1, 2 => "Second"}
++               },
++               :r => 1,
++               :s => ["<ul>\n  ", "\n</ul>"]
++             }
++
++      # change entries, but no part that is rendered
++      assigns =
++        Phoenix.Component.assign(
++          assigns,
++          :items,
++          [
++            {1, %{foo: %{bar: "First", baz: "2"}, other: "heyo"}},
++            {2, %{foo: %{bar: "Second", baz: "2"}, other: "heyo"}}
++          ]
++        )
++
++      {second_render, fingerprints, components} =
++        render(keyed_comprehension_with_nested_access(assigns), fingerprints, components)
++
++      # no diff, because nothing relevant changed
++      assert second_render == %{0 => %{d: [[1], [2]]}}
++
++      # now change bar for first entry
++      assigns =
++        Phoenix.Component.assign(
++          assigns,
++          :items,
++          [
++            {1, %{foo: %{bar: "Updated", baz: "2"}, other: "heyo"}},
++            {2, %{foo: %{bar: "Second", baz: "2"}, other: "heyo"}}
++          ]
++        )
++
++      {third_render, _fingerprints, _components} =
++        render(keyed_comprehension_with_nested_access(assigns), fingerprints, components)
++
++      # no diff, because nothing relevant changed
++      assert third_render == %{
++               0 => %{d: [[1], [2]]},
++               :c => %{1 => %{1 => "Updated", 2 => "Updated"}}
++             }
++    end
++  end
+ end
+diff --git a/test/phoenix_live_view/tag_engine_test.exs b/test/phoenix_live_view/tag_engine_test.exs
+new file mode 100644
+index 0000000000..fb0e987c13
+--- /dev/null
++++ b/test/phoenix_live_view/tag_engine_test.exs
+@@ -0,0 +1,24 @@
++defmodule Phoenix.LiveView.TagEngineTest do
++  use ExUnit.Case, async: true
++
++  alias Phoenix.LiveView.TagEngine
++
++  describe "mark_variables_ast_change_tracked/1" do
++    test "ignores pinned variables and binary modifiers" do
++      ast =
++        quote do
++          %{foo: foo, bar: ^bar, bin: <<thebin::binary>>, other: other}
++        end
++
++      assert {new_ast, variables} = TagEngine.mark_variables_as_change_tracked(ast)
++
++      assert [
++               {:foo, {:foo, [change_track: true], _}},
++               {:other, {:other, [change_track: true], _}},
++               {:thebin, {:thebin, [change_track: true], _}}
++             ] = Enum.sort_by(variables, &elem(&1, 0))
++
++      assert new_ast != ast
++    end
++  end
++end

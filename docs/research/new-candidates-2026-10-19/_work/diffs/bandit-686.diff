@@ -1,0 +1,130 @@
+diff --git a/lib/bandit/websocket/upgrade_validation.ex b/lib/bandit/websocket/upgrade_validation.ex
+index 0b67352d..8b2d99be 100644
+--- a/lib/bandit/websocket/upgrade_validation.ex
++++ b/lib/bandit/websocket/upgrade_validation.ex
+@@ -24,7 +24,7 @@ defmodule Bandit.WebSocket.UpgradeValidation do
+          :ok <- assert_header_nonempty(conn, "host"),
+          :ok <- assert_header_contains(conn, "connection", "upgrade"),
+          :ok <- assert_header_contains(conn, "upgrade", "websocket"),
+-         :ok <- assert_header_nonempty(conn, "sec-websocket-key"),
++         :ok <- assert_websocket_key(conn),
+          :ok <- assert_header_equals(conn, "sec-websocket-version", "13") do
+       :ok
+     end
+@@ -44,6 +44,22 @@ defmodule Bandit.WebSocket.UpgradeValidation do
+     end
+   end
+ 
++  defp assert_websocket_key(conn) do
++    case Plug.Conn.get_req_header(conn, "sec-websocket-key") do
++      [] ->
++        {:error, "'sec-websocket-key' header is absent"}
++
++      [key] ->
++        case Base.decode64(key) do
++          {:ok, decoded} when byte_size(decoded) == 16 -> :ok
++          _ -> {:error, "'sec-websocket-key' header must decode to 16 bytes"}
++        end
++
++      keys ->
++        {:error, "'sec-websocket-key' header must occur exactly once, got #{length(keys)} values"}
++    end
++  end
++
+   defp assert_header_equals(conn, header, expected) do
+     case Plug.Conn.get_req_header(conn, header) |> Enum.map(&String.downcase(&1, :ascii)) do
+       [^expected] -> :ok
+diff --git a/test/bandit/http1/protocol_test.exs b/test/bandit/http1/protocol_test.exs
+index 8a8ca889..761b39fb 100644
+--- a/test/bandit/http1/protocol_test.exs
++++ b/test/bandit/http1/protocol_test.exs
+@@ -2362,6 +2362,31 @@ defmodule HTTP1ProtocolTest do
+       assert msg == "** (Bandit.HTTPError) 'sec-websocket-key' header is absent"
+     end
+ 
++    @tag :capture_log
++    test "returns a 400 when a WebSocket key does not decode to 16 bytes", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      SimpleHTTP1Client.send(
++        client,
++        "GET",
++        "/upgrade_websocket",
++        [
++          "Host: server.example.com",
++          "Upgrade: WebSocket",
++          "Connection: Upgrade",
++          "Sec-WebSocket-Key: eA==",
++          "Sec-WebSocket-Version: 13"
++        ]
++      )
++
++      assert SimpleHTTP1Client.recv_reply(client) ~> {:ok, "400 Bad Request", list(), ""}
++
++      assert_receive {:log, %{level: :error, msg: {:string, msg}}}, 500
++
++      assert msg ==
++               "** (Bandit.HTTPError) 'sec-websocket-key' header must decode to 16 bytes"
++    end
++
+     @tag :capture_log
+     test "returns a 400 and errors loudly in cases where an upgrade is indicated but version header is incorrect",
+          context do
+diff --git a/test/bandit/websocket/upgrade_validation_test.exs b/test/bandit/websocket/upgrade_validation_test.exs
+index 905d5ed6..dcaaf957 100644
+--- a/test/bandit/websocket/upgrade_validation_test.exs
++++ b/test/bandit/websocket/upgrade_validation_test.exs
+@@ -112,6 +112,53 @@ defmodule UpgradeValidationTest do
+                SimpleHTTP1Client.recv_reply(client)
+     end
+ 
++    test "does not accept request keys that are not valid base64", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      SimpleHTTP1Client.send(client, "GET", "/validate_upgrade", [
++        "Host: server.example.com",
++        "Upgrade: WeBsOcKeT",
++        "Connection: UpGrAdE",
++        "Sec-WebSocket-Key: not-base64!",
++        "Sec-WebSocket-Version: 13"
++      ])
++
++      assert {:ok, "200 OK", _headers, "'sec-websocket-key' header must decode to 16 bytes"} =
++               SimpleHTTP1Client.recv_reply(client)
++    end
++
++    test "does not accept request keys that decode to a length other than 16 bytes", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      SimpleHTTP1Client.send(client, "GET", "/validate_upgrade", [
++        "Host: server.example.com",
++        "Upgrade: WeBsOcKeT",
++        "Connection: UpGrAdE",
++        "Sec-WebSocket-Key: #{Base.encode64(<<0::120>>)}",
++        "Sec-WebSocket-Version: 13"
++      ])
++
++      assert {:ok, "200 OK", _headers, "'sec-websocket-key' header must decode to 16 bytes"} =
++               SimpleHTTP1Client.recv_reply(client)
++    end
++
++    test "does not accept multiple request keys", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      SimpleHTTP1Client.send(client, "GET", "/validate_upgrade", [
++        "Host: server.example.com",
++        "Upgrade: WeBsOcKeT",
++        "Connection: UpGrAdE",
++        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
++        "Sec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZg==",
++        "Sec-WebSocket-Version: 13"
++      ])
++
++      assert {:ok, "200 OK", _headers,
++              "'sec-websocket-key' header must occur exactly once, got 2 values"} =
++               SimpleHTTP1Client.recv_reply(client)
++    end
++
+     test "does not accept requests without a version of 13", context do
+       client = SimpleHTTP1Client.tcp_client(context)
+ 

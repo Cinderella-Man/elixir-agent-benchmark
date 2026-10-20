@@ -1,0 +1,140 @@
+diff --git a/lib/thousand_island/telemetry.ex b/lib/thousand_island/telemetry.ex
+index ce86cd1..df87097 100644
+--- a/lib/thousand_island/telemetry.ex
++++ b/lib/thousand_island/telemetry.ex
+@@ -15,6 +15,7 @@ defmodule ThousandIsland.Telemetry do
+       This event contains the following measurements:
+ 
+       * `monotonic_time`: The time of this event, in `:native` units
++      * `system_time`: The system time of this event, in `:native` units
+ 
+       This event contains the following metadata:
+ 
+@@ -57,6 +58,7 @@ defmodule ThousandIsland.Telemetry do
+       This event contains the following measurements:
+ 
+       * `monotonic_time`: The time of this event, in `:native` units
++      * `system_time`: The system time of this event, in `:native` units
+ 
+       This event contains the following metadata:
+ 
+@@ -162,6 +164,7 @@ defmodule ThousandIsland.Telemetry do
+       This event contains the following measurements:
+ 
+       * `monotonic_time`: The time of this event, in `:native` units
++      * `system_time`: The system time of this event, in `:native` units
+ 
+       This event contains the following metadata:
+ 
+@@ -363,7 +366,11 @@ defmodule ThousandIsland.Telemetry do
+   @doc false
+   @spec start_span(span_name(), measurements(), metadata()) :: t()
+   def start_span(span_name, measurements, metadata) do
+-    measurements = Map.put_new_lazy(measurements, :monotonic_time, &monotonic_time/0)
++    measurements =
++      measurements
++      |> Map.put_new_lazy(:monotonic_time, &monotonic_time/0)
++      |> Map.put_new_lazy(:system_time, &system_time/0)
++
+     telemetry_span_context = make_ref()
+     metadata = Map.put(metadata, :telemetry_span_context, telemetry_span_context)
+     _ = event([span_name, :start], measurements, metadata)
+@@ -433,6 +440,10 @@ defmodule ThousandIsland.Telemetry do
+   @spec monotonic_time() :: integer
+   defdelegate monotonic_time, to: System
+ 
++  @doc false
++  @spec system_time() :: integer
++  defdelegate system_time, to: System
++
+   defp event(suffix, measurements, metadata) do
+     :telemetry.execute([@app_name | suffix], measurements, metadata)
+   end
+diff --git a/test/thousand_island/handler_test.exs b/test/thousand_island/handler_test.exs
+index 1b00c34..69c5bf6 100644
+--- a/test/thousand_island/handler_test.exs
++++ b/test/thousand_island/handler_test.exs
+@@ -1202,7 +1202,7 @@ defmodule ThousandIsland.HandlerTest do
+                       metadata},
+                      500
+ 
+-      assert measurements ~> %{monotonic_time: integer()}
++      assert measurements ~> %{monotonic_time: integer(), system_time: integer()}
+ 
+       assert metadata
+              ~> %{
+diff --git a/test/thousand_island/listener_test.exs b/test/thousand_island/listener_test.exs
+index e5aefa5..06c0b10 100644
+--- a/test/thousand_island/listener_test.exs
++++ b/test/thousand_island/listener_test.exs
+@@ -98,7 +98,7 @@ defmodule ThousandIsland.ListenerTest do
+       assert_receive {:telemetry, [:thousand_island, :listener, :start], measurements, metadata},
+                      500
+ 
+-      assert measurements ~> %{monotonic_time: integer()}
++      assert measurements ~> %{monotonic_time: integer(), system_time: integer()}
+ 
+       assert metadata
+              ~> %{
+diff --git a/test/thousand_island/server_test.exs b/test/thousand_island/server_test.exs
+index b6163a7..9159526 100644
+--- a/test/thousand_island/server_test.exs
++++ b/test/thousand_island/server_test.exs
+@@ -333,7 +333,7 @@ defmodule ThousandIsland.ServerTest do
+       assert_receive {:telemetry, [:thousand_island, :listener, :start], measurements, metadata},
+                      500
+ 
+-      assert measurements ~> %{monotonic_time: integer()}
++      assert measurements ~> %{monotonic_time: integer(), system_time: integer()}
+ 
+       assert metadata
+              ~> %{
+@@ -348,7 +348,7 @@ defmodule ThousandIsland.ServerTest do
+       assert_receive {:telemetry, [:thousand_island, :acceptor, :start], measurements, metadata},
+                      500
+ 
+-      assert measurements ~> %{monotonic_time: integer()}
++      assert measurements ~> %{monotonic_time: integer(), system_time: integer()}
+ 
+       assert metadata
+              ~> %{
+diff --git a/test/thousand_island/telemetry_test.exs b/test/thousand_island/telemetry_test.exs
+new file mode 100644
+index 0000000..2d39a8d
+--- /dev/null
++++ b/test/thousand_island/telemetry_test.exs
+@@ -0,0 +1,34 @@
++defmodule ThousandIsland.TelemetryTest do
++  use ExUnit.Case, async: true
++
++  alias ThousandIsland.Telemetry
++
++  test "start spans preserve caller-supplied system and monotonic times" do
++    handler_id = make_ref()
++
++    :ok =
++      :telemetry.attach(
++        handler_id,
++        [:thousand_island, :connection, :start],
++        &__MODULE__.forward_event/4,
++        self()
++      )
++
++    on_exit(fn -> :telemetry.detach(handler_id) end)
++
++    _span =
++      Telemetry.start_span(
++        :connection,
++        %{monotonic_time: 123, system_time: 456},
++        %{handler: __MODULE__}
++      )
++
++    assert_receive {:telemetry_event, %{monotonic_time: 123, system_time: 456}, metadata}
++    assert metadata.handler == __MODULE__
++    assert is_reference(metadata.telemetry_span_context)
++  end
++
++  def forward_event(_event, measurements, metadata, pid) do
++    send(pid, {:telemetry_event, measurements, metadata})
++  end
++end

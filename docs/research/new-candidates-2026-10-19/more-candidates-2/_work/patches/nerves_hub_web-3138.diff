@@ -1,0 +1,1921 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 3075ca41f..6766aacb3 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -73,7 +73,9 @@ when adding or removing one.
+   (a device's identity on networks NervesHub doesn't run, such as iroh or
+   NetBird).
+ - `managed_deployments.ex` / `managed_deployments/` — deployment groups and the
+-  `Distributed.Orchestrator` (one per deployment).
++  `Distributed.Orchestrator` (one per deployment). A release with a workflow
++  is walked a step at a time (`Workflows`, `WorkflowCoordinator`); each step
++  transition is announced to webhooks and Slack (`WorkflowEvents`).
+ - `firmwares.ex` / `firmwares/` and `archives.ex` / `archives/` — firmware and
+   archive artifacts, uploads, and firmware **delta** building.
+ - `products.ex` / `products/` — products and product settings, including
+@@ -109,8 +111,10 @@ when adding or removing one.
+   those messages are carried out by `NervesHubWeb.Integrations.Slack.Actions` as the
+   NervesHub user the Slack user linked (`Slack.Users`), with that user's
+   permissions checked at click time; `NervesHubWeb.Integrations.Slack.Commands` answers
+-  `/nerveshub` with the same checks (`Integrations.Slack.Actions.authorize/5`). Hidden unless the instance has a Slack
+-  app; see [docs/slack.md](docs/slack.md).
++  `/nerveshub` with the same checks (`Integrations.Slack.Actions.authorize/5`), and
++  `NervesHubWeb.Integrations.Slack.WorkflowSteps` approves, retries or skips a deployment
++  workflow step (`Integrations.Slack.Actions.authorize_in/6`). Hidden unless the instance
++  has a Slack app; see [docs/slack.md](docs/slack.md).
+ - `scripts.ex` / `scripts/` — support scripts run against a device console.
+ - `workers/` — Oban workers (e.g. firmware delta building, firmware deletion).
+ - Cross-cutting: `audit_logs.ex`, `product_notifications.ex`, `tracker.ex`,
+diff --git a/docs/slack.md b/docs/slack.md
+index c7ac9c2b2..471ee21e4 100644
+--- a/docs/slack.md
++++ b/docs/slack.md
+@@ -25,9 +25,14 @@ Under a connected workspace, **Add channel** picks a channel, the products whose
+ | Update succeeded | A device finishes updating. |
+ | New error | A device reports an error not seen before in its product. |
+ | Error reopened | An error that was marked resolved happens again. A muted error does not reopen. |
+-| Product notifications | NervesHub adds something to a product's Notifications page, such as a halted deployment workflow or a webhook it turned off. A notification that recurs is posted only the first time. |
++| Workflow step started | A deployment group's workflow begins a step, or begins it again after somebody retries it. |
++| Workflow waiting for approval | A workflow reaches a step that holds the rollout until somebody approves it. |
++| Workflow step completed | Every device a step covers is on the release's firmware, or somebody approved an approval step. |
++| Workflow step failed | Too many of a step's devices fail to update, and the rollout stops there. |
++| Workflow step skipped | Somebody skips a step. |
++| Product notifications | NervesHub adds something to a product's Notifications page, such as a halted deployment workflow or a webhook it turned off. A notification that recurs is posted only the first time. A channel that also gets "Workflow waiting for approval" or "Workflow step failed" hears about a halted workflow from both. |
+ 
+-Events are held for 15 seconds before they are posted, and everything held for a channel goes out as one message per kind of event. A single event gets a message of its own. A burst, such as a fleet's health changing at once, gets one message with a count and the first ten devices, so the channel is not buried. Device names link to the device in NervesHub. Anything a device sent, such as a failure reason, is escaped, so it cannot mention `@channel` or become a link.
++Events are held for 15 seconds before they are posted, and everything held for a channel goes out as one message per kind of event, in the order each kind first happened. A single event gets a message of its own. A burst, such as a fleet's health changing at once, gets one message with a count and the first ten devices, so the channel is not buried. Device names link to the device in NervesHub. Anything a device sent, such as a failure reason, is escaped, so it cannot mention `@channel` or become a link.
+ 
+ **Send test message** posts a message to the channel straight away, saying what it will get.
+ 
+@@ -54,6 +59,14 @@ If any check fails, only the person who clicked is told why. If they all pass, t
+ 
+ A device asked to reboot from Slack is not asked again from Slack for a minute, so a double click, two people clicking at once, or a button and a command together reboot it once. Whoever is refused is told who rebooted it. Each request Slack sends is acted on once, so one replayed while its signature is still good does nothing.
+ 
++## Acting on deployment workflows from Slack
++
++A workflow waiting for approval has an **Approve** button, and a workflow step that failed has **Retry** and **Skip**. Each asks for confirmation, then does what the same button on the deployment group's page does, as the linked NervesHub user. Both kinds of message also have **Open in NervesHub**, which opens the deployment group.
++
++The checks are the device buttons' (above): the deployment group's organization is connected to the workspace, and the linked user's role there can change deployment groups, which takes `manage`. A message can be clicked long after it was posted, so NervesHub also checks that the step still belongs to the deployment group's current release and is still waiting for approval, or still failed. If it was approved or skipped since, the person who clicked is told by whom.
++
++A step is acted on from Slack at most once every 30 seconds, so a double click, or two people clicking at once, approve or retry it once. What was done is recorded in the deployment group's audit log with "from Slack", and a reply in the message's thread tells the channel who did it.
++
+ ## Slash commands
+ 
+ `/nerveshub` works in any channel of a connected workspace, as the NervesHub user the Slack user linked, with the same checks as the buttons:
+diff --git a/docs/webhooks.md b/docs/webhooks.md
+index 8bf5fac12..58ef42bbb 100644
+--- a/docs/webhooks.md
++++ b/docs/webhooks.md
+@@ -147,6 +147,11 @@ A webhook subscribes to any of these. `webhook.test` is only sent on request.
+ | `device.firmware_validated` | A device confirmed that its firmware is good. |
+ | `error_group.created` | A device reported an error not seen before in its product. |
+ | `error_group.reopened` | An error that was marked resolved happened again. |
++| `deployment_group.workflow_step.started` | A deployment group's workflow began a step, or began it again after a retry. |
++| `deployment_group.workflow_step.awaiting_approval` | A workflow reached a step that waits for somebody to approve it. |
++| `deployment_group.workflow_step.completed` | A workflow step finished, or an approval step was approved. |
++| `deployment_group.workflow_step.failed` | Too many of a step's devices failed to update, and the workflow stopped. |
++| `deployment_group.workflow_step.skipped` | Somebody skipped a workflow step. |
+ 
+ ### The device
+ 
+@@ -367,6 +372,65 @@ or so, so a new error can already count more than one. `top_frame` is `null`
+ when the device sent no stack frames. `reason` is what the device said, so
+ treat it as untrusted text.
+ 
++### Deployment workflow events
++
++A deployment group with a workflow rolls a release out a step at a time. Each
++step is announced as it moves:
++
++- `deployment_group.workflow_step.started` when the workflow reaches a step,
++  and again when somebody retries a failed one.
++- `deployment_group.workflow_step.awaiting_approval` when it reaches an
++  approval step. An approval step sends this in place of `started`.
++- `deployment_group.workflow_step.completed` when every device the step covers
++  is on the release's firmware, or when the orchestrator moves on from an
++  approval step somebody approved. The step after it starts straight away, so
++  its `started` follows.
++- `deployment_group.workflow_step.failed` when more of the step's devices
++  failed to update than it tolerates. Nothing more is updated for the release
++  until the step is retried or skipped.
++- `deployment_group.workflow_step.skipped` when somebody skips the step.
++
++The last step of every workflow, which updates the devices no earlier step
++took, starts but never completes: devices keep joining the deployment group,
++so it is never done.
++
++These are about a deployment group rather than one device, so they carry
++`org`, `product` and the workflow, and no `device`:
++
++```json
++{
++  "deployment_group": { "name": "production" },
++  "release": {
++    "number": 4,
++    "firmware": {
++      "uuid": "6bb3bf62-4d9a-5a21-9a8b-38e6e8c8f6d1",
++      "version": "1.5.0"
++    }
++  },
++  "workflow": { "steps": 3 },
++  "step": {
++    "id": 812,
++    "number": 1,
++    "name": "Canary",
++    "type": "update_devices",
++    "status": "error",
++    "started_at": "2026-10-14T09:12:03Z",
++    "finished_at": "2026-10-14T09:40:51Z"
++  },
++  "user": null,
++  "failed_devices": 3
++}
++```
++
++`workflow.steps` is how many steps the release's workflow has, the last one
++included. `step.type` is `update_devices`, `approval_required` or `catch_all`
++(the last step), and `step.status` is the step's status once it moved:
++`in_progress`, `completed`, `error` or `skipped`. `step.name` is the name the
++workflow definition gave the step, or one NervesHub made up when it gave
++none. `user` is who retried, approved or skipped the step, as `{"name": ...}`,
++and `null` when the workflow moved on its own. `failed_devices` is set only
++on `failed`.
++
+ ### `webhook.test`
+ 
+ Sent only by **Send test event**, to the one webhook being tested. It is about
+diff --git a/lib/nerves_hub/audit_logs/templates/deployment_group_templates.ex b/lib/nerves_hub/audit_logs/templates/deployment_group_templates.ex
+index 19b400146..90610e36b 100644
+--- a/lib/nerves_hub/audit_logs/templates/deployment_group_templates.ex
++++ b/lib/nerves_hub/audit_logs/templates/deployment_group_templates.ex
+@@ -68,6 +68,29 @@ defmodule NervesHub.AuditLogs.DeploymentGroupTemplates do
+     AuditLogs.audit!(deployment_group, deployment_group, description)
+   end
+ 
++  @doc """
++  Somebody approved, skipped or retried a workflow step. `via` names where
++  they did it when it was not the deployment group's page, such as a Slack
++  user.
++  """
++  @spec audit_workflow_step_action(
++          User.t(),
++          DeploymentGroup.t(),
++          DeploymentWorkflowStep.t(),
++          :approved | :skipped | :retried,
++          String.t() | nil
++        ) :: :ok
++  def audit_workflow_step_action(user, deployment_group, step, action, via \\ nil)
++      when action in [:approved, :skipped, :retried] do
++    description =
++      "User #{user.name} #{action} workflow step #{step.number} (#{DeploymentWorkflowStep.label(step)}) for deployment group #{deployment_group.name}#{via(via)}"
++
++    AuditLogs.audit!(user, deployment_group, description)
++  end
++
++  defp via(nil), do: ""
++  defp via(source), do: " from #{source}"
++
+   @doc """
+   A workflow reached a step that waits for someone to approve it.
+   """
+diff --git a/lib/nerves_hub/integrations/slack/events.ex b/lib/nerves_hub/integrations/slack/events.ex
+index 195a1c3b0..6786e7098 100644
+--- a/lib/nerves_hub/integrations/slack/events.ex
++++ b/lib/nerves_hub/integrations/slack/events.ex
+@@ -44,6 +44,37 @@ defmodule NervesHub.Integrations.Slack.Events do
+       label: "Error reopened",
+       description: "An error that was marked resolved happened again."
+     },
++    %{
++      key: "deployment_group.workflow_step.started",
++      source: "deployment_group.workflow_step.started",
++      label: "Workflow step started",
++      description: "A deployment group's workflow began a step, or began it again after somebody retried it."
++    },
++    %{
++      key: "deployment_group.workflow_step.awaiting_approval",
++      source: "deployment_group.workflow_step.awaiting_approval",
++      label: "Workflow waiting for approval",
++      description:
++        "A workflow reached a step that holds the rollout until somebody approves it, with an Approve button."
++    },
++    %{
++      key: "deployment_group.workflow_step.completed",
++      source: "deployment_group.workflow_step.completed",
++      label: "Workflow step completed",
++      description: "Every device a step covers is on the release's firmware, or somebody approved an approval step."
++    },
++    %{
++      key: "deployment_group.workflow_step.failed",
++      source: "deployment_group.workflow_step.failed",
++      label: "Workflow step failed",
++      description: "Too many of a step's devices failed to update and the rollout stopped, with Retry and Skip buttons."
++    },
++    %{
++      key: "deployment_group.workflow_step.skipped",
++      source: "deployment_group.workflow_step.skipped",
++      label: "Workflow step skipped",
++      description: "Somebody skipped a step, and its devices were left to the steps after it."
++    },
+     %{
+       key: "product.notification_created",
+       source: "product.notification_created",
+@@ -54,7 +85,6 @@ defmodule NervesHub.Integrations.Slack.Events do
+   ]
+ 
+   @keys Enum.map(@events, & &1.key)
+-  @order @keys |> Enum.with_index() |> Map.new()
+ 
+   @failed_outcomes ["failed", "expired", "abandoned"]
+ 
+@@ -96,8 +126,4 @@ defmodule NervesHub.Integrations.Slack.Events do
+ 
+   def key(type, _data) when type in @keys, do: type
+   def key(_type, _data), do: nil
+-
+-  @doc "The keys in the order the settings page lists them, for ordering messages."
+-  @spec order(String.t()) :: non_neg_integer()
+-  def order(key), do: Map.get(@order, key, map_size(@order))
+ end
+diff --git a/lib/nerves_hub/integrations/slack/messages.ex b/lib/nerves_hub/integrations/slack/messages.ex
+index 1c6d37533..dc938a7d1 100644
+--- a/lib/nerves_hub/integrations/slack/messages.ex
++++ b/lib/nerves_hub/integrations/slack/messages.ex
+@@ -15,7 +15,8 @@ defmodule NervesHub.Integrations.Slack.Messages do
+ 
+   A message about one device carries buttons (`device_buttons/3`). A
+   summary of many devices has none: acting on a list from one click is a
+-  different thing.
++  different thing. A workflow waiting for approval carries Approve, and a
++  failed workflow step Retry and Skip.
+   """
+ 
+   alias NervesHub.Branding
+@@ -41,6 +42,7 @@ defmodule NervesHub.Integrations.Slack.Messages do
+   def build("device.firmware_update.succeeded", events), do: update_succeeded(events)
+   def build("error_group.created", events), do: errors(events, :created)
+   def build("error_group.reopened", events), do: errors(events, :reopened)
++  def build("deployment_group.workflow_step." <> event, events), do: workflow(events, event)
+   def build("product.notification_created", events), do: notifications(events)
+ 
+   @doc "What `Send test message` posts."
+@@ -258,6 +260,202 @@ defmodule NervesHub.Integrations.Slack.Messages do
+     "#{base_url()}/org/#{segment(get_in(event, ["org", "name"]) || "")}/#{segment(get_in(event, ["product", "name"]) || "")}/errors/#{get_in(event, ["error", "id"])}"
+   end
+ 
++  ## Deployment workflows
++
++  # Each is its own section, with its own buttons, rather than a count: a
++  # few deployment groups moving at once is still few enough to read, and
++  # each one waiting on somebody needs its own Approve or Retry.
++  @steps_listed 5
++
++  defp workflow(events, event) do
++    shown = Enum.take(events, @steps_listed)
++    more = length(events) - length(shown)
++
++    blocks =
++      Enum.flat_map(shown, fn data ->
++        [
++          section(step_heading(event, data, :mrkdwn)),
++          context([product_name(data), release(data)]),
++          step_actions(event, data)
++        ]
++      end)
++
++    blocks =
++      if more > 0 do
++        blocks ++ [context(["And #{more} more on the deployment groups' pages."])]
++      else
++        blocks
++      end
++
++    text =
++      case shown do
++        [data] -> step_heading(event, data, :plain)
++        _ -> "#{length(events)} workflow steps #{plural_verb(event)}"
++      end
++
++    %{text: text, blocks: blocks(blocks)}
++  end
++
++  # `:mrkdwn` links the deployment group, stresses the step and leads with an
++  # icon; `:plain` is the same sentence for notifications, which show no
++  # formatting.
++  defp step_heading(event, data, :mrkdwn) do
++    {icon, sentence} = step_sentence(event, step_name(data, :mrkdwn), deployment_group_name(data, :mrkdwn), data)
++    "#{icon} #{sentence}"
++  end
++
++  defp step_heading(event, data, :plain) do
++    {_icon, sentence} = step_sentence(event, step_name(data, :plain), deployment_group_name(data, :plain), data)
++    sentence
++  end
++
++  defp step_sentence(event, step, group, data) do
++    case {event, get_in(data, ["user", "name"])} do
++      {"started", nil} ->
++        {":arrow_forward:", "#{step} started for #{group}"}
++
++      {"started", by} ->
++        {":repeat:", "#{escape(by)} retried #{step} for #{group}"}
++
++      {"awaiting_approval", _} ->
++        {":raised_hand:", "#{group} is waiting for approval at #{step}"}
++
++      {"completed", nil} ->
++        {":white_check_mark:", "#{step} completed for #{group}"}
++
++      {"completed", by} ->
++        {":white_check_mark:", "#{escape(by)} approved #{step} for #{group}"}
++
++      {"skipped", nil} ->
++        {":fast_forward:", "#{step} was skipped for #{group}"}
++
++      {"skipped", by} ->
++        {":fast_forward:", "#{escape(by)} skipped #{step} for #{group}"}
++
++      {"failed", _} ->
++        {":x:",
++         "#{step} failed for #{group}#{failed_devices(data)}. The rollout is stopped until the step is retried or skipped."}
++    end
++  end
++
++  defp plural_verb("awaiting_approval"), do: "waiting for approval"
++  defp plural_verb(event), do: event
++
++  defp step_name(data, format) do
++    name = escape(get_in(data, ["step", "name"]) || "a step")
++    of = step_position(data)
++    if format == :mrkdwn, do: "*#{name}*#{of}", else: "#{name}#{of}"
++  end
++
++  defp step_position(data) do
++    case {get_in(data, ["step", "number"]), get_in(data, ["workflow", "steps"])} do
++      {number, steps} when is_integer(number) and is_integer(steps) -> " (step #{number} of #{steps})"
++      _ -> ""
++    end
++  end
++
++  defp deployment_group_name(data, format) do
++    case {get_in(data, ["deployment_group", "name"]), format, deployment_group_url(data)} do
++      {nil, _format, _url} -> "a deployment group"
++      {name, :mrkdwn, url} when is_binary(url) -> "<#{url}|#{escape(name)}>"
++      {name, _format, _url} -> escape(name)
++    end
++  end
++
++  defp failed_devices(%{"failed_devices" => 1}), do: ": 1 device could not take the update"
++
++  defp failed_devices(%{"failed_devices" => count}) when is_integer(count),
++    do: ": #{count} devices could not take the update"
++
++  defp failed_devices(_data), do: ""
++
++  defp release(data) do
++    number = get_in(data, ["release", "number"])
++
++    case get_in(data, ["release", "firmware", "version"]) do
++      version when is_binary(version) -> "release #{number}, firmware #{escape(version)}"
++      _ -> number && "release #{number}"
++    end
++  end
++
++  # Approve on a workflow waiting for approval, Retry and Skip on a step that
++  # failed. Like the device buttons, a button carries only the step's id, and
++  # `NervesHubWeb.Integrations.Slack.WorkflowSteps` works out the rest when it is clicked.
++  defp step_actions(event, data) when event in ["awaiting_approval", "failed"] do
++    with id when is_integer(id) <- get_in(data, ["step", "id"]),
++         url when is_binary(url) <- deployment_group_url(data) do
++      name = get_in(data, ["step", "name"]) || "this step"
++
++      buttons =
++        case event do
++          "awaiting_approval" ->
++            [
++              step_button("workflow_step.approve", "Approve", id, "primary", %{
++                title: "Approve #{name}?",
++                text: "The rollout carries on with the next step.",
++                confirm: "Approve"
++              })
++            ]
++
++          "failed" ->
++            [
++              step_button("workflow_step.retry", "Retry", id, "primary", %{
++                title: "Retry #{name}?",
++                text: "Its failed devices are let out of the penalty box and offered the update again.",
++                confirm: "Retry"
++              }),
++              step_button("workflow_step.skip", "Skip", id, "danger", %{
++                title: "Skip #{name}?",
++                text: "Its devices are left to the steps after it, and the rollout carries on.",
++                confirm: "Skip"
++              })
++            ]
++        end
++
++      %{type: "actions", elements: buttons ++ [open_button("deployment_group.open", url)]}
++    else
++      _ -> nil
++    end
++  end
++
++  defp step_actions(_event, _data), do: nil
++
++  defp step_button(action_id, label, step_id, style, confirm) do
++    %{
++      type: "button",
++      action_id: action_id,
++      text: plain(label),
++      value: Integer.to_string(step_id),
++      style: style,
++      confirm: %{
++        title: plain(String.slice(confirm.title, 0, 100)),
++        text: %{type: "mrkdwn", text: confirm.text},
++        confirm: plain(confirm.confirm),
++        deny: plain("Cancel"),
++        style: style
++      }
++    }
++  end
++
++  defp open_button(action_id, url) do
++    %{
++      type: "button",
++      action_id: action_id,
++      text: plain(String.slice("Open in #{Branding.friendly_platform_name()}", 0, 75)),
++      url: url
++    }
++  end
++
++  defp deployment_group_url(data) do
++    with org when is_binary(org) <- get_in(data, ["org", "name"]),
++         product when is_binary(product) <- get_in(data, ["product", "name"]),
++         name when is_binary(name) <- get_in(data, ["deployment_group", "name"]) do
++      "#{base_url()}/org/#{segment(org)}/#{segment(product)}/deployment_groups/#{segment(name)}"
++    else
++      _ -> nil
++    end
++  end
++
+   ## Product notifications
+ 
+   @notifications_listed 5
+@@ -318,12 +516,7 @@ defmodule NervesHub.Integrations.Slack.Messages do
+     %{
+       type: "actions",
+       elements: [
+-        %{
+-          type: "button",
+-          action_id: "device.open",
+-          text: plain(String.slice("Open in #{Branding.friendly_platform_name()}", 0, 75)),
+-          url: device_url(org_name, product_name, identifier)
+-        },
++        open_button("device.open", device_url(org_name, product_name, identifier)),
+         %{type: "button", action_id: "device.identify", text: plain("Identify"), value: identifier},
+         %{
+           type: "button",
+diff --git a/lib/nerves_hub/integrations/slack/subscriptions.ex b/lib/nerves_hub/integrations/slack/subscriptions.ex
+index f073acdaa..8ea4c4d4b 100644
+--- a/lib/nerves_hub/integrations/slack/subscriptions.ex
++++ b/lib/nerves_hub/integrations/slack/subscriptions.ex
+@@ -268,10 +268,13 @@ defmodule NervesHub.Integrations.Slack.Subscriptions do
+ 
+   defp post_batch([], _subscription), do: :ok
+ 
++  # One message per kind of event, posted in the order each kind first
++  # happened: a workflow step completing and the next one starting arrive
++  # together, and should read that way round.
+   defp post_batch(events, subscription) do
+     events
+     |> Enum.group_by(& &1.type)
+-    |> Enum.sort_by(fn {key, _events} -> Events.order(key) end)
++    |> Enum.sort_by(fn {_key, [first | _]} -> first.id end)
+     |> Enum.reduce_while(:ok, fn {key, group}, :ok ->
+       message = Messages.build(key, Enum.map(group, & &1.data))
+ 
+diff --git a/lib/nerves_hub/managed_deployments/orchestrator/workflow_coordinator.ex b/lib/nerves_hub/managed_deployments/orchestrator/workflow_coordinator.ex
+index 9d5ebb423..9ca0a6c52 100644
+--- a/lib/nerves_hub/managed_deployments/orchestrator/workflow_coordinator.ex
++++ b/lib/nerves_hub/managed_deployments/orchestrator/workflow_coordinator.ex
+@@ -93,7 +93,7 @@ defmodule NervesHub.ManagedDeployments.Orchestrator.WorkflowCoordinator do
+     if Workflows.step_failed?(deployment_group, step) do
+       failed_count = Workflows.failed_device_count(deployment_group, step)
+ 
+-      _ = Workflows.fail_step(step)
++      _ = Workflows.fail_step(step, failed_devices: failed_count)
+ 
+       Logger.warning("Workflow step failed",
+         deployment_id: deployment_group.id,
+diff --git a/lib/nerves_hub/managed_deployments/workflow_events.ex b/lib/nerves_hub/managed_deployments/workflow_events.ex
+new file mode 100644
+index 000000000..03fe9e2b7
+--- /dev/null
++++ b/lib/nerves_hub/managed_deployments/workflow_events.ex
+@@ -0,0 +1,80 @@
++defmodule NervesHub.ManagedDeployments.WorkflowEvents do
++  @moduledoc """
++  What a deployment workflow tells an organization's webhooks and Slack
++  channels as its steps move (`NervesHub.Integrations.dispatch/3`):
++
++    * `deployment_group.workflow_step.started`: a step began updating its
++      devices, or began again after somebody retried it
++    * `deployment_group.workflow_step.awaiting_approval`: the workflow
++      reached an approval step, which is raised in place of `started` for
++      one
++    * `deployment_group.workflow_step.completed`: every device the step
++      covers is on the release's firmware or, for an approval step,
++      somebody approved it
++    * `deployment_group.workflow_step.failed`: more of the step's devices
++      failed to update than it tolerates, and the workflow stopped there
++    * `deployment_group.workflow_step.skipped`: somebody skipped the step
++
++  `NervesHub.ManagedDeployments.Workflows` raises each one as it writes the
++  change, so a step moved by the orchestrator, from the dashboard or from
++  Slack is announced the same way. The data is
++  `NervesHub.Webhooks.Payloads.workflow_step/3`.
++  """
++
++  import Ecto.Query
++
++  alias NervesHub.Accounts.User
++  alias NervesHub.Integrations
++  alias NervesHub.ManagedDeployments.DeploymentRelease
++  alias NervesHub.ManagedDeployments.DeploymentWorkflowStep
++  alias NervesHub.Repo
++  alias NervesHub.Webhooks.Payloads
++
++  @events ~w(started awaiting_approval completed failed skipped)
++
++  @doc """
++  Raises `event` (one of #{Enum.map_join(@events, ", ", &"`#{&1}`")}) for the
++  step.
++
++  `opts`:
++
++    * `:user`: who did it, when somebody did: the `User` who skipped or
++      retried the step, or the id of the one who approved it
++    * `:failed_devices`: for `failed`, how many of its devices could not
++      take the update
++  """
++  @spec announce(DeploymentWorkflowStep.t(), String.t(), keyword()) :: :ok
++  def announce(%DeploymentWorkflowStep{} = step, event, opts \\ []) when event in @events do
++    case release(step) do
++      nil ->
++        :ok
++
++      release ->
++        Integrations.dispatch(release.product_id, type(event), fn ->
++          Payloads.workflow_step(step, release, user: user(opts[:user]), failed_devices: opts[:failed_devices])
++        end)
++    end
++  end
++
++  defp type(event), do: "deployment_group.workflow_step." <> event
++
++  # What every event says about where the step is, read in one query. A
++  # release whose deployment group has gone has nobody left to tell.
++  defp release(step) do
++    DeploymentRelease
++    |> where([r], r.id == ^step.deployment_release_id)
++    |> join(:inner, [r], dg in assoc(r, :deployment_group))
++    |> join(:left, [r], f in assoc(r, :firmware))
++    |> select([r, dg, f], %{
++      product_id: dg.product_id,
++      deployment_group: %{name: dg.name},
++      number: r.number,
++      firmware: %{uuid: f.uuid, version: f.version}
++    })
++    |> Repo.one()
++  end
++
++  defp user(nil), do: nil
++  defp user(%User{} = user), do: user
++  defp user(id) when is_integer(id), do: Repo.get(User, id)
++end
+diff --git a/lib/nerves_hub/managed_deployments/workflows.ex b/lib/nerves_hub/managed_deployments/workflows.ex
+index 7c9ecf328..d605417c4 100644
+--- a/lib/nerves_hub/managed_deployments/workflows.ex
++++ b/lib/nerves_hub/managed_deployments/workflows.ex
+@@ -36,7 +36,9 @@ defmodule NervesHub.ManagedDeployments.Workflows do
+   the required release and on to the current one.
+ 
+   Every transition broadcasts `step/updated` on `deployment_release:<id>` so an
+-  open deployment group page can move the step along without polling.
++  open deployment group page can move the step along without polling, and
++  each one an organization's integrations hear of is announced to them
++  (`NervesHub.ManagedDeployments.WorkflowEvents`).
+   """
+ 
+   import Ecto.Query
+@@ -49,6 +51,7 @@ defmodule NervesHub.ManagedDeployments.Workflows do
+   alias NervesHub.ManagedDeployments.DeploymentGroup
+   alias NervesHub.ManagedDeployments.DeploymentRelease
+   alias NervesHub.ManagedDeployments.DeploymentWorkflowStep
++  alias NervesHub.ManagedDeployments.WorkflowEvents
+   alias NervesHub.ProductNotifications
+   alias NervesHub.Repo
+   alias Phoenix.Channel.Server, as: PhoenixChannelServer
+@@ -335,10 +338,18 @@ defmodule NervesHub.ManagedDeployments.Workflows do
+ 
+   @doc """
+   Mark a waiting step as in progress.
++
++  An approval step is announced as waiting for approval rather than as
++  started, since waiting is all it does.
+   """
+   @spec start_step(DeploymentWorkflowStep.t()) :: DeploymentWorkflowStep.t()
+   def start_step(step) do
+-    transition(step, status: :in_progress, started_at: now())
++    step = transition(step, status: :in_progress, started_at: now())
++
++    event = if step.type == :approval_required, do: "awaiting_approval", else: "started"
++    :ok = WorkflowEvents.announce(step, event)
++
++    step
+   end
+ 
+   @doc """
+@@ -346,7 +357,12 @@ defmodule NervesHub.ManagedDeployments.Workflows do
+   """
+   @spec complete_step(DeploymentWorkflowStep.t()) :: DeploymentWorkflowStep.t()
+   def complete_step(step) do
+-    transition(step, status: :completed, finished_at: now())
++    step = transition(step, status: :completed, finished_at: now())
++
++    # An approval step completes because somebody approved it.
++    :ok = WorkflowEvents.announce(step, "completed", user: step.approved_by_id)
++
++    step
+   end
+ 
+   @doc """
+@@ -370,10 +386,17 @@ defmodule NervesHub.ManagedDeployments.Workflows do
+   Nothing further is scheduled until somebody retries or skips it. That is the
+   point of a staged rollout: the stage that went wrong should not hand on to the
+   next one.
++
++  `failed_devices`, how many of the step's devices could not take the update,
++  is passed on in the announcement.
+   """
+-  @spec fail_step(DeploymentWorkflowStep.t()) :: DeploymentWorkflowStep.t()
+-  def fail_step(step) do
+-    transition(step, status: :error, finished_at: now())
++  @spec fail_step(DeploymentWorkflowStep.t(), keyword()) :: DeploymentWorkflowStep.t()
++  def fail_step(step, opts \\ []) do
++    step = transition(step, status: :error, finished_at: now())
++
++    :ok = WorkflowEvents.announce(step, "failed", failed_devices: opts[:failed_devices])
++
++    step
+   end
+ 
+   @doc """
+@@ -408,6 +431,7 @@ defmodule NervesHub.ManagedDeployments.Workflows do
+       step = transition(step, status: :skipped, skipped_at: now(), skipped_by_id: user.id)
+ 
+       :ok = resolve_halt_notification(step)
++      :ok = WorkflowEvents.announce(step, "skipped", user: user)
+ 
+       {:ok, step}
+     else
+@@ -442,7 +466,11 @@ defmodule NervesHub.ManagedDeployments.Workflows do
+         devices_released: released
+       )
+ 
+-      {:ok, transition(step, status: :in_progress, finished_at: nil, started_at: now())}
++      step = transition(step, status: :in_progress, finished_at: nil, started_at: now())
++
++      :ok = WorkflowEvents.announce(step, "started", user: user)
++
++      {:ok, step}
+     else
+       {:error, :not_retryable}
+     end
+diff --git a/lib/nerves_hub/webhooks/events.ex b/lib/nerves_hub/webhooks/events.ex
+index c31bf8294..64bde3321 100644
+--- a/lib/nerves_hub/webhooks/events.ex
++++ b/lib/nerves_hub/webhooks/events.ex
+@@ -90,6 +90,37 @@ defmodule NervesHub.Webhooks.Events do
+       group: "Errors",
+       label: "Error reopened",
+       description: "An error that was marked resolved happened again. Muted errors do not reopen."
++    },
++    %{
++      type: "deployment_group.workflow_step.started",
++      group: "Deployment workflows",
++      label: "Step started",
++      description: "A deployment group's workflow began a step, or began it again after somebody retried it."
++    },
++    %{
++      type: "deployment_group.workflow_step.awaiting_approval",
++      group: "Deployment workflows",
++      label: "Waiting for approval",
++      description: "A workflow reached a step that holds the rollout until somebody approves it."
++    },
++    %{
++      type: "deployment_group.workflow_step.completed",
++      group: "Deployment workflows",
++      label: "Step completed",
++      description: "Every device a step covers is on the release's firmware, or somebody approved an approval step."
++    },
++    %{
++      type: "deployment_group.workflow_step.failed",
++      group: "Deployment workflows",
++      label: "Step failed",
++      description:
++        "More of a step's devices failed to update than it tolerates. The rollout stops there until the step is retried or skipped."
++    },
++    %{
++      type: "deployment_group.workflow_step.skipped",
++      group: "Deployment workflows",
++      label: "Step skipped",
++      description: "Somebody skipped a step. Its devices are left to the steps after it."
+     }
+   ]
+ 
+diff --git a/lib/nerves_hub/webhooks/payloads.ex b/lib/nerves_hub/webhooks/payloads.ex
+index b5f8ffdb4..8cc939e12 100644
+--- a/lib/nerves_hub/webhooks/payloads.ex
++++ b/lib/nerves_hub/webhooks/payloads.ex
+@@ -24,6 +24,7 @@ defmodule NervesHub.Webhooks.Payloads do
+   alias NervesHub.Devices.DeviceHealth
+   alias NervesHub.Firmwares.Firmware
+   alias NervesHub.ManagedDeployments.DeploymentGroup
++  alias NervesHub.ManagedDeployments.DeploymentWorkflowStep
+   alias NervesHub.Repo
+ 
+   @doc "`device.connected`"
+@@ -172,6 +173,44 @@ defmodule NervesHub.Webhooks.Payloads do
+     }
+   end
+ 
++  @doc """
++  `deployment_group.workflow_step.started`, `.awaiting_approval`,
++  `.completed`, `.failed` and `.skipped`
++
++  About a deployment group's workflow rather than one device, so there is no
++  `device`. `release` is what `NervesHub.ManagedDeployments.WorkflowEvents`
++  read of the step's release. `user` is who skipped, retried or approved the
++  step, and `nil` when the workflow moved on its own; `failed_devices` is
++  set only for a failed step.
++  """
++  @spec workflow_step(DeploymentWorkflowStep.t(), map(), keyword()) :: map()
++  def workflow_step(%DeploymentWorkflowStep{} = step, release, opts) do
++    step_count =
++      DeploymentWorkflowStep
++      |> where([s], s.deployment_release_id == ^step.deployment_release_id)
++      |> Repo.aggregate(:count)
++
++    %{
++      deployment_group: release.deployment_group,
++      release: %{number: release.number, firmware: release.firmware},
++      workflow: %{steps: step_count},
++      step: %{
++        id: step.id,
++        number: step.number,
++        name: DeploymentWorkflowStep.label(step),
++        type: Atom.to_string(step.type),
++        status: Atom.to_string(step.status),
++        started_at: utc(step.started_at),
++        finished_at: utc(step.finished_at)
++      },
++      user: opts[:user] && %{name: opts[:user].name},
++      failed_devices: opts[:failed_devices]
++    }
++  end
++
++  defp utc(nil), do: nil
++  defp utc(%NaiveDateTime{} = at), do: DateTime.from_naive!(at, "Etc/UTC")
++
+   defp top_frame(%{top_frame_module: nil, top_frame_function: nil}), do: nil
+ 
+   defp top_frame(group) do
+diff --git a/lib/nerves_hub_web/integrations/slack/actions.ex b/lib/nerves_hub_web/integrations/slack/actions.ex
+index 6fa4d9c67..1705c75d2 100644
+--- a/lib/nerves_hub_web/integrations/slack/actions.ex
++++ b/lib/nerves_hub_web/integrations/slack/actions.ex
+@@ -2,7 +2,10 @@ defmodule NervesHubWeb.Integrations.Slack.Actions do
+   @moduledoc """
+   What a person can do to a device from Slack: the Reboot and Identify
+   buttons on NervesHub's messages about a single device
+-  (`NervesHub.Integrations.Slack.Messages`).
++  (`NervesHub.Integrations.Slack.Messages`). Clicks on the other buttons are passed on:
++  sharing to `NervesHubWeb.Integrations.Slack.DeviceCards` and `NervesHubWeb.Integrations.Slack.ScriptRuns`,
++  and a deployment workflow's Approve, Retry and Skip to
++  `NervesHubWeb.Integrations.Slack.WorkflowSteps`.
+ 
+   A click is done as the NervesHub user the Slack user linked
+   (`NervesHub.Integrations.Slack.Users`), and only if, at that moment:
+@@ -44,6 +47,7 @@ defmodule NervesHubWeb.Integrations.Slack.Actions do
+   alias NervesHubWeb.Helpers.Authorization
+   alias NervesHubWeb.Integrations.Slack.DeviceCards
+   alias NervesHubWeb.Integrations.Slack.ScriptRuns
++  alias NervesHubWeb.Integrations.Slack.WorkflowSteps
+ 
+   require Logger
+ 
+@@ -129,6 +133,13 @@ defmodule NervesHubWeb.Integrations.Slack.Actions do
+     end
+   end
+ 
++  defp job(payload, %{"action_id" => "workflow_step." <> _} = action) do
++    case WorkflowSteps.click(payload, action) do
++      nil -> nil
++      click -> fn -> WorkflowSteps.perform(click) end
++    end
++  end
++
+   defp job(payload, action) do
+     case click(payload, action) do
+       nil -> nil
+@@ -138,26 +149,43 @@ defmodule NervesHubWeb.Integrations.Slack.Actions do
+ 
+   defp click(payload, %{"action_id" => action_id, "value" => identifier})
+        when is_map_key(@actions, action_id) and is_binary(identifier) do
+-    case payload do
+-      %{"team" => %{"id" => team_id}, "user" => %{"id" => slack_user_id} = slack_user} ->
+-        %{
+-          action_id: action_id,
+-          identifier: identifier,
+-          team_id: team_id,
+-          slack_user_id: slack_user_id,
+-          slack_username: slack_user["username"] || slack_user["name"],
+-          response_url: payload["response_url"],
+-          channel_id: get_in(payload, ["container", "channel_id"]) || get_in(payload, ["channel", "id"]),
+-          message_ts: get_in(payload, ["container", "message_ts"]) || get_in(payload, ["message", "ts"])
+-        }
+-
+-      _ ->
+-        nil
++    case clicked_by(payload) do
++      nil -> nil
++      clicked_by -> Map.merge(clicked_by, %{action_id: action_id, identifier: identifier})
+     end
+   end
+ 
+   defp click(_payload, _action), do: nil
+ 
++  @doc """
++  Who clicked, and the message they clicked on, from Slack's interaction
++  payload: what every button needs whatever it does. `nil` when Slack did
++  not say who.
++  """
++  @spec clicked_by(map()) ::
++          %{
++            team_id: String.t(),
++            slack_user_id: String.t(),
++            slack_username: String.t() | nil,
++            response_url: String.t() | nil,
++            channel_id: String.t() | nil,
++            message_ts: String.t() | nil
++          }
++          | nil
++  def clicked_by(%{"team" => %{"id" => team_id}, "user" => %{"id" => slack_user_id} = slack_user} = payload)
++      when is_binary(team_id) and is_binary(slack_user_id) do
++    %{
++      team_id: team_id,
++      slack_user_id: slack_user_id,
++      slack_username: slack_user["username"] || slack_user["name"],
++      response_url: payload["response_url"],
++      channel_id: get_in(payload, ["container", "channel_id"]) || get_in(payload, ["channel", "id"]),
++      message_ts: get_in(payload, ["container", "message_ts"]) || get_in(payload, ["message", "ts"])
++    }
++  end
++
++  def clicked_by(_payload), do: nil
++
+   @doc """
+   Carries out a click, or says why not. Returns what happened, for tests.
+   """
+@@ -198,24 +226,35 @@ defmodule NervesHubWeb.Integrations.Slack.Actions do
+   def authorize(team_id, slack_user_id, identifier, permission, what) do
+     with {:user, %Accounts.User{} = user} <- {:user, Users.use_link(team_id, slack_user_id)},
+          {:device, %Device{} = device} <- {:device, device(identifier)},
+-         {:connected, true} <- {:connected, connected?(device.org_id, team_id)},
+-         {:member, {:ok, org_user}} <- {:member, Accounts.get_org_user(device.org, user)},
+-         {:allowed, true} <- {:allowed, Authorization.authorized?(permission, org_user.role)} do
++         :ok <- authorize_in(team_id, user, device.org, permission, what, escape(identifier)) do
+       {:ok, user, device}
+     else
+-      {:user, nil} ->
+-        {:error, :not_linked, link_message(team_id)}
+-
+-      {:device, nil} ->
+-        {:error, :no_device, "#{escape(identifier)} is not in #{platform()}."}
++      {:user, nil} -> {:error, :not_linked, link_message(team_id)}
++      {:device, nil} -> {:error, :no_device, "#{escape(identifier)} is not in #{platform()}."}
++      {:error, _reason, _message} = error -> error
++    end
++  end
+ 
++  @doc """
++  The checks `authorize/5` makes of the organization, for a NervesHub user a
++  Slack user linked and something of the organization's other than a
++  device: the organization is connected to the workspace the request came
++  from, and the user is a member whose role has `permission`. `subject`
++  finishes "the organization ... belongs to", already escaped.
++  """
++  @spec authorize_in(String.t(), Accounts.User.t(), Org.t(), atom(), String.t(), String.t()) ::
++          :ok | {:error, atom(), String.t()}
++  def authorize_in(team_id, %Accounts.User{} = user, %Org{} = org, permission, what, subject) do
++    with {:connected, true} <- {:connected, connected?(org.id, team_id)},
++         {:member, {:ok, org_user}} <- {:member, Accounts.get_org_user(org, user)},
++         {:allowed, true} <- {:allowed, Authorization.authorized?(permission, org_user.role)} do
++      :ok
++    else
+       {:connected, false} ->
+-        {:error, :not_connected,
+-         "This Slack workspace is not connected to the organization #{escape(identifier)} belongs to."}
++        {:error, :not_connected, "This Slack workspace is not connected to the organization #{subject} belongs to."}
+ 
+       {:member, {:error, :not_found}} ->
+-        {:error, :not_member,
+-         "Your #{platform()} account is not a member of the organization #{escape(identifier)} belongs to."}
++        {:error, :not_member, "Your #{platform()} account is not a member of the organization #{subject} belongs to."}
+ 
+       {:allowed, false} ->
+         {:error, :not_allowed, "Your role in #{platform()} does not let you #{what}."}
+@@ -338,7 +377,12 @@ defmodule NervesHubWeb.Integrations.Slack.Actions do
+     }
+   end
+ 
+-  defp refuse(click, reason, message) do
++  @doc """
++  Tells only the person who clicked why it was not done, and returns
++  `{:error, reason}`.
++  """
++  @spec refuse(%{optional(atom()) => term()}, atom(), String.t() | map()) :: {:error, atom()}
++  def refuse(click, reason, message) do
+     :ok = respond_privately(click, message)
+     {:error, reason}
+   end
+@@ -357,8 +401,12 @@ defmodule NervesHubWeb.Integrations.Slack.Actions do
+ 
+   defp respond_privately(_click, _message), do: :ok
+ 
+-  # In the message's thread, for the channel to see who did what.
+-  defp announce(%{channel_id: channel_id, message_ts: ts} = click, text) when is_binary(channel_id) and is_binary(ts) do
++  @doc """
++  Posts what was done in the clicked message's thread, for the channel to
++  see who did what, or, if that fails, tells the person who clicked.
++  """
++  @spec announce(%{optional(atom()) => term()}, String.t()) :: :ok
++  def announce(%{channel_id: channel_id, message_ts: ts} = click, text) when is_binary(channel_id) and is_binary(ts) do
+     with %Workspace{bot_token: token} <- Repo.get_by(Workspace, team_id: click.team_id),
+          {:ok, _} <- Client.post_message(token, channel_id, %{text: text, blocks: []}, thread_ts: ts) do
+       :ok
+@@ -369,7 +417,7 @@ defmodule NervesHubWeb.Integrations.Slack.Actions do
+     end
+   end
+ 
+-  defp announce(click, text), do: respond_privately(click, text)
++  def announce(click, text), do: respond_privately(click, text)
+ 
+   @doc "The name people know this instance by (`NervesHub.Branding`), escaped for Slack."
+   @spec platform() :: String.t()
+diff --git a/lib/nerves_hub_web/integrations/slack/workflow_steps.ex b/lib/nerves_hub_web/integrations/slack/workflow_steps.ex
+new file mode 100644
+index 000000000..708739362
+--- /dev/null
++++ b/lib/nerves_hub_web/integrations/slack/workflow_steps.ex
+@@ -0,0 +1,255 @@
++defmodule NervesHubWeb.Integrations.Slack.WorkflowSteps do
++  @moduledoc """
++  The buttons on NervesHub's Slack messages about a deployment workflow
++  (`NervesHub.Integrations.Slack.Messages`): Approve on a workflow waiting for approval,
++  and Retry and Skip on a step that failed.
++
++  Each does what the same button on the deployment group's page does, as the
++  NervesHub user the Slack user linked, checked as the device buttons are
++  (`NervesHubWeb.Integrations.Slack.Actions.authorize_in/6`): the deployment group's
++  organization is connected to the workspace the click came from, and the
++  user's role there has `deployment_group:update`, at that moment. The
++  button carries only the step's id.
++
++  A message can be clicked long after it was posted, so the step is read
++  back first, and acted on only if it is still part of the deployment
++  group's current release and still in the state the button was for. One
++  approved, retried or skipped since says by whom.
++
++  A step is acted on from Slack once every 30 seconds, by a claim in
++  Postgres (`NervesHub.Integrations.Slack.Claims`), so a double click, or two people
++  clicking at once, approve or retry it once.
++
++  What was done is audited with the Slack user who did it and posted in the
++  message's thread. The orchestrator is then nudged to carry on, as the
++  deployment group's page does.
++  """
++
++  alias NervesHub.Accounts.User
++  alias NervesHub.AuditLogs.DeploymentGroupTemplates
++  alias NervesHub.Integrations.Slack.Claims
++  alias NervesHub.Integrations.Slack.Users
++  alias NervesHub.ManagedDeployments
++  alias NervesHub.ManagedDeployments.DeploymentGroup
++  alias NervesHub.ManagedDeployments.DeploymentRelease
++  alias NervesHub.ManagedDeployments.DeploymentWorkflowStep
++  alias NervesHub.ManagedDeployments.Workflows
++  alias NervesHub.Repo
++  alias NervesHubWeb.Integrations.Slack.Actions
++
++  @actions %{
++    "workflow_step.approve" => :approve,
++    "workflow_step.retry" => :retry,
++    "workflow_step.skip" => :skip
++  }
++
++  @claim_seconds 30
++
++  @typedoc "A click on one of the buttons, read from Slack's interaction payload."
++  @type click() :: %{
++          action: :approve | :retry | :skip,
++          step_id: pos_integer(),
++          team_id: String.t(),
++          slack_user_id: String.t(),
++          slack_username: String.t() | nil,
++          response_url: String.t() | nil,
++          channel_id: String.t() | nil,
++          message_ts: String.t() | nil
++        }
++
++  @doc """
++  The click, from Slack's interaction payload and the action in it, or `nil`
++  for one that is not one of these buttons or names no step.
++  """
++  @spec click(map(), map()) :: click() | nil
++  def click(payload, %{"action_id" => action_id, "value" => value}) when is_map_key(@actions, action_id) do
++    with {:ok, step_id} <- Ecto.Type.cast(:id, value),
++         %{} = clicked_by <- Actions.clicked_by(payload) do
++      Map.merge(clicked_by, %{action: Map.fetch!(@actions, action_id), step_id: step_id})
++    else
++      _ -> nil
++    end
++  end
++
++  def click(_payload, _action), do: nil
++
++  @doc """
++  Carries out a click, or tells the person who clicked why not. Returns
++  what happened, for tests.
++  """
++  @spec perform(click()) :: {:ok, :approve | :retry | :skip} | {:error, atom()}
++  def perform(%{action: action} = click) do
++    with {:user, %User{} = user} <- {:user, Users.use_link(click.team_id, click.slack_user_id)},
++         {:step, {%DeploymentWorkflowStep{} = step, %DeploymentGroup{} = deployment_group}} <-
++           {:step, step(click.step_id)},
++         :ok <-
++           Actions.authorize_in(
++             click.team_id,
++             user,
++             deployment_group.org,
++             :"deployment_group:update",
++             "#{verb(action)} deployment workflow steps",
++             "that deployment group"
++           ),
++         :ok <- current(step, deployment_group),
++         :ok <- still_possible(action, step),
++         :ok <- claim(step, user),
++         {:ok, step} <- act(action, deployment_group, step, user) do
++      :ok =
++        DeploymentGroupTemplates.audit_workflow_step_action(
++          user,
++          deployment_group,
++          step,
++          done_action(action),
++          Actions.via(click)
++        )
++
++      # Approving or skipping only clears the way, and a retried step waits
++      # for the next pass. The orchestrator is what moves the workflow on.
++      :ok = ManagedDeployments.broadcast(deployment_group, "deployments/update")
++
++      :ok = Actions.announce(click, done(action, user, step, deployment_group))
++      {:ok, action}
++    else
++      {:user, nil} ->
++        Actions.refuse(click, :not_linked, Actions.link_message(click.team_id))
++
++      {:step, nil} ->
++        Actions.refuse(click, :no_step, "That workflow step is no longer in #{Actions.platform()}.")
++
++      {:error, reason, message} ->
++        Actions.refuse(click, reason, message)
++    end
++  end
++
++  # The step, and its deployment group with the organization the checks are
++  # made against. A product or organization that was deleted takes its
++  # deployment groups' workflows with it.
++  defp step(id) do
++    with %DeploymentWorkflowStep{} = step <- Repo.get(DeploymentWorkflowStep, id),
++         %{deployment_group_id: deployment_group_id} <-
++           Repo.get(DeploymentRelease, step.deployment_release_id),
++         {:ok, %DeploymentGroup{org: %{}, product: %{}} = deployment_group} <-
++           ManagedDeployments.get_deployment_group(deployment_group_id) do
++      {step, deployment_group}
++    else
++      _ -> nil
++    end
++  end
++
++  # A new release brings its own workflow, and the old one's steps are done
++  # with, whatever state they were left in.
++  defp current(step, deployment_group) do
++    if step.deployment_release_id == deployment_group.current_deployment_release_id do
++      :ok
++    else
++      {:error, :superseded,
++       "#{step_label(step)} is part of an earlier release of #{group_label(deployment_group)}, so there is nothing more to do with it."}
++    end
++  end
++
++  defp claim(step, user) do
++    case Claims.claim("workflow_step:#{step.id}", @claim_seconds, user.name) do
++      :ok ->
++        :ok
++
++      {:held, holder, _expires_at} ->
++        by = if holder, do: " by #{Actions.escape(holder)}", else: ""
++        {:error, :just_done, "#{step_label(step)} was acted on from Slack#{by} a moment ago, so it was left alone."}
++    end
++  end
++
++  # Whether the step is still in the state the button was for. Asked before
++  # the claim, so a click on an old message says what happened to the step
++  # rather than only that it was claimed.
++  defp still_possible(:approve, step) do
++    cond do
++      step.type != :approval_required ->
++        {:error, :not_an_approval_step, "#{step_label(step)} does not wait for approval."}
++
++      not is_nil(step.approved_at) ->
++        {:error, :already_done, "#{step_label(step)} was already approved#{by(step.approved_by_id)}."}
++
++      step.status != :in_progress ->
++        {:error, :already_done, "#{step_label(step)} is no longer waiting for approval: it #{status(step)}."}
++
++      true ->
++        :ok
++    end
++  end
++
++  defp still_possible(:retry, step) do
++    if Workflows.retryable?(step),
++      do: :ok,
++      else: {:error, :not_retryable, "Only a failed step can be retried, and #{step_label(step)} #{status(step)}."}
++  end
++
++  defp still_possible(:skip, step) do
++    cond do
++      step.type == :catch_all ->
++        {:error, :not_skippable, "#{step_label(step)} is the last step, so it cannot be skipped."}
++
++      Workflows.skippable?(step) ->
++        :ok
++
++      true ->
++        {:error, :not_skippable, "#{step_label(step)} can no longer be skipped: it #{status(step)}."}
++    end
++  end
++
++  # The step as read before the claim. Anything that moved it since, such as
++  # the dashboard, is caught by `Workflows` checking again.
++  defp act(:approve, _deployment_group, step, user), do: {:ok, Workflows.approve_step(step, user)}
++
++  defp act(:retry, deployment_group, step, user) do
++    case Workflows.retry_step(deployment_group, step, user) do
++      {:ok, step} -> {:ok, step}
++      {:error, :not_retryable} -> {:error, :not_retryable, "#{step_label(step)} can no longer be retried."}
++    end
++  end
++
++  defp act(:skip, _deployment_group, step, user) do
++    case Workflows.skip_step(step, user) do
++      {:ok, step} -> {:ok, step}
++      {:error, :not_skippable} -> {:error, :not_skippable, "#{step_label(step)} can no longer be skipped."}
++    end
++  end
++
++  defp status(%DeploymentWorkflowStep{status: :skipped, skipped_by_id: id}), do: "was skipped#{by(id)}"
++  defp status(%DeploymentWorkflowStep{status: :waiting}), do: "has not started"
++  defp status(%DeploymentWorkflowStep{status: :in_progress}), do: "is running"
++  defp status(%DeploymentWorkflowStep{status: :completed}), do: "has completed"
++  defp status(%DeploymentWorkflowStep{status: :error}), do: "failed"
++
++  defp by(nil), do: ""
++
++  defp by(user_id) do
++    case Repo.get(User, user_id) do
++      %User{name: name} -> " by #{Actions.escape(name)}"
++      nil -> ""
++    end
++  end
++
++  defp verb(:approve), do: "approve"
++  defp verb(:retry), do: "retry"
++  defp verb(:skip), do: "skip"
++
++  defp done_action(:approve), do: :approved
++  defp done_action(:retry), do: :retried
++  defp done_action(:skip), do: :skipped
++
++  defp done(action, user, step, deployment_group) do
++    name = Actions.escape(user.name)
++    step = step_label(step)
++    group = group_label(deployment_group)
++
++    case action do
++      :approve -> ":white_check_mark: #{name} approved #{step} for #{group} from Slack. The rollout carries on."
++      :retry -> ":repeat: #{name} retried #{step} for #{group} from Slack."
++      :skip -> ":fast_forward: #{name} skipped #{step} for #{group} from Slack."
++    end
++  end
++
++  defp step_label(step), do: "*#{Actions.escape(DeploymentWorkflowStep.label(step))}*"
++  defp group_label(deployment_group), do: "*#{Actions.escape(deployment_group.name)}*"
++end
+diff --git a/lib/nerves_hub_web/live/deployment_groups/show.ex b/lib/nerves_hub_web/live/deployment_groups/show.ex
+index c923a90d6..602252c46 100644
+--- a/lib/nerves_hub_web/live/deployment_groups/show.ex
++++ b/lib/nerves_hub_web/live/deployment_groups/show.ex
+@@ -5,7 +5,6 @@ defmodule NervesHubWeb.Live.DeploymentGroups.Show do
+   alias LiveFlow.Handle
+   alias LiveFlow.Node
+   alias LiveFlow.State
+-  alias NervesHub.AuditLogs
+   alias NervesHub.AuditLogs.DeploymentGroupTemplates
+   alias NervesHub.Devices.BulkActions
+   alias NervesHub.Devices.Deployments
+@@ -13,7 +12,6 @@ defmodule NervesHubWeb.Live.DeploymentGroups.Show do
+   alias NervesHub.FirmwareUpdates
+   alias NervesHub.Helpers.Logging
+   alias NervesHub.ManagedDeployments
+-  alias NervesHub.ManagedDeployments.DeploymentWorkflowStep
+   alias NervesHub.ManagedDeployments.Workflows
+   alias NervesHub.Products
+   alias NervesHubWeb.Components.DeploymentGroupPage.Activity, as: ActivityTab
+@@ -106,11 +104,7 @@ defmodule NervesHubWeb.Live.DeploymentGroups.Show do
+       step ->
+         step = Workflows.approve_step(step, user)
+ 
+-        AuditLogs.audit!(
+-          user,
+-          deployment_group,
+-          "User #{user.name} approved workflow step #{step.number} (#{DeploymentWorkflowStep.label(step)}) for deployment group #{deployment_group.name}"
+-        )
++        DeploymentGroupTemplates.audit_workflow_step_action(user, deployment_group, step, :approved)
+ 
+         # Approving only clears the block. The orchestrator is what completes the
+         # step and starts the next one, so nudge it rather than leaving the page
+@@ -515,11 +509,7 @@ defmodule NervesHubWeb.Live.DeploymentGroups.Show do
+ 
+     case Workflows.skip_step(step, user) do
+       {:ok, skipped} ->
+-        AuditLogs.audit!(
+-          user,
+-          deployment_group,
+-          "User #{user.name} skipped workflow step #{skipped.number} (#{DeploymentWorkflowStep.label(skipped)}) for deployment group #{deployment_group.name}"
+-        )
++        DeploymentGroupTemplates.audit_workflow_step_action(user, deployment_group, skipped, :skipped)
+ 
+         # Skipping only clears the way; the orchestrator is what moves the
+         # workflow on to the next step.
+@@ -537,11 +527,7 @@ defmodule NervesHubWeb.Live.DeploymentGroups.Show do
+ 
+     case Workflows.retry_step(deployment_group, step, user) do
+       {:ok, retried} ->
+-        AuditLogs.audit!(
+-          user,
+-          deployment_group,
+-          "User #{user.name} retried workflow step #{retried.number} (#{DeploymentWorkflowStep.label(retried)}) for deployment group #{deployment_group.name}"
+-        )
++        DeploymentGroupTemplates.audit_workflow_step_action(user, deployment_group, retried, :retried)
+ 
+         :ok = ManagedDeployments.broadcast(deployment_group, "deployments/update")
+ 
+diff --git a/test/nerves_hub/integrations/slack/messages_test.exs b/test/nerves_hub/integrations/slack/messages_test.exs
+index 105919807..15ff0fc6d 100644
+--- a/test/nerves_hub/integrations/slack/messages_test.exs
++++ b/test/nerves_hub/integrations/slack/messages_test.exs
+@@ -160,6 +160,103 @@ defmodule NervesHub.Integrations.Slack.MessagesTest do
+     end
+   end
+ 
++  describe "deployment workflows" do
++    defp step_event(step, data \\ %{}) do
++      Map.merge(
++        %{
++          "org" => %{"name" => "acme"},
++          "product" => %{"name" => "thermostat"},
++          "deployment_group" => %{"name" => "production"},
++          "release" => %{"number" => 4, "firmware" => %{"uuid" => "u", "version" => "1.2.0"}},
++          "workflow" => %{"steps" => 3},
++          "step" => Map.merge(%{"id" => 42, "number" => 1, "name" => "Canary"}, step),
++          "user" => nil,
++          "failed_devices" => nil
++        },
++        data
++      )
++    end
++
++    defp group_url(), do: NervesHubWeb.Endpoint.url() <> "/org/acme/thermostat/deployment_groups/production"
++
++    test "a step starting names the step, where it is in the workflow, and links to the deployment group" do
++      message = Messages.build("deployment_group.workflow_step.started", [step_event(%{})])
++
++      assert message.text == "Canary (step 1 of 3) started for production"
++
++      assert [
++               ":arrow_forward: *Canary* (step 1 of 3) started for <#{group_url()}|production>",
++               "thermostat",
++               "release 4, firmware 1.2.0"
++             ] == texts(message)
++
++      assert buttons(message) == []
++    end
++
++    test "says who retried, approved or skipped a step" do
++      alice = %{"user" => %{"name" => "Alice"}}
++
++      assert Messages.build("deployment_group.workflow_step.started", [step_event(%{}, alice)]).text ==
++               "Alice retried Canary (step 1 of 3) for production"
++
++      assert Messages.build("deployment_group.workflow_step.completed", [step_event(%{"number" => 2}, alice)]).text ==
++               "Alice approved Canary (step 2 of 3) for production"
++
++      assert Messages.build("deployment_group.workflow_step.completed", [step_event(%{})]).text ==
++               "Canary (step 1 of 3) completed for production"
++
++      assert Messages.build("deployment_group.workflow_step.skipped", [step_event(%{}, alice)]).text ==
++               "Alice skipped Canary (step 1 of 3) for production"
++    end
++
++    test "a workflow waiting for approval can be approved, after a confirmation" do
++      message =
++        Messages.build("deployment_group.workflow_step.awaiting_approval", [
++          step_event(%{"number" => 2, "name" => "Sign-off"})
++        ])
++
++      assert message.text == "production is waiting for approval at Sign-off (step 2 of 3)"
++
++      assert [approve, open] = buttons(message)
++      assert %{action_id: "workflow_step.approve", value: "42", style: "primary"} = approve
++      assert approve.confirm.title.text == "Approve Sign-off?"
++      assert open.action_id == "deployment_group.open"
++      assert open.url == group_url()
++    end
++
++    test "a failed step says how many devices failed, and can be retried or skipped" do
++      message = Messages.build("deployment_group.workflow_step.failed", [step_event(%{}, %{"failed_devices" => 3})])
++
++      assert message.text ==
++               "Canary (step 1 of 3) failed for production: 3 devices could not take the update. The rollout is stopped until the step is retried or skipped."
++
++      assert [
++               %{action_id: "workflow_step.retry", value: "42"},
++               %{action_id: "workflow_step.skip", value: "42", style: "danger", confirm: %{}},
++               %{action_id: "deployment_group.open"}
++             ] = buttons(message)
++    end
++
++    test "several are each given their own section and buttons" do
++      events = for id <- 1..7, do: step_event(%{"id" => id}, %{"deployment_group" => %{"name" => "group-#{id}"}})
++      message = Messages.build("deployment_group.workflow_step.failed", events)
++
++      assert message.text == "7 workflow steps failed"
++      assert length(buttons(message)) == 15
++      assert "And 2 more on the deployment groups' pages." in texts(message)
++    end
++
++    test "escapes the names people gave steps and deployment groups" do
++      message =
++        Messages.build("deployment_group.workflow_step.started", [
++          step_event(%{"name" => "<!channel>"}, %{"deployment_group" => %{"name" => "<https://evil.example.com|x>"}})
++        ])
++
++      refute Enum.any?(texts(message), &(&1 =~ "<!channel>"))
++      refute message.text =~ "<https://evil"
++    end
++  end
++
+   test "product notifications carry their title, message and a link to the product's notifications" do
+     message =
+       Messages.build("product.notification_created", [
+diff --git a/test/nerves_hub/integrations/slack/subscriptions_test.exs b/test/nerves_hub/integrations/slack/subscriptions_test.exs
+index 7ba59b58c..eaaaf8704 100644
+--- a/test/nerves_hub/integrations/slack/subscriptions_test.exs
++++ b/test/nerves_hub/integrations/slack/subscriptions_test.exs
+@@ -238,6 +238,31 @@ defmodule NervesHub.Integrations.Slack.SubscriptionsTest do
+       assert Repo.all(PendingEvent) == []
+     end
+ 
++    # A workflow step completing and the next one starting arrive together,
++    # and should read that way round whichever the settings list first.
++    test "posts each kind of event in the order it first happened", context do
++      started = "deployment_group.workflow_step.started"
++      completed = "deployment_group.workflow_step.completed"
++      subscription = subscription_fixture(context, %{"events" => [started, completed]})
++
++      stub_slack(%{"chat.postMessage" => %{"ok" => true}})
++
++      for {type, number} <- [{completed, 1}, {started, 2}] do
++        :ok =
++          Integrations.dispatch(context.product.id, type, fn ->
++            %{deployment_group: %{name: "production"}, step: %{id: number, number: number, name: "Step #{number}"}}
++          end)
++      end
++
++      assert :ok = Subscriptions.post_pending_events(subscription.id)
++
++      assert_received {:slack, "chat.postMessage", first}
++      assert_received {:slack, "chat.postMessage", second}
++
++      assert Jason.decode!(first)["text"] =~ "Step 1 completed"
++      assert Jason.decode!(second)["text"] =~ "Step 2 started"
++    end
++
+     test "waits as long as Slack asks", context do
+       subscription = subscription_fixture(context)
+       stub_slack(%{"chat.postMessage" => {429, [{"retry-after", "12"}], %{"ok" => false, "error" => "ratelimited"}}})
+diff --git a/test/nerves_hub/webhooks/raised_events_test.exs b/test/nerves_hub/webhooks/raised_events_test.exs
+index 079d9fdd7..15731d9e0 100644
+--- a/test/nerves_hub/webhooks/raised_events_test.exs
++++ b/test/nerves_hub/webhooks/raised_events_test.exs
+@@ -23,9 +23,13 @@ defmodule NervesHub.Webhooks.RaisedEventsTest do
+   alias NervesHub.Extensions.Health
+   alias NervesHub.Extensions.Metrics
+   alias NervesHub.Extensions.State
++  alias NervesHub.Firmwares
+   alias NervesHub.FirmwareUpdates
+   alias NervesHub.Fixtures
+   alias NervesHub.Integrations.Cache
++  alias NervesHub.ManagedDeployments
++  alias NervesHub.ManagedDeployments.Orchestrator.WorkflowCoordinator
++  alias NervesHub.ManagedDeployments.Workflows
+   alias NervesHub.Webhooks
+   alias NervesHub.Webhooks.Events
+   alias NervesHub.Webhooks.Webhook
+@@ -64,9 +68,9 @@ defmodule NervesHub.Webhooks.RaisedEventsTest do
+     }
+   end
+ 
+-  # The events queued so far, as receivers will get them.
++  # The events queued so far, as receivers will get them, oldest first.
+   defp raised(type) do
+-    for job <- all_enqueued(worker: DeliverWebhook),
++    for job <- [worker: DeliverWebhook] |> all_enqueued() |> Enum.sort_by(& &1.id),
+         %{"type" => ^type, "data" => data} <- [Jason.decode!(job.args["body"])],
+         do: data
+   end
+@@ -332,4 +336,136 @@ defmodule NervesHub.Webhooks.RaisedEventsTest do
+       assert id == error["id"]
+     end
+   end
++
++  describe "deployment workflow events" do
++    @workflow %{
++      "version" => 1,
++      "steps" => [
++        %{
++          "name" => "Canary",
++          "matching_conditions" => %{"tags" => ["canary"]},
++          "failure_tolerance" => %{"devices" => 1}
++        },
++        %{"name" => "Sign-off", "type" => "approval_required"}
++      ]
++    }
++
++    # A deployment group whose current release walks @workflow, with one
++    # online canary in it.
++    defp workflow_release(context) do
++      %{firmware: firmware, org: org, org_key: org_key, product: product, tmp_dir: tmp_dir, user: user} = context
++
++      deployment_group = Fixtures.deployment_group_fixture(firmware, %{user: user, is_active: true})
++
++      {:ok, deployment_group} =
++        ManagedDeployments.update_deployment_group(deployment_group, %{workflow_definition: @workflow}, user)
++
++      canary = Fixtures.device_fixture(org, product, firmware, %{tags: ["canary"], deployment_id: deployment_group.id})
++      {:ok, connection} = Connections.device_connecting(org.id, product.id, canary.id)
++      :ok = Connections.device_connected(connection.id)
++
++      next_firmware = Fixtures.firmware_fixture(org_key, product, %{version: "0.0.2", dir: tmp_dir})
++
++      {:ok, {release, _}} =
++        ManagedDeployments.create_deployment_release(deployment_group, next_firmware, nil, user, %{}, broadcast: false)
++
++      {:ok, deployment_group} = ManagedDeployments.get_deployment_group(deployment_group.id)
++
++      %{canary: canary, deployment_group: deployment_group, next_firmware: next_firmware, release: release}
++    end
++
++    defp release_step(release, number), do: release.id |> Workflows.release_steps() |> Enum.at(number - 1)
++
++    test "a workflow walked to the end announces each step", context do
++      %{canary: canary, deployment_group: deployment_group, next_firmware: next_firmware, release: release} =
++        workflow_release(context)
++
++      _ = WorkflowCoordinator.schedule_updates(deployment_group)
++
++      assert [started] = raised("deployment_group.workflow_step.started")
++
++      canary_step = release_step(release, 1)
++
++      assert %{
++               "org" => %{"name" => org_name},
++               "product" => %{"name" => product_name},
++               "deployment_group" => %{"name" => group_name},
++               "release" => %{"number" => release_number, "firmware" => %{"uuid" => uuid, "version" => "0.0.2"}},
++               "workflow" => %{"steps" => 3},
++               "step" => %{
++                 "id" => step_id,
++                 "number" => 1,
++                 "name" => "Canary",
++                 "type" => "update_devices",
++                 "status" => "in_progress",
++                 "started_at" => started_at,
++                 "finished_at" => nil
++               },
++               "user" => nil,
++               "failed_devices" => nil
++             } = started
++
++      assert {org_name, product_name, group_name} == {context.org.name, context.product.name, deployment_group.name}
++      assert {release_number, uuid, step_id} == {release.number, next_firmware.uuid, canary_step.id}
++      assert {:ok, _, 0} = DateTime.from_iso8601(started_at)
++
++      {:ok, metadata} = Firmwares.metadata_from_firmware(next_firmware)
++      {:ok, _} = Devices.update_firmware_metadata(canary, metadata, :validated, false)
++
++      _ = WorkflowCoordinator.schedule_updates(deployment_group)
++      _ = WorkflowCoordinator.schedule_updates(deployment_group)
++
++      assert [%{"step" => %{"number" => 1, "status" => "completed"}, "user" => nil}] =
++               raised("deployment_group.workflow_step.completed")
++
++      # An approval step only waits, so it is announced as waiting rather than
++      # as started.
++      assert [%{"step" => %{"number" => 2, "name" => "Sign-off", "type" => "approval_required"}}] =
++               raised("deployment_group.workflow_step.awaiting_approval")
++
++      assert [_canary_only] = raised("deployment_group.workflow_step.started")
++
++      _ = Workflows.approve_step(release_step(release, 2), context.user)
++      _ = WorkflowCoordinator.schedule_updates(deployment_group)
++      _ = WorkflowCoordinator.schedule_updates(deployment_group)
++
++      user_name = context.user.name
++
++      assert [_canary, %{"step" => %{"number" => 2}, "user" => %{"name" => ^user_name}}] =
++               raised("deployment_group.workflow_step.completed")
++
++      assert [_canary, %{"step" => %{"number" => 3, "name" => "Remaining devices", "type" => "catch_all"}}] =
++               raised("deployment_group.workflow_step.started")
++    end
++
++    test "a failed step says how many devices failed, and retrying and skipping say who", context do
++      %{canary: canary, deployment_group: deployment_group, release: release} = workflow_release(context)
++
++      _ = WorkflowCoordinator.schedule_updates(deployment_group)
++
++      canary
++      |> Ecto.Changeset.change(%{
++        updates_blocked_until: DateTime.add(DateTime.utc_now(:second), 3600),
++        update_attempts: [DateTime.utc_now(:second)]
++      })
++      |> Repo.update!()
++
++      _ = WorkflowCoordinator.schedule_updates(deployment_group)
++
++      assert [%{"step" => %{"number" => 1, "status" => "error"}, "failed_devices" => 1}] =
++               raised("deployment_group.workflow_step.failed")
++
++      user_name = context.user.name
++
++      {:ok, _} = Workflows.retry_step(deployment_group, release_step(release, 1), context.user)
++
++      assert [%{"user" => nil}, %{"step" => %{"number" => 1}, "user" => %{"name" => ^user_name}}] =
++               raised("deployment_group.workflow_step.started")
++
++      {:ok, _} = Workflows.skip_step(release_step(release, 1), context.user)
++
++      assert [%{"step" => %{"number" => 1, "status" => "skipped"}, "user" => %{"name" => ^user_name}}] =
++               raised("deployment_group.workflow_step.skipped")
++    end
++  end
+ end
+diff --git a/test/nerves_hub_web/integrations/slack/workflow_steps_test.exs b/test/nerves_hub_web/integrations/slack/workflow_steps_test.exs
+new file mode 100644
+index 000000000..83074faba
+--- /dev/null
++++ b/test/nerves_hub_web/integrations/slack/workflow_steps_test.exs
+@@ -0,0 +1,307 @@
++defmodule NervesHubWeb.Integrations.Slack.WorkflowStepsTest do
++  use NervesHub.DataCase, async: false
++
++  alias NervesHub.Accounts
++  alias NervesHub.AuditLogs
++  alias NervesHub.Devices.Connections
++  alias NervesHub.Fixtures
++  alias NervesHub.Integrations.Slack
++  alias NervesHub.Integrations.Slack.Claims
++  alias NervesHub.Integrations.Slack.UserLink
++  alias NervesHub.ManagedDeployments
++  alias NervesHub.ManagedDeployments.Orchestrator.WorkflowCoordinator
++  alias NervesHub.ManagedDeployments.Workflows
++  alias NervesHubWeb.Integrations.Slack.Actions
++  alias NervesHubWeb.Integrations.Slack.WorkflowSteps
++  alias Phoenix.Socket.Broadcast
++
++  @moduletag :tmp_dir
++
++  @response_url "https://hooks.slack.com/actions/T0ACME/1/abc"
++
++  @workflow %{
++    "version" => 1,
++    "steps" => [
++      %{"name" => "Sign-off", "type" => "approval_required"},
++      %{
++        "name" => "Canary",
++        "matching_conditions" => %{"tags" => ["canary"]},
++        "failure_tolerance" => %{"devices" => 1}
++      }
++    ]
++  }
++
++  setup %{tmp_dir: tmp_dir} do
++    user = Fixtures.user_fixture()
++    org = Fixtures.org_fixture(user)
++    product = Fixtures.product_fixture(user, org)
++    org_key = Fixtures.org_key_fixture(org, user, tmp_dir)
++    firmware = Fixtures.firmware_fixture(org_key, product, %{dir: tmp_dir})
++
++    deployment_group = Fixtures.deployment_group_fixture(firmware, %{user: user, is_active: true})
++
++    {:ok, deployment_group} =
++      ManagedDeployments.update_deployment_group(deployment_group, %{workflow_definition: @workflow}, user)
++
++    canary = Fixtures.device_fixture(org, product, firmware, %{tags: ["canary"], deployment_id: deployment_group.id})
++    {:ok, connection} = Connections.device_connecting(org.id, product.id, canary.id)
++    :ok = Connections.device_connected(connection.id)
++
++    next_firmware = Fixtures.firmware_fixture(org_key, product, %{version: "0.0.2", dir: tmp_dir})
++
++    {:ok, {release, _}} =
++      ManagedDeployments.create_deployment_release(deployment_group, next_firmware, nil, user, %{}, broadcast: false)
++
++    {:ok, deployment_group} = ManagedDeployments.get_deployment_group(deployment_group.id)
++
++    _slack = Fixtures.slack_connection_fixture(org, user, %{team_id: "T0ACME"})
++
++    test_pid = self()
++
++    Req.Test.stub(Slack, fn conn ->
++      {:ok, body, conn} = Plug.Conn.read_body(conn)
++      send(test_pid, {:slack, conn.host, conn.request_path, body})
++
++      case conn.host do
++        "hooks.slack.com" -> Plug.Conn.send_resp(conn, 200, "ok")
++        _api -> Req.Test.json(conn, %{"ok" => true})
++      end
++    end)
++
++    %{
++      canary: canary,
++      deployment_group: deployment_group,
++      next_firmware: next_firmware,
++      org: org,
++      org_key: org_key,
++      release: release,
++      tmp_dir: tmp_dir,
++      user: user
++    }
++  end
++
++  defp link!(user, slack_user_id \\ "U0ALICE") do
++    NervesHub.Repo.insert!(%UserLink{
++      user_id: user.id,
++      team_id: "T0ACME",
++      slack_user_id: slack_user_id,
++      slack_name: "Alice",
++      linked_at: DateTime.utc_now()
++    })
++
++    :ok
++  end
++
++  defp click(action, step, overrides \\ %{}) do
++    Map.merge(
++      %{
++        action: action,
++        step_id: step.id,
++        team_id: "T0ACME",
++        slack_user_id: "U0ALICE",
++        slack_username: "alice",
++        response_url: @response_url,
++        channel_id: "C0FLEET",
++        message_ts: "1728900000.000100"
++      },
++      overrides
++    )
++  end
++
++  defp step(release, number), do: release.id |> Workflows.release_steps() |> Enum.at(number - 1)
++
++  defp private_reply() do
++    assert_received {:slack, "hooks.slack.com", "/actions/T0ACME/1/abc", body}
++    assert %{"response_type" => "ephemeral", "replace_original" => false, "text" => text} = Jason.decode!(body)
++    text
++  end
++
++  defp thread_reply() do
++    assert_received {:slack, "slack.com", "/api/chat.postMessage", body}
++    assert %{"channel" => "C0FLEET", "thread_ts" => "1728900000.000100", "text" => text} = Jason.decode!(body)
++    text
++  end
++
++  # Takes the workflow past Sign-off to Canary, then fails Canary.
++  defp fail_canary(%{canary: canary, deployment_group: deployment_group, release: release, user: user}) do
++    _ = WorkflowCoordinator.schedule_updates(deployment_group)
++    _ = Workflows.approve_step(step(release, 1), user)
++    _ = WorkflowCoordinator.schedule_updates(deployment_group)
++    _ = WorkflowCoordinator.schedule_updates(deployment_group)
++
++    canary
++    |> Ecto.Changeset.change(%{
++      updates_blocked_until: DateTime.add(DateTime.utc_now(:second), 3600),
++      update_attempts: [DateTime.utc_now(:second)]
++    })
++    |> NervesHub.Repo.update!()
++
++    _ = WorkflowCoordinator.schedule_updates(deployment_group)
++
++    failed = step(release, 2)
++    assert failed.status == :error
++    failed
++  end
++
++  describe "approving" do
++    setup %{deployment_group: deployment_group} do
++      _ = WorkflowCoordinator.schedule_updates(deployment_group)
++      :ok
++    end
++
++    test "approves the step as the linked user, audits it, and says so in the thread", context do
++      %{deployment_group: deployment_group, release: release, user: user} = context
++      :ok = link!(user)
++      :ok = Phoenix.PubSub.subscribe(NervesHub.PubSub, "deployment:#{deployment_group.id}")
++
++      assert {:ok, :approve} = WorkflowSteps.perform(click(:approve, step(release, 1)))
++
++      approved = step(release, 1)
++      assert approved.approved_by_id == user.id
++
++      # The orchestrator is what completes the step, so it is nudged.
++      assert_receive %Broadcast{event: "deployments/update"}
++
++      assert [log | _] = AuditLogs.logs_for(deployment_group)
++
++      assert log.description ==
++               "User #{user.name} approved workflow step 1 (Sign-off) for deployment group #{deployment_group.name} from Slack user U0ALICE (@alice, workspace T0ACME)"
++
++      assert thread_reply() ==
++               ":white_check_mark: #{user.name} approved *Sign-off* for *#{deployment_group.name}* from Slack. The rollout carries on."
++    end
++
++    test "a step already approved is not approved again, and says by whom", %{release: release, user: user} do
++      :ok = link!(user)
++
++      assert {:ok, :approve} = WorkflowSteps.perform(click(:approve, step(release, 1)))
++      assert {:error, :already_done} = WorkflowSteps.perform(click(:approve, step(release, 1)))
++
++      assert private_reply() == "*Sign-off* was already approved by #{user.name}."
++    end
++
++    test "two clicks at once act once", %{release: release, user: user} do
++      :ok = link!(user)
++      :ok = Claims.claim("workflow_step:#{step(release, 1).id}", 30, "Bob")
++
++      assert {:error, :just_done} = WorkflowSteps.perform(click(:approve, step(release, 1)))
++      assert is_nil(step(release, 1).approved_at)
++      assert private_reply() =~ "was acted on from Slack by Bob a moment ago"
++    end
++
++    test "a step of an earlier release is left alone", context do
++      %{deployment_group: deployment_group, org_key: org_key, release: release, tmp_dir: tmp_dir, user: user} = context
++      :ok = link!(user)
++
++      newer = Fixtures.firmware_fixture(org_key, deployment_group.product, %{version: "0.0.3", dir: tmp_dir})
++
++      {:ok, _} =
++        ManagedDeployments.create_deployment_release(deployment_group, newer, nil, user, %{}, broadcast: false)
++
++      assert {:error, :superseded} = WorkflowSteps.perform(click(:approve, step(release, 1)))
++      assert private_reply() =~ "is part of an earlier release of"
++    end
++  end
++
++  describe "retrying and skipping a failed step" do
++    test "retry starts it again", context do
++      %{deployment_group: deployment_group, user: user} = context
++      :ok = link!(user)
++      failed = fail_canary(context)
++
++      assert {:ok, :retry} = WorkflowSteps.perform(click(:retry, failed))
++      assert step(context.release, 2).status == :in_progress
++
++      assert [log | _] = AuditLogs.logs_for(deployment_group)
++      assert log.description =~ "User #{user.name} retried workflow step 2 (Canary)"
++      assert log.description =~ "from Slack user U0ALICE"
++
++      assert thread_reply() =~ "retried *Canary*"
++    end
++
++    test "skip moves the workflow past it", context do
++      :ok = link!(context.user)
++      failed = fail_canary(context)
++
++      assert {:ok, :skip} = WorkflowSteps.perform(click(:skip, failed))
++      assert step(context.release, 2).status == :skipped
++
++      assert thread_reply() =~ "skipped *Canary*"
++    end
++
++    test "a step that is running again cannot be retried", context do
++      :ok = link!(context.user)
++      failed = fail_canary(context)
++
++      {:ok, _} = Workflows.retry_step(context.deployment_group, failed, context.user)
++
++      assert {:error, :not_retryable} = WorkflowSteps.perform(click(:retry, failed))
++      assert private_reply() == "Only a failed step can be retried, and *Canary* is running."
++    end
++  end
++
++  describe "who may" do
++    test "a Slack user who is not linked is asked to link first", %{release: release} do
++      assert {:error, :not_linked} = WorkflowSteps.perform(click(:approve, step(release, 1)))
++    end
++
++    test "a viewer cannot approve", %{org: org, release: release} do
++      viewer = Fixtures.user_fixture()
++      {:ok, _} = Accounts.add_org_user(org, viewer, %{role: :view})
++      :ok = link!(viewer)
++
++      assert {:error, :not_allowed} = WorkflowSteps.perform(click(:approve, step(release, 1)))
++      assert private_reply() == "Your role in NervesHub does not let you approve deployment workflow steps."
++    end
++
++    test "a workspace the organization is not connected to cannot", %{release: release, user: user} do
++      :ok = link!(user)
++
++      _other =
++        Fixtures.slack_connection_fixture(Fixtures.org_fixture(user, %{name: "other"}), user, %{team_id: "T0OTHER"})
++
++      NervesHub.Repo.insert!(%UserLink{
++        user_id: user.id,
++        team_id: "T0OTHER",
++        slack_user_id: "U0ALICE",
++        slack_name: "Alice",
++        linked_at: DateTime.utc_now()
++      })
++
++      assert {:error, :not_connected} =
++               WorkflowSteps.perform(click(:approve, step(release, 1), %{team_id: "T0OTHER", response_url: nil}))
++    end
++
++    test "a step that no longer exists", %{user: user} do
++      :ok = link!(user)
++      assert {:error, :no_step} = WorkflowSteps.perform(click(:approve, %{id: 0}))
++    end
++  end
++
++  describe "a click from Slack" do
++    test "is carried out in the background", %{deployment_group: deployment_group, release: release, user: user} do
++      :ok = link!(user)
++      _ = WorkflowCoordinator.schedule_updates(deployment_group)
++
++      payload = %{
++        "type" => "block_actions",
++        "team" => %{"id" => "T0ACME"},
++        "user" => %{"id" => "U0ALICE", "username" => "alice"},
++        "response_url" => @response_url,
++        "container" => %{"channel_id" => "C0FLEET", "message_ts" => "1728900000.000100"},
++        "actions" => [%{"action_id" => "workflow_step.approve", "value" => Integer.to_string(step(release, 1).id)}]
++      }
++
++      assert :ok = Actions.handle_interaction(payload)
++      assert_receive {:slack, "slack.com", "/api/chat.postMessage", _body}, 2000
++      assert step(release, 1).approved_by_id == user.id
++    end
++
++    test "that names no step is ignored" do
++      payload = %{"team" => %{"id" => "T0ACME"}, "user" => %{"id" => "U0ALICE"}}
++
++      assert WorkflowSteps.click(payload, %{"action_id" => "workflow_step.approve", "value" => "nope"}) == nil
++      assert WorkflowSteps.click(payload, %{"action_id" => "workflow_step.explode", "value" => "1"}) == nil
++    end
++  end
++end

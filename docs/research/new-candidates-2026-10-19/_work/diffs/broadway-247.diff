@@ -1,0 +1,142 @@
+diff --git a/lib/broadway/topology.ex b/lib/broadway/topology.ex
+index 831564fc..241cc456 100644
+--- a/lib/broadway/topology.ex
++++ b/lib/broadway/topology.ex
+@@ -362,6 +362,7 @@ defmodule Broadway.Topology do
+         batcher: key,
+         partition: key,
+         processors: processors,
++        context: config[:context],
+         # Partitioning is handled inside the batcher since the batcher
+         # needs to associate the partition with the batcher key.
+         partition_by: options[:partition_by],
+diff --git a/lib/broadway/topology/batch_processor_stage.ex b/lib/broadway/topology/batch_processor_stage.ex
+index 26909d8a..514fc12e 100644
+--- a/lib/broadway/topology/batch_processor_stage.ex
++++ b/lib/broadway/topology/batch_processor_stage.ex
+@@ -88,7 +88,8 @@ defmodule Broadway.Topology.BatchProcessorStage do
+       name: state.name,
+       index: state.partition,
+       messages: messages,
+-      batch_info: batch_info
++      batch_info: batch_info,
++      context: state.context
+     }
+ 
+     measurements = %{time: start_time}
+@@ -102,7 +103,8 @@ defmodule Broadway.Topology.BatchProcessorStage do
+       index: state.partition,
+       successful_messages: successful_messages,
+       failed_messages: failed_messages,
+-      batch_info: batch_info
++      batch_info: batch_info,
++      context: state.context
+     }
+ 
+     stop_time = System.monotonic_time()
+diff --git a/lib/broadway/topology/batcher_stage.ex b/lib/broadway/topology/batcher_stage.ex
+index dc0cff0a..9ecc9329 100644
+--- a/lib/broadway/topology/batcher_stage.ex
++++ b/lib/broadway/topology/batcher_stage.ex
+@@ -41,7 +41,8 @@ defmodule Broadway.Topology.BatcherStage do
+       batcher: args[:batcher],
+       batch_size: args[:batch_size],
+       batch_timeout: args[:batch_timeout],
+-      partition_by: partition_by
++      partition_by: partition_by,
++      context: args[:context]
+     }
+ 
+     {:producer_consumer, state, dispatcher: dispatcher}
+@@ -61,7 +62,8 @@ defmodule Broadway.Topology.BatcherStage do
+       topology_name: state.topology_name,
+       name: state.name,
+       batcher_key: state.batcher,
+-      messages: events
++      messages: events,
++      context: state.context
+     }
+ 
+     measurements = %{time: start_time}
+@@ -71,7 +73,14 @@ defmodule Broadway.Topology.BatcherStage do
+   defp emit_stop_event(state, start_time) do
+     stop_time = System.monotonic_time()
+     measurements = %{time: stop_time, duration: stop_time - start_time}
+-    metadata = %{topology_name: state.topology_name, name: state.name, batcher_key: state.batcher}
++
++    metadata = %{
++      topology_name: state.topology_name,
++      name: state.name,
++      batcher_key: state.batcher,
++      context: state.context
++    }
++
+     :telemetry.execute([:broadway, :batcher, :stop], measurements, metadata)
+   end
+ 
+diff --git a/lib/broadway/topology/processor_stage.ex b/lib/broadway/topology/processor_stage.ex
+index a5afec3e..8a01d61e 100644
+--- a/lib/broadway/topology/processor_stage.ex
++++ b/lib/broadway/topology/processor_stage.ex
+@@ -97,7 +97,8 @@ defmodule Broadway.Topology.ProcessorStage do
+       name: state.name,
+       index: state.partition,
+       processor_key: state.processor_key,
+-      messages: messages
++      messages: messages,
++      context: state.context
+     }
+ 
+     measurements = %{time: start_time}
+@@ -119,7 +120,8 @@ defmodule Broadway.Topology.ProcessorStage do
+       successful_messages_to_ack: successful_messages_to_ack,
+       successful_messages_to_forward: successful_messages_to_forward,
+       processor_key: state.processor_key,
+-      failed_messages: failed_messages
++      failed_messages: failed_messages,
++      context: state.context
+     }
+ 
+     stop_time = System.monotonic_time()
+@@ -210,7 +212,8 @@ defmodule Broadway.Topology.ProcessorStage do
+       topology_name: state.topology_name,
+       index: state.partition,
+       name: state.name,
+-      message: message
++      message: message,
++      context: state.context
+     }
+ 
+     :telemetry.execute([:broadway, :processor, :message, :start], %{time: start_time}, metadata)
+@@ -225,7 +228,8 @@ defmodule Broadway.Topology.ProcessorStage do
+       topology_name: state.topology_name,
+       index: state.partition,
+       name: state.name,
+-      message: message
++      message: message,
++      context: state.context
+     }
+ 
+     :telemetry.execute([:broadway, :processor, :message, :stop], measurements, metadata)
+@@ -250,7 +254,8 @@ defmodule Broadway.Topology.ProcessorStage do
+       message: message,
+       kind: kind,
+       reason: reason,
+-      stacktrace: stacktrace
++      stacktrace: stacktrace,
++      context: state.context
+     }
+ 
+     :telemetry.execute([:broadway, :processor, :message, :exception], measurements, metadata)
+diff --git a/test/broadway_test.exs b/test/broadway_test.exs
+index 05f9cf5d..6a6f2d2e 100644
+--- a/test/broadway_test.exs
++++ b/test/broadway_test.exs
+@@ -814,6 +814,7 @@ defmodule BroadwayTest do
+           fn name, measurements, metadata, _ ->
+             assert metadata.name
+             assert metadata.topology_name == broadway
++            assert %{} = metadata.context
+ 
+             case name do
+               [:broadway, stage, _] when stage in [:processor, :consumer] ->

@@ -1,0 +1,118 @@
+From 24fa67d35f395857eac8b63d267f4401bbd45478 Mon Sep 17 00:00:00 2001
+From: Alexandre Rosenfeld <arsfeld@gmail.com>
+Date: Sat, 17 Oct 2026 00:18:25 -0400
+Subject: [PATCH] fix(jobs): return float averages from timestamp diff macros
+ on PostgreSQL
+
+EXTRACT(EPOCH ...) and AVG return numeric on PostgreSQL, which Postgrex
+decodes to Decimal, so round(avg_duration * 1000) in get_job_stats/1 raised
+ArithmeticError and the Jobs page failed to mount. Cast to float8 in both
+timestamp diff macros so SQLite and PostgreSQL return floats.
+---
+ lib/mydia/db.ex          | 13 +++++++++----
+ test/mydia/db_test.exs   |  6 ++----
+ test/mydia/jobs_test.exs | 27 +++++++++++++++++++++++++++
+ 3 files changed, 38 insertions(+), 8 deletions(-)
+
+diff --git a/lib/mydia/db.ex b/lib/mydia/db.ex
+index 56dc13b2ad..025a20053c 100644
+--- a/lib/mydia/db.ex
++++ b/lib/mydia/db.ex
+@@ -549,13 +549,16 @@ defmodule Mydia.DB do
+   ## Database-specific behavior
+ 
+   - **SQLite**: Uses `AVG((julianday(end) - julianday(start)) * 86400)`
+-  - **PostgreSQL**: Uses `AVG(EXTRACT(EPOCH FROM (end - start)))`
++  - **PostgreSQL**: Uses `AVG(EXTRACT(EPOCH FROM (end - start)))::float8`
++
++  Both adapters return a float. The `::float8` cast matters on PostgreSQL, where
++  `EXTRACT` and `AVG` yield `numeric` and Postgrex would return a `Decimal`.
+   """
+   defmacro avg_timestamp_diff_seconds(end_field, start_field) do
+     if postgres_configured?() do
+       quote do
+         fragment(
+-          "AVG(EXTRACT(EPOCH FROM (? - ?)))",
++          "AVG(EXTRACT(EPOCH FROM (? - ?)))::float8",
+           unquote(end_field),
+           unquote(start_field)
+         )
+@@ -592,12 +595,14 @@ defmodule Mydia.DB do
+   ## Database-specific behavior
+ 
+   - **SQLite**: Uses `(julianday(end) - julianday(start)) * 86400`
+-  - **PostgreSQL**: Uses `EXTRACT(EPOCH FROM (end - start))`
++  - **PostgreSQL**: Uses `EXTRACT(EPOCH FROM (end - start))::float8`
++
++  Both adapters return a float (see `avg_timestamp_diff_seconds/2`).
+   """
+   defmacro timestamp_diff_seconds(end_field, start_field) do
+     if postgres_configured?() do
+       quote do
+-        fragment("EXTRACT(EPOCH FROM (? - ?))", unquote(end_field), unquote(start_field))
++        fragment("EXTRACT(EPOCH FROM (? - ?))::float8", unquote(end_field), unquote(start_field))
+       end
+     else
+       quote do
+diff --git a/test/mydia/db_test.exs b/test/mydia/db_test.exs
+index 9b9a136ff8..833f97f378 100644
+--- a/test/mydia/db_test.exs
++++ b/test/mydia/db_test.exs
+@@ -401,8 +401,7 @@ defmodule Mydia.DBTest do
+         |> Repo.one()
+ 
+       # Allow for small timing differences (within 5 seconds)
+-      # PostgreSQL returns Decimal from EXTRACT(EPOCH), convert to float
+-      result = if is_struct(result, Decimal), do: Decimal.to_float(result), else: result
++      assert is_float(result)
+       assert_in_delta result, 3600.0, 5.0
+     end
+   end
+@@ -495,8 +494,7 @@ defmodule Mydia.DBTest do
+ 
+       # Average of 3600 and 7200 seconds = 5400 seconds
+       # Allow for small timing differences
+-      # PostgreSQL returns Decimal from EXTRACT(EPOCH), convert to float
+-      result = if is_struct(result, Decimal), do: Decimal.to_float(result), else: result
++      assert is_float(result)
+       assert_in_delta result, 5400.0, 10.0
+     end
+   end
+diff --git a/test/mydia/jobs_test.exs b/test/mydia/jobs_test.exs
+index 2f21a5fde4..1ece695eb9 100644
+--- a/test/mydia/jobs_test.exs
++++ b/test/mydia/jobs_test.exs
+@@ -125,6 +125,33 @@ defmodule Mydia.JobsTest do
+     end
+   end
+ 
++  describe "get_job_stats/1" do
++    test "returns an integer avg_duration_ms for completed jobs" do
++      now = DateTime.utc_now()
++
++      for seconds <- [2, 4] do
++        %{}
++        |> Mydia.Jobs.BlacklistCleanup.new()
++        |> Ecto.Changeset.change(%{
++          state: "completed",
++          attempted_at: DateTime.add(now, -seconds, :second),
++          completed_at: now
++        })
++        |> Repo.insert!()
++      end
++
++      stats = Jobs.get_job_stats(Mydia.Jobs.BlacklistCleanup)
++
++      assert stats.completed_count == 2
++      assert is_integer(stats.avg_duration_ms)
++      assert_in_delta stats.avg_duration_ms, 3000, 50
++    end
++
++    test "returns zero avg_duration_ms when no job completed" do
++      assert Jobs.get_job_stats(Mydia.Jobs.BlacklistCleanup).avg_duration_ms == 0
++    end
++  end
++
+   # Both callers read the crontab out of the *running* Oban's normalized
+   # config, so the fixture declares the legacy `Oban.Plugins.Cron` module name
+   # exactly as config/config.exs does. Oban rewrites it to `Oban.Cron` on

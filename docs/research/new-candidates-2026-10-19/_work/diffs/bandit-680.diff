@@ -1,0 +1,316 @@
+diff --git a/lib/bandit/headers.ex b/lib/bandit/headers.ex
+index e0c13cbf..1d3af6a0 100644
+--- a/lib/bandit/headers.ex
++++ b/lib/bandit/headers.ex
+@@ -2,33 +2,21 @@ defmodule Bandit.Headers do
+   @moduledoc false
+   # Conveniences for dealing with headers.
+ 
+-  @invalid_field_value_pattern_key {__MODULE__, :invalid_field_value_pattern}
+-
+   @spec is_port_number(integer()) :: Macro.t()
+   defguardp is_port_number(port) when Bitwise.band(port, 0xFFFF) === port
+ 
+-  # RFC9110§5.5 / RFC9113§8.2.1: field values containing CR, LF, or NUL characters
+-  # are invalid and dangerous (a common request-smuggling / response-splitting /
+-  # log-injection vector). Shared by both HTTP/1 and HTTP/2 so that neither
+-  # transport can drift from the other's validation. The match pattern is
+-  # compiled once (lazily, on first use) and cached in :persistent_term, since
+-  # compiling it on every call is a measurable fraction of header parsing time.
++  # RFC9110§5.5 defines field values in terms of VCHAR (0x21-0x7e), obs-text
++  # (0x80-0xff), and internal SP / HTAB. All other control bytes and DEL are
++  # outside the field-value grammar. HTTP/2 applies the additional edge-whitespace
++  # prohibition from RFC9113§8.2.1 in its field-section validator.
+   @spec field_value_valid?(binary()) :: boolean()
+-  def field_value_valid?(value) do
+-    :binary.match(value, invalid_field_value_pattern()) == :nomatch
+-  end
++  def field_value_valid?(<<>>), do: true
+ 
+-  defp invalid_field_value_pattern do
+-    case :persistent_term.get(@invalid_field_value_pattern_key, :undefined) do
+-      :undefined ->
+-        pattern = :binary.compile_pattern(["\r", "\n", "\0"])
+-        :persistent_term.put(@invalid_field_value_pattern_key, pattern)
+-        pattern
++  def field_value_valid?(<<char, rest::binary>>)
++      when char == 0x09 or char in 0x20..0x7E or char in 0x80..0xFF,
++      do: field_value_valid?(rest)
+ 
+-      pattern ->
+-        pattern
+-    end
+-  end
++  def field_value_valid?(_value), do: false
+ 
+   @spec get_header(Plug.Conn.headers(), header :: binary()) :: binary() | nil
+   def get_header(headers, header) do
+diff --git a/lib/bandit/http2/stream.ex b/lib/bandit/http2/stream.ex
+index 158db9de..df6d76b1 100644
+--- a/lib/bandit/http2/stream.ex
++++ b/lib/bandit/http2/stream.ex
+@@ -126,17 +126,18 @@ defmodule Bandit.HTTP2.Stream do
+       case do_recv(stream, stream.read_timeout) do
+         {:headers, headers, stream} ->
+           method = Bandit.Headers.get_header(headers, ":method")
+-          request_target = build_request_target!(headers, stream)
+           {pseudo_headers, headers} = split_headers!(headers, stream)
++          headers = normalize_empty_field_values(headers)
+           pseudo_headers_all_request!(pseudo_headers, stream)
++          headers_all_lowercase!(headers, stream)
++          valid_field_values!(pseudo_headers ++ headers, stream)
++          request_target = build_request_target!(pseudo_headers, stream)
+           exactly_one_instance_of!(pseudo_headers, ":scheme", stream)
+           exactly_one_instance_of!(pseudo_headers, ":method", stream)
+           exactly_one_instance_of!(pseudo_headers, ":path", stream)
+           at_most_one_instance_of!(pseudo_headers, ":authority", stream)
+-          headers_all_lowercase!(headers, stream)
+           no_connection_headers!(headers, stream)
+           valid_te_header!(headers, stream)
+-          valid_field_values!(headers, stream)
+           content_length = get_content_length!(headers, stream)
+           headers = combine_cookie_crumbs(headers)
+           stream = %{stream | bytes_remaining: content_length}
+@@ -204,16 +205,36 @@ defmodule Bandit.HTTP2.Stream do
+         do: stream_error!("Expected at most 1 #{header} headers", stream)
+     end
+ 
+-    # RFC9113§8.2 - all headers name fields must be lowercsae
++    # RFC9110§5.1 defines a field name as a non-empty token, and RFC9113§8.2.1 additionally
++    # prohibits uppercase characters in HTTP/2 field names. Check uppercase first so that the
++    # more specific existing diagnostic is preserved.
+     defp headers_all_lowercase!(headers, stream) do
+-      if !Enum.all?(headers, fn {key, _value} -> lowercase?(key) end),
+-        do: stream_error!("Received uppercase header", stream)
++      cond do
++        Enum.any?(headers, fn {key, _value} -> not lowercase?(key) end) ->
++          stream_error!("Received uppercase header", stream)
++
++        Enum.any?(headers, fn {key, _value} -> not valid_field_name?(key) end) ->
++          stream_error!("Received invalid header field name (RFC9113§8.2.1)", stream)
++
++        true ->
++          :ok
++      end
+     end
+ 
+     defp lowercase?(<<char, _rest::bits>>) when char >= ?A and char <= ?Z, do: false
+     defp lowercase?(<<_char, rest::bits>>), do: lowercase?(rest)
+     defp lowercase?(<<>>), do: true
+ 
++    defp valid_field_name?(<<>>), do: false
++    defp valid_field_name?(name), do: valid_field_name_bytes?(name)
++
++    defp valid_field_name_bytes?(<<char, rest::binary>>)
++         when char in ?a..?z or char in ?0..?9 or char in ~c"!#$%&'*+-.^_`|~",
++         do: valid_field_name_bytes?(rest)
++
++    defp valid_field_name_bytes?(<<_char, _rest::binary>>), do: false
++    defp valid_field_name_bytes?(<<>>), do: true
++
+     # RFC9113§8.2.2 - no hop-by-hop headers
+     # Note that we do not filter out the TE header here, since it is allowed in
+     # specific cases by RFC9113§8.2.2. We check those cases in a separate filter
+@@ -231,13 +252,33 @@ defmodule Bandit.HTTP2.Stream do
+         do: stream_error!("Received invalid TE header", stream)
+     end
+ 
+-    # RFC9113§8.2.1 - field values containing CR, LF, or NUL characters are invalid and
+-    # dangerous (a common request-smuggling / response-splitting / log-injection vector)
++    # RFC9113§8.2.1 - field values containing CR, LF, or NUL characters, or beginning or
++    # ending with SP or HTAB, are malformed.
+     defp valid_field_values!(headers, stream) do
+-      if Enum.any?(headers, fn {_key, value} -> not Bandit.Headers.field_value_valid?(value) end),
++      if Enum.any?(headers, fn {_key, value} -> not valid_field_value?(value) end),
+         do: stream_error!("Field value contains invalid characters (RFC9113§8.2.1)", stream)
+     end
+ 
++    # HPAX decodes an indexed static-table entry with no value (for example a bare
++    # `user-agent` at index 58) to a nil value. Regular fields are normalized to the empty
++    # binary they represent before reaching the Plug; drop this and the nil clause below
++    # once we depend on a hpax release with elixir-mint/hpax#27
++    defp normalize_empty_field_values(headers),
++      do:
++        Enum.map(headers, fn
++          {name, nil} -> {name, ""}
++          header -> header
++        end)
++
++    defp valid_field_value?(nil), do: true
++    defp valid_field_value?(<<>>), do: true
++
++    defp valid_field_value?(value) do
++      Bandit.Headers.field_value_valid?(value) and
++        :binary.first(value) not in [0x09, 0x20] and
++        :binary.last(value) not in [0x09, 0x20]
++    end
++
+     defp get_content_length!(headers, stream) do
+       case Bandit.Headers.get_content_length(headers) do
+         {:ok, content_length} -> content_length
+diff --git a/test/bandit/http2/protocol_test.exs b/test/bandit/http2/protocol_test.exs
+index 31df0913..a41e8ee1 100644
+--- a/test/bandit/http2/protocol_test.exs
++++ b/test/bandit/http2/protocol_test.exs
+@@ -2158,6 +2158,34 @@ defmodule HTTP2ProtocolTest do
+       assert msg == "** (Bandit.HTTP2.Errors.StreamError) Received uppercase header"
+     end
+ 
++    @tag :capture_log
++    test "returns a stream error for forbidden bytes in regular field names", context do
++      for invalid_name <- [
++            "",
++            "bad name",
++            "bad\tname",
++            "bad:name",
++            "bad/name",
++            "bad(name",
++            "bad" <> <<0x7F>>,
++            "bad" <> <<0xFF>>
++          ] do
++        socket = SimpleH2Client.setup_connection(context)
++
++        headers = [
++          {":method", "GET"},
++          {":path", "/"},
++          {":scheme", "https"},
++          {":authority", "localhost:#{context.port}"},
++          {invalid_name, "value"}
++        ]
++
++        SimpleH2Client.send_headers(socket, 1, true, headers)
++        assert SimpleH2Client.recv_rst_stream(socket) == {:ok, 1, 1}
++        assert SimpleH2Client.connection_alive?(socket)
++      end
++    end
++
+     @tag :capture_log
+     test "returns a stream error if sent headers with invalid pseudo headers", context do
+       socket = SimpleH2Client.setup_connection(context)
+@@ -2518,6 +2546,115 @@ defmodule HTTP2ProtocolTest do
+                "** (Bandit.HTTP2.Errors.StreamError) Field value contains invalid characters (RFC9113§8.2.1)"
+     end
+ 
++    @tag :capture_log
++    test "returns a stream error if a field value begins or ends with SP or HTAB", context do
++      for invalid_value <- [" leading", "trailing ", "\tleading", "trailing\t"] do
++        socket = SimpleH2Client.setup_connection(context)
++
++        headers = [
++          {":method", "GET"},
++          {":path", "/"},
++          {":scheme", "https"},
++          {":authority", "localhost:#{context.port}"},
++          {"x-test", invalid_value}
++        ]
++
++        SimpleH2Client.send_headers(socket, 1, true, headers)
++        assert SimpleH2Client.recv_rst_stream(socket) == {:ok, 1, 1}
++        assert SimpleH2Client.connection_alive?(socket)
++      end
++    end
++
++    @tag :capture_log
++    test "returns a stream error for control bytes and DEL in regular field values", context do
++      for invalid_byte <- [0x01, 0x0B, 0x0C, 0x1F, 0x7F] do
++        socket = SimpleH2Client.setup_connection(context)
++
++        headers = [
++          {":method", "GET"},
++          {":path", "/"},
++          {":scheme", "https"},
++          {":authority", "localhost:#{context.port}"},
++          {"x-test", "before" <> <<invalid_byte>> <> "after"}
++        ]
++
++        SimpleH2Client.send_headers(socket, 1, true, headers)
++        assert SimpleH2Client.recv_rst_stream(socket) == {:ok, 1, 1}
++        assert SimpleH2Client.connection_alive?(socket)
++      end
++    end
++
++    @tag :capture_log
++    test "returns a stream error for control bytes in pseudo-field values", context do
++      socket = SimpleH2Client.setup_connection(context)
++
++      headers = [
++        {":method", "GET"},
++        {":path", "/before" <> <<0x01>> <> "after"},
++        {":scheme", "https"},
++        {":authority", "localhost:#{context.port}"}
++      ]
++
++      SimpleH2Client.send_headers(socket, 1, true, headers)
++      assert SimpleH2Client.recv_rst_stream(socket) == {:ok, 1, 1}
++      assert SimpleH2Client.connection_alive?(socket)
++    end
++
++    @tag :capture_log
++    test "applies field-value validation to pseudo-header fields", context do
++      socket = SimpleH2Client.setup_connection(context)
++
++      headers = [
++        {":method", "GET"},
++        {":path", "/\t"},
++        {":scheme", "https"},
++        {":authority", "localhost:#{context.port}"}
++      ]
++
++      SimpleH2Client.send_headers(socket, 1, true, headers)
++      assert SimpleH2Client.recv_rst_stream(socket) == {:ok, 1, 1}
++      assert SimpleH2Client.connection_alive?(socket)
++    end
++
++    @tag :capture_log
++    test "validates :authority before parsing it", context do
++      socket = SimpleH2Client.setup_connection(context)
++
++      headers = [
++        {":method", "GET"},
++        {":path", "/"},
++        {":scheme", "https"},
++        {":authority", "localhost:#{context.port} "}
++      ]
++
++      SimpleH2Client.send_headers(socket, 1, true, headers)
++      assert SimpleH2Client.recv_rst_stream(socket) == {:ok, 1, 1}
++      assert SimpleH2Client.connection_alive?(socket)
++    end
++
++    test "accepts an indexed static-table field with no value as an empty value", context do
++      socket = SimpleH2Client.setup_connection(context)
++
++      headers = [
++        {:store, ":method", "GET"},
++        {:store, ":path", "/echo_user_agent"},
++        {:store, ":scheme", "https"},
++        {:store, ":authority", "localhost:#{context.port}"}
++      ]
++
++      {block, _} = HPAX.encode(headers, HPAX.new(4096))
++
++      # Append static-table index 58 (`user-agent`) as an indexed field, which HPAX
++      # decodes with a nil value (elixir-mint/hpax#27)
++      fragment = IO.iodata_to_binary(block) <> <<0xBA>>
++      SimpleH2Client.send_frame(socket, 1, 0x05, 1, fragment)
++
++      assert {:ok, 1, false, [{":status", "200"} | _], _ctx} =
++               SimpleH2Client.recv_headers(socket)
++
++      assert SimpleH2Client.recv_body(socket) == {:ok, 1, true, ~s([""])}
++    end
++
+     test "combines Cookie headers per RFC9113§8.2.3", context do
+       socket = SimpleH2Client.setup_connection(context)
+ 
+@@ -2543,6 +2680,10 @@ defmodule HTTP2ProtocolTest do
+       conn |> send_resp(200, "OK")
+     end
+ 
++    def echo_user_agent(conn) do
++      conn |> send_resp(200, inspect(get_req_header(conn, "user-agent")))
++    end
++
+     test "breaks Cookie headers up per RFC9113§8.2.3", context do
+       socket = SimpleH2Client.setup_connection(context)
+ 

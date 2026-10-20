@@ -1,0 +1,262 @@
+diff --git a/lib/craftplan/catalog/product/calculations/allergens.ex b/lib/craftplan/catalog/product/calculations/allergens.ex
+index abb9e204..7753b455 100644
+--- a/lib/craftplan/catalog/product/calculations/allergens.ex
++++ b/lib/craftplan/catalog/product/calculations/allergens.ex
+@@ -2,6 +2,11 @@ defmodule Craftplan.Catalog.Product.Calculations.Allergens do
+   @moduledoc false
+   use Ash.Resource.Calculation
+ 
++  alias Craftplan.Catalog.Services.BOMRollup
++  alias Craftplan.Inventory.Material
++
++  require Ash.Query
++
+   @impl true
+   def init(_opts) do
+     {:ok, []}
+@@ -9,34 +14,31 @@ defmodule Craftplan.Catalog.Product.Calculations.Allergens do
+ 
+   @impl true
+   def load(_query, _opts, _context) do
+-    [
+-      active_bom: [
+-        components: [
+-          :component_type,
+-          material: [allergens: [:name]]
+-        ]
+-      ]
+-    ]
++    [:active_bom]
+   end
+ 
+   @impl true
+-  def calculate(records, _opts, _arguments) do
++  def calculate(records, _opts, context) do
++    opts = [actor: context.actor, authorize?: context.authorize?]
++
+     Enum.map(records, fn record ->
+       case record.active_bom do
+         %Ash.NotLoaded{} -> []
+         nil -> []
+-        bom -> allergen_list_from_bom(bom)
++        bom -> allergen_list_from_bom(bom, opts)
+       end
+     end)
+   end
+ 
+-  defp allergen_list_from_bom(bom) do
+-    bom.components
+-    |> Enum.filter(&(&1.component_type == :material))
+-    |> Enum.flat_map(fn component -> component.material.allergens end)
++  defp allergen_list_from_bom(bom, opts) do
++    material_ids = bom |> BOMRollup.flatten_components(Decimal.new(1), opts) |> Map.keys()
++
++    Material
++    |> Ash.Query.filter(id in ^material_ids)
++    |> Ash.Query.load(allergens: [:name])
++    |> Ash.read!(opts)
++    |> Enum.flat_map(& &1.allergens)
+     |> Enum.uniq_by(& &1.name)
+     |> Enum.sort_by(& &1.name)
+   end
+-
+-  # no recipe fallback
+ end
+diff --git a/lib/craftplan/catalog/services/bom_rollup.ex b/lib/craftplan/catalog/services/bom_rollup.ex
+index f0797d7b..f14679c0 100644
+--- a/lib/craftplan/catalog/services/bom_rollup.ex
++++ b/lib/craftplan/catalog/services/bom_rollup.ex
+@@ -90,7 +90,12 @@ defmodule Craftplan.Catalog.Services.BOMRollup do
+   end
+ 
+   @spec flatten_components(BOM.t(), D.t(), keyword()) :: %{any() => D.t()}
+-  defp flatten_components(%BOM{} = bom, quantity, opts) do
++  def flatten_components(%BOM{} = bom, quantity, opts \\ []) do
++    do_flatten(bom, quantity, [bom.product_id], opts)
++  end
++
++  @spec do_flatten(BOM.t(), D.t(), [Catalog.product_id()], keyword()) :: %{any() => D.t()}
++  defp do_flatten(%BOM{} = bom, quantity, path, opts) do
+     authorize? = Keyword.get(opts, :authorize?, false)
+     actor = Keyword.get(opts, :actor)
+ 
+@@ -100,11 +105,6 @@ defmodule Craftplan.Catalog.Services.BOMRollup do
+         authorize?: authorize?
+       )
+ 
+-    do_flatten(bom, quantity, [], opts)
+-  end
+-
+-  @spec do_flatten(BOM.t(), D.t(), [Catalog.product_id()], keyword()) :: %{any() => D.t()}
+-  defp do_flatten(%BOM{} = bom, quantity, path, opts) do
+     components =
+       case Map.get(bom, :components) do
+         %Ash.NotLoaded{} -> []
+diff --git a/test/craftplan/catalog/product_allergens_test.exs b/test/craftplan/catalog/product_allergens_test.exs
+new file mode 100644
+index 00000000..9893edf7
+--- /dev/null
++++ b/test/craftplan/catalog/product_allergens_test.exs
+@@ -0,0 +1,110 @@
++defmodule Craftplan.Catalog.ProductAllergensTest do
++  use Craftplan.DataCase, async: true
++
++  alias Craftplan.Catalog.BOM
++  alias Craftplan.Catalog.Services.BOMRollup
++  alias Craftplan.Orders
++  alias Craftplan.Test.Factory
++  alias Decimal, as: D
++
++  defp bom!(product, components, actor) do
++    BOM
++    |> Ash.Changeset.for_create(:create, %{
++      product_id: product.id,
++      status: :active,
++      components: components
++    })
++    |> Ash.create!(actor: actor)
++  end
++
++  defp material_component(material), do: %{component_type: :material, material_id: material.id, quantity: D.new(10)}
++
++  defp product_component(product), do: %{component_type: :product, product_id: product.id, quantity: D.new(2)}
++
++  defp allergen_names(product, actor),
++    do: product |> Ash.reload!(load: [:allergens], actor: actor) |> Map.fetch!(:allergens) |> Enum.map(& &1.name)
++
++  test "nested and shared subassemblies include deduplicated sorted material allergens" do
++    actor = Craftplan.DataCase.staff_actor()
++    flour = Factory.create_material!(%{name: "Material-#{Ecto.UUID.generate()}"})
++    Factory.add_allergen!(flour, "Gluten", actor)
++    milk = Factory.create_material!(%{name: "Material-#{Ecto.UUID.generate()}"})
++    Factory.add_allergen!(milk, "Milk", actor)
++    eggs = Factory.create_material!(%{name: "Material-#{Ecto.UUID.generate()}"})
++    Factory.add_allergen!(eggs, "Eggs", actor)
++
++    base = Factory.create_product!(%{name: "Product-#{Ecto.UUID.generate()}"})
++    bom!(base, [material_component(flour)], actor)
++    blend = Factory.create_product!(%{name: "Product-#{Ecto.UUID.generate()}"})
++    bom!(blend, [product_component(base), material_component(milk)], actor)
++    finished = Factory.create_product!(%{name: "Product-#{Ecto.UUID.generate()}"})
++
++    bom =
++      bom!(
++        finished,
++        [product_component(blend), product_component(base), material_component(eggs)],
++        actor
++      )
++
++    assert allergen_names(finished, actor) == ["Eggs", "Gluten", "Milk"]
++    components = BOMRollup.flatten_components(bom, D.new(1), actor: actor)
++    assert D.equal?(components[flour.id], 60)
++    assert D.equal?(components[milk.id], 20)
++    assert D.equal?(components[eggs.id], 10)
++    rollup = Ash.reload!(bom, load: [:rollup], actor: actor).rollup
++    assert D.equal?(D.new(rollup.components_map[flour.id]), 60)
++
++    {:ok, batch} =
++      Orders.open_batch_with_allocations(%{product_id: finished.id, planned_qty: D.new(1)},
++        actor: actor
++      )
++
++    assert batch.label_snapshot["allergens"] == ["Eggs", "Gluten", "Milk"]
++
++    assert Enum.sort(Enum.map(batch.label_snapshot["ingredients"], & &1["name"])) ==
++             Enum.sort([flour.name, milk.name, eggs.name])
++
++    Factory.add_allergen!(flour, "Sesame", actor)
++    assert allergen_names(finished, actor) == ["Eggs", "Gluten", "Milk", "Sesame"]
++
++    assert Ash.reload!(batch, actor: actor).label_snapshot["allergens"] == [
++             "Eggs",
++             "Gluten",
++             "Milk"
++           ]
++  end
++
++  test "products without an active recipe do not contribute allergens" do
++    actor = Craftplan.DataCase.staff_actor()
++    no_recipe = Factory.create_product!(%{name: "Product-#{Ecto.UUID.generate()}"})
++    assert allergen_names(no_recipe, actor) == []
++    parent = Factory.create_product!(%{name: "Product-#{Ecto.UUID.generate()}"})
++    bom!(parent, [product_component(no_recipe)], actor)
++    assert allergen_names(parent, actor) == []
++  end
++
++  test "cyclic recipes terminate without duplicating root material quantities" do
++    actor = Craftplan.DataCase.staff_actor()
++    material = Factory.create_material!(%{name: "Material-#{Ecto.UUID.generate()}"})
++    Factory.add_allergen!(material, "Gluten", actor)
++    first = Factory.create_product!(%{name: "Product-#{Ecto.UUID.generate()}"})
++    first_bom = bom!(first, [material_component(material)], actor)
++    second = Factory.create_product!(%{name: "Product-#{Ecto.UUID.generate()}"})
++    bom!(second, [product_component(first)], actor)
++
++    first_bom =
++      Ash.update!(
++        first_bom,
++        %{components: [material_component(material), product_component(second)]},
++        action: :update,
++        actor: actor
++      )
++
++    assert allergen_names(first, actor) == ["Gluten"]
++
++    assert D.equal?(
++             BOMRollup.flatten_components(first_bom, D.new(1), actor: actor)[material.id],
++             10
++           )
++  end
++end
+diff --git a/test/craftplan_web/subassembly_allergens_live_test.exs b/test/craftplan_web/subassembly_allergens_live_test.exs
+new file mode 100644
+index 00000000..31c4dd7b
+--- /dev/null
++++ b/test/craftplan_web/subassembly_allergens_live_test.exs
+@@ -0,0 +1,46 @@
++defmodule CraftplanWeb.SubassemblyAllergensLiveTest do
++  use CraftplanWeb.ConnCase, async: true
++
++  import Phoenix.LiveViewTest
++
++  alias Craftplan.Catalog.BOM
++  alias Craftplan.Orders
++  alias Craftplan.Test.Factory
++  alias Decimal, as: D
++
++  @tag role: :staff
++  test "product and batch label declare a subassembly material's allergen", %{
++    conn: conn,
++    user: actor
++  } do
++    material = Factory.create_material!(%{name: "Nested flour"}, actor)
++    Factory.add_allergen!(material, "Gluten", actor)
++    blend = Factory.create_product!(%{name: "Blend"}, actor)
++    finished = Factory.create_product!(%{name: "Finished product"}, actor)
++
++    for {product, components} <- [
++          {blend, [%{component_type: :material, material_id: material.id, quantity: D.new(10)}]},
++          {finished, [%{component_type: :product, product_id: blend.id, quantity: D.new(2)}]}
++        ] do
++      BOM
++      |> Ash.Changeset.for_create(:create, %{
++        product_id: product.id,
++        status: :active,
++        components: components
++      })
++      |> Ash.create!(actor: actor)
++    end
++
++    {:ok, view, _} = live(conn, ~p"/manage/products/#{finished.sku}")
++    assert has_element?(view, "span", "Gluten")
++
++    {:ok, batch} =
++      Orders.open_batch_with_allocations(%{product_id: finished.id, planned_qty: D.new(1)},
++        actor: actor
++      )
++
++    {:ok, view, _} = live(conn, ~p"/manage/production/batches/#{batch.batch_code}/label")
++    assert has_element?(view, "#label-allergens", "Gluten")
++    assert has_element?(view, "#label-ingredients", "Nested flour")
++  end
++end

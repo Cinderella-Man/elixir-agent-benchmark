@@ -1,0 +1,265 @@
+diff --git a/assets/js/phoenix_live_view/live_socket.ts b/assets/js/phoenix_live_view/live_socket.ts
+index 9776925fc6..cbc858c095 100644
+--- a/assets/js/phoenix_live_view/live_socket.ts
++++ b/assets/js/phoenix_live_view/live_socket.ts
+@@ -190,6 +190,14 @@ export interface LiveSocketOptions {
+    * Defaults to `false`.
+    */
+   blockPhxChangeWhileComposing?: boolean;
++  /**
++   * Whether `phx-remove` commands on descendants of the outgoing main LiveView
++   * are executed during live navigation. When set to `false`, only a
++   * `phx-remove` command on the LiveView's own container is executed.
++   *
++   * Defaults to `true`.
++   */
++  cascadePhxRemoveOnNavigation?: boolean;
+   /** DOM callbacks. */
+   dom?: {
+     /**
+@@ -280,6 +288,7 @@ export default class LiveSocket {
+   private boundTopLevelEvents: boolean;
+   private boundEventNames: Set<string>;
+   private blockPhxChangeWhileComposing: boolean;
++  private cascadePhxRemoveOnNavigation: boolean;
+   private serverCloseRef: string | null;
+   /** @internal */
+   domCallbacks: {
+@@ -383,6 +392,9 @@ export default class LiveSocket {
+     this.boundEventNames = new Set();
+     this.blockPhxChangeWhileComposing =
+       opts.blockPhxChangeWhileComposing || false;
++    // TODO: Default to false in LiveView 2.0.
++    this.cascadePhxRemoveOnNavigation =
++      opts.cascadePhxRemoveOnNavigation ?? true;
+     this.serverCloseRef = null;
+     this.domCallbacks = Object.assign(
+       {
+@@ -922,10 +934,10 @@ export default class LiveSocket {
+     this.outgoingMainEl = this.outgoingMainEl || this.main!.el;
+ 
+     const stickies = DOM.findPhxSticky(document) || [];
+-    const removeEls = DOM.all(
++    const removeEls = this.phxRemoveElementsForNavigation(
+       this.outgoingMainEl!,
+-      `[${this.binding("remove")}]`,
+-    ).filter((el) => !DOM.isChildOfAny(el, stickies));
++      stickies,
++    );
+ 
+     const newMainEl = DOM.cloneNode(this.outgoingMainEl, "");
+     const oldMainView = this.main;
+@@ -940,8 +952,14 @@ export default class LiveSocket {
+     this.main.join((joinCount, onDone) => {
+       if (joinCount === 1 && this.commitPendingLink(linkRef)) {
+         this.requestDOMUpdate(() => {
+-          // remove phx-remove els right before we replace the main element
+-          removeEls.forEach((el) => el.remove());
++          // Remove descendant phx-remove elements right before we replace the
++          // main element. The outgoing main itself must remain connected so
++          // replaceWith below can swap in the new main element.
++          removeEls.forEach((el) => {
++            if (!el.isSameNode(this.outgoingMainEl)) {
++              el.remove();
++            }
++          });
+           stickies.forEach((el) => newMainEl.appendChild(el));
+           this.outgoingMainEl!.replaceWith(newMainEl);
+           this.outgoingMainEl = null;
+@@ -952,6 +970,20 @@ export default class LiveSocket {
+     });
+   }
+ 
++  private phxRemoveElementsForNavigation(
++    mainEl: Element,
++    stickies = DOM.findPhxSticky(document) || [],
++  ) {
++    const removeSelector = `[${this.binding("remove")}]`;
++    const removeEls = this.cascadePhxRemoveOnNavigation
++      ? [mainEl, ...DOM.all(mainEl, removeSelector)]
++      : [mainEl];
++
++    return removeEls.filter(
++      (el) => el.matches(removeSelector) && !DOM.isChildOfAny(el, stickies),
++    );
++  }
++
+   /** @internal */
+   transitionRemoves(elements, view: View, callback?) {
+     const removeAttr = this.binding("remove");
+diff --git a/assets/test/live_socket_test.ts b/assets/test/live_socket_test.ts
+index 507e5359b4..383740f42f 100644
+--- a/assets/test/live_socket_test.ts
++++ b/assets/test/live_socket_test.ts
+@@ -62,6 +62,28 @@ describe("LiveSocket", () => {
+     expect(liveSocket.unloaded).toBe(false);
+     expect(liveSocket.bindingPrefix).toBe("phx-");
+     expect(liveSocket.prevActive).toBe(null);
++    expect(liveSocket.cascadePhxRemoveOnNavigation).toBe(true);
++  });
++
++  test("selects phx-remove elements for live navigation", () => {
++    const mainEl = container(1)!;
++    mainEl.setAttribute("phx-remove", "[]");
++    mainEl.innerHTML = `
++      <div id="remove-child" phx-remove="[]"></div>
++      <div id="keep-child"></div>
++    `;
++
++    liveSocket = new LiveSocket("/live", Socket);
++    expect(
++      liveSocket.phxRemoveElementsForNavigation(mainEl).map((el) => el.id),
++    ).toEqual(["container1", "remove-child"]);
++
++    liveSocket = new LiveSocket("/live", Socket, {
++      cascadePhxRemoveOnNavigation: false,
++    });
++    expect(
++      liveSocket.phxRemoveElementsForNavigation(mainEl).map((el) => el.id),
++    ).toEqual(["container1"]);
+   });
+ 
+   test("viewLogger", async () => {
+diff --git a/test/e2e/support/issues/issue_3199.ex b/test/e2e/support/issues/issue_3199.ex
+new file mode 100644
+index 0000000000..95be424e5e
+--- /dev/null
++++ b/test/e2e/support/issues/issue_3199.ex
+@@ -0,0 +1,52 @@
++defmodule Phoenix.LiveViewTest.E2E.Issue3199Live do
++  # https://github.com/phoenixframework/phoenix_live_view/issues/3199
++
++  use Phoenix.LiveView
++
++  alias Phoenix.LiveView.JS
++
++  def remove_view do
++    JS.transition("view-removing", time: 100)
++  end
++
++  def mount(_params, _session, socket) do
++    {:ok,
++     stream(socket, :items, [
++       %{id: 1, name: "Item 1"},
++       %{id: 2, name: "Item 2"}
++     ])}
++  end
++
++  def render(assigns) do
++    ~H"""
++    <h1>Items</h1>
++
++    <.link navigate="/issues/3199/away">Navigate away</.link>
++
++    <ul id="items" phx-update="stream">
++      <li
++        :for={{dom_id, item} <- @streams.items}
++        id={dom_id}
++        phx-remove={JS.transition("item-removing", time: 1_000)}
++      >
++        {item.name}
++        <button phx-click="delete" phx-value-id={dom_id}>Delete</button>
++      </li>
++    </ul>
++    """
++  end
++
++  def handle_event("delete", %{"id" => dom_id}, socket) do
++    {:noreply, stream_delete_by_dom_id(socket, :items, dom_id)}
++  end
++end
++
++defmodule Phoenix.LiveViewTest.E2E.Issue3199Live.Away do
++  use Phoenix.LiveView
++
++  def render(assigns) do
++    ~H"""
++    <h1>Away</h1>
++    """
++  end
++end
+diff --git a/test/e2e/test_helper.exs b/test/e2e/test_helper.exs
+index 879070af8c..684e69655d 100644
+--- a/test/e2e/test_helper.exs
++++ b/test/e2e/test_helper.exs
+@@ -78,6 +78,10 @@ defmodule Phoenix.LiveViewTest.E2E.Layout do
+         params: { _csrf_token: csrfToken },
+         hooks: { ...Hooks, ...window.hooks, ...colocatedHooks },
+         uploaders: Uploaders,
++        cascadePhxRemoveOnNavigation:
++          new URLSearchParams(window.location.search).get(
++            "cascadePhxRemoveOnNavigation",
++          ) !== "false",
+       });
+       liveSocket.connect();
+       window.liveSocket = liveSocket;
+@@ -196,6 +200,11 @@ defmodule Phoenix.LiveViewTest.E2E.Router do
+       live "/3083", Issue3083Live
+       live "/3107", Issue3107Live
+       live "/3117", Issue3117Live
++
++      live "/3199", Issue3199Live,
++        container: {:div, [{:"phx-remove", Phoenix.LiveViewTest.E2E.Issue3199Live.remove_view()}]}
++
++      live "/3199/away", Issue3199Live.Away
+       live "/3200/messages", Issue3200.PanelLive, :messages_tab
+       live "/3200/settings", Issue3200.PanelLive, :settings_tab
+       live "/3194", Issue3194Live
+diff --git a/test/e2e/tests/issues/3199.spec.js b/test/e2e/tests/issues/3199.spec.js
+new file mode 100644
+index 0000000000..e616fbca1c
+--- /dev/null
++++ b/test/e2e/tests/issues/3199.spec.js
+@@ -0,0 +1,52 @@
++import { test, expect } from "../../test-fixtures";
++import { syncLV } from "../../utils";
++
++// https://github.com/phoenixframework/phoenix_live_view/issues/3199
++test.describe("Issue #3199", () => {
++  test("runs an item's phx-remove transition when it is deleted from a stream", async ({
++    page,
++  }) => {
++    await page.goto("/issues/3199");
++    await syncLV(page);
++
++    const item = page.locator("#items-1");
++    await item.getByRole("button", { name: "Delete" }).click();
++
++    await expect(item).toHaveClass(/item-removing/);
++    await expect(item).toHaveCount(0);
++    await expect(page.locator("#items-2")).toHaveCount(1);
++  });
++
++  test("also runs the item transitions when live navigation removes their container", async ({
++    page,
++  }) => {
++    await page.goto("/issues/3199");
++    await syncLV(page);
++
++    await page.getByRole("link", { name: "Navigate away" }).click();
++
++    // This is the behavior reported in #3199: replaceMain finds every
++    // phx-remove element in the outgoing LiveView, so both item transitions
++    // run and delay replacing the old page even though neither item was
++    // individually deleted from the stream.
++    await expect(page.locator("#items > li.item-removing")).toHaveCount(2);
++    await expect(page.getByRole("heading", { name: "Items" })).toBeVisible();
++
++    await expect(page.getByRole("heading", { name: "Away" })).toBeVisible();
++    await syncLV(page);
++  });
++
++  test("can limit phx-remove to the LiveView container during navigation", async ({
++    page,
++  }) => {
++    await page.goto("/issues/3199?cascadePhxRemoveOnNavigation=false");
++    await syncLV(page);
++
++    await page.getByRole("link", { name: "Navigate away" }).click();
++
++    await expect(page.locator("[data-phx-main].view-removing")).toHaveCount(1);
++    await expect(page.locator("#items > li.item-removing")).toHaveCount(0);
++    await expect(page.getByRole("heading", { name: "Away" })).toBeVisible();
++    await syncLV(page);
++  });
++});

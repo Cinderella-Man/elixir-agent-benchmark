@@ -1,0 +1,1810 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index f62dbc98e..d12690c8e 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -80,7 +80,9 @@ jobs:
+ 
+       - run: mix deps.get --only-test
+ 
+-      - run: mix tailwind.install
++      - run: mix tailwind.install --no-assets
++
++      - run: mix esbuild.install
+ 
+       - name: mix test
+         env:
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 62321c5c8..1eb5d25eb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,11 +3,10 @@
+ ## Unreleased
+ 
+ ### Enhancements
+-
++  - Added support for user-defined JS Hooks
+   - Added `--host` option for `mix beacon.gen.site` to serve your site at an alternative domain
+ 
+ ### Fixes
+-
+   - Fixed a bug where MediaLibrary could check for file contents on the wrong node in multi-node deployments
+ 
+ ### Breaking Changes
+@@ -19,29 +18,24 @@
+ ## 0.3.3 (2024-12-13)
+ 
+ ### Fixes
+-
+   - Support LiveView v1.0.1
+   - Fix variant roll changing when fetching assets
+ 
+ ## 0.3.2 (2024-12-11)
+ 
+ ### Fixes
+-
+   - Make the logic to find reachable sites less strict
+   - Prevent components module reloading in manual mode
+ 
+ ### Doc
+-
+   - Add missing instructions on Upgrade Guide v0.3.0 where to place the Beacon tuple
+ 
+ ### Chore
+-
+   - Exclude Dialyzer files from package
+ 
+ ## 0.3.1 (2024-12-10)
+ 
+ ### Fixes
+-
+   - Avoid unloading imported dynamic Components modules without a replacement
+ 
+ ## 0.3.0 (2024-12-05)
+diff --git a/assets/js/beacon.js b/assets/js/beacon.js
+index 55f03b811..a699f1e72 100644
+--- a/assets/js/beacon.js
++++ b/assets/js/beacon.js
+@@ -28,6 +28,9 @@ window.addEventListener("phx:beacon:page-updated", (e) => {
+ 
+ let socketPath = document.querySelector("html").getAttribute("phx-socket") || "/live"
+ let csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
+-let liveSocket = new LiveView.LiveSocket(socketPath, Phoenix.Socket, { params: { _csrf_token: csrfToken } })
++let liveSocket = new LiveView.LiveSocket(socketPath, Phoenix.Socket, {
++  params: { _csrf_token: csrfToken },
++  hooks: window.BeaconHooks?.default ?? {},
++})
+ liveSocket.connect()
+ window.liveSocket = liveSocket
+diff --git a/config/config.exs b/config/config.exs
+index 9bbb2a7ca..8d01eec6a 100644
+--- a/config/config.exs
++++ b/config/config.exs
+@@ -18,7 +18,7 @@ if Mix.env() == :dev do
+     cdn: esbuild.(~w(--format=iife --target=es2016 --global-name=Beacon --outfile=../priv/static/beacon.js)),
+     cdn_min: esbuild.(~w(--format=iife --target=es2016 --global-name=Beacon --minify --outfile=../priv/static/beacon.min.js)),
+     tailwind_bundle: [
+-      args: ~w(tailwind.config.js --bundle --format=esm --target=es2020 --outfile=../priv/tailwind.config.bundle.js),
++      args: ~w(tailwind.config.js --bundle --format=esm --target=es2016 --outfile=../priv/tailwind.config.bundle.js),
+       cd: Path.expand("../assets", __DIR__),
+       env: %{"NODE_PATH" => Path.expand("../deps", __DIR__)}
+     ]
+diff --git a/dev.exs b/dev.exs
+index e69216155..59bc0bef1 100644
+--- a/dev.exs
++++ b/dev.exs
+@@ -140,7 +140,7 @@ defmodule Demo.Beacon.TagsField do
+   end
+ end
+ 
+-upsert_layout = fn params ->
++get_or_insert_layout = fn params ->
+   %{site: site, title: title} = params
+   site = String.to_existing_atom(site)
+ 
+@@ -156,7 +156,7 @@ upsert_layout = fn params ->
+   end
+ end
+ 
+-upsert_page = fn params ->
++get_or_insert_page = fn params ->
+   %{site: site, path: path} = params
+   site = String.to_existing_atom(site)
+ 
+@@ -172,7 +172,7 @@ upsert_page = fn params ->
+   end
+ end
+ 
+-upsert_component = fn params ->
++get_or_insert_component = fn params ->
+   %{site: site, name: name} = params
+   site = String.to_existing_atom(site)
+ 
+@@ -182,9 +182,19 @@ upsert_component = fn params ->
+   end
+ end
+ 
++get_or_insert_js_hook = fn params ->
++  %{site: site, name: name} = params
++  site = String.to_existing_atom(site)
++
++  case Beacon.Content.get_js_hook_by(site, name: name) do
++    %Beacon.Content.JSHook{} = js_hook -> js_hook
++    _ -> Beacon.Content.create_js_hook!(params)
++  end
++end
++
+ dev_seeds = fn ->
+   layout =
+-    upsert_layout.(%{
++    get_or_insert_layout.(%{
+       site: "dev",
+       title: "dev",
+       meta_tags: [
+@@ -200,7 +210,7 @@ dev_seeds = fn ->
+       """
+     })
+ 
+-  upsert_component.(%{
++  get_or_insert_component.(%{
+     site: "dev",
+     name: "sample_component",
+     attrs: [%{name: "project", type: "any", opts: [required: true]}],
+@@ -217,6 +227,21 @@ dev_seeds = fn ->
+     """
+   })
+ 
++  get_or_insert_js_hook.(%{
++    site: "dev",
++    name: "ConsoleLogHook",
++    code: ~S"""
++    const now = new Date()
++    const message = '[dev] page mounted at ' + now
++
++    export const ConsoleLogHook = {
++      mounted() {
++        console.log(message)
++      }
++    }
++    """
++  })
++
+   home_live_data =
+     Beacon.Content.get_live_data_by(:dev, path: "/sample") || Beacon.Content.create_live_data!(%{site: "dev", path: "/sample"})
+ 
+@@ -231,7 +256,7 @@ dev_seeds = fn ->
+     }
+   )
+ 
+-  upsert_page.(%{
++  get_or_insert_page.(%{
+     path: "/sample",
+     site: "dev",
+     title: "dev home",
+@@ -255,7 +280,7 @@ dev_seeds = fn ->
+       "author_id" => 1
+     },
+     template: """
+-    <main class="custom-font-style">
++    <main id="dev-sample" class="custom-font-style" phx-hook="ConsoleLogHook">
+       <%!-- Home Page --%>
+ 
+       <.image site={@beacon.site} name="beacon.webp" class="h-24" alt="logo" />
+@@ -305,7 +330,7 @@ dev_seeds = fn ->
+     ]
+   })
+ 
+-  upsert_page.(%{
++  get_or_insert_page.(%{
+     path: "/authors/:author_id",
+     site: "dev",
+     title: "dev author",
+@@ -330,7 +355,7 @@ dev_seeds = fn ->
+     """
+   })
+ 
+-  upsert_page.(%{
++  get_or_insert_page.(%{
+     path: "/posts/*slug",
+     site: "dev",
+     title: "dev post",
+@@ -355,7 +380,7 @@ dev_seeds = fn ->
+     """
+   })
+ 
+-  upsert_page.(%{
++  get_or_insert_page.(%{
+     path: "/markdown",
+     site: "dev",
+     title: "dev markdown",
+@@ -460,7 +485,7 @@ dev_seeds = fn ->
+     """
+   })
+ 
+-  upsert_page.(%{
++  get_or_insert_page.(%{
+     path: "/drag-drop",
+     site: "dev",
+     title: "dev drag and drop playground",
+@@ -573,7 +598,7 @@ dev_seeds = fn ->
+ end
+ 
+ dy_seeds = fn ->
+-  upsert_component.(%{
++  get_or_insert_component.(%{
+     site: "dy",
+     name: "header",
+     template: """
+@@ -647,7 +672,7 @@ dy_seeds = fn ->
+     example: "<.header />"
+   })
+ 
+-  upsert_component.(%{
++  get_or_insert_component.(%{
+     site: "dy",
+     name: "footer",
+     template: """
+@@ -933,7 +958,7 @@ dy_seeds = fn ->
+   })
+ 
+   layout =
+-    upsert_layout.(%{
++    get_or_insert_layout.(%{
+       site: "dy",
+       title: "main",
+       template: """
+@@ -943,7 +968,7 @@ dy_seeds = fn ->
+       """
+     })
+ 
+-  upsert_page.(%{
++  get_or_insert_page.(%{
+     path: "/",
+     site: "dy",
+     title: "home",
+diff --git a/guides/recipes/javascript-interoperability.md b/guides/recipes/javascript-interoperability.md
+new file mode 100644
+index 000000000..83fb84161
+--- /dev/null
++++ b/guides/recipes/javascript-interoperability.md
+@@ -0,0 +1,41 @@
++# JavaScript interoperability
++
++Beacon provides support for custom client-side JavaScript via LiveView's [JS Hooks](https://hexdocs.pm/phoenix_live_view/js-interop.html#client-hooks-via-phx-hook).
++
++Hooks are blocks of custom JS code which run when an element in a Beacon template reaches a specific
++stage of its lifecycle.  There are six possible stages which you can use:
++
++  * `mounted` - the element has been added to the DOM and its server
++    LiveView has finished mounting
++  * `beforeUpdate` - the element is about to be updated in the DOM.
++    *Note*: any call here must be synchronous as the operation cannot
++    be deferred or cancelled.
++  * `updated` - the element has been updated in the DOM by the server
++  * `destroyed` - the element has been removed from the page, either
++    by a parent update, or by the parent being removed entirely
++  * `disconnected` - the element's parent LiveView has disconnected from the server
++  * `reconnected` - the element's parent LiveView has reconnected to the server
++
++To add code to one or more of these, first go into your BeaconLiveAdmin dashboard and navigate to the 
++"JS Hooks" section.  Create a new hook with the name of your choice, and you will see a code editor
++with each of the above callbacks.  For an example, let's add a log message to output to the console when
++our page's logo is mounted:
++
++```javascript
++mounted() {
++  console.log("logo mounted!");
++}
++```
++
++Then in the page's template, add a `phx-hook` attr to the desired element:
++```html
++<div id="logo" phx-hook="MyHookName">
++  <img ...>
++</div>
++```
++
++`MyHookName` should be replaced with whatever name you chose for your hook.  Also note the element
++must have an `id` attr defined.
++
++With these changes saved and the page published, you can open that page in your browser and should see
++`logo mounted!` in the javascript console.
+\ No newline at end of file
+diff --git a/guides/upgrading/v0.4.0.md b/guides/upgrading/v0.4.0.md
+index d72397c1d..95a6db5e1 100644
+--- a/guides/upgrading/v0.4.0.md
++++ b/guides/upgrading/v0.4.0.md
+@@ -1,5 +1,22 @@
+ # Upgrading to v0.4.0
+ 
++## Update Beacon tables
++
++Beacon v0.4 requires some new database tables for the latest features.  To create these tables,
++simply run the generator for a new Ecto Migration module:
++
++```sh
++mix ecto.gen.migration update_beacon_v003
++```
++
++Then, within the generated module, call Beacon's migration helpers:
++
++```elixir
++use Ecto.Migration
++def up, do: Beacon.Migration.up()
++def down, do: Beacon.Migration.down()
++```
++
+ ## Move `Beacon` before the endpoint in application.ex
+ 
+ Open the file `application.ex`, find the Beacon tuple in the list of `children`,
+diff --git a/lib/beacon/content.ex b/lib/beacon/content.ex
+index 67e597623..a6ca8a214 100644
+--- a/lib/beacon/content.ex
++++ b/lib/beacon/content.ex
+@@ -35,8 +35,9 @@ defmodule Beacon.Content do
+   alias Beacon.Content.ComponentSlot
+   alias Beacon.Content.ComponentSlotAttr
+   alias Beacon.Content.ErrorPage
+-  alias Beacon.Content.InfoHandler
+   alias Beacon.Content.EventHandler
++  alias Beacon.Content.InfoHandler
++  alias Beacon.Content.JSHook
+   alias Beacon.Content.Layout
+   alias Beacon.Content.LayoutEvent
+   alias Beacon.Content.LayoutSnapshot
+@@ -1138,7 +1139,7 @@ defmodule Beacon.Content do
+ 
+   ## Example
+ 
+-      iex >create_stylesheet(%{
++      iex> create_stylesheet(%{
+         site: :my_site,
+         name: "override",
+         content: ~S|
+@@ -1172,7 +1173,7 @@ defmodule Beacon.Content do
+ 
+   ## Example
+ 
+-      iex >create_stylesheet!(%{
++      iex> create_stylesheet!(%{
+         site: :my_site,
+         name: "override",
+         content: ~S|
+@@ -1248,6 +1249,136 @@ defmodule Beacon.Content do
+     )
+   end
+ 
++  # JS HOOKS
++
++  @doc """
++  Returns an `%Ecto.Changeset{}` for tracking JS Hook changes.
++
++  ## Example
++
++      iex> change_js_hook(js_hook, %{name: "MyCustomHook"})
++      %Ecto.Changeset{data: %JSHook{}}
++
++  """
++  @doc type: :js_hooks
++  @spec change_js_hook(JSHook.t(), map()) :: Changeset.t()
++  def change_js_hook(%JSHook{} = js_hook, attrs \\ %{}) do
++    JSHook.changeset(js_hook, attrs)
++  end
++
++  @doc """
++  Creates a JS Hook.
++
++  Returns `{:ok, js_hook}` if successful, otherwise `{:error, changeset}`.
++
++  ## Example
++
++      iex> code = "export const ConsoleLogHook = {mounted() {console.log(\"foo\")}}"
++      iex> create_js_hook(%{site: :my_site, name: "ConsoleLogHook", code: code})
++      {:ok, %JSHook{}}
++
++  """
++  @doc type: :js_hooks
++  @spec create_js_hook(map()) :: {:ok, JSHook.t()} | {:error, Changeset.t()}
++  def create_js_hook(attrs) do
++    changeset = JSHook.changeset(%JSHook{}, attrs)
++    site = Changeset.get_field(changeset, :site)
++
++    changeset
++    |> repo(site).insert()
++    |> tap(&maybe_broadcast_updated_content_event(&1, :js_hook))
++  end
++
++  @doc """
++  Creates a JS Hook, raising an error if unsuccessful.
++  """
++  @doc type: :js_hooks
++  @spec create_js_hook!(map()) :: JSHook.t()
++  def create_js_hook!(attrs) do
++    case create_js_hook(attrs) do
++      {:ok, js_hook} -> js_hook
++      {:error, changeset} -> raise "failed to create JS Hook, got: #{inspect(changeset.errors)}"
++    end
++  end
++
++  @doc """
++  Generates an empty Hook template for the given name.
++  """
++  @doc type: :js_hooks
++  @spec default_hook_code(String.t()) :: String.t()
++  def default_hook_code(name) do
++    """
++    export const #{name} = {
++      mounted() {
++
++      },
++      beforeUpdate() {
++
++      },
++      updated() {
++
++      },
++      destroyed() {
++
++      },
++      disconnected() {
++
++      },
++      reconnected() {
++
++      },
++    };
++    """
++  end
++
++  @doc """
++  Gets a single JS hooks by `clauses`.
++
++  ## Example
++
++      iex> get_component_by(site, name: "CloseOnGlobalClick")
++      %JSHook{}
++
++  """
++  @doc type: :js_hooks
++  @spec get_js_hook_by(Site.t(), keyword(), keyword()) :: JSHook.t() | nil
++  def get_js_hook_by(site, clauses, opts \\ []) when is_atom(site) and is_list(clauses) do
++    clauses = Keyword.put(clauses, :site, site)
++    repo(site).get_by(JSHook, clauses, opts)
++  end
++
++  @doc """
++  Lists all JS Hooks for a site.
++  """
++  @doc type: :js_hooks
++  @spec list_js_hooks(Site.t()) :: [JSHook.t()]
++  def list_js_hooks(site) do
++    repo(site).all(from h in JSHook, where: h.site == ^site)
++  end
++
++  @doc """
++  Updates a JS Hook.
++  """
++  @doc type: :js_hooks
++  @spec update_js_hook(JSHook.t(), map()) :: {:ok, JSHook.t()} | {:error, Changeset.t()}
++  def update_js_hook(js_hook, attrs) do
++    js_hook
++    |> JSHook.changeset(attrs)
++    |> repo(js_hook).update()
++    |> tap(&maybe_broadcast_updated_content_event(&1, :js_hook))
++  end
++
++  @doc """
++  Deletes a JS Hook.
++  """
++  @doc type: :js_hooks
++  @spec delete_js_hook(JSHook.t()) :: {:ok, JSHook.t()} | {:error, Changeset.t()}
++  def delete_js_hook(js_hook) do
++    js_hook
++    |> repo(js_hook).delete()
++    |> tap(&maybe_broadcast_updated_content_event(&1, :js_hook))
++  end
++
+   # COMPONENTS
+ 
+   @doc false
+diff --git a/lib/beacon/content/js_hook.ex b/lib/beacon/content/js_hook.ex
+new file mode 100644
+index 000000000..7cd6042ce
+--- /dev/null
++++ b/lib/beacon/content/js_hook.ex
+@@ -0,0 +1,66 @@
++defmodule Beacon.Content.JSHook do
++  @moduledoc """
++  Stores a JS Hook which can be referenced from your Beacon pages, layouts, and components.
++
++  > #### Do not create or edit JS Hooks manually {: .warning}
++  >
++  > Use the public functions in `Beacon.Content` instead.
++  > The functions in that module guarantee that all dependencies
++  > are created correctly and all processes are updated.
++  > Manipulating data manually will most likely result
++  > in inconsistent behavior and crashes.
++
++  """
++
++  use Beacon.Schema
++  alias Beacon.RuntimeJS
++
++  @type t :: %__MODULE__{
++          id: UUID.t(),
++          site: Site.t(),
++          name: binary(),
++          code: binary(),
++          inserted_at: DateTime.t(),
++          updated_at: DateTime.t()
++        }
++
++  schema "beacon_js_hooks" do
++    field :site, Beacon.Types.Site
++    field :name, :string
++    field :code, :string
++    timestamps()
++  end
++
++  @doc false
++  def changeset(js_hook, attrs) do
++    fields = [:name, :site, :code]
++
++    js_hook
++    |> cast(attrs, fields)
++    |> validate_required(fields)
++    |> validate_format(:name, ~r/[a-zA-Z_][a-zA-Z0-9_]*/)
++    |> validate_code()
++  end
++
++  @doc false
++  def validate_code(changeset) do
++    hook = apply_changes(changeset)
++
++    case RuntimeJS.get_export(hook, cleanup: true) do
++      {:ok, export} when export in ["default", hook.name] ->
++        changeset
++
++      {:ok, export} ->
++        add_error(changeset, :name, "does not match export", export: export)
++
++      {:error, :no_export} ->
++        add_error(changeset, :code, "no export found")
++
++      {:error, :multiple_exports} ->
++        add_error(changeset, :code, "multiple exports are not allowed")
++
++      {:error, _} ->
++        add_error(changeset, :code, "syntax error: please double-check your code and try again")
++    end
++  end
++end
+diff --git a/lib/beacon/loader.ex b/lib/beacon/loader.ex
+index 020202710..63dd850ca 100644
+--- a/lib/beacon/loader.ex
++++ b/lib/beacon/loader.ex
+@@ -128,7 +128,7 @@ defmodule Beacon.Loader do
+   end
+ 
+   def load_runtime_js(site) do
+-    GenServer.call(worker(site), :load_runtime_js, :timer.minutes(2))
++    call_worker(site, :load_runtime_js, {:load_runtime_js, [site]}, timeout: :timer.minutes(2))
+   end
+ 
+   def load_runtime_css(site) do
+@@ -243,12 +243,13 @@ defmodule Beacon.Loader do
+ 
+   # call worker asyncly or syncly depending on the current site mode
+   # or skip if mode is manual so we don't load modules
+-  defp call_worker(site, async_request, sync_request) do
++  defp call_worker(site, async_request, sync_request, opts \\ []) do
+     mode = Beacon.Config.fetch!(site).mode
++    timeout = Keyword.get(opts, :timeout, @timeout)
+ 
+     case mode do
+       :live ->
+-        GenServer.call(worker(site), async_request, @timeout)
++        GenServer.call(worker(site), async_request, timeout)
+ 
+       :testing ->
+         {sync_fun, sync_args} = sync_request
+@@ -397,6 +398,12 @@ defmodule Beacon.Loader do
+     {:noreply, config}
+   end
+ 
++  def handle_info({:content_updated, :js_hook, %{site: site}}, config) do
++    load_runtime_js(site)
++
++    {:noreply, config}
++  end
++
+   def handle_info(msg, config) do
+     raise inspect(msg)
+     Logger.warning("Beacon.Loader can not handle the message: #{inspect(msg)}")
+diff --git a/lib/beacon/loader/worker.ex b/lib/beacon/loader/worker.ex
+index c4177f8af..3a2961a97 100644
+--- a/lib/beacon/loader/worker.ex
++++ b/lib/beacon/loader/worker.ex
+@@ -394,7 +394,7 @@ defmodule Beacon.Loader.Worker do
+   end
+ 
+   def handle_call(:load_runtime_js, _from, config) do
+-    stop(Beacon.RuntimeJS.load!(), config)
++    stop(Beacon.RuntimeJS.load!(config.site), config)
+   end
+ 
+   def handle_call(:load_runtime_css, _from, config) do
+@@ -534,6 +534,10 @@ defmodule Beacon.Loader.Worker do
+     end
+   end
+ 
++  def load_runtime_js(site) do
++    Beacon.RuntimeJS.load!(site)
++  end
++
+   defp stop(reply, state) do
+     {:stop, {:shutdown, :loaded}, reply, state}
+   end
+diff --git a/lib/beacon/migration.ex b/lib/beacon/migration.ex
+index f2042dc11..d9722ce07 100644
+--- a/lib/beacon/migration.ex
++++ b/lib/beacon/migration.ex
+@@ -52,7 +52,7 @@ defmodule Beacon.Migration do
+   """
+ 
+   @initial_version 1
+-  @current_version 2
++  @current_version 3
+ 
+   @doc """
+   Upgrades Beacon database schemas.
+diff --git a/lib/beacon/migrations/v003.ex b/lib/beacon/migrations/v003.ex
+new file mode 100644
+index 000000000..6c63c0953
+--- /dev/null
++++ b/lib/beacon/migrations/v003.ex
+@@ -0,0 +1,19 @@
++defmodule Beacon.Migrations.V003 do
++  @moduledoc false
++  use Ecto.Migration
++
++  def up do
++    create_if_not_exists table(:beacon_js_hooks, primary_key: false) do
++      add :id, :binary_id, primary_key: true
++      add :site, :text, null: false
++      add :name, :text, null: false
++      add :code, :text, null: false
++
++      timestamps(type: :utc_datetime_usec)
++    end
++  end
++
++  def down do
++    drop_if_exists table(:beacon_js_hooks)
++  end
++end
+diff --git a/lib/beacon/runtime_css.ex b/lib/beacon/runtime_css.ex
+index ceafc69aa..09aa0fe6d 100644
+--- a/lib/beacon/runtime_css.ex
++++ b/lib/beacon/runtime_css.ex
+@@ -74,11 +74,13 @@ defmodule Beacon.RuntimeCSS do
+ 
+     gzip = :zlib.gzip(css)
+ 
+-    if :ets.insert(:beacon_assets, {{site, :css}, {hash, css, brotli, gzip}}) do
+-      :ok
+-    else
+-      raise Beacon.LoaderError, "failed to compress css"
++    try do
++      true = :ets.insert(:beacon_assets, {{site, :css}, {hash, css, brotli, gzip}})
++    rescue
++      _ -> reraise Beacon.LoaderError, [message: "failed to compress css"], __STACKTRACE__
+     end
++
++    :ok
+   end
+ 
+   @doc false
+diff --git a/lib/beacon/runtime_js.ex b/lib/beacon/runtime_js.ex
+index 594fda3e3..d65d49ab0 100644
+--- a/lib/beacon/runtime_js.ex
++++ b/lib/beacon/runtime_js.ex
+@@ -1,52 +1,131 @@
+ defmodule Beacon.RuntimeJS do
+   # Runtime compilation and processing of JS files.
+   @moduledoc false
++  alias Beacon.Content
++
++  require Logger
+ 
+   # merge beacon js with host application dependencies js
+   # similar to https://github.com/phoenixframework/phoenix_live_dashboard/blob/9140f56c34201237f0feeeff747528eed2795c0c/lib/phoenix/live_dashboard/controllers/assets.ex#L6-L11
+-  # TODO: build and minfy at runtime with esbuild
+-  def build do
++  def build(site) do
++    minify? = !(Code.ensure_loaded?(Mix.Project) and Mix.env() in [:test, :dev])
++
++    validate_esbuild_install!()
++
+     assets =
+-      if Code.ensure_loaded?(Mix.Project) and Mix.env() in [:test, :dev] do
++      if minify? do
+         [
+-          phoenix: "phoenix.js",
++          phoenix: "phoenix.min.js",
+           phoenix_html: "phoenix_html.js",
+-          phoenix_live_view: "phoenix_live_view.js",
+-          beacon: "beacon.js"
++          phoenix_live_view: "phoenix_live_view.min.js",
++          beacon: "beacon.min.js"
+         ]
+       else
+         [
+-          phoenix: "phoenix.min.js",
++          phoenix: "phoenix.js",
+           phoenix_html: "phoenix_html.js",
+-          phoenix_live_view: "phoenix_live_view.min.js",
+-          beacon: "beacon.min.js"
++          phoenix_live_view: "phoenix_live_view.js",
++          beacon: "beacon.js"
+         ]
+       end
+ 
+-    assets
+-    |> Enum.map(fn {app, asset} ->
+-      app
+-      |> Application.app_dir(["priv", "static", asset])
+-      |> File.read!()
+-      |> String.replace("//# sourceMappingURL=", "// ")
+-    end)
+-    |> IO.iodata_to_binary()
++    tmp_dir = tmp_dir!()
++
++    {names, imports, paths} =
++      Enum.reduce(Content.list_js_hooks(site), {[], [], []}, fn hook, {names, imports, paths} = acc ->
++        # Write a file for each hook
++        hook_js_path = Path.join(tmp_dir, hook.name <> ".js")
++        File.write!(hook_js_path, hook.code)
++
++        # Don't cleanup these files yet, we'll cleanup altogether at the end
++        export =
++          case get_export(hook, dir: tmp_dir, cleanup: false) do
++            {:ok, export} when export in ["default", hook.name] -> export
++            _ -> nil
++          end
++
++        import_code =
++          cond do
++            export == "default" -> "import #{hook.name} from '#{hook_js_path}';"
++            is_binary(export) -> "import { #{export} as #{hook.name} } from '#{hook_js_path}';"
++            :else -> nil
++          end
++
++        if import_code do
++          {[hook.name | names], [import_code | imports], [hook_js_path | paths]}
++        else
++          Logger.error("failed to import hook: #{inspect(hook)}")
++          acc
++        end
++      end)
++
++    # With all the valid data accumulated, write a single file for beacon hook imports
++    # and load it into memory to be injected into the existing js deps
++    hooks_js_path = Path.join(tmp_dir, "hooks.js")
++    hooks = build_beacon_hooks(hooks_js_path, imports, names, minify?)
++
++    js_deps =
++      assets
++      |> Enum.map(fn {app, asset} ->
++        app
++        |> Application.app_dir(["priv", "static", asset])
++        |> File.read!()
++        |> String.replace("//# sourceMappingURL=", "// ")
++      end)
++
++    # Everything we need is in memory now, so we can cleanup the files
++    cleanup([hooks_js_path | paths], tmp_dir)
++
++    IO.iodata_to_binary([hooks, "\n", js_deps])
++  end
++
++  defp build_beacon_hooks(path, imports, names, minify?) do
++    hooks_code = [
++      Enum.intersperse(imports, "\n"),
++      "\n",
++      "export default {\n",
++      Enum.intersperse(names, ",\n"),
++      "\n}"
++    ]
++
++    File.write!(path, hooks_code)
++
++    # --log-level=error is required to avoid gargabe in stdout
++    args =
++      ~w(#{path} --bundle --format=iife --target=es2016 --platform=browser) ++
++        ~w(--global-name=BeaconHooks --log-level=error) ++
++        if(minify?, do: ~w(--minify), else: [])
++
++    cmd_opts = [cd: File.cwd!(), stderr_to_stdout: true]
++
++    case System.cmd(Esbuild.bin_path(), args, cmd_opts) do
++      {hooks, 0} -> hooks
++      _ -> []
++    end
++  end
++
++  defp tmp_dir! do
++    tmp_dir = Path.join(System.tmp_dir!(), random_dir())
++    File.mkdir_p!(tmp_dir)
++    tmp_dir
+   end
+ 
+-  def fetch(version \\ :brotli)
+-  def fetch(:brotli), do: do_fetch({:_, :_, :"$1", :_})
+-  def fetch(:gzip), do: do_fetch({:_, :_, :_, :"$1"})
+-  def fetch(:deflate), do: do_fetch({:_, :"$1", :_, :_})
++  defp random_dir, do: :crypto.strong_rand_bytes(12) |> Base.encode16()
+ 
+-  defp do_fetch(guard) do
+-    case :ets.match(:beacon_assets, {:js, guard}) do
++  def fetch(site, version \\ :brotli)
++  def fetch(site, :brotli), do: do_fetch(site, {:_, :_, :"$1", :_})
++  def fetch(site, :gzip), do: do_fetch(site, {:_, :_, :_, :"$1"})
++  def fetch(site, :deflate), do: do_fetch(site, {:_, :"$1", :_, :_})
++
++  defp do_fetch(site, guard) do
++    case :ets.match(:beacon_assets, {{site, :js}, guard}) do
+       [[js]] -> js
+       _ -> "// JS not found"
+     end
+   end
+ 
+-  def load! do
+-    js = build()
++  def load!(site) do
++    js = build(site)
+ 
+     hash = Base.encode16(:crypto.hash(:md5, js), case: :lower)
+ 
+@@ -58,17 +137,89 @@ defmodule Beacon.RuntimeJS do
+ 
+     gzip = :zlib.gzip(js)
+ 
+-    if :ets.insert(:beacon_assets, {:js, {hash, js, brotli, gzip}}) do
+-      :ok
+-    else
+-      raise Beacon.LoaderError, "failed to compress js"
++    try do
++      true = :ets.insert(:beacon_assets, {{site, :js}, {hash, js, brotli, gzip}})
++    rescue
++      _ -> reraise Beacon.LoaderError, [message: "failed to compress js"], __STACKTRACE__
+     end
++
++    :ok
+   end
+ 
+-  def current_hash do
+-    case :ets.match(:beacon_assets, {:js, {:"$1", :_, :_, :_}}) do
++  def current_hash(site) do
++    case :ets.match(:beacon_assets, {{site, :js}, {:"$1", :_, :_, :_}}) do
+       [[hash]] -> hash
+       _ -> nil
+     end
+   end
++
++  def get_export(hook, opts \\ []) do
++    dir = Keyword.get(opts, :dir, tmp_dir!())
++    cleanup? = Keyword.get(opts, :cleanup, true)
++    hook_js_path = Path.join(dir, hook.name <> ".js")
++
++    validate_esbuild_install!()
++
++    if !File.exists?(hook_js_path), do: File.write!(hook_js_path, hook.code)
++
++    with %{"outputs" => %{} = outputs} <- get_code_metadata(hook, dir),
++         {_, %{"exports" => exports}} <- Enum.at(outputs, 0) do
++      if cleanup?, do: cleanup([hook_js_path], dir)
++
++      case exports do
++        [] -> {:error, :no_export}
++        [export] -> {:ok, export}
++        exports when is_list(exports) -> {:error, :multiple_exports}
++        _ -> {:error, :unknown}
++      end
++    else
++      _ ->
++        if cleanup?, do: cleanup([hook], dir)
++        {:error, :esbuild_failed}
++    end
++  end
++
++  defp validate_esbuild_install! do
++    case Esbuild.bin_version() do
++      {:ok, _version} ->
++        :ok
++
++      :error ->
++        raise Beacon.LoaderError, """
++        esbuild binary not found or the installation is invalid.
++
++        Execute the following command to install the binary used to process JS:
++
++            mix esbuild.install
++
++        """
++    end
++  end
++
++  defp get_code_metadata(hook, dir) do
++    hook_js_path = Path.join(dir, hook.name <> ".js")
++    meta_json_path = Path.join(dir, hook.name <> ".json")
++    meta_out_js_path = Path.join(dir, hook.name <> "_meta.js")
++    cmd_opts = [cd: File.cwd!(), stderr_to_stdout: true]
++
++    with {_, 0} <- System.cmd(Esbuild.bin_path(), ~w(#{hook_js_path} --metafile=#{meta_json_path} --outfile=#{meta_out_js_path}), cmd_opts),
++         {:ok, meta} <- File.read(meta_json_path),
++         {:ok, meta} <- Jason.decode(meta) do
++      cleanup([meta_json_path, meta_out_js_path])
++      meta
++    else
++      _ ->
++        cleanup([meta_json_path, meta_out_js_path])
++        nil
++    end
++  end
++
++  defp cleanup(files) when is_list(files) do
++    Enum.each(files, &File.rm/1)
++  end
++
++  defp cleanup(files, dir) when is_list(files) do
++    Enum.each(files, &File.rm/1)
++    File.rmdir(dir)
++  end
+ end
+diff --git a/lib/beacon/tailwind_compiler.ex b/lib/beacon/tailwind_compiler.ex
+index afdd97ac1..89aa40a8b 100644
+--- a/lib/beacon/tailwind_compiler.ex
++++ b/lib/beacon/tailwind_compiler.ex
+@@ -241,15 +241,6 @@ defmodule Beacon.RuntimeCSS.TailwindCompiler do
+     |> List.flatten()
+   end
+ 
+-  defp generate_template_files!(tmp_dir, templates) when is_list(templates) do
+-    Enum.map(templates, fn template ->
+-      hash = Base.encode16(:crypto.hash(:md5, template), case: :lower)
+-      template_path = Path.join(tmp_dir, "#{hash}.template")
+-      File.write!(template_path, template)
+-      template_path
+-    end)
+-  end
+-
+   defp generate_input_css_file!(tmp_dir, site) do
+     tailwind_css_path = tailwind_css_path!(site)
+ 
+diff --git a/lib/beacon/test/fixtures.ex b/lib/beacon/test/fixtures.ex
+index df0ecc055..71aa8cc33 100644
+--- a/lib/beacon/test/fixtures.ex
++++ b/lib/beacon/test/fixtures.ex
+@@ -110,7 +110,8 @@ defmodule Beacon.Test.Fixtures do
+               :beacon_error_page_fixture,
+               :beacon_live_data_fixture,
+               :beacon_live_data_assign_fixture,
+-              :beacon_info_handler_fixture
++              :beacon_info_handler_fixture,
++              :beacon_js_hook_fixture
+             ] do
+           quote do
+             def unquote(fun)() do
+@@ -549,4 +550,33 @@ defmodule Beacon.Test.Fixtures do
+     |> Content.create_info_handler!()
+     |> tap(&Loader.load_info_handlers_module(&1.site))
+   end
++
++  @doc """
++  Creates a `Beacon.Content.JSHook`.
++
++  ## Example
++      iex> code = "export const MyHook = {mounted() {console.log(\"foo\")}}"
++      iex> beacon_js_hook_fixture(site: :my_site, name: "MyHook", code: code)
++      %Beacon.Content.JSHook{}
++
++  """
++  @spec beacon_js_hook_fixture(map() | Keyword.t()) :: Beacon.Content.JSHook.t()
++  def beacon_js_hook_fixture(attrs \\ %{}) do
++    name = attrs[:name] || attrs["name"] || "TestHook#{System.unique_integer([:positive])}"
++
++    attrs
++    |> Enum.into(%{
++      site: "my_site",
++      name: name,
++      code: """
++      export const #{name} = {
++        mounted() {
++          console.log("mounted")
++        }
++      }
++      """
++    })
++    |> Content.create_js_hook!()
++    |> tap(&Loader.load_runtime_js(&1.site))
++  end
+ end
+diff --git a/lib/beacon/web/components/layouts.ex b/lib/beacon/web/components/layouts.ex
+index b3469d7f0..3b7a3e3f6 100644
+--- a/lib/beacon/web/components/layouts.ex
++++ b/lib/beacon/web/components/layouts.ex
+@@ -28,7 +28,7 @@ defmodule Beacon.Web.Layouts do
+     hash =
+       cond do
+         asset == :css -> Beacon.RuntimeCSS.current_hash(site)
+-        asset == :js -> Beacon.RuntimeJS.current_hash()
++        asset == :js -> Beacon.RuntimeJS.current_hash(site)
+       end
+ 
+     path = Beacon.Router.sanitize_path("#{prefix}/__beacon_assets__/#{asset}-#{hash}")
+diff --git a/lib/beacon/web/controllers/assets_controller.ex b/lib/beacon/web/controllers/assets_controller.ex
+index f047b0ee3..91dc92194 100644
+--- a/lib/beacon/web/controllers/assets_controller.ex
++++ b/lib/beacon/web/controllers/assets_controller.ex
+@@ -81,7 +81,7 @@ defmodule Beacon.Web.AssetsController do
+   end
+ 
+   defp content_and_type(site, :js, :brotli) do
+-    body = Beacon.RuntimeJS.fetch(:brotli)
++    body = Beacon.RuntimeJS.fetch(site, :brotli)
+ 
+     if body do
+       %{body: body, type: "text/javascript", encoding: @brotli}
+@@ -90,12 +90,12 @@ defmodule Beacon.Web.AssetsController do
+     end
+   end
+ 
+-  defp content_and_type(_site, :js, :gzip) do
+-    %{body: Beacon.RuntimeJS.fetch(:gzip), type: "text/javascript", encoding: @gzip}
++  defp content_and_type(site, :js, :gzip) do
++    %{body: Beacon.RuntimeJS.fetch(site, :gzip), type: "text/javascript", encoding: @gzip}
+   end
+ 
+-  defp content_and_type(_site, :js, :deflate) do
+-    %{body: Beacon.RuntimeJS.fetch(:deflate), type: "text/javascript", encoding: nil}
++  defp content_and_type(site, :js, :deflate) do
++    %{body: Beacon.RuntimeJS.fetch(site, :deflate), type: "text/javascript", encoding: nil}
+   end
+ 
+   defp content_and_type(site, :css_config) do
+diff --git a/lib/mix/tasks/beacon.gen.tailwind_config.ex b/lib/mix/tasks/beacon.gen.tailwind_config.ex
+index 8479d00cd..04f4a8a85 100644
+--- a/lib/mix/tasks/beacon.gen.tailwind_config.ex
++++ b/lib/mix/tasks/beacon.gen.tailwind_config.ex
+@@ -94,7 +94,7 @@ defmodule Mix.Tasks.Beacon.Gen.TailwindConfig do
+       {:code,
+        Sourceror.parse_string!("""
+          [
+-           args: ~w(beacon.tailwind.config.js --bundle --format=esm --target=es2020 --outfile=../priv/beacon.tailwind.config.bundle.js),
++           args: ~w(beacon.tailwind.config.js --bundle --format=esm --target=es2016 --outfile=../priv/beacon.tailwind.config.bundle.js),
+            cd: Path.expand("../assets", __DIR__),
+            env: %{"NODE_PATH" => Path.expand("../deps", __DIR__)}
+          ]
+diff --git a/mix.exs b/mix.exs
+index 9b3147292..e4eb36b87 100644
+--- a/mix.exs
++++ b/mix.exs
+@@ -79,6 +79,7 @@ defmodule Beacon.MixProject do
+       {:safe_code, "~> 0.2"},
+       {:solid, "~> 0.14"},
+       {:tailwind, "~> 0.2"},
++      {:esbuild, "~> 0.5"},
+       {:igniter, "~> 0.5"},
+ 
+       # Dev, Test, Docs
+@@ -86,7 +87,6 @@ defmodule Beacon.MixProject do
+       {:bandit, "~> 1.0", only: :dev, optional: true},
+       {:phoenix_view, "~> 2.0", only: [:dev, :test]},
+       {:ex_doc, "~> 0.29", only: :dev, runtime: false},
+-      {:esbuild, "~> 0.5", only: :dev},
+       {:phoenix_live_reload, "~> 1.3", only: :dev},
+       {:bypass, "~> 2.1", only: :test},
+       {:phx_new, "~> 1.7", only: :test, runtime: false}
+@@ -140,7 +140,8 @@ defmodule Beacon.MixProject do
+         "Functions: Event Handlers": &(&1[:type] == :event_handlers),
+         "Functions: Error Pages": &(&1[:type] == :error_pages),
+         "Functions: Live Data": &(&1[:type] == :live_data),
+-        "Functions: Info Handlers": &(&1[:type] == :info_handlers)
++        "Functions: Info Handlers": &(&1[:type] == :info_handlers),
++        "Functions: JS Hooks": &(&1[:type] == :js_hooks)
+       ],
+       skip_undefined_reference_warnings_on: ["CHANGELOG.md"],
+       before_closing_body_tag: &before_closing_body_tag/1
+@@ -225,6 +226,7 @@ defmodule Beacon.MixProject do
+         Beacon.Content.ErrorPage,
+         Beacon.Content.EventHandler,
+         Beacon.Content.InfoHandler,
++        Beacon.Content.JSHook,
+         Beacon.Content.Layout,
+         Beacon.Content.LayoutEvent,
+         Beacon.Content.LayoutSnapshot,
+diff --git a/priv/static/beacon.js b/priv/static/beacon.js
+index e1202922a..648145a22 100644
+--- a/priv/static/beacon.js
++++ b/priv/static/beacon.js
+@@ -17,7 +17,11 @@ var Beacon = (() => {
+   });
+   var socketPath = document.querySelector("html").getAttribute("phx-socket") || "/live";
+   var csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content");
+-  var liveSocket = new LiveView.LiveSocket(socketPath, Phoenix.Socket, { params: { _csrf_token: csrfToken } });
++  var _a, _b;
++  var liveSocket = new LiveView.LiveSocket(socketPath, Phoenix.Socket, {
++    params: { _csrf_token: csrfToken },
++    hooks: (_b = (_a = window.BeaconHooks) == null ? void 0 : _a.default) != null ? _b : {}
++  });
+   liveSocket.connect();
+   window.liveSocket = liveSocket;
+ })();
+diff --git a/priv/static/beacon.min.js b/priv/static/beacon.min.js
+index 65bd13c07..4deacd509 100644
+--- a/priv/static/beacon.min.js
++++ b/priv/static/beacon.min.js
+@@ -1 +1 @@
+-var Beacon=(()=>{window.addEventListener("phx:beacon:page-updated",e=>{e.detail.hasOwnProperty("runtime_css_path")&&(document.getElementById("beacon-runtime-stylesheet").href=e.detail.runtime_css_path),e.detail.hasOwnProperty("meta_tags")&&(document.querySelectorAll("meta:not([name='csrf-token'])").forEach(t=>t.remove()),e.detail.meta_tags.forEach(t=>{let n=document.createElement("meta");Object.keys(t).forEach(a=>{n.setAttribute(a,t[a])}),document.getElementsByTagName("head")[0].appendChild(n)}))});var c=document.querySelector("html").getAttribute("phx-socket")||"/live",r=document.querySelector("meta[name='csrf-token']").getAttribute("content"),o=new LiveView.LiveSocket(c,Phoenix.Socket,{params:{_csrf_token:r}});o.connect();window.liveSocket=o;})();
++var Beacon=(()=>{window.addEventListener("phx:beacon:page-updated",e=>{e.detail.hasOwnProperty("runtime_css_path")&&(document.getElementById("beacon-runtime-stylesheet").href=e.detail.runtime_css_path),e.detail.hasOwnProperty("meta_tags")&&(document.querySelectorAll("meta:not([name='csrf-token'])").forEach(t=>t.remove()),e.detail.meta_tags.forEach(t=>{let o=document.createElement("meta");Object.keys(t).forEach(n=>{o.setAttribute(n,t[n])}),document.getElementsByTagName("head")[0].appendChild(o)}))});var i=document.querySelector("html").getAttribute("phx-socket")||"/live",l=document.querySelector("meta[name='csrf-token']").getAttribute("content"),a,c,r=new LiveView.LiveSocket(i,Phoenix.Socket,{params:{_csrf_token:l},hooks:(c=(a=window.BeaconHooks)==null?void 0:a.default)!=null?c:{}});r.connect();window.liveSocket=r;})();
+diff --git a/priv/tailwind.config.bundle.js b/priv/tailwind.config.bundle.js
+index 3983c6787..1e571b3a8 100644
+--- a/priv/tailwind.config.bundle.js
++++ b/priv/tailwind.config.bundle.js
+@@ -1,4 +1,23 @@
++var __defProp = Object.defineProperty;
++var __defProps = Object.defineProperties;
++var __getOwnPropDescs = Object.getOwnPropertyDescriptors;
+ var __getOwnPropNames = Object.getOwnPropertyNames;
++var __getOwnPropSymbols = Object.getOwnPropertySymbols;
++var __hasOwnProp = Object.prototype.hasOwnProperty;
++var __propIsEnum = Object.prototype.propertyIsEnumerable;
++var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
++var __spreadValues = (a, b) => {
++  for (var prop in b || (b = {}))
++    if (__hasOwnProp.call(b, prop))
++      __defNormalProp(a, prop, b[prop]);
++  if (__getOwnPropSymbols)
++    for (var prop of __getOwnPropSymbols(b)) {
++      if (__propIsEnum.call(b, prop))
++        __defNormalProp(a, prop, b[prop]);
++    }
++  return a;
++};
++var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
+ var __commonJS = (cb, mod) => function __require() {
+   return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
+ };
+@@ -223,8 +242,7 @@ var require_config_full = __commonJS({
+       darkMode: "media",
+       // or 'class'
+       theme: {
+-        accentColor: ({ theme }) => ({
+-          ...theme("colors"),
++        accentColor: ({ theme }) => __spreadProps(__spreadValues({}, theme("colors")), {
+           auto: "auto"
+         }),
+         animation: {
+@@ -299,8 +317,7 @@ var require_config_full = __commonJS({
+           "2xl": "40px",
+           "3xl": "64px"
+         },
+-        borderColor: ({ theme }) => ({
+-          ...theme("colors"),
++        borderColor: ({ theme }) => __spreadProps(__spreadValues({}, theme("colors")), {
+           DEFAULT: theme("colors.gray.200", "currentColor")
+         }),
+         borderOpacity: ({ theme }) => theme("opacity"),
+@@ -315,9 +332,7 @@ var require_config_full = __commonJS({
+           "3xl": "1.5rem",
+           full: "9999px"
+         },
+-        borderSpacing: ({ theme }) => ({
+-          ...theme("spacing")
+-        }),
++        borderSpacing: ({ theme }) => __spreadValues({}, theme("spacing")),
+         borderWidth: {
+           DEFAULT: "1px",
+           0: "0px",
+@@ -470,19 +485,18 @@ var require_config_full = __commonJS({
+           "2xl": "0 25px 25px rgb(0 0 0 / 0.15)",
+           none: "0 0 #0000"
+         },
+-        fill: ({ theme }) => ({
+-          none: "none",
+-          ...theme("colors")
+-        }),
++        fill: ({ theme }) => __spreadValues({
++          none: "none"
++        }, theme("colors")),
+         flex: {
+           1: "1 1 0%",
+           auto: "1 1 auto",
+           initial: "0 1 auto",
+           none: "none"
+         },
+-        flexBasis: ({ theme }) => ({
+-          auto: "auto",
+-          ...theme("spacing"),
++        flexBasis: ({ theme }) => __spreadProps(__spreadValues({
++          auto: "auto"
++        }, theme("spacing")), {
+           "1/2": "50%",
+           "1/3": "33.333333%",
+           "2/3": "66.666667%",
+@@ -736,9 +750,9 @@ var require_config_full = __commonJS({
+           11: "repeat(11, minmax(0, 1fr))",
+           12: "repeat(12, minmax(0, 1fr))"
+         },
+-        height: ({ theme }) => ({
+-          auto: "auto",
+-          ...theme("spacing"),
++        height: ({ theme }) => __spreadProps(__spreadValues({
++          auto: "auto"
++        }, theme("spacing")), {
+           "1/2": "50%",
+           "1/3": "33.333333%",
+           "2/3": "66.666667%",
+@@ -771,9 +785,9 @@ var require_config_full = __commonJS({
+           90: "90deg",
+           180: "180deg"
+         },
+-        inset: ({ theme }) => ({
+-          auto: "auto",
+-          ...theme("spacing"),
++        inset: ({ theme }) => __spreadProps(__spreadValues({
++          auto: "auto"
++        }, theme("spacing")), {
+           "1/2": "50%",
+           "1/3": "33.333333%",
+           "2/3": "66.666667%",
+@@ -846,10 +860,9 @@ var require_config_full = __commonJS({
+         listStyleImage: {
+           none: "none"
+         },
+-        margin: ({ theme }) => ({
+-          auto: "auto",
+-          ...theme("spacing")
+-        }),
++        margin: ({ theme }) => __spreadValues({
++          auto: "auto"
++        }, theme("spacing")),
+         lineClamp: {
+           1: "1",
+           2: "2",
+@@ -858,8 +871,7 @@ var require_config_full = __commonJS({
+           5: "5",
+           6: "6"
+         },
+-        maxHeight: ({ theme }) => ({
+-          ...theme("spacing"),
++        maxHeight: ({ theme }) => __spreadProps(__spreadValues({}, theme("spacing")), {
+           none: "none",
+           full: "100%",
+           screen: "100vh",
+@@ -870,8 +882,7 @@ var require_config_full = __commonJS({
+           max: "max-content",
+           fit: "fit-content"
+         }),
+-        maxWidth: ({ theme, breakpoints }) => ({
+-          ...theme("spacing"),
++        maxWidth: ({ theme, breakpoints }) => __spreadValues(__spreadProps(__spreadValues({}, theme("spacing")), {
+           none: "none",
+           xs: "20rem",
+           sm: "24rem",
+@@ -888,11 +899,9 @@ var require_config_full = __commonJS({
+           min: "min-content",
+           max: "max-content",
+           fit: "fit-content",
+-          prose: "65ch",
+-          ...breakpoints(theme("screens"))
+-        }),
+-        minHeight: ({ theme }) => ({
+-          ...theme("spacing"),
++          prose: "65ch"
++        }), breakpoints(theme("screens"))),
++        minHeight: ({ theme }) => __spreadProps(__spreadValues({}, theme("spacing")), {
+           full: "100%",
+           screen: "100vh",
+           svh: "100svh",
+@@ -902,8 +911,7 @@ var require_config_full = __commonJS({
+           max: "max-content",
+           fit: "fit-content"
+         }),
+-        minWidth: ({ theme }) => ({
+-          ...theme("spacing"),
++        minWidth: ({ theme }) => __spreadProps(__spreadValues({}, theme("spacing")), {
+           full: "100%",
+           min: "min-content",
+           max: "max-content",
+@@ -978,10 +986,9 @@ var require_config_full = __commonJS({
+         padding: ({ theme }) => theme("spacing"),
+         placeholderColor: ({ theme }) => theme("colors"),
+         placeholderOpacity: ({ theme }) => theme("opacity"),
+-        ringColor: ({ theme }) => ({
+-          DEFAULT: theme("colors.blue.500", "#3b82f6"),
+-          ...theme("colors")
+-        }),
++        ringColor: ({ theme }) => __spreadValues({
++          DEFAULT: theme("colors.blue.500", "#3b82f6")
++        }, theme("colors")),
+         ringOffsetColor: ({ theme }) => theme("colors"),
+         ringOffsetWidth: {
+           0: "0px",
+@@ -990,10 +997,9 @@ var require_config_full = __commonJS({
+           4: "4px",
+           8: "8px"
+         },
+-        ringOpacity: ({ theme }) => ({
+-          DEFAULT: "0.5",
+-          ...theme("opacity")
+-        }),
++        ringOpacity: ({ theme }) => __spreadValues({
++          DEFAULT: "0.5"
++        }, theme("opacity")),
+         ringWidth: {
+           DEFAULT: "3px",
+           0: "0px",
+@@ -1039,9 +1045,7 @@ var require_config_full = __commonJS({
+           xl: "1280px",
+           "2xl": "1536px"
+         },
+-        scrollMargin: ({ theme }) => ({
+-          ...theme("spacing")
+-        }),
++        scrollMargin: ({ theme }) => __spreadValues({}, theme("spacing")),
+         scrollPadding: ({ theme }) => theme("spacing"),
+         sepia: {
+           0: "0",
+@@ -1055,9 +1059,7 @@ var require_config_full = __commonJS({
+           6: "6deg",
+           12: "12deg"
+         },
+-        space: ({ theme }) => ({
+-          ...theme("spacing")
+-        }),
++        space: ({ theme }) => __spreadValues({}, theme("spacing")),
+         spacing: {
+           px: "1px",
+           0: "0px",
+@@ -1095,10 +1097,9 @@ var require_config_full = __commonJS({
+           80: "20rem",
+           96: "24rem"
+         },
+-        stroke: ({ theme }) => ({
+-          none: "none",
+-          ...theme("colors")
+-        }),
++        stroke: ({ theme }) => __spreadValues({
++          none: "none"
++        }, theme("colors")),
+         strokeWidth: {
+           0: "0",
+           1: "1",
+@@ -1117,9 +1118,7 @@ var require_config_full = __commonJS({
+           4: "4px",
+           8: "8px"
+         },
+-        textIndent: ({ theme }) => ({
+-          ...theme("spacing")
+-        }),
++        textIndent: ({ theme }) => __spreadValues({}, theme("spacing")),
+         textOpacity: ({ theme }) => theme("opacity"),
+         textUnderlineOffset: {
+           auto: "auto",
+@@ -1179,8 +1178,7 @@ var require_config_full = __commonJS({
+           out: "cubic-bezier(0, 0, 0.2, 1)",
+           "in-out": "cubic-bezier(0.4, 0, 0.2, 1)"
+         },
+-        translate: ({ theme }) => ({
+-          ...theme("spacing"),
++        translate: ({ theme }) => __spreadProps(__spreadValues({}, theme("spacing")), {
+           "1/2": "50%",
+           "1/3": "33.333333%",
+           "2/3": "66.666667%",
+@@ -1189,9 +1187,9 @@ var require_config_full = __commonJS({
+           "3/4": "75%",
+           full: "100%"
+         }),
+-        size: ({ theme }) => ({
+-          auto: "auto",
+-          ...theme("spacing"),
++        size: ({ theme }) => __spreadProps(__spreadValues({
++          auto: "auto"
++        }, theme("spacing")), {
+           "1/2": "50%",
+           "1/3": "33.333333%",
+           "2/3": "66.666667%",
+@@ -1223,9 +1221,9 @@ var require_config_full = __commonJS({
+           max: "max-content",
+           fit: "fit-content"
+         }),
+-        width: ({ theme }) => ({
+-          auto: "auto",
+-          ...theme("spacing"),
++        width: ({ theme }) => __spreadProps(__spreadValues({
++          auto: "auto"
++        }, theme("spacing")), {
+           "1/2": "50%",
+           "1/3": "33.333333%",
+           "2/3": "66.666667%",
+@@ -4225,7 +4223,7 @@ var require_styles = __commonJS({
+         }
+       }
+     };
+-    module.exports = {
++    module.exports = __spreadValues({
+       DEFAULT: {
+         css: [
+           {
+@@ -4459,9 +4457,8 @@ var require_styles = __commonJS({
+           defaultModifiers.gray.css,
+           ...defaultModifiers.base.css
+         ]
+-      },
+-      ...defaultModifiers
+-    };
++      }
++    }, defaultModifiers);
+   }
+ });
+ 
+@@ -8092,7 +8089,7 @@ var require_utils = __commonJS({
+           if (!pseudos) {
+             continue;
+           }
+-          let values = new Set(pseudos.map((p) => p.value));
++          let values = /* @__PURE__ */ new Set([...pseudos.map((p) => p.value)]);
+           if (values.size > 1) {
+             break;
+           }
+diff --git a/test/beacon/content/js_hook_test.exs b/test/beacon/content/js_hook_test.exs
+new file mode 100644
+index 000000000..18cd51106
+--- /dev/null
++++ b/test/beacon/content/js_hook_test.exs
+@@ -0,0 +1,133 @@
++defmodule Beacon.Content.JSHookTest do
++  use Beacon.DataCase, async: true
++  use Beacon.Test, site: :my_site
++
++  alias Beacon.Content.JSHook
++
++  describe "validate_code" do
++    test "success (named hook)" do
++      attrs = %{
++        site: default_site(),
++        name: "FooHook",
++        code: """
++        export const FooHook = {
++          mounted() {
++            console.log("mounted");
++          }
++        }
++        """
++      }
++
++      changeset = JSHook.changeset(%JSHook{}, attrs)
++
++      assert changeset.valid? == true
++      assert changeset.errors == []
++    end
++
++    test "success (default hook)" do
++      attrs = %{
++        site: default_site(),
++        name: "FooHook",
++        code: """
++        const BarHook = { mounted() { console.log("mounted") } }
++
++        export default BarHook
++        """
++      }
++
++      changeset = JSHook.changeset(%JSHook{}, attrs)
++
++      assert changeset.valid? == true
++      assert changeset.errors == []
++    end
++
++    test "success (object)" do
++      attrs = %{
++        site: default_site(),
++        name: "FooHook",
++        code: """
++        const FooHook = { mounted() { console.log("mounted") } }
++
++        export { FooHook };
++        """
++      }
++
++      changeset = JSHook.changeset(%JSHook{}, attrs)
++
++      assert changeset.valid? == true
++      assert changeset.errors == []
++    end
++
++    test "error (name mismatch)" do
++      attrs = %{
++        site: default_site(),
++        name: "FooHook",
++        code: """
++        export const BarHook = {
++          mounted() {
++            console.log("mounted");
++          }
++        }
++        """
++      }
++
++      changeset = JSHook.changeset(%JSHook{}, attrs)
++
++      assert changeset.valid? == false
++      assert changeset.errors == [name: {"does not match export", [export: "BarHook"]}]
++    end
++
++    test "error (no export)" do
++      attrs = %{
++        site: default_site(),
++        name: "FooHook",
++        code: """
++        const FooHook = {
++          mounted() {
++            console.log("mounted");
++          }
++        }
++        """
++      }
++
++      changeset = JSHook.changeset(%JSHook{}, attrs)
++
++      assert changeset.valid? == false
++      assert changeset.errors == [code: {"no export found", []}]
++    end
++
++    test "error (mutliple exports)" do
++      attrs = %{
++        site: default_site(),
++        name: "FooHook",
++        code: """
++        export const FooHook = { mounted() { console.log("foo") } }
++        export const BarHook = { mounted() { console.log("bar") } }
++        """
++      }
++
++      changeset = JSHook.changeset(%JSHook{}, attrs)
++
++      assert changeset.valid? == false
++      assert changeset.errors == [code: {"multiple exports are not allowed", []}]
++    end
++
++    test "error (multiple hooks in export)" do
++      attrs = %{
++        site: default_site(),
++        name: "FooHook",
++        code: """
++        const FooHook = { mounted() { console.log("foo") } }
++        const BarHook = { mounted() { console.log("bar") } }
++
++        export { FooHook, BarHook }
++        """
++      }
++
++      changeset = JSHook.changeset(%JSHook{}, attrs)
++
++      assert changeset.valid? == false
++      assert changeset.errors == [code: {"multiple exports are not allowed", []}]
++    end
++  end
++end
+diff --git a/test/beacon/content_test.exs b/test/beacon/content_test.exs
+index 6be403d9a..74e60ced2 100644
+--- a/test/beacon/content_test.exs
++++ b/test/beacon/content_test.exs
+@@ -8,6 +8,7 @@ defmodule Beacon.ContentTest do
+   alias Beacon.Content.ErrorPage
+   alias Beacon.Content.EventHandler
+   alias Beacon.Content.InfoHandler
++  alias Beacon.Content.JSHook
+   alias Beacon.Content.Layout
+   alias Beacon.Content.LayoutEvent
+   alias Beacon.Content.LayoutSnapshot
+@@ -456,6 +457,53 @@ defmodule Beacon.ContentTest do
+     end
+   end
+ 
++  describe "js hooks" do
++    test "create_js_hook/1" do
++      attrs = %{
++        site: :my_site,
++        name: "FooHook",
++        code: """
++        export const FooHook = {
++          mounted() {
++            console.log("foo")
++          }
++        }
++        """
++      }
++
++      assert {:ok, js_hook} = Content.create_js_hook(attrs)
++      assert %JSHook{name: "FooHook"} = js_hook
++    end
++
++    test "get_js_hook_by/3" do
++      js_hook = beacon_js_hook_fixture(name: "TestHook")
++
++      assert Content.get_js_hook_by(:my_site, name: "TestHook") == js_hook
++    end
++
++    test "list_js_hooks/1" do
++      js_hooks = for i <- 1..3, do: beacon_js_hook_fixture(site: :my_site, name: "Hook#{i}")
++
++      result = Content.list_js_hooks(:my_site)
++
++      assert Enum.sort(js_hooks) == Enum.sort(result)
++    end
++
++    test "update_js_hook/2" do
++      js_hook = beacon_js_hook_fixture()
++      attrs = %{name: "Changed", code: "export const Changed = { mounted() {} }"}
++
++      assert {:ok, updated_js_hook} = Content.update_js_hook(js_hook, attrs)
++      assert %JSHook{name: "Changed", code: "export const Changed = { mounted() {} }"} = updated_js_hook
++    end
++
++    test "delete_js_hook/1" do
++      %{id: id} = js_hook = beacon_js_hook_fixture()
++
++      assert {:ok, %{id: ^id}} = Content.delete_js_hook(js_hook)
++    end
++  end
++
+   describe "snippets" do
+     test "create_snippet_helper/1" do
+       attrs = %{site: :my_site, name: "foo_snippet", body: "page title is {{ page.title }}"}
+diff --git a/test/beacon/runtime_js_test.exs b/test/beacon/runtime_js_test.exs
+index 918a133d3..b8225cbf2 100644
+--- a/test/beacon/runtime_js_test.exs
++++ b/test/beacon/runtime_js_test.exs
+@@ -3,17 +3,122 @@ defmodule Beacon.RuntimeJSTest do
+ 
+   alias Beacon.RuntimeJS
+ 
++  @site :my_site
++
+   test "load" do
+-    assert RuntimeJS.load!() == :ok
++    assert RuntimeJS.load!(@site) == :ok
+   end
+ 
+   test "fetch defaults to compressed" do
+-    RuntimeJS.load!()
+-    assert RuntimeJS.fetch() |> :erlang.size() > 100
++    RuntimeJS.load!(@site)
++    assert RuntimeJS.fetch(@site) |> :erlang.size() > 100
+   end
+ 
+   test "fetch uncompressed deflate" do
+-    RuntimeJS.load!()
+-    assert RuntimeJS.fetch(:deflate) =~ "Beacon"
++    RuntimeJS.load!(@site)
++    assert RuntimeJS.fetch(@site, :deflate) =~ "Beacon"
++  end
++
++  describe "build/1" do
++    setup do
++      beacon_js_hook_fixture(
++        name: "CloseOnGlobalClick",
++        code: ~S"""
++        const MyHook = {
++          mounted() {
++            this.button = this.el.querySelector("button");
++            this.handle = () => {
++              if (this.button.matches("[data-opened]")) {
++                this.button.click();
++              }
++            };
++            window.addEventListener("click", this.handle);
++          },
++
++          destroyed() {
++            window.removeEventListener("click", this.handle);
++          },
++        };
++
++        export default MyHook;
++        """
++      )
++
++      beacon_js_hook_fixture(
++        name: "InvalidZipDisplay",
++        code: ~S"""
++        export const InvalidZipDisplay = {
++          mounted() {
++            this.handleEvent("invalid-zip", e => {
++              this.el.setCustomValidity(e.message);
++            })
++            this.handleEvent("valid-zip", e => {
++              this.el.setCustomValidity('');
++            })
++          }
++        }
++        """
++      )
++
++      :ok
++    end
++
++    test "success" do
++      js = RuntimeJS.build(@site)
++
++      assert js =~
++               """
++                 var hooks_exports = {};
++                 __export(hooks_exports, {
++                   default: () => hooks_default
++                 });
++               """
++
++      assert js =~
++               """
++                 var InvalidZipDisplay = {
++                   mounted() {
++                     this.handleEvent(\"invalid-zip\", (e) => {
++                       this.el.setCustomValidity(e.message);
++                     });
++                     this.handleEvent(\"valid-zip\", (e) => {
++                       this.el.setCustomValidity(\"\");
++                     });
++                   }
++                 };
++               """
++
++      assert js =~
++               """
++                 var MyHook = {
++                   mounted() {
++                     this.button = this.el.querySelector(\"button\");
++                     this.handle = () => {
++                       if (this.button.matches(\"[data-opened]\")) {
++                         this.button.click();
++                       }
++                     };
++                     window.addEventListener(\"click\", this.handle);
++                   },
++                   destroyed() {
++                     window.removeEventListener(\"click\", this.handle);
++                   }
++                 };
++                 var CloseOnGlobalClick_default = MyHook;
++               """
++
++      assert js =~
++               """
++                 var hooks_default = {
++                   InvalidZipDisplay,
++                   CloseOnGlobalClick: CloseOnGlobalClick_default
++                 };
++               """
++
++      assert js =~
++               """
++                 return __toCommonJS(hooks_exports);
++               """
++    end
+   end
+ end
+diff --git a/test/mix/tasks/gen_tailwind_config_test.exs b/test/mix/tasks/gen_tailwind_config_test.exs
+index cbe85b579..bbc2838cf 100644
+--- a/test/mix/tasks/gen_tailwind_config_test.exs
++++ b/test/mix/tasks/gen_tailwind_config_test.exs
+@@ -23,7 +23,7 @@ defmodule Mix.Tasks.Beacon.GenTailwindConfigTest do
+     |> assert_has_patch("config/config.exs", """
+        41 + |  ],
+        42 + |  beacon_tailwind_config: [
+-       43 + |    args: ~w(beacon.tailwind.config.js --bundle --format=esm --target=es2020 --outfile=../priv/beacon.tailwind.config.bundle.js),
++       43 + |    args: ~w(beacon.tailwind.config.js --bundle --format=esm --target=es2016 --outfile=../priv/beacon.tailwind.config.bundle.js),
+        44 + |    cd: Path.expand("../assets", __DIR__),
+        45 + |    env: %{"NODE_PATH" => Path.expand("../deps", __DIR__)}
+     41 46   |  ]

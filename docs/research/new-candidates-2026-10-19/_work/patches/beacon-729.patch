@@ -1,0 +1,241 @@
+From fdb7c12c978b380b91eb910f5f32ab4fd5901e4d Mon Sep 17 00:00:00 2001
+From: Leandro Pereira <leandro@leandro.io>
+Date: Thu, 16 Jan 2025 13:19:57 -0500
+Subject: [PATCH 1/3] fix: crash recovery
+
+Start Beacon before Endpoint so requests are blocked until the host app
+is ready to accept them, otherwise we expose Beacon to race conditions
+causing blank pages and boot errors.
+---
+ dev.exs                           |  4 ++--
+ guides/general/troubleshooting.md |  5 -----
+ guides/upgrading/v0.4.0.md        | 19 +++++++++++++++++++
+ lib/beacon/beacon.ex              | 13 ++++++-------
+ lib/beacon/private.ex             | 22 ++++++++++++++++++++++
+ lib/beacon/router.ex              |  7 ++++---
+ lib/mix/tasks/beacon.gen.site.ex  |  3 ++-
+ test/mix/tasks/gen_site_test.exs  |  9 +++++++--
+ 8 files changed, 62 insertions(+), 20 deletions(-)
+ create mode 100644 guides/upgrading/v0.4.0.md
+
+diff --git a/dev.exs b/dev.exs
+index 121520be2..e69216155 100644
+--- a/dev.exs
++++ b/dev.exs
+@@ -1220,8 +1220,8 @@ Task.start(fn ->
+   children = [
+     Demo.Repo,
+     {Phoenix.PubSub, [name: Demo.PubSub]},
+-    DemoWeb.Endpoint,
+-    {Beacon, sites: [dev_site, dy_site]}
++    {Beacon, sites: [dev_site, dy_site]},
++    DemoWeb.Endpoint
+   ]
+ 
+   {:ok, _} = Supervisor.start_link(children, strategy: :one_for_one)
+diff --git a/guides/general/troubleshooting.md b/guides/general/troubleshooting.md
+index 83cc56f85..66e518cf6 100644
+--- a/guides/general/troubleshooting.md
++++ b/guides/general/troubleshooting.md
+@@ -41,8 +41,3 @@ Note that if you're using `:host` on the scope and running in `localhost`,
+ consider adding `"localhost"` to the list of allowed hosts.
+ 
+ Also check the [Beacon.Router](https://hexdocs.pm/beacon/Beacon.Router.html) for more information.
+-
+-## RuntimeError - could not find persistent term for endpoint
+-
+-`Beacon` should be started after your host's `Endpoint`, please review the application children
+-and make sure is declared after the endpoint.
+diff --git a/guides/upgrading/v0.4.0.md b/guides/upgrading/v0.4.0.md
+new file mode 100644
+index 000000000..3d635acc7
+--- /dev/null
++++ b/guides/upgrading/v0.4.0.md
+@@ -0,0 +1,19 @@
++# Upgrading to v0.4.0
++
++## Move `Beacon` before the endpoint in application.ex
++
++Open the file `application.ex`, find the Beacon tuple in the list of `children`,
++and move it to before the endpoint(s) declarations:
++
++```elixir
++@impl true
++def start(_type, _args) do
++  children = [
++    # ...
++    {Beacon, [sites: [Application.fetch_env!(:beacon, :my_site)]]}, # <- moved to before `MyAppWeb.Endpoint`
++    MyAppWeb.Endpoint
++  ]
++```
++
++In v0.3.0 the order was inverted which caused a regression on crash recoveries.
++
+diff --git a/lib/beacon/beacon.ex b/lib/beacon/beacon.ex
+index 0636d24ea..53322c785 100644
+--- a/lib/beacon/beacon.ex
++++ b/lib/beacon/beacon.ex
+@@ -58,13 +58,12 @@ defmodule Beacon do
+         children = [
+           MyApp.Repo,
+           {Phoenix.PubSub, name: MyApp.PubSub},
+-          MyAppWeb.Endpoint,
+-          {Beacon,
+-           [
+-             sites: [
+-               Application.fetch_env!(:beacon, :my_site)
+-             ]
+-           ]}
++          {Beacon, [
++            sites: [
++              Application.fetch_env!(:beacon, :my_site)
++            ]
++          ]},
++          MyAppWeb.Endpoint
+         ]
+ 
+         opts = [strategy: :one_for_one, name: MyApp.Supervisor]
+diff --git a/lib/beacon/private.ex b/lib/beacon/private.ex
+index 673194b7a..35c91571f 100644
+--- a/lib/beacon/private.ex
++++ b/lib/beacon/private.ex
+@@ -6,6 +6,15 @@ defmodule Beacon.Private do
+ 
+   # Should be avoided as much as possible.
+ 
++  @doc """
++  Fetch the host app `:otp_app` from the Repo config.
++  """
++  def otp_app!(%Beacon.Config{repo: repo}) do
++    repo.config()[:otp_app] || raise Beacon.RuntimeError, "failed to discover :otp_app"
++  rescue
++    _ -> reraise Beacon.RuntimeError, [message: "failed to discover :otp_app, make sure Repo is started before Beacon"], __STACKTRACE__
++  end
++
+   @phoenix_live_view_version to_string(Application.spec(:phoenix_live_view)[:vsn])
+ 
+   @doc """
+@@ -48,4 +57,17 @@ defmodule Beacon.Private do
+       Phoenix.LiveView.Route.live_link_info(endpoint, router, url)
+     end
+   end
++
++  def endpoint_config(otp_app, endpoint) do
++    Phoenix.Endpoint.Supervisor.config(otp_app, endpoint)[:url]
++  end
++
++  def endpoint_host(otp_app, endpoint) do
++    url_config = endpoint_config(otp_app, endpoint)[:url]
++    host_to_binary(url_config[:host] || "localhost")
++  end
++
++  # https://github.com/phoenixframework/phoenix/blob/4ebefb9d1f710c576f08c517f5852498dd9b935c/lib/phoenix/endpoint/supervisor.ex#L301-L302
++  defp host_to_binary({:system, env_var}), do: host_to_binary(System.get_env(env_var))
++  defp host_to_binary(host), do: host
+ end
+diff --git a/lib/beacon/router.ex b/lib/beacon/router.ex
+index 9bbfbc69d..9fe845c59 100644
+--- a/lib/beacon/router.ex
++++ b/lib/beacon/router.ex
+@@ -257,15 +257,16 @@ defmodule Beacon.Router do
+   #
+   # It's considered reachable if a dynamic page can be served on the site prefix.
+   def reachable?(%Beacon.Config{} = config, opts \\ []) do
++    otp_app = Beacon.Private.otp_app!(config)
+     %{site: site, endpoint: endpoint, router: router} = config
+-    reachable?(site, endpoint, router, opts)
++    reachable?(site, endpoint, router, otp_app, opts)
+   rescue
+     # missing router or missing beacon macros in the router
+     _ -> false
+   end
+ 
+-  defp reachable?(site, endpoint, router, opts) do
+-    host = Keyword.get_lazy(opts, :host, fn -> endpoint.host() end)
++  defp reachable?(site, endpoint, router, otp_app, opts) do
++    host = Keyword.get_lazy(opts, :host, fn -> Beacon.Private.endpoint_host(otp_app, endpoint) end)
+ 
+     prefix =
+       Keyword.get_lazy(opts, :prefix, fn ->
+diff --git a/lib/mix/tasks/beacon.gen.site.ex b/lib/mix/tasks/beacon.gen.site.ex
+index 1be5e7a50..00443a7b3 100644
+--- a/lib/mix/tasks/beacon.gen.site.ex
++++ b/lib/mix/tasks/beacon.gen.site.ex
+@@ -188,7 +188,8 @@ defmodule Mix.Tasks.Beacon.Gen.Site do
+         quote do
+           [sites: [Application.fetch_env!(:beacon, unquote(site))]]
+         end}},
+-      after: [repo, endpoint],
++      after: [repo],
++      before: [endpoint],
+       opts_updater: fn zipper ->
+         with {:ok, zipper} <-
+                Igniter.Code.Keyword.put_in_keyword(
+diff --git a/test/mix/tasks/gen_site_test.exs b/test/mix/tasks/gen_site_test.exs
+index e570203e5..4cf20c31d 100644
+--- a/test/mix/tasks/gen_site_test.exs
++++ b/test/mix/tasks/gen_site_test.exs
+@@ -137,8 +137,13 @@ defmodule Mix.Tasks.Beacon.GenSiteTest do
+       project
+       |> Igniter.compose_task("beacon.gen.site", @opts_my_site)
+       |> assert_has_patch("lib/test/application.ex", """
+-      20 + |      TestWeb.Endpoint,
+-      21 + |      {Beacon, [sites: [Application.fetch_env!(:beacon, :my_site)]]}
++            ...|
++       12 12   |      Test.Repo,
++       13 13   |      {DNSCluster, query: Application.get_env(:test, :dns_cluster_query) || :ignore},
++          14 + |      {Beacon, [sites: [Application.fetch_env!(:beacon, :my_site)]]},
++       14 15   |      {Phoenix.PubSub, name: Test.PubSub},
++       15 16   |      # Start the Finch HTTP client for sending emails
++            ...|
+       """)
+     end
+ 
+
+From e571d460db2d44d287152ecd5fdbe63b4e4be392 Mon Sep 17 00:00:00 2001
+From: Leandro Pereira <leandro@leandro.io>
+Date: Thu, 16 Jan 2025 13:22:40 -0500
+Subject: [PATCH 2/3] fix config
+
+---
+ lib/beacon/private.ex | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/beacon/private.ex b/lib/beacon/private.ex
+index 35c91571f..ccd5e97a1 100644
+--- a/lib/beacon/private.ex
++++ b/lib/beacon/private.ex
+@@ -59,7 +59,7 @@ defmodule Beacon.Private do
+   end
+ 
+   def endpoint_config(otp_app, endpoint) do
+-    Phoenix.Endpoint.Supervisor.config(otp_app, endpoint)[:url]
++    Phoenix.Endpoint.Supervisor.config(otp_app, endpoint)
+   end
+ 
+   def endpoint_host(otp_app, endpoint) do
+
+From 49cd8f5043b617e7f38cca90b625287ae767034e Mon Sep 17 00:00:00 2001
+From: Leandro Pereira <leandro@leandro.io>
+Date: Thu, 16 Jan 2025 13:44:58 -0500
+Subject: [PATCH 3/3] fix test
+
+---
+ test/mix/tasks/gen_site_test.exs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/test/mix/tasks/gen_site_test.exs b/test/mix/tasks/gen_site_test.exs
+index 4cf20c31d..170dff352 100644
+--- a/test/mix/tasks/gen_site_test.exs
++++ b/test/mix/tasks/gen_site_test.exs
+@@ -153,8 +153,8 @@ defmodule Mix.Tasks.Beacon.GenSiteTest do
+       |> apply_igniter!()
+       |> Igniter.compose_task("beacon.gen.site", @opts_other_site)
+       |> assert_has_patch("lib/test/application.ex", """
+-      21    - |      {Beacon, [sites: [Application.fetch_env!(:beacon, :my_site)]]}
+-         21 + |      {Beacon, [sites: [Application.fetch_env!(:beacon, :my_site), Application.fetch_env!(:beacon, :other)]]}
++      14    - |      {Beacon, [sites: [Application.fetch_env!(:beacon, :my_site)]]},
++         14 + |      {Beacon, [sites: [Application.fetch_env!(:beacon, :my_site), Application.fetch_env!(:beacon, :other)]]},
+       """)
+     end
+   end

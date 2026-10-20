@@ -1,0 +1,75 @@
+diff --git a/lib/absinthe/phase/document/validation/one_of_directive.ex b/lib/absinthe/phase/document/validation/one_of_directive.ex
+index 153123d530..d13b35fa60 100644
+--- a/lib/absinthe/phase/document/validation/one_of_directive.ex
++++ b/lib/absinthe/phase/document/validation/one_of_directive.ex
+@@ -7,22 +7,18 @@ defmodule Absinthe.Phase.Document.Validation.OneOfDirective do
+   use Absinthe.Phase
+ 
+   alias Absinthe.Blueprint
+-  alias Absinthe.Blueprint.Input.Argument
+   alias Absinthe.Blueprint.Input.Object
+   alias Absinthe.Phase.Error
++  alias Absinthe.Type
+ 
+   def run(blueprint, _options \\ []) do
+     {:ok, Blueprint.prewalk(blueprint, &process/1)}
+   end
+ 
+-  # Ignore input objects without schema nodes
+-  defp process(%Argument{input_value: %{normalized: %Object{schema_node: nil}}} = node), do: node
+-
+-  defp process(%Argument{input_value: %{normalized: %Object{} = object}} = node) do
+-    if Keyword.has_key?(object.schema_node.__private__, :one_of) and
+-         field_count(object.fields) != 1 do
++  defp process(%Object{schema_node: %Type.InputObject{__private__: private} = schema_node} = node) do
++    if Keyword.has_key?(private, :one_of) and field_count(node.fields) != 1 do
+       message =
+-        ~s[The Input Type "#{object.schema_node.name}" has the @oneOf directive. It must have exactly one non-null field.]
++        ~s[The Input Type "#{schema_node.name}" has the @oneOf directive. It must have exactly one non-null field.]
+ 
+       error = %Error{locations: [node.source_location], message: message, phase: __MODULE__}
+       put_error(node, error)
+diff --git a/test/absinthe/phase/document/validation/one_of_directive_test.exs b/test/absinthe/phase/document/validation/one_of_directive_test.exs
+index c299759ca0..647539fdfb 100644
+--- a/test/absinthe/phase/document/validation/one_of_directive_test.exs
++++ b/test/absinthe/phase/document/validation/one_of_directive_test.exs
+@@ -13,6 +13,7 @@ defmodule Absinthe.Phase.Document.Validation.OneOfDirectiveTest do
+     query do
+       field :valid, :boolean do
+         arg :input, :valid_input
++        arg :inputs, list_of(:valid_input)
+         resolve fn _, _ -> {:ok, true} end
+       end
+     end
+@@ -53,21 +54,28 @@ defmodule Absinthe.Phase.Document.Validation.OneOfDirectiveTest do
+     test "with both inline args" do
+       query = ~s[query { valid(input: {id: 1, name: "a"}) }]
+       assert {:ok, %{errors: [error]} = result} = Absinthe.run(query, Schema)
+-      assert %{locations: [%{column: 15, line: 1}], message: @message} = error
++      assert %{locations: [%{column: 23, line: 1}], message: @message} = error
+       refute result[:data]
+     end
+ 
+     test "with both inline args nil" do
+       query = ~s[query { valid(input: {id: null, name: null}) }]
+       assert {:ok, %{errors: [error]} = result} = Absinthe.run(query, Schema)
+-      assert %{locations: [%{column: 15, line: 1}], message: @message} = error
++      assert %{locations: [%{column: 23, line: 1}], message: @message} = error
+       refute result[:data]
+     end
+ 
+     test "with both variable args" do
+       options = [variables: %{"input" => %{"id" => 1, "name" => "a"}}]
+       assert {:ok, %{errors: [error]} = result} = Absinthe.run(@query, Schema, options)
+-      assert %{locations: [%{column: 47, line: 1}], message: @message} = error
++      assert %{locations: [], message: @message} = error
++      refute result[:data]
++    end
++
++    test "with an inline list of oneOf inputs and both fields set" do
++      query = ~s|query { valid(inputs: [{id: 1, name: "a"}]) }|
++      assert {:ok, %{errors: [error]} = result} = Absinthe.run(query, Schema)
++      assert %{message: @message} = error
+       refute result[:data]
+     end
+   end

@@ -1,0 +1,571 @@
+diff --git a/lib/pinchflat/downloading/codec_parser.ex b/lib/pinchflat/downloading/codec_parser.ex
+new file mode 100644
+index 000000000..6953cf432
+--- /dev/null
++++ b/lib/pinchflat/downloading/codec_parser.ex
+@@ -0,0 +1,82 @@
++defmodule Pinchflat.Downloading.CodecParser do
++  @moduledoc """
++  Functions for generating yt-dlp codec strings
++  """
++
++  alias Pinchflat.Settings
++
++  @doc """
++  Generate a video codec string based on the value of the video_codec_preference setting.
++
++  Returns binary()
++  """
++  def generate_vcodec_string_from_settings do
++    generate_vcodec_string(Settings.get!(:video_codec_preference))
++  end
++
++  @doc """
++  Generate an audio codec string based on the value of the audio_codec_preference setting.
++
++  Returns binary()
++  """
++  def generate_acodec_string_from_settings do
++    generate_acodec_string(Settings.get!(:audio_codec_preference))
++  end
++
++  @doc """
++  Generate a video codec string from a list of video codecs.
++
++  If the list is nil or empty, the default video codec is AVC.
++
++  Returns binary()
++  """
++  def generate_vcodec_string(nil), do: "bestvideo[vcodec~='^avc']/bestvideo"
++  def generate_vcodec_string([]), do: generate_vcodec_string(nil)
++
++  def generate_vcodec_string(video_codecs) do
++    video_codecs
++    |> Enum.map(&video_codec_map()[&1])
++    |> Enum.reject(&is_nil/1)
++    |> Enum.map(&"bestvideo[vcodec~='^#{&1}']")
++    |> Enum.concat(["bestvideo"])
++    |> Enum.join("/")
++  end
++
++  @doc """
++  Generate an audio codec string from a list of audio codecs.
++
++  If the list is nil or empty, the default audio codec is MP4A.
++
++  Returns binary()
++  """
++  def generate_acodec_string(nil), do: "bestaudio[acodec~='^mp4a']/bestaudio"
++  def generate_acodec_string([]), do: generate_acodec_string(nil)
++
++  def generate_acodec_string(audio_codecs) do
++    audio_codecs
++    |> Enum.map(&audio_codec_map()[&1])
++    |> Enum.reject(&is_nil/1)
++    |> Enum.map(&"bestaudio[acodec~='^#{&1}']")
++    |> Enum.concat(["bestaudio"])
++    |> Enum.join("/")
++  end
++
++  @doc false
++  def video_codec_map do
++    %{
++      "av01" => "av01",
++      "avc" => "avc",
++      "vp9" => "vp0?9"
++    }
++  end
++
++  @doc false
++  def audio_codec_map do
++    %{
++      "aac" => "aac",
++      "mp4a" => "mp4a",
++      "mp3" => "mp3",
++      "opus" => "opus"
++    }
++  end
++end
+diff --git a/lib/pinchflat/downloading/download_option_builder.ex b/lib/pinchflat/downloading/download_option_builder.ex
+index c1ccf6fab..d508b26cf 100644
+--- a/lib/pinchflat/downloading/download_option_builder.ex
++++ b/lib/pinchflat/downloading/download_option_builder.ex
+@@ -6,6 +6,7 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+   alias Pinchflat.Sources
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.Media.MediaItem
++  alias Pinchflat.Downloading.CodecParser
+   alias Pinchflat.Downloading.OutputPathBuilder
+ 
+   alias Pinchflat.Utils.FilesystemUtils, as: FSUtils
+@@ -121,28 +122,26 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+   end
+ 
+   defp quality_options(media_profile) do
+-    video_codec_option = fn res ->
+-      [format_sort: "res:#{res},+codec:avc:m4a", remux_video: "mp4"]
+-    end
+-
+-    audio_format_precedence = [
+-      "bestaudio[ext=m4a]",
+-      "bestaudio[ext=mp3]",
+-      "bestaudio",
+-      "best[ext=m4a]",
+-      "best[ext=mp3]",
+-      "best"
+-    ]
++    vcodec_string = CodecParser.generate_vcodec_string_from_settings()
++    acodec_string = CodecParser.generate_acodec_string_from_settings()
+ 
+     case media_profile.preferred_resolution do
+       # Also be aware that :audio disabled all embedding options for subtitles
+-      :audio -> [:extract_audio, format: Enum.join(audio_format_precedence, "/")]
+-      :"360p" -> video_codec_option.("360")
+-      :"480p" -> video_codec_option.("480")
+-      :"720p" -> video_codec_option.("720")
+-      :"1080p" -> video_codec_option.("1080")
+-      :"2160p" -> video_codec_option.("2160")
+-      :"4320p" -> video_codec_option.("4320")
++      :audio ->
++        [:extract_audio, format: "#{acodec_string}/best"]
++
++      resolution_atom ->
++        {resolution_string, _} =
++          resolution_atom
++          |> Atom.to_string()
++          |> Integer.parse()
++
++        [
++          format_sort: "res:#{resolution_string}",
++          # Since Plex doesn't support reading metadata from MKV
++          remux_video: "mp4",
++          format: "((#{vcodec_string})+(#{acodec_string}))/best"
++        ]
+     end
+   end
+ 
+diff --git a/lib/pinchflat/settings/setting.ex b/lib/pinchflat/settings/setting.ex
+index f9eb386e5..8c393ffad 100644
+--- a/lib/pinchflat/settings/setting.ex
++++ b/lib/pinchflat/settings/setting.ex
+@@ -11,7 +11,14 @@ defmodule Pinchflat.Settings.Setting do
+     :pro_enabled,
+     :yt_dlp_version,
+     :apprise_version,
+-    :apprise_server
++    :apprise_server,
++    :video_codec_preference,
++    :audio_codec_preference
++  ]
++
++  @virtual_fields [
++    :video_codec_preference_string,
++    :audio_codec_preference_string
+   ]
+ 
+   @required_fields ~w(
+@@ -25,12 +32,43 @@ defmodule Pinchflat.Settings.Setting do
+     field :yt_dlp_version, :string
+     field :apprise_version, :string
+     field :apprise_server, :string
++
++    field :video_codec_preference, {:array, :string}, default: []
++    field :audio_codec_preference, {:array, :string}, default: []
++    field :video_codec_preference_string, :string, default: nil, virtual: true
++    field :audio_codec_preference_string, :string, default: nil, virtual: true
+   end
+ 
+   @doc false
+   def changeset(setting, attrs) do
+     setting
+     |> cast(attrs, @allowed_fields)
++    |> cast(attrs, @virtual_fields, empty_values: [])
++    |> convert_codec_preference_strings()
+     |> validate_required(@required_fields)
+   end
++
++  defp convert_codec_preference_strings(changeset) do
++    fields = [
++      video_codec_preference_string: :video_codec_preference,
++      audio_codec_preference_string: :audio_codec_preference
++    ]
++
++    Enum.reduce(fields, changeset, fn {virtual_field, actual_field}, changeset ->
++      case get_change(changeset, virtual_field) do
++        nil ->
++          changeset
++
++        value ->
++          new_value =
++            value
++            |> String.split(">")
++            |> Enum.map(&String.trim/1)
++            |> Enum.reject(&(String.trim(&1) == ""))
++            |> Enum.map(&String.downcase/1)
++
++          put_change(changeset, actual_field, new_value)
++      end
++    end)
++  end
+ end
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_html.ex b/lib/pinchflat_web/controllers/media_items/media_item_html.ex
+index 659e74268..d0639e6b0 100644
+--- a/lib/pinchflat_web/controllers/media_items/media_item_html.ex
++++ b/lib/pinchflat_web/controllers/media_items/media_item_html.ex
+@@ -18,7 +18,7 @@ defmodule PinchflatWeb.MediaItems.MediaItemHTML do
+   def media_type(media_item) do
+     case Path.extname(media_item.media_filepath) do
+       ext when ext in [".mp4", ".webm", ".mkv"] -> :video
+-      ext when ext in [".mp3", ".m4a"] -> :audio
++      ext when ext in [".mp3", ".m4a", ".opus"] -> :audio
+       _ -> :unknown
+     end
+   end
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_html/media_item_form.html.heex b/lib/pinchflat_web/controllers/media_items/media_item_html/media_item_form.html.heex
+index 9e61673e0..a8f5d9aa7 100644
+--- a/lib/pinchflat_web/controllers/media_items/media_item_html/media_item_form.html.heex
++++ b/lib/pinchflat_web/controllers/media_items/media_item_html/media_item_form.html.heex
+@@ -9,7 +9,7 @@
+     Oops, something went wrong! Please check the errors below.
+   </.error>
+ 
+-  <h3 class=" text-2xl text-black dark:text-white">
++  <h3 class="text-2xl text-black dark:text-white">
+     General Options
+   </h3>
+ 
+diff --git a/lib/pinchflat_web/controllers/settings/setting_html.ex b/lib/pinchflat_web/controllers/settings/setting_html.ex
+index bb5e255c9..1441b62ea 100644
+--- a/lib/pinchflat_web/controllers/settings/setting_html.ex
++++ b/lib/pinchflat_web/controllers/settings/setting_html.ex
+@@ -1,6 +1,8 @@
+ defmodule PinchflatWeb.Settings.SettingHTML do
+   use PinchflatWeb, :html
+ 
++  alias Pinchflat.Downloading.CodecParser
++
+   embed_templates "setting_html/*"
+ 
+   @doc """
+diff --git a/lib/pinchflat_web/controllers/settings/setting_html/codec_settings_help.html.heex b/lib/pinchflat_web/controllers/settings/setting_html/codec_settings_help.html.heex
+new file mode 100644
+index 000000000..d6b635468
+--- /dev/null
++++ b/lib/pinchflat_web/controllers/settings/setting_html/codec_settings_help.html.heex
+@@ -0,0 +1,17 @@
++<aside>
++  <h2 class="text-xl font-bold mb-2">Codec Preferences</h2>
++  <section class="ml-2 md:ml-4 mb-2 max-w-prose">
++    <section>
++      Available video codecs:
++      <ul class="list-disc ml-8">
++        <li :for={{codec, _} <- CodecParser.video_codec_map()}><%= codec %></li>
++      </ul>
++    </section>
++    <section class="mt-4">
++      Available audio codecs:
++      <ul class="list-disc ml-8">
++        <li :for={{codec, _} <- CodecParser.audio_codec_map()}><%= codec %></li>
++      </ul>
++    </section>
++  </section>
++</aside>
+diff --git a/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex b/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
+index f8e5d7ef2..73ee7bb39 100644
+--- a/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
++++ b/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
+@@ -1,13 +1,24 @@
+-<.simple_form :let={f} for={@changeset} action={@action}>
++<.simple_form
++  :let={f}
++  for={@changeset}
++  action={@action}
++  x-data="{ advancedMode: !!JSON.parse(localStorage.getItem('advancedMode')) }"
++  x-init="$watch('advancedMode', value => localStorage.setItem('advancedMode', JSON.stringify(value)))"
++>
+   <.error :if={@changeset.action}>
+     Oops, something went wrong! Please check the errors below.
+   </.error>
+ 
+-  <h3 class="mt-2 md:mt-8 text-2xl text-black dark:text-white">
+-    Notification Settings
+-  </h3>
+-
+   <section>
++    <section class="flex justify-between items-center mt-4">
++      <h3 class="text-2xl text-black dark:text-white">
++        Notification Settings
++      </h3>
++      <span class="cursor-pointer hover:underline" x-on:click="advancedMode = !advancedMode">
++        Editing Mode: <span x-text="advancedMode ? 'Advanced' : 'Basic'"></span>
++      </span>
++    </section>
++
+     <%= live_render(
+       @conn,
+       Pinchflat.Settings.AppriseServerLive,
+@@ -15,5 +26,43 @@
+     ) %>
+   </section>
+ 
++  <section class="mt-10" x-show="advancedMode">
++    <section>
++      <h3 class="text-2xl text-black dark:text-white">
++        Codec Options
++      </h3>
++
++      <p class="text-sm mt-2 max-w-prose">
++        The best available codec will be used if your preferred codecs are not found
++      </p>
++
++      <.input
++        id="video_codec_preference_string"
++        name="setting[video_codec_preference_string]"
++        value={Enum.join(f[:video_codec_preference].value, ">")}
++        placeholder="avc>vp9>av01"
++        type="text"
++        label="Video Codec Preference"
++        help="Order of preference for video codecs. Separate with >. Will be remuxed into an MP4 container. See below for available codecs"
++        inputclass="font-mono text-sm mr-4"
++      />
++
++      <.input
++        id="audio_codec_preference_string"
++        name="setting[audio_codec_preference_string]"
++        value={Enum.join(f[:audio_codec_preference].value, ">")}
++        placeholder="mp4a>opus>aac"
++        type="text"
++        label="Audio Codec Preference"
++        help="Order of preference for audio codecs. Separate with >. See below for available codecs"
++        inputclass="font-mono text-sm mr-4"
++      />
++    </section>
++
++    <div class="rounded-sm dark:bg-meta-4 p-4 md:p-6 mt-5">
++      <.codec_settings_help />
++    </div>
++  </section>
++
+   <.button class="mt-10 mb-4 sm:mb-8 w-full sm:w-auto" rounding="rounded-lg">Save Settings</.button>
+ </.simple_form>
+diff --git a/priv/repo/migrations/20240521193719_add_codec_preferences_to_settings.exs b/priv/repo/migrations/20240521193719_add_codec_preferences_to_settings.exs
+new file mode 100644
+index 000000000..64c34aaa7
+--- /dev/null
++++ b/priv/repo/migrations/20240521193719_add_codec_preferences_to_settings.exs
+@@ -0,0 +1,10 @@
++defmodule Pinchflat.Repo.Migrations.AddCodecPreferencesToSettings do
++  use Ecto.Migration
++
++  def change do
++    alter table(:settings) do
++      add :video_codec_preference, {:array, :string}, default: []
++      add :audio_codec_preference, {:array, :string}, default: []
++    end
++  end
++end
+diff --git a/test/pinchflat/downloading/codec_parser_test.exs b/test/pinchflat/downloading/codec_parser_test.exs
+new file mode 100644
+index 000000000..c7b856a93
+--- /dev/null
++++ b/test/pinchflat/downloading/codec_parser_test.exs
+@@ -0,0 +1,70 @@
++defmodule Pinchflat.Downloading.CodecParserTest do
++  use Pinchflat.DataCase
++
++  alias Pinchflat.Settings
++  alias Pinchflat.Downloading.CodecParser
++
++  describe "generate_vcodec_string_from_settings/1" do
++    test "returns a default vcodec string when setting isn't set" do
++      Settings.set(video_codec_preference: [])
++
++      assert "bestvideo[vcodec~='^avc']/bestvideo" == CodecParser.generate_vcodec_string_from_settings()
++    end
++
++    test "generates a vcodec string" do
++      Settings.set(video_codec_preference: ["av01"])
++
++      assert "bestvideo[vcodec~='^av01']/bestvideo" == CodecParser.generate_vcodec_string_from_settings()
++    end
++  end
++
++  describe "generate_acodec_string_from_settings/1" do
++    test "returns a default acodec string when setting isn't set" do
++      Settings.set(audio_codec_preference: [])
++
++      assert "bestaudio[acodec~='^mp4a']/bestaudio" == CodecParser.generate_acodec_string_from_settings()
++    end
++
++    test "generates an acodec string" do
++      Settings.set(audio_codec_preference: ["mp3"])
++
++      assert "bestaudio[acodec~='^mp3']/bestaudio" == CodecParser.generate_acodec_string_from_settings()
++    end
++  end
++
++  describe "generate_vcodec_string/1" do
++    test "returns a default vcodec string when nil" do
++      assert "bestvideo[vcodec~='^avc']/bestvideo" == CodecParser.generate_vcodec_string(nil)
++    end
++
++    test "returns a default vcodec string when empty" do
++      assert "bestvideo[vcodec~='^avc']/bestvideo" == CodecParser.generate_vcodec_string([])
++    end
++
++    test "generates a vcodec string" do
++      assert "bestvideo[vcodec~='^av01']/bestvideo" == CodecParser.generate_vcodec_string(["av01"])
++    end
++
++    test "ignores options that don't exist" do
++      assert "bestvideo[vcodec~='^av01']/bestvideo" == CodecParser.generate_vcodec_string(["av01", "foo"])
++    end
++  end
++
++  describe "generate_acodec_string/1" do
++    test "returns a default acodec string when nil" do
++      assert "bestaudio[acodec~='^mp4a']/bestaudio" == CodecParser.generate_acodec_string(nil)
++    end
++
++    test "returns a default acodec string when empty" do
++      assert "bestaudio[acodec~='^mp4a']/bestaudio" == CodecParser.generate_acodec_string([])
++    end
++
++    test "generates an acodec string" do
++      assert "bestaudio[acodec~='^mp3']/bestaudio" == CodecParser.generate_acodec_string(["mp3"])
++    end
++
++    test "ignores options that don't exist" do
++      assert "bestaudio[acodec~='^mp3']/bestaudio" == CodecParser.generate_acodec_string(["mp3", "foo"])
++    end
++  end
++end
+diff --git a/test/pinchflat/downloading/download_option_builder_test.exs b/test/pinchflat/downloading/download_option_builder_test.exs
+index 735e72da1..a22e11c12 100644
+--- a/test/pinchflat/downloading/download_option_builder_test.exs
++++ b/test/pinchflat/downloading/download_option_builder_test.exs
+@@ -6,6 +6,7 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilderTest do
+ 
+   alias Pinchflat.Sources
+   alias Pinchflat.Profiles
++  alias Pinchflat.Settings
+   alias Pinchflat.Utils.FilesystemUtils
+   alias Pinchflat.Downloading.DownloadOptionBuilder
+ 
+@@ -244,7 +245,7 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilderTest do
+   end
+ 
+   describe "build/1 when testing quality options" do
+-    test "it includes quality options" do
++    test "includes quality options" do
+       resolutions = ["360", "480", "720", "1080", "2160", "4320"]
+ 
+       Enum.each(resolutions, fn resolution ->
+@@ -255,21 +256,35 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilderTest do
+         media_item = Repo.preload(media_item_fixture(source_id: source.id), source: :media_profile)
+ 
+         assert {:ok, res} = DownloadOptionBuilder.build(media_item)
+-        assert {:format_sort, "res:#{resolution},+codec:avc:m4a"} in res
++        assert {:format_sort, "res:#{resolution}"} in res
++
++        assert {:format, "((bestvideo[vcodec~='^avc']/bestvideo)+(bestaudio[acodec~='^mp4a']/bestaudio))/best"} in res
++
+         assert {:remux_video, "mp4"} in res
+       end)
+     end
+ 
+-    test "it includes quality options for audio only", %{media_item: media_item} do
++    test "includes quality options for audio only", %{media_item: media_item} do
+       media_item = update_media_profile_attribute(media_item, %{preferred_resolution: :audio})
+ 
+       assert {:ok, res} = DownloadOptionBuilder.build(media_item)
+ 
+       assert :extract_audio in res
+-      assert {:format, "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best[ext=m4a]/best[ext=mp3]/best"} in res
++      assert {:format, "bestaudio[acodec~='^mp4a']/bestaudio/best"} in res
+ 
+       refute {:remux_video, "mp4"} in res
+     end
++
++    test "includes custom quality options if specified", %{media_item: media_item} do
++      Settings.set(video_codec_preference: ["av01"])
++      Settings.set(audio_codec_preference: ["aac"])
++
++      media_item = update_media_profile_attribute(media_item, %{preferred_resolution: :"1080p"})
++
++      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
++
++      assert {:format, "((bestvideo[vcodec~='^av01']/bestvideo)+(bestaudio[acodec~='^aac']/bestaudio))/best"} in res
++    end
+   end
+ 
+   describe "build/1 when testing sponsorblock options" do
+diff --git a/test/pinchflat/settings_test.exs b/test/pinchflat/settings_test.exs
+index 944eaf172..3c4d6531d 100644
+--- a/test/pinchflat/settings_test.exs
++++ b/test/pinchflat/settings_test.exs
+@@ -78,4 +78,64 @@ defmodule Pinchflat.SettingsTest do
+       assert %Ecto.Changeset{} = Settings.change_setting(setting, %{onboarding: true})
+     end
+   end
++
++  describe "change_setting/2 when testing codec preferences" do
++    test "converts (video|audio)_codec_preference_string to an array" do
++      setting = Settings.record()
++
++      new_setting = %{
++        video_codec_preference_string: "avc>vp9",
++        audio_codec_preference_string: "aac>opus"
++      }
++
++      changeset = Settings.change_setting(setting, new_setting)
++
++      assert ["avc", "vp9"] = changeset.changes.video_codec_preference
++      assert ["aac", "opus"] = changeset.changes.audio_codec_preference
++    end
++
++    test "removes whitespace from (video|audio)_codec_preference" do
++      setting = Settings.record()
++
++      new_setting = %{
++        video_codec_preference_string: "  avc  > >  vp9  ",
++        audio_codec_preference_string: "aac> opus "
++      }
++
++      changeset = Settings.change_setting(setting, new_setting)
++
++      assert ["avc", "vp9"] = changeset.changes.video_codec_preference
++      assert ["aac", "opus"] = changeset.changes.audio_codec_preference
++    end
++
++    test "downcases (video|audio)_codec_preference" do
++      setting = Settings.record()
++
++      new_setting = %{
++        video_codec_preference_string: "AVC>VP9",
++        audio_codec_preference_string: "AAC>OPUS"
++      }
++
++      changeset = Settings.change_setting(setting, new_setting)
++
++      assert ["avc", "vp9"] = changeset.changes.video_codec_preference
++      assert ["aac", "opus"] = changeset.changes.audio_codec_preference
++    end
++
++    test "an empty value will remove the codec settings" do
++      Settings.set(video_codec_preference: ["avc", "vp9"])
++      Settings.set(audio_codec_preference: ["aac", "opus"])
++      setting = Settings.record()
++
++      new_setting = %{
++        video_codec_preference_string: "",
++        audio_codec_preference_string: ""
++      }
++
++      changeset = Settings.change_setting(setting, new_setting)
++
++      assert [] = changeset.changes.video_codec_preference
++      assert [] = changeset.changes.audio_codec_preference
++    end
++  end
+ end

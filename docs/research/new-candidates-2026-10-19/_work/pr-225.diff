@@ -1,0 +1,166 @@
+diff --git a/lib/thousand_island/transport.ex b/lib/thousand_island/transport.ex
+index 898756d..5f95a20 100644
+--- a/lib/thousand_island/transport.ex
++++ b/lib/thousand_island/transport.ex
+@@ -11,7 +11,6 @@ defmodule ThousandIsland.Transport do
+   @required_options [mode: :binary, active: false]
+   @default_options [
+     backlog: 1024,
+-    nodelay: true,
+     send_timeout: 30_000,
+     send_timeout_close: true,
+     reuseaddr: true
+@@ -114,10 +113,28 @@ defmodule ThousandIsland.Transport do
+   @spec resolve_options(list()) :: list()
+   def resolve_options(user_options) do
+     # We can't use Keyword functions here because the Erlang transports accept bare options
+-    Enum.uniq_by(@required_options ++ user_options ++ @default_options, fn
+-      {key, _} when is_atom(key) -> key
+-      key when is_atom(key) -> key
+-    end)
++    Enum.uniq_by(
++      @required_options ++
++        user_options ++
++        default_nodelay_options(user_options) ++
++        @default_options,
++      fn
++        {key, _} when is_atom(key) -> key
++        key when is_atom(key) -> key
++      end
++    )
++  end
++
++  # `nodelay` is a TCP-specific option, and the default is omitted for Unix domain sockets:
++  # the legacy inet backend ignores the invalid combination, but the socket backend rejects
++  # it, so injecting it breaks Unix domain listeners under `inet_backend: :socket`. An
++  # explicitly supplied `nodelay` value is still passed through unchanged.
++  defp default_nodelay_options(user_options) do
++    local_address? =
++      match?({:local, _}, :proplists.get_value(:ip, user_options)) or
++        match?({:local, _}, :proplists.get_value(:ifaddr, user_options))
++
++    if local_address?, do: [], else: [nodelay: true]
+   end
+ 
+   @doc """
+diff --git a/lib/thousand_island/transports/ssl.ex b/lib/thousand_island/transports/ssl.ex
+index edf4111..b4340fb 100644
+--- a/lib/thousand_island/transports/ssl.ex
++++ b/lib/thousand_island/transports/ssl.ex
+@@ -28,6 +28,9 @@ defmodule ThousandIsland.Transports.SSL do
+   reuseaddr: true
+   ```
+ 
++  The `nodelay` default is omitted for Unix domain sockets, since it is a
++  TCP-specific option.
++
+   The following options are required for the proper operation of Thousand Island
+   and cannot be overridden:
+ 
+diff --git a/lib/thousand_island/transports/tcp.ex b/lib/thousand_island/transports/tcp.ex
+index 8f9b377..0f904cb 100644
+--- a/lib/thousand_island/transports/tcp.ex
++++ b/lib/thousand_island/transports/tcp.ex
+@@ -26,6 +26,9 @@ defmodule ThousandIsland.Transports.TCP do
+   reuseaddr: true
+   ```
+ 
++  The `nodelay` default is omitted for Unix domain sockets, since it is a
++  TCP-specific option.
++
+   The following options are required for the proper operation of Thousand Island
+   and cannot be overridden:
+ 
+diff --git a/test/thousand_island/transport_options_test.exs b/test/thousand_island/transport_options_test.exs
+new file mode 100644
+index 0000000..2ec13e3
+--- /dev/null
++++ b/test/thousand_island/transport_options_test.exs
+@@ -0,0 +1,87 @@
++defmodule ThousandIsland.TransportOptionsTest do
++  use ExUnit.Case, async: false
++
++  @certfile Path.expand("../support/cert.pem", __DIR__)
++  @keyfile Path.expand("../support/key.pem", __DIR__)
++
++  test "TCP and SSL omit the nodelay default only for Unix domain sockets" do
++    unix_path =
++      Path.join(
++        System.tmp_dir!(),
++        "thousand_island_#{System.unique_integer([:positive])}.sock"
++      )
++
++    on_exit(fn -> File.rm(unix_path) end)
++
++    for {transport, backend, required_options} <- transports() do
++      [
++        ip_unix_options,
++        ifaddr_unix_options,
++        explicit_ip_options,
++        explicit_ifaddr_options,
++        ip_options
++      ] =
++        traced_listen_options(transport, backend, [
++          [ip: {:local, unix_path}] ++ required_options,
++          [ifaddr: {:local, unix_path}] ++ required_options,
++          [ip: {:local, unix_path}, nodelay: false] ++ required_options,
++          [ifaddr: {:local, unix_path}, nodelay: false] ++ required_options,
++          required_options
++        ])
++
++      refute :proplists.is_defined(:nodelay, ip_unix_options)
++      refute :proplists.is_defined(:nodelay, ifaddr_unix_options)
++      assert :proplists.get_value(:nodelay, explicit_ip_options) == false
++      assert :proplists.get_value(:nodelay, explicit_ifaddr_options) == false
++      assert :proplists.get_value(:nodelay, ip_options) == true
++    end
++  end
++
++  defp transports do
++    [
++      {ThousandIsland.Transports.TCP, :gen_tcp, []},
++      {ThousandIsland.Transports.SSL, :ssl, [certfile: @certfile, keyfile: @keyfile]}
++    ]
++  end
++
++  defp traced_listen_options(transport, backend, options_list) do
++    Code.ensure_loaded!(backend)
++
++    task =
++      Task.async(fn ->
++        receive do
++          :listen ->
++            Enum.each(options_list, fn options ->
++              try do
++                case transport.listen(0, options) do
++                  {:ok, socket} -> transport.close(socket)
++                  {:error, _reason} -> :ok
++                end
++              rescue
++                ArgumentError -> :ok
++              end
++            end)
++        end
++      end)
++
++    :erlang.trace_pattern({backend, :listen, 2}, true, [])
++    :erlang.trace(task.pid, true, [:call])
++    send(task.pid, :listen)
++    task_pid = task.pid
++
++    try do
++      resolved_options =
++        Enum.map(options_list, fn _options ->
++          assert_receive {:trace, ^task_pid, :call, {^backend, :listen, [0, options]}},
++                         1_000
++
++          options
++        end)
++
++      Task.await(task)
++      resolved_options
++    after
++      :erlang.trace_pattern({backend, :listen, 2}, false, [])
++    end
++  end
++end

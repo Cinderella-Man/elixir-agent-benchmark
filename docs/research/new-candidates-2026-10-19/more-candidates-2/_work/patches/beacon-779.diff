@@ -1,0 +1,177 @@
+diff --git a/lib/beacon/config.ex b/lib/beacon/config.ex
+index 7435b8780..4bc5da5f8 100644
+--- a/lib/beacon/config.ex
++++ b/lib/beacon/config.ex
+@@ -62,6 +62,20 @@ defmodule Beacon.Config do
+   """
+   @type mode :: :live | :testing | :manual
+ 
++  @typedoc """
++  The host per env used to generate the URLs for the site.
++
++  ## Example
++
++      [
++        local: "local.mysite.com",
++        prod: "mysite.com"
++      ]
++
++  When the site is deployed with the env var `BEACON_HOST=prod` it will generate URLs as `"mysite.com"`.
++  """
++  @type hosts :: [{env :: atom(), host :: binary()}]
++
+   @typedoc """
+   A module that implements `Beacon.RuntimeCSS`.
+   """
+@@ -205,6 +219,7 @@ defmodule Beacon.Config do
+           endpoint: endpoint(),
+           router: router(),
+           repo: repo(),
++          hosts: hosts(),
+           mode: mode(),
+           css_compiler: css_compiler(),
+           tailwind_config: tailwind_config(),
+@@ -240,6 +255,7 @@ defmodule Beacon.Config do
+             endpoint: nil,
+             router: nil,
+             repo: nil,
++            hosts: [],
+             mode: :live,
+             # TODO: rename to `authorization_policy`, see https://github.com/BeaconCMS/beacon/pull/563
+             # authorization_source: Beacon.Authorization.DefaultPolicy,
+@@ -273,6 +289,7 @@ defmodule Beacon.Config do
+           | {:endpoint, endpoint()}
+           | {:router, router()}
+           | {:repo, repo()}
++          | {:hosts, hosts()}
+           | {:mode, mode()}
+           | {:css_compiler, css_compiler()}
+           | {:tailwind_config, tailwind_config()}
+@@ -301,6 +318,8 @@ defmodule Beacon.Config do
+ 
+     * `:repo` - `t:repo/0` (required)
+ 
++    * `:hosts` - `t:hosts/0` (optional). Defaults to `[]`.
++
+     * `:mode` - `t:mode/0` (optional). Defaults to `:live`.
+ 
+     * `css_compiler` - `t:css_compiler/0` (optional). Defaults to `Beacon.RuntimeCSS.TailwindCompiler`.
+@@ -343,6 +362,11 @@ defmodule Beacon.Config do
+         endpoint: MyAppWeb.Endpoint,
+         router: MyAppWeb.Router,
+         repo: MyApp.Repo,
++        hosts: [
++          local: "local.mysite.com",
++          qa: "qa.mysite.com",
++          prod: "mysite.com"
++        ],
+         tailwind_config: Path.join(Application.app_dir(:my_app, "priv"), "tailwind.config.js"),
+         tailwind_css: Path.join([Application.app_dir(:my_app, "assets"), "css", "app.css"]),
+         template_formats: [
+@@ -372,6 +396,11 @@ defmodule Beacon.Config do
+         endpoint: MyAppWeb.Endpoint,
+         router: MyAppWeb.Router,
+         repo: MyApp.Repo,
++        hosts: [
++          local: "local.mysite.com",
++          qa: "qa.mysite.com",
++          prod: "mysite.com"
++        ],
+         mode: :live,
+         css_compiler: Beacon.RuntimeCSS.TailwindCompiler,
+         tailwind_config: "/my_app/priv/tailwind.config.js",
+@@ -428,6 +457,8 @@ defmodule Beacon.Config do
+     opts[:router] || raise ConfigError, "missing required option :router"
+     ensure_repo(opts[:repo])
+ 
++    hosts = get_opt(opts, :hosts, [])
++
+     tailwind_css = get_opt(opts, :tailwind_css, Path.join(Application.app_dir(:beacon, "priv"), "tailwind.css"))
+ 
+     template_formats =
+@@ -463,6 +494,7 @@ defmodule Beacon.Config do
+     struct!(
+       __MODULE__,
+       Keyword.merge(opts,
++        hosts: hosts,
+         tailwind_config: ensure_tailwind_config(opts[:tailwind_config]),
+         tailwind_css: tailwind_css,
+         template_formats: template_formats,
+diff --git a/lib/beacon/proxy_endpoint.ex b/lib/beacon/proxy_endpoint.ex
+index 1461f6faf..b6bf26aaf 100644
+--- a/lib/beacon/proxy_endpoint.ex
++++ b/lib/beacon/proxy_endpoint.ex
+@@ -144,6 +144,35 @@ defmodule Beacon.ProxyEndpoint do
+     %URI{scheme: scheme, host: host, port: port}
+   end
+ 
++  @doc """
++  Returns the `:host` configuration for `site` to be used in the app config.
++
++  ## Examples
++
++      iex> url_host(:my_site, "prod")
++      "mysite.com"
++
++      iex> url_host(:my_site, "local")
++      "local.mysite.com"
++
++  The host is fetched from the `:hosts` config in your site config,
++  see `Beacon.Config` for more info.
++
++  Defaults to `"localhost"` if no host is found.
++  """
++  @spec url_host(Beacon.Types.Site.t(), beacon_env :: String.t() | atom()) :: String.t()
++  def url_host(site, beacon_env)
++
++  def url_host(site, beacon_env) when is_atom(site) and is_binary(beacon_env) do
++    beacon_env = String.to_existing_atom(beacon_env)
++    url_host(site, beacon_env)
++  end
++
++  def url_host(site, beacon_env) when is_atom(site) and is_atom(beacon_env) do
++    hosts = Beacon.Config.fetch!(site).hosts
++    Keyword.get(hosts, beacon_env) || "localhost"
++  end
++
+   # https://github.com/phoenixframework/phoenix/blob/2614f2a0d95a3b4b745bdf88ccd9f3b7f6d5966a/lib/phoenix/endpoint/supervisor.ex#L386
+   @doc """
+   Similar to `public_url/1` but returns a `%URI{}` instead.
+diff --git a/test/beacon/proxy_endpoint_test.exs b/test/beacon/proxy_endpoint_test.exs
+new file mode 100644
+index 000000000..44e94da4c
+--- /dev/null
++++ b/test/beacon/proxy_endpoint_test.exs
+@@ -0,0 +1,16 @@
++defmodule Beacon.ProxyEndpointTest do
++  use ExUnit.Case, async: true
++  use Beacon.Test
++
++  alias Beacon.ProxyEndpoint
++
++  describe "url_host" do
++    test "defaults to localhost when no host is found" do
++      assert ProxyEndpoint.url_host(:my_site, nil) == "localhost"
++    end
++
++    test "resolves to existing host when defined" do
++      assert ProxyEndpoint.url_host(:host_test, :local) == "local.mysite.com"
++    end
++  end
++end
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index a84cf9fc5..2a04f8481 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -41,7 +41,10 @@ Supervisor.start_link(
+          mode: :testing,
+          endpoint: Beacon.BeaconTest.EndpointB,
+          router: Beacon.BeaconTest.Router,
+-         repo: Beacon.BeaconTest.Repo
++         repo: Beacon.BeaconTest.Repo,
++         hosts: [
++           local: "local.mysite.com"
++         ]
+        ],
+        [
+          site: :no_routes,

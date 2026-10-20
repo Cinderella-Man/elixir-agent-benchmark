@@ -1,0 +1,112 @@
+diff --git a/lib/beacon/runtime_css.ex b/lib/beacon/runtime_css.ex
+index f320082ea..d971fcf21 100644
+--- a/lib/beacon/runtime_css.ex
++++ b/lib/beacon/runtime_css.ex
+@@ -5,6 +5,8 @@ defmodule Beacon.RuntimeCSS do
+   Beacon supports Tailwind by default implemented by `Beacon.RuntimeCSS.TailwindCompiler`,
+   you can use that module as template to implement any ther CSS engine as needed.
+   """
++
++  require Logger
+   alias Beacon.Types.Site
+ 
+   @doc """
+@@ -75,9 +77,32 @@ defmodule Beacon.RuntimeCSS do
+ 
+   @doc false
+   def current_hash(site) do
++    case get_current_hash(site) do
++      nil ->
++        # retry once if not found
++        Beacon.Loader.load_runtime_css(site)
++        get_current_hash(site)
++
++      hash ->
++        hash
++    end
++  end
++
++  defp get_current_hash(site) do
+     case :ets.match(:beacon_assets, {{site, :css}, {:"$1", :_, :_}}) do
+-      [[hash]] -> hash
+-      _ -> ""
++      [[hash]] ->
++        hash
++
++      found ->
++        Logger.warning("""
++        failed to fetch current css hash
++
++        Got:
++
++          #{inspect(found)}
++        """)
++
++        nil
+     end
+   end
+ end
+diff --git a/lib/beacon/runtime_js.ex b/lib/beacon/runtime_js.ex
+index 0da7de7e6..f0bf7a69f 100644
+--- a/lib/beacon/runtime_js.ex
++++ b/lib/beacon/runtime_js.ex
+@@ -57,7 +57,7 @@ defmodule Beacon.RuntimeJS do
+   def current_hash do
+     case :ets.match(:beacon_assets, {:js, {:"$1", :_, :_}}) do
+       [[hash]] -> hash
+-      _ -> ""
++      _ -> nil
+     end
+   end
+ end
+diff --git a/lib/beacon/web/components/layouts.ex b/lib/beacon/web/components/layouts.ex
+index 05de73bd6..8e98d2922 100644
+--- a/lib/beacon/web/components/layouts.ex
++++ b/lib/beacon/web/components/layouts.ex
+@@ -21,7 +21,7 @@ defmodule Beacon.Web.Layouts do
+   """
+   # TODO: style nonce
+   def asset_path(conn, asset) when asset in [:css, :js] do
+-    %{assigns: %{beacon: %{site: site}}} = conn
++    site = site(conn)
+     prefix = router(conn).__beacon_scoped_prefix_for_site__(site)
+ 
+     hash =
+@@ -34,6 +34,13 @@ defmodule Beacon.Web.Layouts do
+     Phoenix.VerifiedRoutes.unverified_path(conn, conn.private.phoenix_router, path)
+   end
+ 
++  defp site(%{assigns: %{beacon: %{site: site}}}), do: site
++
++  defp site(_site) do
++    Logger.error("Failed to find site to serve assets")
++    nil
++  end
++
+   defp router(%Plug.Conn{private: %{phoenix_router: router}}), do: router
+   defp router(%Phoenix.LiveView.Socket{router: router}), do: router
+ 
+diff --git a/lib/beacon/web/controllers/assets_controller.ex b/lib/beacon/web/controllers/assets_controller.ex
+index 0ead4cfac..560401022 100644
+--- a/lib/beacon/web/controllers/assets_controller.ex
++++ b/lib/beacon/web/controllers/assets_controller.ex
+@@ -6,7 +6,7 @@ defmodule Beacon.Web.AssetsController do
+ 
+   def init(asset) when asset in [:css_config, :css, :js], do: asset
+ 
+-  def call(%{assigns: %{site: site}} = conn, asset) when asset in [:css, :js] do
++  def call(%{assigns: %{site: site}, params: %{"md5" => hash}} = conn, asset) when asset in [:css, :js] when is_binary(hash) do
+     {content, content_type} = content_and_type(site, asset)
+ 
+     # The static files are served for sites,
+@@ -38,6 +38,10 @@ defmodule Beacon.Web.AssetsController do
+     |> halt()
+   end
+ 
++  def call(_conn, asset) do
++    raise Beacon.Web.ServerError, "failed to serve asset #{asset}"
++  end
++
+   defp content_and_type(site, :css) do
+     {Beacon.RuntimeCSS.fetch(site), "text/css"}
+   end

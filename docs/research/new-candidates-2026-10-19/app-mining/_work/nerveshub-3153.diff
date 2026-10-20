@@ -1,0 +1,185 @@
+diff --git a/docs/device_authentication.md b/docs/device_authentication.md
+index 71a7c25ee..6d150029a 100644
+--- a/docs/device_authentication.md
++++ b/docs/device_authentication.md
+@@ -107,3 +107,12 @@ Product keys work differently. Their secrets stay visible on the product's
+ settings page to members with the `manage` or `admin` role. Deactivating one
+ refuses new connections with it, but devices already connected with it stay
+ connected until they reconnect.
++
++## Deleted devices
++
++Deleting a device closes the connection it has open and takes it out of its
++deployment group. It cannot connect again while it is deleted: certificate
++authentication rejects it as described above, its device keys stop
++authenticating, and a product key cannot create a new device under its
++identifier. A restored device is matched to a deployment group again the next
++time it connects.
+diff --git a/lib/nerves_hub/devices.ex b/lib/nerves_hub/devices.ex
+index 491b0160e..d6d8c3dda 100644
+--- a/lib/nerves_hub/devices.ex
++++ b/lib/nerves_hub/devices.ex
+@@ -574,6 +574,16 @@ defmodule NervesHub.Devices do
+     |> Repo.update!()
+   end
+ 
++  @doc """
++  Soft delete a device, which `restore_device/1` can undo.
++
++  The device leaves its deployment group in the same transaction, and a
++  connection it has open is closed once that commits. Left in the group and
++  connected, it would still be picked by the orchestrator, which cannot penalty
++  box a deleted device and so would pick it again on every run. A restored device
++  is matched to a deployment group again when it next connects, as any device
++  without one is.
++  """
+   def delete_device(%Device{} = device) do
+     device_certificates_query = from(dc in DeviceCertificate, where: dc.device_id == ^device.id)
+     pinned_devices_query = from(p in PinnedDevice, where: p.device_id == ^device.id)
+@@ -583,7 +593,10 @@ defmodule NervesHub.Devices do
+     # the same hardware collides with the identity of the device just deleted.
+     network_identities_query = from(ei in NetworkIdentity, where: ei.device_id == ^device.id)
+ 
+-    changeset = Repo.soft_delete_changeset(device)
++    changeset =
++      device
++      |> Device.clear_deployment_group()
++      |> Repo.soft_delete_changeset()
+ 
+     Multi.new()
+     |> Multi.delete_all(:device_certificates, device_certificates_query)
+@@ -592,8 +605,12 @@ defmodule NervesHub.Devices do
+     |> Multi.update(:device, changeset)
+     |> Repo.transact()
+     |> case do
+-      {:ok, %{device: device}} -> {:ok, device}
+-      error -> error
++      {:ok, %{device: device}} ->
++        DeviceEvents.deleted(device)
++        {:ok, %{device | deployment_group: nil}}
++
++      error ->
++        error
+     end
+   end
+ 
+diff --git a/lib/nerves_hub/events/device_events.ex b/lib/nerves_hub/events/device_events.ex
+index d8138a472..5e5c9781e 100644
+--- a/lib/nerves_hub/events/device_events.ex
++++ b/lib/nerves_hub/events/device_events.ex
+@@ -31,6 +31,21 @@ defmodule NervesHub.DeviceEvents do
+   end
+ 
+   def moved_product(device) do
++    disconnect(device)
++  end
++
++  @doc """
++  Closes the connection of a device that has just been deleted.
++
++  It is refused when it tries again: certificate authentication rejects a
++  deleted device, a device key stops authenticating with it, and a product key
++  cannot create a new device under its identifier.
++  """
++  def deleted(device) do
++    disconnect(device)
++  end
++
++  defp disconnect(device) do
+     :ok =
+       ChannelServer.broadcast(NervesHub.PubSub, "device_socket:#{device.id}", "disconnect", %{})
+   end
+diff --git a/lib/nerves_hub_web/components/device_page/settings_tab.ex b/lib/nerves_hub_web/components/device_page/settings_tab.ex
+index b94249e24..272e3fbbf 100644
+--- a/lib/nerves_hub_web/components/device_page/settings_tab.ex
++++ b/lib/nerves_hub_web/components/device_page/settings_tab.ex
+@@ -381,7 +381,7 @@ defmodule NervesHubWeb.Components.DevicePage.SettingsTab do
+               class="flex gap-2 rounded border border-alert bg-base-800 px-3 py-1.5 hover:bg-alert-soft"
+               type="button"
+               phx-click="delete-device"
+-              data-confirm="Are you sure you want to delete this device? This will also delete any certificates associated with the device."
++              data-confirm="Are you sure you want to delete this device? It will be disconnected and removed from its deployment group, and any certificates associated with it will be deleted."
+             >
+               <svg class="size-5 stroke-alert" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                 <path
+diff --git a/test/nerves_hub/devices_test.exs b/test/nerves_hub/devices_test.exs
+index 2e94d8d10..5b51b4ecd 100644
+--- a/test/nerves_hub/devices_test.exs
++++ b/test/nerves_hub/devices_test.exs
+@@ -371,6 +371,32 @@ defmodule NervesHub.DevicesTest do
+     assert {:error, _} = Devices.get_device_by_org(org, device.id)
+   end
+ 
++  test "delete_device takes a connected device out of its deployment group and disconnects it", %{
++    device: device,
++    deployment_group: deployment_group
++  } do
++    Fixtures.device_connection_fixture(device)
++
++    # On other firmware than the deployment group's release, so it has an update to take
++    {:ok, device} =
++      Devices.update_firmware_metadata(device, %{"uuid" => Ecto.UUID.generate()}, :validated, false)
++
++    {:ok, device} = Devices.update_device(device, %{deployment_id: deployment_group.id})
++
++    device_id = device.id
++    assert [%Device{id: ^device_id}] = Updates.available_for_update(deployment_group, 10)
++
++    Phoenix.PubSub.subscribe(NervesHub.PubSub, "device_socket:#{device.id}")
++
++    assert {:ok, deleted} = Devices.delete_device(device)
++
++    assert deleted.deleted_at
++    refute deleted.deployment_id
++    refute Repo.reload(deleted).deployment_id
++    assert_receive %Broadcast{event: "disconnect"}
++    assert Updates.available_for_update(deployment_group, 10) == []
++  end
++
+   test "destroy_device", %{device: device} do
+     {:ok, _} =
+       Health.save_device_health(%{
+diff --git a/test/nerves_hub_web/channels/websocket_test.exs b/test/nerves_hub_web/channels/websocket_test.exs
+index 4c6ae7af4..292c8e3f5 100644
+--- a/test/nerves_hub_web/channels/websocket_test.exs
++++ b/test/nerves_hub_web/channels/websocket_test.exs
+@@ -559,6 +559,39 @@ defmodule NervesHubWeb.WebsocketTest do
+       eventually(refute(Repo.exists?(where(DeviceConnection, device_id: ^device.id, status: :connected))))
+     end
+ 
++    test "closes the connection of a device that is deleted, and refuses it afterwards", %{
++      user: user,
++      tmp_dir: tmp_dir
++    } do
++      {device, _firmware} = device_fixture(tmp_dir, user)
++      assert {:ok, auth} = Devices.create_shared_secret_auth(device)
++
++      opts = [
++        mint_opts: [protocols: [:http1]],
++        uri: "ws://127.0.0.1:#{@web_port}/device-socket/websocket",
++        headers: Utils.nh1_key_secret_headers(auth, device.identifier)
++      ]
++
++      subscribe_for_updates(device)
++
++      {:ok, socket} = SocketClient.start_link(with_serializer(opts))
++      SocketClient.join_and_wait(socket, shared_secret_params(device))
++
++      assert_connection_change()
++      assert_online_and_available(device)
++
++      assert {:ok, _device} = Devices.delete_device(device)
++
++      assert_receive %{event: "connection:change", payload: %{status: "offline"}}
++
++      # Same key and signature, still inside its max age, so only the deletion
++      # can be what refuses it.
++      {:ok, socket} = SocketClient.start_link(with_serializer(opts))
++      SocketClient.wait_connect(socket)
++
++      refute SocketClient.connected?(socket)
++    end
++
+     test "records the address a trusted balancer announced", %{user: user, tmp_dir: tmp_dir} do
+       {device, _firmware} = device_fixture(tmp_dir, user)
+       assert {:ok, auth} = Devices.create_shared_secret_auth(device)

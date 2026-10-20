@@ -1,0 +1,62 @@
+diff --git a/lib/ecto/repo/preloader.ex b/lib/ecto/repo/preloader.ex
+index d6f2859d84..5ae8eb6f5b 100644
+--- a/lib/ecto/repo/preloader.ex
++++ b/lib/ecto/repo/preloader.ex
+@@ -159,10 +159,12 @@ defmodule Ecto.Repo.Preloader do
+       # still necessary.
+       opts = Keyword.put_new(opts, :caller, self())
+       on_preloader_spawn = Keyword.get(opts, :on_preloader_spawn, fn -> :ok end)
++      log_level = caller_log_level()
+ 
+       preloaders
+       |> Task.async_stream(
+         fn preloader ->
++          put_log_level(log_level)
+           on_preloader_spawn.()
+           preloader.({adapter_meta, opts})
+         end,
+@@ -177,6 +179,16 @@ defmodule Ecto.Repo.Preloader do
+     end
+   end
+ 
++  # Logger.get_process_level/1 and put_process_level/2 require Elixir 1.15+.
++  if Version.match?(System.version(), ">= 1.15.0") do
++    defp caller_log_level, do: Logger.get_process_level(self())
++    defp put_log_level(nil), do: :ok
++    defp put_log_level(level), do: Logger.put_process_level(self(), level)
++  else
++    defp caller_log_level, do: nil
++    defp put_log_level(_level), do: :ok
++  end
++
+   # Then we unpack the query results, merge them, and preload recursively
+   defp preload_assocs(
+          [{assoc, query?, loaded_ids, loaded_structs, sub_preloads} | assocs],
+diff --git a/test/ecto/repo_test.exs b/test/ecto/repo_test.exs
+index 8498890866..5d9f34587b 100644
+--- a/test/ecto/repo_test.exs
++++ b/test/ecto/repo_test.exs
+@@ -2382,6 +2382,23 @@ defmodule Ecto.RepoTest do
+       assert_received {:callback_ran, pid2} when pid2 != self()
+       assert pid1 != pid2
+     end
++
++    # Logger.{put,get,delete}_process_level were added in Elixir 1.15.
++    if Version.match?(System.version(), ">= 1.15.0") do
++      test "preload tasks inherit the caller's Logger level" do
++        Logger.put_process_level(self(), :warning)
++        on_exit(fn -> Logger.delete_process_level(self()) end)
++
++        test_process = self()
++        fun = fn -> send(test_process, {:level, Logger.get_process_level(self())}) end
++
++        %MySchemaWithMultiAssoc{parent_id: 1, mother_id: 2}
++        |> PrepareRepo.preload([:parent, :mother], on_preloader_spawn: fun)
++
++        assert_received {:level, :warning}
++        assert_received {:level, :warning}
++      end
++    end
+   end
+ 
+   describe "prepare_transaction" do

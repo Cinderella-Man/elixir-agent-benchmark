@@ -1,0 +1,176 @@
+diff --git a/assets/js/phoenix_live_view/view.ts b/assets/js/phoenix_live_view/view.ts
+index bdcc400298..36b6a1f1d2 100644
+--- a/assets/js/phoenix_live_view/view.ts
++++ b/assets/js/phoenix_live_view/view.ts
+@@ -1152,6 +1152,10 @@ export default class View {
+   }
+ 
+   onJoinError(resp) {
++    if (resp.events) {
++      this.liveSocket.dispatchEvents(resp.events);
++    }
++
+     if (resp.reason === "reload") {
+       this.log("error", () => [
+         `failed mount with ${resp.status}. Falling back to page reload`,
+diff --git a/assets/test/view_test.ts b/assets/test/view_test.ts
+index fe375253f0..d2e3c6a30b 100644
+--- a/assets/test/view_test.ts
++++ b/assets/test/view_test.ts
+@@ -1266,6 +1266,30 @@ describe("View", function () {
+     // still need a few tests
+   });
+ 
++  test("onJoinError dispatches mount reply events before redirecting", () => {
++    liveSocket = new LiveSocket("/live", Socket);
++    const el = liveViewDOM();
++    const view = new View(el, liveSocket, null, null, null);
++    stubChannel(view);
++
++    const payloads: unknown[] = [];
++    window.addEventListener("phx:mount-error", (e) => {
++      payloads.push((e as CustomEvent).detail);
++    });
++
++    const redirectSpy = jest
++      .spyOn(view, "onRedirect")
++      .mockImplementation(() => undefined);
++
++    view.onJoinError({
++      events: [["mount-error", { from: "mount" }]],
++      redirect: { to: "/redirected" },
++    });
++
++    expect(payloads).toEqual([{ from: "mount" }]);
++    expect(redirectSpy).toHaveBeenCalledWith({ to: "/redirected" });
++  });
++
+   test("sends _track_static and _mounts on params", () => {
+     liveSocket = new LiveSocket("/live", Socket);
+     const el = liveViewDOM();
+diff --git a/lib/phoenix_live_view/channel.ex b/lib/phoenix_live_view/channel.ex
+index 565d3d8cf8..a4fc5034a9 100644
+--- a/lib/phoenix_live_view/channel.ex
++++ b/lib/phoenix_live_view/channel.ex
+@@ -1419,11 +1419,19 @@ defmodule Phoenix.LiveView.Channel do
+         {:noreply, post_verified_mount(new_state)}
+ 
+       {:live_redirect, opts, new_state} ->
+-        GenServer.reply(from, {:error, %{live_redirect: opts}})
++        GenServer.reply(
++          from,
++          {:error, %{live_redirect: opts, events: Utils.get_push_events(new_state.socket)}}
++        )
++
+         {:stop, :shutdown, new_state}
+ 
+       {:redirect, opts, new_state} ->
+-        GenServer.reply(from, {:error, %{redirect: opts}})
++        GenServer.reply(
++          from,
++          {:error, %{redirect: opts, events: Utils.get_push_events(new_state.socket)}}
++        )
++
+         {:stop, :shutdown, new_state}
+     end
+   end
+diff --git a/lib/phoenix_live_view/test/client_proxy.ex b/lib/phoenix_live_view/test/client_proxy.ex
+index 2f70f19fe2..a16a086d75 100644
+--- a/lib/phoenix_live_view/test/client_proxy.ex
++++ b/lib/phoenix_live_view/test/client_proxy.ex
+@@ -227,10 +227,12 @@ defmodule Phoenix.LiveViewTest.ClientProxy do
+             Process.demonitor(mon_ref, [:flush])
+             {%{view | pid: pid}, Diff.merge_diff(%{}, rendered), resp}
+ 
+-          {^ref, {:error, %{live_redirect: opts}}} ->
++          {^ref, {:error, %{live_redirect: opts} = resp}} ->
++            maybe_push_events(resp, state)
+             throw(stop_redirect(state, view.topic, {:live_redirect, opts}))
+ 
+-          {^ref, {:error, %{redirect: opts}}} ->
++          {^ref, {:error, %{redirect: opts} = resp}} ->
++            maybe_push_events(resp, state)
+             throw(stop_redirect(state, view.topic, {:redirect, opts}))
+ 
+           {^ref, {:error, %{reason: reason}}} when reason in ~w(stale unauthorized) ->
+@@ -1389,8 +1391,12 @@ defmodule Phoenix.LiveViewTest.ClientProxy do
+ 
+   defp maybe_push_events(diff, state) do
+     case diff do
++      %{events: events} ->
++        push_events(events, state)
++        Map.delete(diff, :events)
++
+       %{@events => events} ->
+-        for [name, payload] <- events, do: send_caller(state, {:push_event, name, payload})
++        push_events(events, state)
+         Map.delete(diff, @events)
+ 
+       %{} ->
+@@ -1398,6 +1404,10 @@ defmodule Phoenix.LiveViewTest.ClientProxy do
+     end
+   end
+ 
++  defp push_events(events, state) do
++    for [name, payload | _] <- events, do: send_caller(state, {:push_event, name, payload})
++  end
++
+   defp maybe_push_reply(diff, state) do
+     case diff do
+       %{@reply => reply} ->
+diff --git a/test/phoenix_live_view/integrations/event_test.exs b/test/phoenix_live_view/integrations/event_test.exs
+index f3bc0237c5..b8f6dbbc30 100644
+--- a/test/phoenix_live_view/integrations/event_test.exs
++++ b/test/phoenix_live_view/integrations/event_test.exs
+@@ -57,6 +57,21 @@ defmodule Phoenix.LiveView.EventTest do
+       assert_redirect(view, "/events")
+     end
+ 
++    test "supports events with redirects during mount", %{conn: conn} do
++      for {kind, expected_kind, expected_opts} <- [
++            {"redirect", :redirect, %{to: "/thermo"}},
++            {"push_navigate", :live_redirect, %{kind: :push, to: "/thermo"}}
++          ] do
++        conn = get(conn, "/redir?during=connected&kind=#{kind}&to=/thermo&push_event=true")
++
++        assert html_response(conn, 200) =~ "parent_content"
++        assert {:error, {^expected_kind, opts}} = live(conn)
++        assert Map.take(opts, Map.keys(expected_opts)) == expected_opts
++
++        assert_receive {_ref, {:push_event, "mount-redirect", %{kind: ^kind, to: "/thermo"}}}
++      end
++    end
++
+     test "sends updates with no assigns diff", %{conn: conn} do
+       {:ok, view, _html} = live(conn, "/events")
+ 
+diff --git a/test/support/live_views/general.ex b/test/support/live_views/general.ex
+index 17a15e5408..3bb3b25f96 100644
+--- a/test/support/live_views/general.ex
++++ b/test/support/live_views/general.ex
+@@ -250,10 +250,10 @@ defmodule Phoenix.LiveViewTest.Support.RedirLive do
+     """
+   end
+ 
+-  def mount(%{"to" => to, "kind" => kind, "during" => during}, _session, socket) do
++  def mount(%{"to" => to, "kind" => kind, "during" => during} = params, _session, socket) do
+     cond do
+       during == "connected" and connected?(socket) ->
+-        {:ok, do_redirect(socket, kind, to: to)}
++        {:ok, socket |> maybe_push_redirect_event(params) |> do_redirect(kind, to: to)}
+ 
+       during == "disconnected" and not connected?(socket) ->
+         {:ok, do_redirect(socket, kind, to: to)}
+@@ -297,6 +297,12 @@ defmodule Phoenix.LiveViewTest.Support.RedirLive do
+   defp do_redirect(socket, "redirect", opts), do: redirect(socket, opts)
+   defp do_redirect(socket, "external", to: url), do: redirect(socket, external: url)
+   defp do_redirect(socket, "push_patch", opts), do: push_patch(socket, opts)
++
++  defp maybe_push_redirect_event(socket, %{"push_event" => "true", "kind" => kind, "to" => to}) do
++    push_event(socket, "mount-redirect", %{kind: kind, to: to})
++  end
++
++  defp maybe_push_redirect_event(socket, _params), do: socket
+ end
+ 
+ defmodule Phoenix.LiveViewTest.Support.AssignsNotInSocketLive do

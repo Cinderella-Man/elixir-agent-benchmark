@@ -1,0 +1,207 @@
+diff --git a/lib/beacon/config.ex b/lib/beacon/config.ex
+index 3963b907c..e80b8bb9b 100644
+--- a/lib/beacon/config.ex
++++ b/lib/beacon/config.ex
+@@ -425,7 +425,7 @@ defmodule Beacon.Config do
+     opts[:router] || raise ConfigError, "missing required option :router"
+     ensure_repo(opts[:repo])
+ 
+-    tailwind_css = Keyword.get(opts, :tailwind_css) || Path.join(Application.app_dir(:beacon, "priv"), "tailwind.css")
++    tailwind_css = get_opt(opts, :tailwind_css, Path.join(Application.app_dir(:beacon, "priv"), "tailwind.css"))
+ 
+     template_formats =
+       Keyword.merge(
+@@ -433,7 +433,7 @@ defmodule Beacon.Config do
+           {:heex, "HEEx (HTML)"},
+           {:markdown, "Markdown (GitHub Flavored version)"}
+         ],
+-        Keyword.get(opts, :template_formats, [])
++        get_opt(opts, :template_formats, [])
+       )
+ 
+     lifecycle = [
+@@ -445,32 +445,36 @@ defmodule Beacon.Config do
+       upload_asset: get_in(opts, [:lifecycle, :upload_asset]) || [thumbnail: &Beacon.Lifecycle.Asset.thumbnail/2]
+     ]
+ 
+-    allowed_media_accept_types = Keyword.get(opts, :allowed_media_accept_types, @default_media_types)
++    allowed_media_accept_types = get_opt(opts, :allowed_media_accept_types, @default_media_types)
+     validate_allowed_media_accept_types!(allowed_media_accept_types)
+ 
+-    assigned_assets = Keyword.get(opts, :assets, [])
++    assigned_assets = get_opt(opts, :assets, [])
+     assets = process_assets_config(allowed_media_accept_types, assigned_assets)
+ 
+-    default_meta_tags = Keyword.get(opts, :default_meta_tags, [])
+-    extra_asset_fields = Keyword.get(opts, :extra_asset_fields, [{"image/*", [Beacon.MediaLibrary.AssetFields.AltText]}])
+-
+-    page_warming = Keyword.get(opts, :page_warming, {:shortest_paths, 10})
+-
+-    opts =
+-      opts
+-      |> Keyword.put(:tailwind_config, ensure_tailwind_config(opts[:tailwind_config]))
+-      |> Keyword.put(:tailwind_css, tailwind_css)
+-      |> Keyword.put(:template_formats, template_formats)
+-      |> Keyword.put(:lifecycle, lifecycle)
+-      |> Keyword.put(:allowed_media_accept_types, allowed_media_accept_types)
+-      |> Keyword.put(:assets, assets)
+-      |> Keyword.put(:default_meta_tags, default_meta_tags)
+-      |> Keyword.put(:extra_asset_fields, extra_asset_fields)
+-      |> Keyword.put(:page_warming, page_warming)
+-
+-    struct!(__MODULE__, opts)
++    default_meta_tags = get_opt(opts, :default_meta_tags, [])
++    extra_asset_fields = get_opt(opts, :extra_asset_fields, [{"image/*", [Beacon.MediaLibrary.AssetFields.AltText]}])
++
++    page_warming = get_opt(opts, :page_warming, {:shortest_paths, 10})
++
++    struct!(
++      __MODULE__,
++      Keyword.merge(opts,
++        tailwind_config: ensure_tailwind_config(opts[:tailwind_config]),
++        tailwind_css: tailwind_css,
++        template_formats: template_formats,
++        lifecycle: lifecycle,
++        allowed_media_accept_types: allowed_media_accept_types,
++        assets: assets,
++        default_meta_tags: default_meta_tags,
++        extra_asset_fields: extra_asset_fields,
++        page_warming: page_warming
++      )
++    )
+   end
+ 
++  # Get `key` from `opts` keyword, otherwise returns `default` even if the key is present but returns `nil`.
++  defp get_opt(opts, key, default), do: Keyword.get(opts, key) || default
++
+   @doc """
+   Returns the `Beacon.Config` for `site`.
+   """
+diff --git a/test/beacon/config_test.exs b/test/beacon/config_test.exs
+index cceae3ce9..0ce5eae52 100644
+--- a/test/beacon/config_test.exs
++++ b/test/beacon/config_test.exs
+@@ -1,11 +1,24 @@
+ defmodule Beacon.ConfigTest do
+   use ExUnit.Case, async: true
+ 
+-  alias Beacon.Config
+-
+   @site :my_site
+   @repo Beacon.BeaconTest.Repo
+ 
++  test "returns default when value is nil" do
++    assert %Beacon.Config{
++             default_meta_tags: [],
++             page_warming: {:shortest_paths, 10}
++           } =
++             Beacon.Config.new(
++               site: :site,
++               endpoint: :endpoint,
++               router: :router,
++               repo: @repo,
++               default_meta_tags: nil,
++               page_warming: nil
++             )
++  end
++
+   describe "registry" do
+     test "returns the site config" do
+       assert %Beacon.Config{
+@@ -14,19 +27,19 @@ defmodule Beacon.ConfigTest do
+                safe_code_check: false,
+                site: :my_site,
+                tailwind_config: tailwind_config
+-             } = Config.fetch!(@site)
++             } = Beacon.Config.fetch!(@site)
+ 
+       assert tailwind_config =~ "tailwind.config.templates.js"
+     end
+ 
+     test "raises for non existing site" do
+       assert_raise Beacon.ConfigError, ~r/site :invalid not found/, fn ->
+-        Config.fetch!(:invalid)
++        Beacon.Config.fetch!(:invalid)
+       end
+     end
+ 
+     test "updates key from config" do
+-      assert %Config{live_socket_path: "/new_live"} = Config.update_value(:not_booted, :live_socket_path, "/new_live")
++      assert %Beacon.Config{live_socket_path: "/new_live"} = Beacon.Config.update_value(:not_booted, :live_socket_path, "/new_live")
+     end
+   end
+ 
+@@ -37,7 +50,7 @@ defmodule Beacon.ConfigTest do
+                  {:heex, "HEEx (HTML)"},
+                  {:markdown, "Markdown (GitHub Flavored version)"}
+                ]
+-             } = Config.new(site: :site, endpoint: :endpoint, router: :router, repo: @repo, template_formats: [])
++             } = Beacon.Config.new(site: :site, endpoint: :endpoint, router: :router, repo: @repo, template_formats: [])
+     end
+ 
+     test "merge existing config" do
+@@ -46,7 +59,14 @@ defmodule Beacon.ConfigTest do
+                  {:markdown, "Markdown (GitHub Flavored version)"},
+                  {:heex, "Custom HEEx description"}
+                ]
+-             } = Config.new(site: :site, endpoint: :endpoint, router: :router, repo: @repo, template_formats: [{:heex, "Custom HEEx description"}])
++             } =
++               Beacon.Config.new(
++                 site: :site,
++                 endpoint: :endpoint,
++                 router: :router,
++                 repo: @repo,
++                 template_formats: [{:heex, "Custom HEEx description"}]
++               )
+     end
+ 
+     test "add config" do
+@@ -56,7 +76,14 @@ defmodule Beacon.ConfigTest do
+                  {:markdown, "Markdown (GitHub Flavored version)"},
+                  {:custom_format, "Custom Format"}
+                ]
+-             } = Config.new(site: :site, endpoint: :endpoint, router: :router, repo: @repo, template_formats: [{:custom_format, "Custom Format"}])
++             } =
++               Beacon.Config.new(
++                 site: :site,
++                 endpoint: :endpoint,
++                 router: :router,
++                 repo: @repo,
++                 template_formats: [{:custom_format, "Custom Format"}]
++               )
+     end
+   end
+ 
+@@ -71,7 +98,7 @@ defmodule Beacon.ConfigTest do
+                  after_publish_page: [],
+                  upload_asset: [{:thumbnail, _}]
+                ]
+-             } = Config.new(site: :site, endpoint: :endpoint, router: :router, repo: @repo, lifecycle: [load_template: []])
++             } = Beacon.Config.new(site: :site, endpoint: :endpoint, router: :router, repo: @repo, lifecycle: [load_template: []])
+     end
+   end
+ 
+@@ -108,20 +135,20 @@ defmodule Beacon.ConfigTest do
+                   {:validations, []},
+                   {:providers, [Beacon.MediaLibrary.Provider.Repo]}
+                 ]}
+-             ] = Config.new(site: :site, endpoint: :endpoint, router: :router, repo: @repo).assets
++             ] = Beacon.Config.new(site: :site, endpoint: :endpoint, router: :router, repo: @repo).assets
+     end
+   end
+ 
+   describe "config_for_media_type/2" do
+     test "retrieves" do
+       media_type = "image/jpeg"
+-      config = Config.new(site: :site, endpoint: :endpoint, router: :router, repo: @repo)
++      config = Beacon.Config.new(site: :site, endpoint: :endpoint, router: :router, repo: @repo)
+ 
+       assert [
+                {:processor, _},
+                {:validations, []},
+                {:providers, [Beacon.MediaLibrary.Provider.Repo]}
+-             ] = Config.config_for_media_type(config, media_type)
++             ] = Beacon.Config.config_for_media_type(config, media_type)
+     end
+   end
+ end

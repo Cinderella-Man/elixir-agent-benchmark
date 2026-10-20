@@ -1,0 +1,200 @@
+diff --git a/lib/cachex.ex b/lib/cachex.ex
+index feb93261..f7279ad0 100644
+--- a/lib/cachex.ex
++++ b/lib/cachex.ex
+@@ -98,7 +98,8 @@ defmodule Cachex do
+     touch: [2, 3],
+     transaction: [3, 4],
+     ttl: [2, 3],
+-    update: [3, 4]
++    update: [3, 4],
++    warm: [1, 2]
+   ]
+ 
+   ##############
+@@ -1368,6 +1369,37 @@ defmodule Cachex do
+   def update(cache, key, value, options \\ []) when is_list(options),
+     do: Router.call(cache, {:update, [key, value, options]})
+ 
++  @doc """
++  Triggers a manual warming in a cache.
++
++  This allows for manual warming of a cache in situations where
++  you already know the backing state has been updated. The return
++  value of this function will contain the list of modules which
++  were warmed as a result of this call.
++
++  ## Options
++
++    * `:modules`
++
++      An optional list of modules to warm, acting as a whitelist. The default
++      behaviour of this function is to trigger warming in all modules.
++
++  ## Examples
++
++      iex> Cachex.warm(:my_cache)
++      { :ok, [MyWarmer] }
++
++      iex> Cachex.warm(:my_cache, modules: [MyWarmer])
++      { :ok, [MyWarmer] }
++
++      iex> Cachex.warm(:my_cache, modules: [])
++      { :ok, [] }
++
++  """
++  @spec warm(cache, Keyword.t()) :: {status, [atom()]}
++  def warm(cache, options \\ []),
++    do: Router.call(cache, {:warm, [options]})
++
+   ###############
+   # Private API #
+   ###############
+diff --git a/lib/cachex/actions/warm.ex b/lib/cachex/actions/warm.ex
+new file mode 100644
+index 00000000..de2c750a
+--- /dev/null
++++ b/lib/cachex/actions/warm.ex
+@@ -0,0 +1,40 @@
++defmodule Cachex.Actions.Warm do
++  @moduledoc false
++  # Command module to trigger manual cache warming.
++  #
++  # The only reason to call this command is the case in which you already
++  # know the backing state of your cache has been updated and you need to
++  # immediately refresh your warmed entries.
++  alias Cachex.Services
++
++  # we need our imports
++  import Cachex.Spec
++
++  ##############
++  # Public API #
++  ##############
++
++  @doc """
++  Triggers a manual warming in a cache.
++
++  The warmers are fetched back out of the supervision tree, by calling out
++  to our services module. This allows us to avoid having to track any special
++  state in order to support manual warming.
++
++  You can provide a `:modules` option to restrict the warming to a specific
++  set of warmer modules. The list of modules which had a warming triggered will
++  be returned in the result of this call.
++  """
++  def execute(cache() = cache, options) do
++    mods = Keyword.get(options, :modules, nil)
++    parent = Services.locate(cache, Services.Incubator)
++    children = Supervisor.which_children(parent)
++
++    handlers =
++      for {mod, pid, _, _} <- children, mods == nil or mod in mods do
++        send(pid, :cachex_warmer) && mod
++      end
++
++    {:ok, handlers}
++  end
++end
+diff --git a/lib/cachex/router.ex b/lib/cachex/router.ex
+index dd9d2efc..888be1d7 100644
+--- a/lib/cachex/router.ex
++++ b/lib/cachex/router.ex
+@@ -246,7 +246,7 @@ defmodule Cachex.Router do
+   end
+ 
+   # actions which always run locally
+-  @local_actions [:dump, :inspect, :load]
++  @local_actions [:dump, :inspect, :load, :warm]
+ 
+   # Provides handling of `:inspect` operations.
+   #
+diff --git a/test/cachex/actions/warm_test.exs b/test/cachex/actions/warm_test.exs
+new file mode 100644
+index 00000000..517cff65
+--- /dev/null
++++ b/test/cachex/actions/warm_test.exs
+@@ -0,0 +1,70 @@
++defmodule Cachex.Actions.WarmTest do
++  use CachexCase
++
++  # This test covers the basic case of manually rewarming a cache,
++  # after manually clearing it but checking again before the schedule.
++  test "manually warming a cache" do
++    # create a test warmer to pass to the cache
++    Helper.create_warmer(:manual_warmer1, :timer.hours(1), fn _ ->
++      {:ok, [{1, 1}]}
++    end)
++
++    # create a cache instance with a warmer
++    cache = Helper.create_cache(warmers: [warmer(module: :manual_warmer1)])
++
++    # check that the key was warmed
++    assert Cachex.get!(cache, 1) == 1
++
++    # clean out our cache entries
++    assert Cachex.clear!(cache) == 1
++    assert Cachex.get!(cache, 1) == nil
++
++    # manually trigger a cache warming of all modules
++    assert Cachex.warm(cache) == {:ok, [:manual_warmer1]}
++
++    # wait for the warming
++    :timer.sleep(50)
++
++    # check that our key has been put back
++    assert Cachex.get!(cache, 1) == 1
++  end
++
++  # This test covers the case where you manually specify a list of modules
++  # to use for the warming. It also covers cases where no modules match the
++  # provided list, and therefore no cache warming actually executes.
++  test "manually warming a cache using specific warmers" do
++    # create a test warmer to pass to the cache
++    Helper.create_warmer(:manual_warmer2, :timer.hours(1), fn _ ->
++      {:ok, [{1, 1}]}
++    end)
++
++    # create a cache instance with a warmer
++    cache = Helper.create_cache(warmers: [warmer(module: :manual_warmer2)])
++
++    # check that the key was warmed
++    assert Cachex.get!(cache, 1) == 1
++
++    # clean out our cache entries
++    assert Cachex.clear!(cache) == 1
++    assert Cachex.get!(cache, 1) == nil
++
++    # manually trigger a cache warming
++    assert Cachex.warm(cache, modules: []) == {:ok, []}
++
++    # wait for the warming
++    :timer.sleep(50)
++
++    # check that our key was never put back
++    assert Cachex.get!(cache, 1) == nil
++
++    # manually trigger a cache warming, specifying our module
++    assert Cachex.warm(cache, modules: [:manual_warmer2]) ==
++             {:ok, [:manual_warmer2]}
++
++    # wait for the warming
++    :timer.sleep(50)
++
++    # check that our key has been put back
++    assert Cachex.get!(cache, 1) == 1
++  end
++end
+diff --git a/test/cachex_test.exs b/test/cachex_test.exs
+index d8b92c68..19bd0245 100644
+--- a/test/cachex_test.exs
++++ b/test/cachex_test.exs
+@@ -177,7 +177,7 @@ defmodule CachexTest do
+     assert(is_even(length(definitions)))
+ 
+     # verify the size to cause errors on addition/removal
+-    assert(length(definitions) == 152)
++    assert(length(definitions) == 156)
+ 
+     # validate all definitions
+     for {name, arity} <- definitions do

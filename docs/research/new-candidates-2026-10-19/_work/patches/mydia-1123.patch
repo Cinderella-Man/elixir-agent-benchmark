@@ -1,0 +1,624 @@
+From 78873591ace8f4c016757969961e7abec846d4ae Mon Sep 17 00:00:00 2001
+From: Alexandre Rosenfeld <arsfeld@gmail.com>
+Date: Mon, 12 Oct 2026 15:50:01 -0400
+Subject: [PATCH 1/4] fix(calendar): make the media type filter reach the
+ server
+
+The select had phx-change but no enclosing form, and the LiveView client
+throws on form events from a control outside a form, so picking Movies or
+TV Shows never reached the server.
+
+Fixes #1120
+---
+ .../live/calendar_live/index.html.heex        | 13 +++-
+ test/mydia_web/live/calendar_live_test.exs    | 75 +++++++++++++++++++
+ 2 files changed, 84 insertions(+), 4 deletions(-)
+ create mode 100644 test/mydia_web/live/calendar_live_test.exs
+
+diff --git a/lib/mydia_web/live/calendar_live/index.html.heex b/lib/mydia_web/live/calendar_live/index.html.heex
+index f21d2a7b7b..313c1c8ce1 100644
+--- a/lib/mydia_web/live/calendar_live/index.html.heex
++++ b/lib/mydia_web/live/calendar_live/index.html.heex
+@@ -9,18 +9,23 @@
+         </p>
+       </div>
+ 
+-      <%!-- Filter controls --%>
+-      <div class="flex items-center gap-2">
++      <%!-- Filter controls. LiveView only sends phx-change from inside a form. --%>
++      <.form
++        for={%{}}
++        id="calendar-filter-form"
++        phx-change="filter"
++        class="flex items-center gap-2"
++      >
+         <select
+           name="type"
+-          phx-change="filter"
++          aria-label="Filter by media type"
+           class="select select-bordered select-sm"
+         >
+           <option value="all" selected={is_nil(@filter_type)}>All Media</option>
+           <option value="tv_show" selected={@filter_type == "tv_show"}>TV Shows</option>
+           <option value="movie" selected={@filter_type == "movie"}>Movies</option>
+         </select>
+-      </div>
++      </.form>
+     </div>
+ 
+     <%!-- Month navigation --%>
+diff --git a/test/mydia_web/live/calendar_live_test.exs b/test/mydia_web/live/calendar_live_test.exs
+new file mode 100644
+index 0000000000..6b54112e68
+--- /dev/null
++++ b/test/mydia_web/live/calendar_live_test.exs
+@@ -0,0 +1,75 @@
++defmodule MydiaWeb.CalendarLiveTest do
++  use MydiaWeb.ConnCase, async: false
++
++  import Phoenix.LiveViewTest
++  import Mydia.AccountsFixtures
++  import Mydia.MediaFixtures
++
++  @movie_entry ~s{button[phx-click="view_item"][phx-value-type="movie"]}
++  @episode_entry ~s{button[phx-click="view_item"][phx-value-type="episode"]}
++
++  setup %{conn: conn} do
++    today = Date.utc_today()
++
++    media_item_fixture(%{
++      type: "movie",
++      title: "Harbor of Quiet Lanterns",
++      metadata: %{
++        provider_id: "9001",
++        provider: :metadata_relay,
++        media_type: :movie,
++        release_date: today
++      }
++    })
++
++    show = media_item_fixture(%{type: "tv_show", title: "The Copper Orchard"})
++    episode_fixture(%{media_item_id: show.id, air_date: today, title: "Seedfall"})
++
++    %{conn: log_in_user(conn, admin_user_fixture())}
++  end
++
++  defp filter(view, type) do
++    view |> element("#calendar-filter-form") |> render_change(%{"type" => type})
++  end
++
++  test "the type select sits inside a form, so the browser can send its change", %{conn: conn} do
++    {:ok, view, _html} = live(conn, ~p"/calendar")
++
++    assert has_element?(view, "#calendar-filter-form select[name=type]")
++  end
++
++  test "shows both kinds by default", %{conn: conn} do
++    {:ok, view, _html} = live(conn, ~p"/calendar")
++
++    assert has_element?(view, @movie_entry)
++    assert has_element?(view, @episode_entry)
++  end
++
++  test "Movies hides episodes", %{conn: conn} do
++    {:ok, view, _html} = live(conn, ~p"/calendar")
++
++    filter(view, "movie")
++
++    assert has_element?(view, @movie_entry)
++    refute has_element?(view, @episode_entry)
++  end
++
++  test "TV Shows hides movies", %{conn: conn} do
++    {:ok, view, _html} = live(conn, ~p"/calendar")
++
++    filter(view, "tv_show")
++
++    refute has_element?(view, @movie_entry)
++    assert has_element?(view, @episode_entry)
++  end
++
++  test "All Media brings both back", %{conn: conn} do
++    {:ok, view, _html} = live(conn, ~p"/calendar")
++
++    filter(view, "movie")
++    filter(view, "all")
++
++    assert has_element?(view, @movie_entry)
++    assert has_element?(view, @episode_entry)
++  end
++end
+
+From c5ccc80f26e2ea0670a9772fd5bbef99aebcd565 Mon Sep 17 00:00:00 2001
+From: Alexandre Rosenfeld <arsfeld@gmail.com>
+Date: Mon, 12 Oct 2026 15:52:01 -0400
+Subject: [PATCH 2/4] fix(admin): make the Users role filter reach the server
+
+Same defect as the calendar filter: a phx-change select with no enclosing
+form, which the LiveView client refuses to send.
+---
+ .../live/admin_users_live/components.ex       | 27 ++++++++++---------
+ test/mydia_web/live/admin_users_live_test.exs | 26 ++++++++++++++++++
+ 2 files changed, 40 insertions(+), 13 deletions(-)
+
+diff --git a/lib/mydia_web/live/admin_users_live/components.ex b/lib/mydia_web/live/admin_users_live/components.ex
+index 868b674510..2b5c8592fe 100644
+--- a/lib/mydia_web/live/admin_users_live/components.ex
++++ b/lib/mydia_web/live/admin_users_live/components.ex
+@@ -50,19 +50,20 @@ defmodule MydiaWeb.AdminUsersLive.Components do
+             class="input input-bordered w-full"
+           />
+         </.form>
+-        <select
+-          id="users-role-filter"
+-          phx-change="filter_users"
+-          name="role"
+-          aria-label="Filter by role"
+-          class="select select-bordered"
+-        >
+-          <option value="all" selected={@filter_role == "all"}>All Roles</option>
+-          <option value="admin" selected={@filter_role == "admin"}>Admin</option>
+-          <option value="user" selected={@filter_role == "user"}>User</option>
+-          <option value="readonly" selected={@filter_role == "readonly"}>Read Only</option>
+-          <option value="guest" selected={@filter_role == "guest"}>Guest</option>
+-        </select>
++        <.form for={%{}} id="users-role-filter-form" phx-change="filter_users">
++          <select
++            id="users-role-filter"
++            name="role"
++            aria-label="Filter by role"
++            class="select select-bordered"
++          >
++            <option value="all" selected={@filter_role == "all"}>All Roles</option>
++            <option value="admin" selected={@filter_role == "admin"}>Admin</option>
++            <option value="user" selected={@filter_role == "user"}>User</option>
++            <option value="readonly" selected={@filter_role == "readonly"}>Read Only</option>
++            <option value="guest" selected={@filter_role == "guest"}>Guest</option>
++          </select>
++        </.form>
+       </div>
+ 
+       <.admin_table id="users" rows={@users} row_id={&"user-#{&1.user.id}"}>
+diff --git a/test/mydia_web/live/admin_users_live_test.exs b/test/mydia_web/live/admin_users_live_test.exs
+index 5f5d2fd419..86c8b8f7e4 100644
+--- a/test/mydia_web/live/admin_users_live_test.exs
++++ b/test/mydia_web/live/admin_users_live_test.exs
+@@ -215,4 +215,30 @@ defmodule MydiaWeb.AdminUsersLiveTest do
+       assert has_element?(view, "#reset-password-form", "must be at least 8 characters")
+     end
+   end
++
++  describe "role filter" do
++    setup do
++      %{guest: user_fixture(%{username: "quillon", role: "guest"})}
++    end
++
++    test "the select sits inside a form, so the browser can send its change", %{conn: conn} do
++      {:ok, view, _html} = live(conn, ~p"/admin/users")
++
++      assert has_element?(view, "#users-role-filter-form select#users-role-filter")
++    end
++
++    test "picking a role hides users with other roles", %{
++      conn: conn,
++      admin: admin,
++      guest: guest
++    } do
++      {:ok, view, _html} = live(conn, ~p"/admin/users")
++
++      view |> element("#users-role-filter-form") |> render_change(%{"role" => "admin"})
++
++      assert_patch(view, ~p"/admin/users?role=admin")
++      assert has_element?(view, "#user-#{admin.id}")
++      refute has_element?(view, "#user-#{guest.id}")
++    end
++  end
+ end
+
+From 7b13687e634e7ac1fdcb8e728d9b6d5079396c51 Mon Sep 17 00:00:00 2001
+From: Alexandre Rosenfeld <arsfeld@gmail.com>
+Date: Mon, 12 Oct 2026 15:53:53 -0400
+Subject: [PATCH 3/4] refactor(web): delete two unreachable phx-change controls
+
+The settings :select branch lost its last setting in 040cafc8e, and
+MetadataSearchForm has no callers. Both carried a phx-change control outside
+a form, which the LiveView client would refuse to send anyway.
+---
+ .../live/admin_settings_live/components.ex    |  19 ---
+ .../live/admin_settings_live/index.ex         |  37 ------
+ lib/mydia_web/live/components/README.md       |  41 -------
+ .../live/components/metadata_search_form.ex   | 109 ------------------
+ 4 files changed, 206 deletions(-)
+ delete mode 100644 lib/mydia_web/live/components/metadata_search_form.ex
+
+diff --git a/lib/mydia_web/live/admin_settings_live/components.ex b/lib/mydia_web/live/admin_settings_live/components.ex
+index b290a672aa..db0f6bb8b7 100644
+--- a/lib/mydia_web/live/admin_settings_live/components.ex
++++ b/lib/mydia_web/live/admin_settings_live/components.ex
+@@ -198,25 +198,6 @@ defmodule MydiaWeb.AdminSettingsLive.Components do
+   defp setting_value_control(assigns) do
+     ~H"""
+     <%= cond do %>
+-      <% @setting.type == :select -> %>
+-        <%= if @editable do %>
+-          <select
+-            class="select select-sm select-bordered w-full sm:w-56"
+-            phx-change="update_select_setting"
+-            phx-value-key={@setting.key}
+-            phx-value-category={@category}
+-            name="value"
+-          >
+-            <%= for {value, label} <- @setting.options do %>
+-              <option value={value || ""} selected={@setting.value == value}>
+-                {label}
+-              </option>
+-            <% end %>
+-          </select>
+-        <% else %>
+-          <% label = Enum.find_value(@setting.options, fn {v, l} -> v == @setting.value && l end) %>
+-          <kbd class="kbd kbd-sm font-mono">{label || "Not set"}</kbd>
+-        <% end %>
+       <% is_boolean(@setting.value) -> %>
+         <%= if @editable do %>
+           <label class="label cursor-pointer gap-2">
+diff --git a/lib/mydia_web/live/admin_settings_live/index.ex b/lib/mydia_web/live/admin_settings_live/index.ex
+index 8babe7a805..4e8ace90af 100644
+--- a/lib/mydia_web/live/admin_settings_live/index.ex
++++ b/lib/mydia_web/live/admin_settings_live/index.ex
+@@ -160,43 +160,6 @@ defmodule MydiaWeb.AdminSettingsLive.Index do
+     end
+   end
+ 
+-  @impl true
+-  def handle_event(
+-        "update_select_setting",
+-        %{"key" => key, "category" => category, "value" => value},
+-        socket
+-      ) do
+-    category_atom = category_string_to_atom(category)
+-
+-    changeset =
+-      validate_config_setting(%{
+-        key: key,
+-        value: value,
+-        category: category_atom
+-      })
+-
+-    if changeset.valid? do
+-      validated_data = Ecto.Changeset.apply_changes(changeset)
+-
+-      validated_data_with_user =
+-        Map.put(validated_data, :updated_by_id, socket.assigns.current_user.id)
+-
+-      case Settings.upsert_config_setting(validated_data_with_user) do
+-        {:ok, _setting} ->
+-          {:noreply, after_config_write(socket, "Setting updated successfully")}
+-
+-        {:error, _changeset} ->
+-          {:noreply,
+-           socket
+-           |> put_flash(:error, "Failed to update setting")}
+-      end
+-    else
+-      {:noreply,
+-       socket
+-       |> put_flash(:error, "Invalid setting value")}
+-    end
+-  end
+-
+   @impl true
+   def handle_event("save_language_settings", params, socket) do
+     case LanguageSettings.save(params, socket.assigns.current_user.id) do
+diff --git a/lib/mydia_web/live/components/README.md b/lib/mydia_web/live/components/README.md
+index e5063b11c7..e448562452 100644
+--- a/lib/mydia_web/live/components/README.md
++++ b/lib/mydia_web/live/components/README.md
+@@ -81,47 +81,6 @@ A LiveComponent for manual metadata search when automatic parsing or matching fa
+ 
+ ---
+ 
+-### `MetadataSearchForm`
+-
+-A function component that provides an autocomplete-style search input with live TMDB results.
+-
+-**Location:** `lib/mydia_web/live/components/metadata_search_form.ex`
+-
+-**Usage:**
+-
+-```heex
+-<.metadata_search_form
+-  title_value={@edit_form["title"]}
+-  search_results={@search_results}
+-  on_search="search_series"
+-  on_select="select_search_result"
+-  placeholder="Search by title..."
+-  input_name="edit_form[title]"
+-  input_class="input input-bordered w-full"
+-/>
+-```
+-
+-**Props:**
+-
+-- `title_value` (string, required) - Current value of search input
+-- `search_results` (list, required) - List of search results to display in dropdown
+-- `on_search` (string, required) - Event to trigger when user types (phx-change)
+-- `on_select` (string, required) - Event to trigger when user clicks a result
+-- `placeholder` (string, optional, default: "Search by title...") - Input placeholder text
+-- `input_name` (string, optional, default: "title") - Name attribute for the input field
+-- `input_class` (string, optional) - CSS classes for styling the input
+-- `show_no_results` (boolean, optional, default: false) - Whether to show "no results" helper text
+-
+-**Features:**
+-
+-- Debounced search input (300ms)
+-- Dropdown with results (max height 64px with scroll)
+-- Each result shows: poster image, title, year, and media type badge
+-- Handles missing poster images
+-- Emits complete result data via phx-value attributes
+-
+----
+-
+ ## Implementation Notes
+ 
+ ### Event Handling
+diff --git a/lib/mydia_web/live/components/metadata_search_form.ex b/lib/mydia_web/live/components/metadata_search_form.ex
+deleted file mode 100644
+index 22d82f7076..0000000000
+--- a/lib/mydia_web/live/components/metadata_search_form.ex
++++ /dev/null
+@@ -1,109 +0,0 @@
+-defmodule MydiaWeb.Live.Components.MetadataSearchForm do
+-  @moduledoc """
+-  A reusable function component for metadata search with live results.
+-
+-  Provides a search input with autocomplete-style dropdown showing TMDB search results.
+-  Used for searching and selecting media metadata.
+-
+-  ## Usage
+-
+-      <.metadata_search_form
+-        title_value={@edit_form["title"]}
+-        search_results={@search_results}
+-        on_search="search_series"
+-        on_select="select_search_result"
+-        placeholder="Search by title..."
+-        input_name="edit_form[title]"
+-        input_class="input input-bordered w-full"
+-      />
+-
+-  ## Attributes
+-
+-  - `title_value` - Current value of the search input
+-  - `search_results` - List of search results to display
+-  - `on_search` - Event to trigger when user types (includes title param)
+-  - `on_select` - Event to trigger when user clicks a result (includes match params)
+-  - `placeholder` - (optional) Placeholder text for input
+-  - `input_name` - (optional) Name attribute for the input field
+-  - `input_class` - (optional) CSS classes for the input
+-  - `show_no_results` - (optional) Whether to show "no results" message
+-  """
+-  use Phoenix.Component
+-  alias Mydia.Metadata.ImageUrl
+-  import MydiaWeb.CoreComponents
+-
+-  attr :title_value, :string, required: true
+-  attr :search_results, :list, default: []
+-  attr :on_search, :string, required: true
+-  attr :on_select, :string, required: true
+-  attr :placeholder, :string, default: "Search by title..."
+-  attr :input_name, :string, default: "title"
+-  attr :input_class, :string, default: "input input-bordered w-full"
+-  attr :show_no_results, :boolean, default: false
+-
+-  def metadata_search_form(assigns) do
+-    ~H"""
+-    <div class="relative">
+-      <input
+-        type="text"
+-        name={@input_name}
+-        value={@title_value}
+-        class={@input_class}
+-        phx-change={@on_search}
+-        phx-debounce="300"
+-        autocomplete="off"
+-        placeholder={@placeholder}
+-      />
+-      <%= if @search_results != [] do %>
+-        <div class="absolute z-10 w-full mt-1 bg-base-100 border border-base-300 rounded-lg shadow-lg max-h-64 overflow-y-auto">
+-          <%= for result <- @search_results do %>
+-            <button
+-              type="button"
+-              class="w-full text-left px-3 py-2 hover:bg-base-200 border-b border-base-300 last:border-b-0 flex gap-3"
+-              phx-click={@on_select}
+-              phx-value-provider_id={result.provider_id}
+-              phx-value-title={result.title}
+-              phx-value-year={String.slice(result.release_date || result.first_air_date || "", 0..3)}
+-              phx-value-type={if result.media_type == :tv_show, do: "tv", else: "movie"}
+-            >
+-              <%= if Map.get(result, :poster_path) do %>
+-                <img
+-                  src={ImageUrl.image_url(result.poster_path, "w92")}
+-                  alt={result.title}
+-                  class="w-10 h-14 object-cover rounded flex-shrink-0"
+-                />
+-              <% else %>
+-                <div class="w-10 h-14 bg-base-300 rounded flex items-center justify-center flex-shrink-0">
+-                  <.icon name="hero-film" class="w-5 h-5 text-base-content/30" />
+-                </div>
+-              <% end %>
+-              <div class="flex-1 min-w-0">
+-                <div class="font-medium text-sm line-clamp-1">
+-                  {result.title}
+-                </div>
+-                <div class="flex gap-2 items-center mt-0.5">
+-                  <%= if result.release_date || result.first_air_date do %>
+-                    <span class="text-xs text-base-content/60">
+-                      {String.slice(result.release_date || result.first_air_date, 0..3)}
+-                    </span>
+-                  <% end %>
+-                  <span class="badge badge-xs badge-outline">
+-                    {if result.media_type == :tv_show, do: "TV", else: "Movie"}
+-                  </span>
+-                </div>
+-              </div>
+-            </button>
+-          <% end %>
+-        </div>
+-      <% end %>
+-      <%= if @show_no_results && @title_value != "" && @search_results == [] do %>
+-        <label class="label">
+-          <span class="label-text-alt text-base-content/50">
+-            Type at least 2 characters to search...
+-          </span>
+-        </label>
+-      <% end %>
+-    </div>
+-    """
+-  end
+-end
+
+From bccf4ea8096c8296df3f11890deb772dc152dff9 Mon Sep 17 00:00:00 2001
+From: Alexandre Rosenfeld <arsfeld@gmail.com>
+Date: Mon, 12 Oct 2026 15:55:16 -0400
+Subject: [PATCH 4/4] test(web): fail on phx-change controls outside a form
+
+LiveViewTest happily drives render_change on a control the browser would
+refuse to send, which is how #1120 shipped. Scan the templates instead.
+---
+ .../form_controls_inside_forms_test.exs       | 127 ++++++++++++++++++
+ 1 file changed, 127 insertions(+)
+ create mode 100644 test/mydia_web/form_controls_inside_forms_test.exs
+
+diff --git a/test/mydia_web/form_controls_inside_forms_test.exs b/test/mydia_web/form_controls_inside_forms_test.exs
+new file mode 100644
+index 0000000000..b356603b4d
+--- /dev/null
++++ b/test/mydia_web/form_controls_inside_forms_test.exs
+@@ -0,0 +1,127 @@
++defmodule MydiaWeb.FormControlsInsideFormsTest do
++  @moduledoc """
++  The LiveView client refuses form events from a control with no enclosing
++  form: `pushInput` throws "form events require the input to be inside a
++  form", so the event never reaches the server. `Phoenix.LiveViewTest` does
++  not check this, so a test driving `render_change` on such a control passes
++  while the real page does nothing (#1120).
++
++  This scans every template under `lib/mydia_web` and fails on a
++  `select`, `input`, `textarea` or `<.input>` carrying `phx-change` outside
++  a `<form>` or `<.form>`. Put `phx-change` on the form instead.
++
++  The scan is per template: a component whose control only ever renders
++  inside a parent's form in another template is a false positive. List those
++  in `@allowlist` with the reason.
++  """
++  use ExUnit.Case, async: true
++
++  @root Path.expand("../../lib/mydia_web", __DIR__)
++
++  # Tag name, optional leading slash, and attributes. Attribute values in
++  # `{...}` may contain `>`.
++  @tag_re ~r/<(\/?)(\.form|form|select|input|textarea|\.input)\b((?:[^>{]|\{[^}]*\})*)>/
++  @heex_sigil_re ~r/~H"""(.*?)"""/s
++  @form_tags ["form", ".form"]
++
++  # %{"lib/mydia_web/...ex" => "why the control is always inside a form"}
++  @allowlist %{}
++
++  test "every phx-change control sits inside a form" do
++    offenders =
++      @root
++      |> Path.join("**/*.{ex,heex}")
++      |> Path.wildcard()
++      |> Enum.flat_map(&offenders_in_file/1)
++      |> Enum.reject(fn {path, _line} -> Map.has_key?(@allowlist, path) end)
++
++    assert offenders == [], """
++    phx-change on a control outside a form. The LiveView client throws on
++    these and the event never reaches the server. Wrap the control in
++    <.form for={%{}} id="..." phx-change="..."> and move phx-change onto the form:
++
++    #{Enum.map_join(offenders, "\n", fn {path, line} -> "  #{path}:#{line}" end)}
++    """
++  end
++
++  describe "offending_lines/1" do
++    test "flags a select outside a form" do
++      assert offending_lines("""
++             <div>
++               <select name="type" phx-change="filter"></select>
++             </div>
++             """) == [2]
++    end
++
++    test "ignores a control inside <.form> or <form>" do
++      assert offending_lines("""
++             <.form for={%{}} phx-change="filter">
++               <select name="type" phx-change="filter"></select>
++             </.form>
++             <form phx-change="x"><input name="q" phx-change="x" /></form>
++             """) == []
++    end
++
++    test "flags a control after a form closes" do
++      assert offending_lines("""
++             <.form for={%{}}></.form>
++             <input name="q" phx-change={@on_search} />
++             """) == [2]
++    end
++
++    test "ignores controls without phx-change and attributes containing >" do
++      assert offending_lines("""
++             <input name="q" phx-click="go" class={if(@a > 1, do: "x")} />
++             """) == []
++    end
++  end
++
++  def offending_lines(body) do
++    @tag_re
++    |> Regex.scan(body, return: :index)
++    |> Enum.reduce({0, []}, fn [{start, _} | groups], {depth, acc} ->
++      [close, name, attrs] = Enum.map(groups, fn {s, l} -> binary_part(body, s, l) end)
++
++      cond do
++        name in @form_tags and close == "/" ->
++          {depth - 1, acc}
++
++        name in @form_tags ->
++          self_closing? = attrs |> String.trim_trailing() |> String.ends_with?("/")
++          {if(self_closing?, do: depth, else: depth + 1), acc}
++
++        close == "" and depth <= 0 and attrs =~ ~r/\bphx-change\b/ ->
++          {depth, [line_at(body, start) | acc]}
++
++        true ->
++          {depth, acc}
++      end
++    end)
++    |> elem(1)
++    |> Enum.reverse()
++  end
++
++  defp offenders_in_file(path) do
++    source = File.read!(path)
++    relative = Path.relative_to(path, Path.expand("../..", __DIR__))
++
++    for {offset, body} <- template_bodies(source, path),
++        line <- offending_lines(body) do
++      {relative, line_at(source, offset) + line - 1}
++    end
++  end
++
++  defp template_bodies(source, path) do
++    if String.ends_with?(path, ".heex") do
++      [{0, source}]
++    else
++      for [_whole, {start, length}] <- Regex.scan(@heex_sigil_re, source, return: :index) do
++        {start, binary_part(source, start, length)}
++      end
++    end
++  end
++
++  defp line_at(text, byte_offset) do
++    text |> binary_part(0, byte_offset) |> String.split("\n") |> length()
++  end
++end

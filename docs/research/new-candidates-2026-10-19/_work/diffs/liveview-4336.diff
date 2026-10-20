@@ -1,0 +1,1516 @@
+diff --git a/assets/js/phoenix_live_view/constants.ts b/assets/js/phoenix_live_view/constants.ts
+index 9f2d69c2c0..54c95090f5 100644
+--- a/assets/js/phoenix_live_view/constants.ts
++++ b/assets/js/phoenix_live_view/constants.ts
+@@ -121,3 +121,6 @@ export const REPLY = "r";
+ export const TITLE = "t";
+ export const TEMPLATES = "p";
+ export const STREAM = "stream";
++// Diagnostics
++export const PHX_LV_DIAGNOSTIC_EVENT = "phx:live-view:diagnostic";
++export const PHX_LV_DIAGNOSTIC_VERSION = 1;
+diff --git a/assets/js/phoenix_live_view/diagnostics.ts b/assets/js/phoenix_live_view/diagnostics.ts
+new file mode 100644
+index 0000000000..a845b63f50
+--- /dev/null
++++ b/assets/js/phoenix_live_view/diagnostics.ts
+@@ -0,0 +1,51 @@
++import {
++  PHX_LV_DIAGNOSTIC_EVENT,
++  PHX_LV_DIAGNOSTIC_VERSION,
++} from "./constants";
++
++export type LiveViewDiagnosticLevel = "debug" | "error";
++
++export type LiveViewDiagnosticMetadata = Record<string, unknown>;
++
++export type LiveViewDiagnosticContext = {
++  viewId?: string;
++};
++
++export type LiveViewDiagnostic = {
++  version: typeof PHX_LV_DIAGNOSTIC_VERSION;
++  level: LiveViewDiagnosticLevel;
++  code: string;
++  message: string;
++  viewId?: string;
++  metadata?: LiveViewDiagnosticMetadata;
++};
++
++// Debug-level diagnostics are gated on LiveSocket.isDebugEnabled() by the
++// caller; error-level diagnostics are always emitted.
++export const dispatchDiagnostic = (
++  diagnostic: Omit<LiveViewDiagnostic, "version">,
++): void => {
++  window.dispatchEvent(
++    new CustomEvent<LiveViewDiagnostic>(PHX_LV_DIAGNOSTIC_EVENT, {
++      detail: { version: PHX_LV_DIAGNOSTIC_VERSION, ...diagnostic },
++    }),
++  );
++};
++
++export const logError = (
++  code: string,
++  message: string,
++  metadata?: LiveViewDiagnosticMetadata,
++  context: LiveViewDiagnosticContext = {},
++): void => {
++  console.error && console.error(message, metadata);
++  dispatchDiagnostic({
++    level: "error",
++    code,
++    message,
++    metadata,
++    ...context,
++  });
++};
++
++export type LogError = typeof logError;
+diff --git a/assets/js/phoenix_live_view/dom.ts b/assets/js/phoenix_live_view/dom.ts
+index 5fa8dfa80f..efd55aa4ce 100644
+--- a/assets/js/phoenix_live_view/dom.ts
++++ b/assets/js/phoenix_live_view/dom.ts
+@@ -26,7 +26,7 @@ import {
+   PHX_STREAM,
+ } from "./constants";
+ 
+-import { logError } from "./utils";
++import { logError, type LogError } from "./diagnostics";
+ 
+ export type FormInputLike = HTMLElement & {
+   readonly form?: HTMLFormElement | null;
+@@ -39,7 +39,10 @@ export type QueryableNode = Element | Document | DocumentFragment;
+ 
+ const DOM = {
+   byId(id) {
+-    return document.getElementById(id) || logError(`no id found for ${id}`);
++    return (
++      document.getElementById(id) ||
++      logError("dom.element-not-found", `no id found for ${id}`, { id })
++    );
+   },
+ 
+   elementFromTarget(target: EventTarget): Element | null {
+@@ -362,7 +365,11 @@ const DOM = {
+           throttle ? this.deletePrivate(el, THROTTLED) : callback();
+         const currentCycle = this.incCycle(el, DEBOUNCE_TRIGGER, trigger);
+         if (isNaN(timeout)) {
+-          return logError(`invalid throttle/debounce value: ${value}`);
++          return logError(
++            "binding.invalid-debounce",
++            `invalid throttle/debounce value: ${value}`,
++            { el, value },
++          );
+         }
+         if (throttle) {
+           let newKeyDown = false;
+@@ -471,10 +478,14 @@ const DOM = {
+     if (el.isConnected) {
+       el.setAttribute("data-phx-hook", "");
+     } else {
+-      console.error(`
++      logError(
++        "hook.non-connected-element",
++        `
+         hook attached to non-connected DOM element
+         ensure you are calling createHook within your connectedCallback. ${el.outerHTML}
+-      `);
++      `,
++        { el },
++      );
+     }
+     this.putPrivate(el, "custom-el-hook", hook);
+   },
+@@ -717,7 +728,11 @@ const DOM = {
+     );
+   },
+ 
+-  cleanChildNodes(container: Element, phxUpdate: string) {
++  cleanChildNodes(
++    container: Element,
++    phxUpdate: string,
++    reportError: LogError = logError,
++  ) {
+     if (
+       DOM.isPhxUpdate(container, phxUpdate, ["append", "prepend", PHX_STREAM])
+     ) {
+@@ -730,9 +745,11 @@ const DOM = {
+             childNode.nodeValue &&
+             childNode.nodeValue.trim() === "";
+           if (!isEmptyTextNode && childNode.nodeType !== Node.COMMENT_NODE) {
+-            logError(
++            reportError(
++              "dom.invalid-phx-update-child",
+               "only HTML element tags with an id are allowed inside containers with phx-update.\n\n" +
+                 `removing illegal node: "${(("outerHTML" in childNode && (childNode.outerHTML as string)) || childNode.nodeValue || "").trim()}"\n\n`,
++              { container, childNode, phxUpdate },
+             );
+           }
+           toRemove.push(childNode);
+diff --git a/assets/js/phoenix_live_view/dom_patch.ts b/assets/js/phoenix_live_view/dom_patch.ts
+index c52e44a585..8164d634f1 100644
+--- a/assets/js/phoenix_live_view/dom_patch.ts
++++ b/assets/js/phoenix_live_view/dom_patch.ts
+@@ -136,6 +136,8 @@ export default class DOMPatch {
+ 
+   perform(isJoinPatch) {
+     const { view, liveSocket, html, container } = this;
++    const reportError = (code, message, metadata?) =>
++      view.logError(code, message, metadata);
+     let targetContainer = this.targetContainer;
+ 
+     if (this.targetCID) {
+@@ -378,7 +380,7 @@ export default class DOMPatch {
+             phxViewportTop,
+             phxViewportBottom,
+           );
+-          DOM.cleanChildNodes(toEl, phxUpdate);
++          DOM.cleanChildNodes(toEl, phxUpdate, reportError);
+           const isFocusedFormEl =
+             focused &&
+             fromEl.isSameNode(focused) &&
+@@ -574,15 +576,16 @@ export default class DOMPatch {
+     });
+ 
+     if (liveSocket.isDebugEnabled()) {
+-      detectDuplicateIds();
+-      detectInvalidStreamInserts(this.streamInserts);
++      detectDuplicateIds(reportError);
++      detectInvalidStreamInserts(this.streamInserts, reportError);
+       // warn if there are any inputs named "id"
+       Array.from(document.querySelectorAll("input[name=id]")).forEach(
+         (node) => {
+           if (node instanceof HTMLInputElement && node.form) {
+-            console.error(
++            reportError(
++              "dom.form-input-name-id",
+               'Detected an input with name="id" inside a form! This will cause problems when patching the DOM.\n',
+-              node,
++              { el: node },
+             );
+           }
+         },
+diff --git a/assets/js/phoenix_live_view/entry_uploader.js b/assets/js/phoenix_live_view/entry_uploader.js
+index 772f2ac8f7..ef7dc780f8 100644
+--- a/assets/js/phoenix_live_view/entry_uploader.js
++++ b/assets/js/phoenix_live_view/entry_uploader.js
+@@ -1,5 +1,3 @@
+-import { logError } from "./utils";
+-
+ export default class EntryUploader {
+   constructor(entry, config, liveSocket) {
+     const { chunk_size, chunk_timeout } = config;
+@@ -48,7 +46,11 @@ export default class EntryUploader {
+         this.offset += /** @type {ArrayBuffer} */ (e.target.result).byteLength;
+         this.pushChunk(/** @type {ArrayBuffer} */ (e.target.result));
+       } else {
+-        return logError("Read error: " + e.target?.error);
++        return this.entry.view.logError(
++          "upload.read-failed",
++          "Read error: " + e.target?.error,
++          { entry: this.entry, offset: this.offset },
++        );
+       }
+     };
+     reader.readAsArrayBuffer(blob);
+diff --git a/assets/js/phoenix_live_view/index.ts b/assets/js/phoenix_live_view/index.ts
+index 103b8112c2..442f250bc8 100644
+--- a/assets/js/phoenix_live_view/index.ts
++++ b/assets/js/phoenix_live_view/index.ts
+@@ -12,7 +12,7 @@ import LiveSocket, { type LiveSocketOptions, isUsedInput } from "./live_socket";
+ import DOM from "./dom";
+ import { ViewHook } from "./view_hook";
+ import View from "./view";
+-import { logError } from "./utils";
++import { logError } from "./diagnostics";
+ 
+ import type { EncodedJS } from "./js_commands";
+ import type { Hook, HooksOptions, HookInterface } from "./view_hook";
+@@ -55,8 +55,9 @@ function createHook(el: HTMLElement, callbacks: Hook): ViewHook {
+ 
+   if (!el.hasAttribute("id")) {
+     logError(
++      "hook.missing-id",
+       "Elements passed to createHook need to have a unique id attribute",
+-      el,
++      { el },
+     );
+   }
+ 
+diff --git a/assets/js/phoenix_live_view/live_socket.ts b/assets/js/phoenix_live_view/live_socket.ts
+index 46fcb3f632..87af9c2341 100644
+--- a/assets/js/phoenix_live_view/live_socket.ts
++++ b/assets/js/phoenix_live_view/live_socket.ts
+@@ -40,9 +40,14 @@ import {
+   closure,
+   debug,
+   maybe,
+-  logError,
+   eventContainsFiles,
+ } from "./utils";
++import {
++  dispatchDiagnostic,
++  logError,
++  type LiveViewDiagnosticLevel,
++  type LiveViewDiagnosticMetadata,
++} from "./diagnostics";
+ 
+ import Browser from "./browser";
+ import DOM from "./dom";
+@@ -495,7 +500,11 @@ export default class LiveSocket {
+    */
+   connect(): void {
+     // enable debug by default if on localhost and not explicitly disabled
+-    if (window.location.hostname === "localhost" && !this.isDebugDisabled()) {
++    const host = window.location.hostname.toLowerCase();
++    if (
++      (host === "localhost" || host.endsWith(".localhost")) &&
++      !this.isDebugDisabled()
++    ) {
+       this.enableDebug();
+     }
+     const doConnect = () => {
+@@ -576,7 +585,9 @@ export default class LiveSocket {
+       return;
+     }
+     if (this.main && this.isConnected()) {
+-      this.log(this.main, "socket", () => ["disconnect for page nav"]);
++      this.log(this.main, "socket", () => ["disconnect for page nav"], {
++        code: "socket.page-navigation-disconnect",
++      });
+     }
+     this.unloaded = true;
+     this.destroyAllViews();
+@@ -600,13 +611,40 @@ export default class LiveSocket {
+   }
+ 
+   /** @internal */
+-  log(view, kind, msgCallback) {
++  log(
++    view,
++    kind,
++    msgCallback,
++    diagnostic?: {
++      code: string;
++      level?: LiveViewDiagnosticLevel;
++      metadata?: () => LiveViewDiagnosticMetadata;
++    },
++  ) {
++    const debugEnabled = this.isDebugEnabled();
++    const level = diagnostic?.level ?? "debug";
++    // debug-level diagnostics are only emitted when debugging is enabled,
++    // while other levels are always emitted; console output stays gated on
++    // debugging (or the viewLogger) either way
++    const emitDiagnostic = !!diagnostic && (level !== "debug" || debugEnabled);
++    if (!this.viewLogger && !debugEnabled && !emitDiagnostic) {
++      return;
++    }
++
++    const [message, obj] = msgCallback();
+     if (this.viewLogger) {
+-      const [msg, obj] = msgCallback();
+-      this.viewLogger(view, kind, msg, obj);
+-    } else if (this.isDebugEnabled()) {
+-      const [msg, obj] = msgCallback();
+-      debug(view, kind, msg, obj);
++      this.viewLogger(view, kind, message, obj);
++    } else if (debugEnabled) {
++      debug(view, kind, message, obj);
++    }
++    if (emitDiagnostic && diagnostic) {
++      dispatchDiagnostic({
++        level,
++        code: diagnostic.code,
++        message,
++        viewId: view.id,
++        metadata: diagnostic.metadata?.(),
++      });
+     }
+   }
+ 
+@@ -663,13 +701,28 @@ export default class LiveSocket {
+       view.destroy();
+       log
+         ? log()
+-        : this.log(view, "join", () => [
+-            `encountered ${tries} consecutive reloads`,
+-          ]);
++        : this.log(
++            view,
++            "join",
++            () => [`encountered ${tries} consecutive reloads`],
++            {
++              code: "view.reload-attempts",
++              metadata: () => ({ tries }),
++            },
++          );
+       if (tries >= this.maxReloads) {
+-        this.log(view, "join", () => [
+-          `exceeded ${this.maxReloads} consecutive reloads. Entering failsafe mode`,
+-        ]);
++        this.log(
++          view,
++          "join",
++          () => [
++            `exceeded ${this.maxReloads} consecutive reloads. Entering failsafe mode`,
++          ],
++          {
++            code: "view.reload-failsafe",
++            level: "error",
++            metadata: () => ({ tries, maxReloads: this.maxReloads }),
++          },
++        );
+       }
+       if (this.pendingLink !== null) {
+         window.location.href = this.pendingLink;
+@@ -706,7 +759,14 @@ export default class LiveSocket {
+     }
+     let callbacks = window[`phx_hook_${name}`];
+     if (!callbacks || typeof callbacks !== "function") {
+-      logError("a runtime hook must be a function", runtimeHook);
++      logError(
++        "hook.runtime-not-function",
++        "a runtime hook must be a function",
++        {
++          runtimeHook,
++          name,
++        },
++      );
+       return;
+     }
+     const hookDefiniton = callbacks();
+@@ -717,8 +777,9 @@ export default class LiveSocket {
+       return hookDefiniton;
+     }
+     logError(
++      "hook.runtime-invalid-return",
+       "runtime hook must return an object with hook callbacks or an instance of ViewHook",
+-      runtimeHook,
++      { runtimeHook, name },
+     );
+   }
+ 
+diff --git a/assets/js/phoenix_live_view/rendered.js b/assets/js/phoenix_live_view/rendered.js
+index a8384f7458..f951dd7dd7 100644
+--- a/assets/js/phoenix_live_view/rendered.js
++++ b/assets/js/phoenix_live_view/rendered.js
+@@ -16,7 +16,8 @@ import {
+   KEYED_MOVED,
+ } from "./constants";
+ 
+-import { isObject, logError, isCid } from "./utils";
++import { isObject, isCid } from "./utils";
++import { logError } from "./diagnostics";
+ 
+ const VOID_TAGS = new Set([
+   "area",
+@@ -531,45 +532,60 @@ export default class Rendered {
+   }
+ 
+   recursiveCIDToString(components, cid, onlyCids) {
+-    const component =
+-      components[cid] || logError(`no component for CID ${cid}`, components);
+-    const attrs = { [PHX_COMPONENT]: cid, [PHX_VIEW_REF]: this.viewId };
+-    const skip = onlyCids && !onlyCids.has(cid);
+-    // Two optimization paths apply here:
+-    //
+-    //   1. The onlyCids optimization works by the server diff telling us only specific
+-    //     cid's have changed. This allows us to skip rendering any component that hasn't changed,
+-    //     which ultimately sets PHX_SKIP root attribute and avoids rendering the innerHTML.
+-    //
+-    //   2. The root PHX_SKIP optimization generalizes to all HEEx function components, and
+-    //     works in the same PHX_SKIP attribute fashion as 1, but the newRender tracking is done
+-    //     at the general diff merge level. If we merge a diff with new dynamics, we necessarily have
+-    //     experienced a change which must be a newRender, and thus we can't skip the render.
+-    //
+-    // Both optimization flows apply here. newRender is set based on the onlyCids optimization, and
+-    // we track a deterministic magicId based on the cid.
+-    //
+-    // changeTracking is about the entire tree
+-    // newRender is about the current root in the tree
+-    //
+-    // By default changeTracking is enabled, but we special case the flow where the client is pruning
+-    // cids and the server adds the component back. In such cases, we explicitly disable changeTracking
+-    // with resetRender for this cid, then re-enable it after the recursive call to skip the optimization
+-    // for the entire component tree.
+-    component.newRender = !skip;
+-    component.magicId = `c${cid}-${this.parentViewId()}`;
+-    // enable change tracking as long as the component hasn't been reset
+-    const changeTracking = !component.reset;
+-    const { buffer: html, streams } = this.recursiveToString(
+-      component,
+-      components,
+-      onlyCids,
+-      changeTracking,
+-      attrs,
+-    );
+-    // disable reset after we've rendered
+-    delete component.reset;
++    if (components[cid]) {
++      const component = components[cid];
++
++      const attrs = { [PHX_COMPONENT]: cid, [PHX_VIEW_REF]: this.viewId };
++      const skip = onlyCids && !onlyCids.has(cid);
++      // Two optimization paths apply here:
++      //
++      //   1. The onlyCids optimization works by the server diff telling us only specific
++      //     cid's have changed. This allows us to skip rendering any component that hasn't changed,
++      //     which ultimately sets PHX_SKIP root attribute and avoids rendering the innerHTML.
++      //
++      //   2. The root PHX_SKIP optimization generalizes to all HEEx function components, and
++      //     works in the same PHX_SKIP attribute fashion as 1, but the newRender tracking is done
++      //     at the general diff merge level. If we merge a diff with new dynamics, we necessarily have
++      //     experienced a change which must be a newRender, and thus we can't skip the render.
++      //
++      // Both optimization flows apply here. newRender is set based on the onlyCids optimization, and
++      // we track a deterministic magicId based on the cid.
++      //
++      // changeTracking is about the entire tree
++      // newRender is about the current root in the tree
++      //
++      // By default changeTracking is enabled, but we special case the flow where the client is pruning
++      // cids and the server adds the component back. In such cases, we explicitly disable changeTracking
++      // with resetRender for this cid, then re-enable it after the recursive call to skip the optimization
++      // for the entire component tree.
++      component.newRender = !skip;
++      component.magicId = `c${cid}-${this.parentViewId()}`;
++      // enable change tracking as long as the component hasn't been reset
++      const changeTracking = !component.reset;
++      const { buffer: html, streams } = this.recursiveToString(
++        component,
++        components,
++        onlyCids,
++        changeTracking,
++        attrs,
++      );
++      // disable reset after we've rendered
++      delete component.reset;
+ 
+-    return { buffer: html, streams: streams };
++      return { buffer: html, streams: streams };
++    } else {
++      logError(
++        "render.missing-component",
++        `no component for CID ${cid}`,
++        {
++          cid,
++          components,
++        },
++        { viewId: this.viewId },
++      );
++      throw new Error(
++        "Cannot continue render due to missing component: " + cid,
++      );
++    }
+   }
+ }
+diff --git a/assets/js/phoenix_live_view/upload_entry.js b/assets/js/phoenix_live_view/upload_entry.js
+index 801f466fda..2453fe8d00 100644
+--- a/assets/js/phoenix_live_view/upload_entry.js
++++ b/assets/js/phoenix_live_view/upload_entry.js
+@@ -4,7 +4,7 @@ import {
+   PHX_PREFLIGHTED_REFS,
+ } from "./constants";
+ 
+-import { channelUploader, logError } from "./utils";
++import { channelUploader } from "./utils";
+ 
+ import LiveUploader from "./live_uploader";
+ 
+@@ -133,7 +133,11 @@ export default class UploadEntry {
+     if (this.meta.uploader) {
+       const callback =
+         uploaders[this.meta.uploader] ||
+-        logError(`no uploader configured for ${this.meta.uploader}`);
++        this.view.logError(
++          "upload.missing-uploader",
++          `no uploader configured for ${this.meta.uploader}`,
++          { uploader: this.meta.uploader, uploaders },
++        );
+       return { name: this.meta.uploader, callback: callback };
+     } else {
+       return { name: "channel", callback: channelUploader };
+@@ -143,10 +147,15 @@ export default class UploadEntry {
+   zipPostFlight(resp) {
+     this.meta = resp.entries[this.ref];
+     if (!this.meta) {
+-      logError(`no preflight upload response returned with ref ${this.ref}`, {
+-        input: this.fileEl,
+-        response: resp,
+-      });
++      this.view.logError(
++        "upload.missing-preflight-response",
++        `no preflight upload response returned with ref ${this.ref}`,
++        {
++          ref: this.ref,
++          input: this.fileEl,
++          response: resp,
++        },
++      );
+     }
+   }
+ }
+diff --git a/assets/js/phoenix_live_view/utils.ts b/assets/js/phoenix_live_view/utils.ts
+index 3e2743bd49..48bd739611 100644
+--- a/assets/js/phoenix_live_view/utils.ts
++++ b/assets/js/phoenix_live_view/utils.ts
+@@ -1,8 +1,7 @@
+ import { PHX_VIEW_SELECTOR } from "./constants";
+ 
+ import EntryUploader from "./entry_uploader";
+-
+-export const logError = (msg, obj?) => console.error && console.error(msg, obj);
++import { logError, type LogError } from "./diagnostics";
+ 
+ // Live navigation can only stay within the current origin, as it joins the
+ // target over the existing socket. A full URL to a different origin (or a
+@@ -33,22 +32,29 @@ export const isCid = (cid): cid is number | string => {
+   return type === "number" || (type === "string" && /^(0|[1-9]\d*)$/.test(cid));
+ };
+ 
+-export function detectDuplicateIds() {
+-  const ids = new Set();
++export function detectDuplicateIds(reportError: LogError = logError) {
++  const ids = new Map<string, Element>();
+   const elems = document.querySelectorAll("*[id]");
+   for (let i = 0, len = elems.length; i < len; i++) {
+-    if (ids.has(elems[i].id)) {
+-      console.error(
+-        `Multiple IDs detected: ${elems[i].id}. Ensure unique element ids.`,
++    const id = elems[i].id;
++    const existing = ids.get(id);
++    if (existing) {
++      reportError(
++        "dom.duplicate-id",
++        `Multiple IDs detected: ${id}. Ensure unique element ids.`,
++        { id, elements: [existing, elems[i]] },
+       );
+     } else {
+-      ids.add(elems[i].id);
++      ids.set(id, elems[i]);
+     }
+   }
+ }
+ 
+-export function detectInvalidStreamInserts(inserts) {
+-  const errors = new Set();
++export function detectInvalidStreamInserts(
++  inserts,
++  reportError: LogError = logError,
++) {
++  const invalidContainers = new Set<Element>();
+   Object.keys(inserts).forEach((id) => {
+     const streamEl = document.getElementById(id);
+     if (
+@@ -56,12 +62,17 @@ export function detectInvalidStreamInserts(inserts) {
+       streamEl.parentElement &&
+       streamEl.parentElement.getAttribute("phx-update") !== "stream"
+     ) {
+-      errors.add(
+-        `The stream container with id "${streamEl.parentElement.id}" is missing the phx-update="stream" attribute. Ensure it is set for streams to work properly.`,
+-      );
++      invalidContainers.add(streamEl.parentElement);
+     }
+   });
+-  errors.forEach((error) => console.error(error));
++  invalidContainers.forEach((container) => {
++    const id = container.id;
++    reportError(
++      "dom.invalid-stream-container",
++      `The stream container with id "${id}" is missing the phx-update="stream" attribute. Ensure it is set for streams to work properly.`,
++      { id, container },
++    );
++  });
+ }
+ 
+ export const debug = (view, kind, msg, obj) => {
+diff --git a/assets/js/phoenix_live_view/view.ts b/assets/js/phoenix_live_view/view.ts
+index 77fa0f10c1..79fecb52cb 100644
+--- a/assets/js/phoenix_live_view/view.ts
++++ b/assets/js/phoenix_live_view/view.ts
+@@ -51,10 +51,10 @@ import {
+   closestPhxBinding,
+   isEmpty,
+   isEqualObj,
+-  logError,
+   maybe,
+   isCid,
+ } from "./utils";
++import { logError } from "./diagnostics";
+ 
+ import Browser from "./browser";
+ import DOM, { FormInputLike, QueryableNode } from "./dom";
+@@ -137,7 +137,8 @@ export default class View {
+     // check if the element is already bound to a view
+     const boundView = DOM.private(this.el, "view");
+     if (boundView !== undefined && boundView.isDead !== true) {
+-      logError(
++      this.logError(
++        "view.duplicate-binding",
+         `The DOM element for this view has already been bound to a view.
+ 
+         An element can only ever be associated with a single view!
+@@ -270,7 +271,13 @@ export default class View {
+ 
+     DOM.markPhxChildDestroyed(this.el);
+ 
+-    this.log("destroyed", () => ["the child has been removed from the parent"]);
++    this.log(
++      "destroyed",
++      () => ["the child has been removed from the parent"],
++      {
++        code: "view.child-destroyed",
++      },
++    );
+     this.channel
+       .leave()
+       .receive("ok", onFinished)
+@@ -320,8 +327,14 @@ export default class View {
+     }
+   }
+ 
+-  log(kind, msgCallback) {
+-    this.liveSocket.log(this, kind, msgCallback);
++  log(kind, msgCallback, diagnostic?) {
++    this.liveSocket.log(this, kind, msgCallback, diagnostic);
++  }
++
++  logError(code, message, metadata?) {
++    logError(code, message, metadata, {
++      viewId: this.id ?? this.el.id,
++    });
+   }
+ 
+   transition(time, onStart, onDone = function () {}) {
+@@ -347,7 +360,11 @@ export default class View {
+     if (isCid(phxTarget)) {
+       const target = DOM.findComponent(this.id, phxTarget, dom);
+       if (!target) {
+-        logError(`no component found matching phx-target of ${phxTarget}`);
++        this.logError(
++          "event.missing-component-target",
++          `no component found matching phx-target of ${phxTarget}`,
++          { target: phxTarget },
++        );
+       } else {
+         callback(
+           this,
+@@ -357,8 +374,10 @@ export default class View {
+     } else {
+       const targets = Array.from(dom.querySelectorAll(phxTarget));
+       if (targets.length === 0) {
+-        logError(
++        this.logError(
++          "event.missing-selector-target",
+           `nothing found matching the phx-target selector "${phxTarget}"`,
++          { target: phxTarget },
+         );
+       }
+       targets.forEach((target) =>
+@@ -367,8 +386,12 @@ export default class View {
+     }
+   }
+ 
+-  applyDiff(type, rawDiff, callback) {
+-    this.log(type, () => ["", clone(rawDiff)]);
++  applyDiff(type: "mount" | "update", rawDiff, callback) {
++    const clonedDiff = clone(rawDiff);
++    this.log(type, () => ["received diff", clonedDiff], {
++      code: `view.diff.${type}`,
++      metadata: () => ({ diff: clonedDiff }),
++    });
+     const { diff, reply, events, title } = Rendered.extract(rawDiff);
+ 
+     // Events are either [event, payload] or [event, payload, true]
+@@ -968,7 +991,11 @@ export default class View {
+       // hook created, but not attached (createHook for web component)
+       const hook =
+         DOM.getCustomElHook(el) ||
+-        logError(`no hook found for custom element: ${el.id}`);
++        this.logError(
++          "hook.custom-element-missing-hook",
++          `no hook found for custom element: ${el.id}`,
++          { el },
++        );
+       this.viewHooks[hookElId] = hook;
+       hook.__attachView(this);
+       return hook;
+@@ -989,9 +1016,10 @@ export default class View {
+ 
+       if (hookDefinition) {
+         if (!el.id) {
+-          logError(
++          this.logError(
++            "hook.missing-id",
+             `no DOM ID for hook "${hookName}". Hooks require a unique ID on each element.`,
+-            el,
++            { el, hookName },
+           );
+           return;
+         }
+@@ -1011,22 +1039,30 @@ export default class View {
+             // It's an object literal, pass it to the ViewHook constructor for wrapping
+             hookInstance = new ViewHook(this, el, hookDefinition);
+           } else {
+-            logError(
++            this.logError(
++              "hook.invalid-definition",
+               `Invalid hook definition for "${hookName}". Expected a class extending ViewHook or an object definition.`,
+-              el,
++              { el, hookName },
+             );
+             return;
+           }
+         } catch (e) {
+           const errorMessage = e instanceof Error ? e.message : String(e);
+-          logError(`Failed to create hook "${hookName}": ${errorMessage}`, el);
++          this.logError(
++            "hook.creation-failed",
++            `Failed to create hook "${hookName}": ${errorMessage}`,
++            { el, hookName, error: e },
++          );
+           return;
+         }
+ 
+         this.viewHooks[ViewHook.elementID(hookInstance.el)] = hookInstance;
+         return hookInstance;
+       } else if (hookName !== null) {
+-        logError(`unknown hook found for "${hookName}"`, el);
++        this.logError("hook.unknown", `unknown hook found for "${hookName}"`, {
++          el,
++          hookName,
++        });
+       }
+     }
+   }
+@@ -1163,20 +1199,36 @@ export default class View {
+     }
+ 
+     if (resp.reason === "reload") {
+-      this.log("error", () => [
+-        `failed mount with ${resp.status}. Falling back to page reload`,
+-        resp,
+-      ]);
++      this.log(
++        "error",
++        () => [
++          `failed mount with ${resp.status}. Falling back to page reload`,
++          resp,
++        ],
++        {
++          code: "view.mount-reload",
++          level: "error",
++          metadata: () => ({ status: resp.status }),
++        },
++      );
+       this.onRedirect({
+         to: this.liveSocket.main!.href!,
+         reloadToken: resp.token,
+       });
+       return;
+     } else if (resp.reason === "unauthorized" || resp.reason === "stale") {
+-      this.log("error", () => [
+-        "unauthorized live_redirect. Falling back to page request",
+-        resp,
+-      ]);
++      this.log(
++        "error",
++        () => [
++          "unauthorized live_redirect. Falling back to page request",
++          resp,
++        ],
++        {
++          code: "view.unauthorized-live-redirect",
++          level: "error",
++          metadata: () => ({ reason: resp.reason }),
++        },
++      );
+       this.onRedirect({ to: this.liveSocket.main!.href!, flash: this.flash });
+       return;
+     }
+@@ -1190,7 +1242,11 @@ export default class View {
+     if (resp.live_redirect) {
+       return this.onLiveRedirect(resp.live_redirect);
+     }
+-    this.log("error", () => ["unable to join", resp]);
++    this.log("error", () => ["unable to join", resp], {
++      code: "view.join-failed",
++      level: "error",
++      metadata: () => ({ response: resp }),
++    });
+     if (this.isMain()) {
+       this.displayError(
+         [PHX_LOADING_CLASS, PHX_ERROR_CLASS, PHX_SERVER_ERROR_CLASS],
+@@ -1206,10 +1262,21 @@ export default class View {
+           [PHX_LOADING_CLASS, PHX_ERROR_CLASS, PHX_SERVER_ERROR_CLASS],
+           { unstructuredError: resp, errorKind: "server" },
+         );
+-        this.log("error", () => [
+-          `giving up trying to mount after ${MAX_CHILD_JOIN_ATTEMPTS} tries`,
+-          resp,
+-        ]);
++        this.log(
++          "error",
++          () => [
++            `giving up trying to mount after ${MAX_CHILD_JOIN_ATTEMPTS} tries`,
++            resp,
++          ],
++          {
++            code: "view.mount-give-up",
++            level: "error",
++            metadata: () => ({
++              attempts: MAX_CHILD_JOIN_ATTEMPTS,
++              response: resp,
++            }),
++          },
++        );
+         this.destroy();
+       }
+       const trueChildEl = DOM.byId(this.el.id);
+@@ -1247,7 +1314,11 @@ export default class View {
+   onError(reason) {
+     this.onClose(reason);
+     if (this.liveSocket.isConnected()) {
+-      this.log("error", () => ["view crashed", reason]);
++      this.log("error", () => ["view crashed", reason], {
++        code: "view.crashed",
++        level: "error",
++        metadata: () => ({ reason }),
++      });
+     }
+     if (!this.liveSocket.isUnloaded()) {
+       if (this.liveSocket.isConnected()) {
+@@ -1368,9 +1439,13 @@ export default class View {
+           reject(new Error("timeout"));
+           if (this.joinCount === oldJoinCount) {
+             this.liveSocket.reloadWithJitter(this, () => {
+-              this.log("timeout", () => [
+-                "received timeout while communicating with server. Falling back to hard refresh for recovery",
+-              ]);
++              this.log(
++                "timeout",
++                () => [
++                  "received timeout while communicating with server. Falling back to hard refresh for recovery",
++                ],
++                { code: "view.push-timeout", level: "error" },
++              );
+             });
+           }
+         },
+@@ -1611,11 +1686,17 @@ export default class View {
+     payload,
+   ): Promise<{ reply: any; ref: number }> {
+     if (!this.isConnected()) {
+-      this.log("hook", () => [
+-        "unable to push hook event. LiveView not connected",
+-        event,
+-        payload,
+-      ]);
++      this.log(
++        "hook",
++        () => [
++          "unable to push hook event. LiveView not connected",
++          { event, payload },
++        ],
++        {
++          code: "hook.push-disconnected",
++          metadata: () => ({ event, payload }),
++        },
++      );
+       return Promise.reject(
+         new Error("unable to push hook event. LiveView not connected"),
+       );
+@@ -1807,7 +1888,14 @@ export default class View {
+       },
+     )
+       .then(({ reply }) => onReply && onReply(reply))
+-      .catch((error) => logError("Failed to push event", error));
++      .catch((error) =>
++        this.logError("event.push-failed", "Failed to push event", {
++          error,
++          type,
++          phxEvent,
++          el,
++        }),
++      );
+   }
+ 
+   pushFileProgress(fileEl, entryRef, progress, onReply = function () {}) {
+@@ -1821,7 +1909,13 @@ export default class View {
+           cid: view.targetComponentID(fileEl.form, targetCtx),
+         })
+         .then(() => onReply())
+-        .catch((error) => logError("Failed to push file progress", error));
++        .catch((error) =>
++          view.logError(
++            "upload.progress-push-failed",
++            "Failed to push file progress",
++            { error, fileEl, entryRef, progress },
++          ),
++        );
+     });
+   }
+ 
+@@ -1910,7 +2004,13 @@ export default class View {
+           callback && callback(resp);
+         }
+       })
+-      .catch((error) => logError("Failed to push input event", error));
++      .catch((error) =>
++        this.logError("event.input-push-failed", "Failed to push input event", {
++          error,
++          inputEl,
++          phxEvent,
++        }),
++      );
+   }
+ 
+   triggerAwaitingSubmit(formEl, phxEvent) {
+@@ -2044,7 +2144,17 @@ export default class View {
+           cid: cid,
+         })
+           .then(({ resp }) => onReply(resp))
+-          .catch((error) => logError("Failed to push form submit", error));
++          .catch((error) =>
++            this.logError(
++              "event.submit-push-failed",
++              "Failed to push form submit",
++              {
++                error,
++                phxEvent,
++                formEl,
++              },
++            ),
++          );
+       });
+     } else if (
+       !(
+@@ -2062,7 +2172,17 @@ export default class View {
+         cid: cid,
+       })
+         .then(({ resp }) => onReply(resp))
+-        .catch((error) => logError("Failed to push form submit", error));
++        .catch((error) =>
++          this.logError(
++            "event.submit-push-failed",
++            "Failed to push form submit",
++            {
++              error,
++              phxEvent,
++              formEl,
++            },
++          ),
++        );
+     }
+   }
+ 
+@@ -2095,11 +2215,17 @@ export default class View {
+         cid: this.targetComponentID(inputEl.form, targetCtx),
+       };
+ 
+-      this.log("upload", () => ["sending preflight request", payload]);
++      this.log("upload", () => ["sending preflight request", payload], {
++        code: "upload.preflight-request",
++        metadata: () => ({ payload }),
++      });
+ 
+       this.pushWithReply(null, "allow_upload", payload)
+         .then(({ resp }) => {
+-          this.log("upload", () => ["got preflight response", resp]);
++          this.log("upload", () => ["got preflight response", resp], {
++            code: "upload.preflight-response",
++            metadata: () => ({ response: resp }),
++          });
+           // the preflight will reject entries beyond the max entries
+           // so we error and cancel entries on the client that are missing from the response
+           uploader.entries().forEach((entry) => {
+@@ -2130,7 +2256,13 @@ export default class View {
+             uploader.initAdapterUpload(resp, onError, this.liveSocket);
+           }
+         })
+-        .catch((error) => logError("Failed to push upload", error));
++        .catch((error) =>
++          this.logError("upload.push-failed", "Failed to push upload", {
++            error,
++            phxEvent,
++            formEl,
++          }),
++        );
+     });
+   }
+ 
+@@ -2146,7 +2278,10 @@ export default class View {
+     } else {
+       uploader.entries().map((entry) => entry.cancel());
+     }
+-    this.log("upload", () => [`error for entry ${uploadRef}`, reason]);
++    this.log("upload", () => [`error for entry ${uploadRef}`, reason], {
++      code: "upload.entry-error",
++      metadata: () => ({ uploadRef, reason }),
++    });
+   }
+ 
+   dispatchUploads(targetCtx, name, filesOrBlobs) {
+@@ -2155,9 +2290,17 @@ export default class View {
+       (el) => el.name === name,
+     );
+     if (inputs.length === 0) {
+-      logError(`no live file inputs found matching the name "${name}"`);
++      this.logError(
++        "upload.input-not-found",
++        `no live file inputs found matching the name "${name}"`,
++        { name },
++      );
+     } else if (inputs.length > 1) {
+-      logError(`duplicate live file inputs found matching the name "${name}"`);
++      this.logError(
++        "upload.duplicate-input",
++        `duplicate live file inputs found matching the name "${name}"`,
++        { name, inputs },
++      );
+     } else {
+       DOM.dispatchEvent(inputs[0], PHX_TRACK_UPLOADS, {
+         detail: { files: filesOrBlobs },
+@@ -2364,9 +2507,13 @@ export default class View {
+       return DOM.findComponent(this.id, cid) === null;
+     });
+ 
+-    const onError = (error) => {
++    const onError = (error, cids) => {
+       if (!this.isDestroyed()) {
+-        logError("Failed to push components destroyed", error);
++        this.logError(
++          "component.destroy-push-failed",
++          "Failed to push components destroyed",
++          { error, cids },
++        );
+       }
+     };
+ 
+@@ -2393,11 +2540,11 @@ export default class View {
+                 .then(({ resp }) => {
+                   this.rendered!.pruneCIDs(resp.cids);
+                 })
+-                .catch(onError);
++                .catch((err) => onError(err, completelyDestroyCIDs));
+             }
+           });
+         })
+-        .catch(onError);
++        .catch((err) => onError(err, willDestroyCIDs));
+     }
+   }
+ 
+diff --git a/assets/test/diagnostics_test.ts b/assets/test/diagnostics_test.ts
+new file mode 100644
+index 0000000000..7c702ae80f
+--- /dev/null
++++ b/assets/test/diagnostics_test.ts
+@@ -0,0 +1,82 @@
++import { dispatchDiagnostic, logError } from "phoenix_live_view/diagnostics";
++import { PHX_LV_DEBUG } from "phoenix_live_view/constants";
++import { captureDiagnostics } from "./test_helpers";
++
++describe("diagnostics", () => {
++  afterEach(() => jest.restoreAllMocks());
++
++  test("dispatches a versioned envelope on a stable event name", () => {
++    // debug gating is done by the caller
++    window.sessionStorage.setItem(PHX_LV_DEBUG, "false");
++    const received: unknown[] = [];
++    const listener = (event: Event) =>
++      received.push((event as CustomEvent).detail);
++    window.addEventListener("phx:live-view:diagnostic", listener);
++
++    try {
++      dispatchDiagnostic({
++        level: "debug",
++        code: "test.code",
++        message: "message",
++      });
++    } finally {
++      window.removeEventListener("phx:live-view:diagnostic", listener);
++      window.sessionStorage.removeItem(PHX_LV_DEBUG);
++    }
++
++    expect(received).toEqual([
++      { version: 1, level: "debug", code: "test.code", message: "message" },
++    ]);
++  });
++
++  test("logError dispatches without metadata and view context", () => {
++    const consoleError = jest
++      .spyOn(console, "error")
++      .mockImplementation(() => {});
++    const { diagnostics, stop } = captureDiagnostics();
++
++    try {
++      logError("hook.missing-id", "no id");
++    } finally {
++      stop();
++    }
++
++    expect(consoleError).toHaveBeenCalledWith("no id", undefined);
++    expect(diagnostics).toEqual([
++      {
++        version: 1,
++        level: "error",
++        code: "hook.missing-id",
++        message: "no id",
++      },
++    ]);
++  });
++
++  test("logs and dispatches structured errors", () => {
++    const consoleError = jest
++      .spyOn(console, "error")
++      .mockImplementation(() => {});
++    const { diagnostics, stop } = captureDiagnostics();
++    const metadata = { id: "users" };
++
++    try {
++      logError("dom.duplicate-id", "duplicate", metadata, {
++        viewId: "users-view",
++      });
++    } finally {
++      stop();
++    }
++
++    expect(consoleError).toHaveBeenCalledWith("duplicate", metadata);
++    expect(diagnostics).toEqual([
++      {
++        version: 1,
++        level: "error",
++        code: "dom.duplicate-id",
++        message: "duplicate",
++        metadata,
++        viewId: "users-view",
++      },
++    ]);
++  });
++});
+diff --git a/assets/test/live_socket_test.ts b/assets/test/live_socket_test.ts
+index 2d4aa697a0..190b96f734 100644
+--- a/assets/test/live_socket_test.ts
++++ b/assets/test/live_socket_test.ts
+@@ -1,4 +1,6 @@
+ import { Socket } from "phoenix";
++import { type LiveViewDiagnostic } from "phoenix_live_view/diagnostics";
++import { PHX_LV_DIAGNOSTIC_EVENT } from "phoenix_live_view/constants";
+ import LiveSocket from "phoenix_live_view/live_socket";
+ import JS from "phoenix_live_view/js";
+ import { simulateJoinedView, simulateVisibility } from "./test_helpers";
+@@ -57,13 +59,195 @@ describe("LiveSocket", () => {
+     expect(liveSocket.viewLogger).toBe(viewLogger);
+     liveSocket.connect();
+     const view = liveSocket.getViewByEl(container(1));
+-    liveSocket.log(view, "updated", () => ["", JSON.stringify("<div>")]);
++    const diagnostics: LiveViewDiagnostic[] = [];
++    const listener = (event: Event) => {
++      diagnostics.push((event as CustomEvent<LiveViewDiagnostic>).detail);
++    };
++    window.addEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
++    try {
++      liveSocket.log(
++        view,
++        "update",
++        () => ["received diff", JSON.stringify("<div>")],
++        {
++          code: "view.diff.update",
++          metadata: () => ({ diff: "<div>" }),
++        },
++      );
++    } finally {
++      window.removeEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
++    }
+     expect(viewLogger).toHaveBeenCalledWith(
+       view,
+-      "updated",
+-      "",
++      "update",
++      "received diff",
+       JSON.stringify("<div>"),
+     );
++    expect(diagnostics).toEqual([
++      {
++        version: 1,
++        level: "debug",
++        code: "view.diff.update",
++        message: "received diff",
++        viewId: view.id,
++        metadata: { diff: "<div>" },
++      },
++    ]);
++  });
++
++  test("view errors are always emitted and include the view ID", () => {
++    liveSocket = new LiveSocket("/live", Socket);
++    liveSocket.connect();
++    liveSocket.disableDebug();
++    const view = liveSocket.getViewByEl(container(1));
++    const diagnostics: LiveViewDiagnostic[] = [];
++    const listener = (event: Event) => {
++      diagnostics.push((event as CustomEvent<LiveViewDiagnostic>).detail);
++    };
++    const consoleError = jest
++      .spyOn(console, "error")
++      .mockImplementation(() => {});
++    window.addEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
++
++    try {
++      view.logError("view.test-error", "test error", { reason: "test" });
++
++      expect(consoleError).toHaveBeenCalledWith("test error", {
++        reason: "test",
++      });
++      expect(diagnostics).toEqual([
++        {
++          version: 1,
++          level: "error",
++          code: "view.test-error",
++          message: "test error",
++          viewId: view.id,
++          metadata: { reason: "test" },
++        },
++      ]);
++    } finally {
++      window.removeEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
++      consoleError.mockRestore();
++    }
++  });
++
++  test("does not dispatch debug diagnostics for viewLogger when debugging is disabled", () => {
++    const viewLogger = jest.fn();
++    liveSocket = new LiveSocket("/live", Socket, { viewLogger });
++    liveSocket.disableDebug();
++    const view = { id: "view-id" };
++    const listener = jest.fn();
++    const metadata = jest.fn(() => ({ value: 1 }));
++    window.addEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
++
++    try {
++      liveSocket.log(view, "update", () => ["message", { value: 1 }], {
++        code: "view.diff.update",
++        metadata,
++      });
++    } finally {
++      window.removeEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
++    }
++
++    expect(viewLogger).toHaveBeenCalledWith(view, "update", "message", {
++      value: 1,
++    });
++    expect(metadata).not.toHaveBeenCalled();
++    expect(listener).not.toHaveBeenCalled();
++  });
++
++  test("dispatches error-level log diagnostics without logging to the console when debugging is disabled", () => {
++    liveSocket = new LiveSocket("/live", Socket);
++    liveSocket.disableDebug();
++    const view = { id: "view-id" };
++    const diagnostics: LiveViewDiagnostic[] = [];
++    const listener = (event: Event) => {
++      diagnostics.push((event as CustomEvent<LiveViewDiagnostic>).detail);
++    };
++    const consoleLog = jest.spyOn(console, "log").mockImplementation(() => {});
++    window.addEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
++
++    try {
++      liveSocket.log(view, "error", () => ["unable to join", { reason: 1 }], {
++        code: "view.join-failed",
++        level: "error",
++        metadata: () => ({ response: { reason: 1 } }),
++      });
++    } finally {
++      window.removeEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
++      consoleLog.mockRestore();
++    }
++
++    expect(consoleLog).not.toHaveBeenCalled();
++    expect(diagnostics).toEqual([
++      {
++        version: 1,
++        level: "error",
++        code: "view.join-failed",
++        message: "unable to join",
++        viewId: "view-id",
++        metadata: { response: { reason: 1 } },
++      },
++    ]);
++  });
++
++  test("does not evaluate or dispatch debug logs when debugging is disabled", () => {
++    liveSocket = new LiveSocket("/live", Socket);
++    liveSocket.disableDebug();
++    const view = { id: "view-id" };
++    const msgCallback = jest.fn(() => ["message", { value: 1 }]);
++    const listener = jest.fn();
++    window.addEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
++
++    try {
++      liveSocket.log(view, "update", msgCallback, {
++        code: "view.diff.update",
++      });
++    } finally {
++      window.removeEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
++    }
++
++    expect(msgCallback).not.toHaveBeenCalled();
++    expect(listener).not.toHaveBeenCalled();
++  });
++
++  test("dispatches enabled console debug logs as diagnostics", () => {
++    liveSocket = new LiveSocket("/live", Socket);
++    liveSocket.enableDebug();
++    const view = { id: "view-id", liveSocket };
++    const metadata = { value: 1 };
++    const diagnostics: LiveViewDiagnostic[] = [];
++    const listener = (event: Event) => {
++      diagnostics.push((event as CustomEvent<LiveViewDiagnostic>).detail);
++    };
++    const consoleLog = jest.spyOn(console, "log").mockImplementation(() => {});
++    window.addEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
++
++    try {
++      liveSocket.log(view, "update", () => ["received diff", metadata], {
++        code: "view.diff.update",
++        metadata: () => metadata,
++      });
++
++      expect(consoleLog).toHaveBeenCalledWith(
++        "view-id update: received diff - ",
++        metadata,
++      );
++      expect(diagnostics).toEqual([
++        {
++          version: 1,
++          level: "debug",
++          code: "view.diff.update",
++          message: "received diff",
++          viewId: "view-id",
++          metadata,
++        },
++      ]);
++    } finally {
++      window.removeEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
++      liveSocket.disableDebug();
++      consoleLog.mockRestore();
++    }
+   });
+ 
+   test("connect", async () => {
+diff --git a/assets/test/test_helpers.ts b/assets/test/test_helpers.ts
+index bbeb1f7790..8b8fbc5c15 100644
+--- a/assets/test/test_helpers.ts
++++ b/assets/test/test_helpers.ts
+@@ -1,4 +1,6 @@
+ import View from "phoenix_live_view/view";
++import { type LiveViewDiagnostic } from "phoenix_live_view/diagnostics";
++import { PHX_LV_DIAGNOSTIC_EVENT } from "phoenix_live_view/constants";
+ import { version as liveview_version } from "../../package.json";
+ 
+ export const appendTitle = (opts, innerHTML?: string) => {
+@@ -108,3 +110,15 @@ export function liveViewDOM(content?: string) {
+   document.body.appendChild(div);
+   return div;
+ }
++
++export const captureDiagnostics = () => {
++  const diagnostics: LiveViewDiagnostic[] = [];
++  const listener = (event: Event) => {
++    diagnostics.push((event as CustomEvent<LiveViewDiagnostic>).detail);
++  };
++  window.addEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener);
++  return {
++    diagnostics,
++    stop: () => window.removeEventListener(PHX_LV_DIAGNOSTIC_EVENT, listener),
++  };
++};
+diff --git a/assets/test/utils_test.ts b/assets/test/utils_test.ts
+index b96ddeba7b..32d707ff08 100644
+--- a/assets/test/utils_test.ts
++++ b/assets/test/utils_test.ts
+@@ -1,7 +1,15 @@
+ import { Socket } from "phoenix";
+-import { closestPhxBinding } from "phoenix_live_view/utils";
++import {
++  closestPhxBinding,
++  detectDuplicateIds,
++  detectInvalidStreamInserts,
++} from "phoenix_live_view/utils";
+ import LiveSocket from "phoenix_live_view/live_socket";
+-import { simulateJoinedView, liveViewDOM } from "./test_helpers";
++import {
++  simulateJoinedView,
++  liveViewDOM,
++  captureDiagnostics,
++} from "./test_helpers";
+ 
+ const setupView = (content) => {
+   const el = liveViewDOM(content);
+@@ -33,4 +41,65 @@ describe("utils", () => {
+       expect(closestPhxBinding(element, "phx-click")).toBe(null);
+     });
+   });
++
++  describe("diagnostics", () => {
++    afterEach(() => jest.restoreAllMocks());
++
++    test("duplicate ID diagnostics include both elements", () => {
++      jest.spyOn(console, "error").mockImplementation(() => {});
++      const { diagnostics, stop } = captureDiagnostics();
++      const root = document.createElement("div");
++      const id = "diagnostic-duplicate-id";
++      root.innerHTML = `<div id="${id}"></div><div id="${id}"></div>`;
++      document.body.appendChild(root);
++      const elements = Array.from(root.children);
++
++      try {
++        detectDuplicateIds();
++      } finally {
++        root.remove();
++        stop();
++      }
++
++      expect(
++        diagnostics.find(
++          ({ code, metadata }) =>
++            code === "dom.duplicate-id" && metadata?.id === id,
++        ),
++      ).toMatchObject({
++        version: 1,
++        level: "error",
++        code: "dom.duplicate-id",
++        metadata: { id, elements },
++      });
++    });
++
++    test("invalid stream diagnostics include the container", () => {
++      jest.spyOn(console, "error").mockImplementation(() => {});
++      const { diagnostics, stop } = captureDiagnostics();
++      const container = document.createElement("div");
++      const containerId = "diagnostic-stream-container";
++      const itemId = "diagnostic-stream-item";
++      container.id = containerId;
++      container.innerHTML = `<div id="${itemId}"></div>`;
++      document.body.appendChild(container);
++
++      try {
++        detectInvalidStreamInserts({ [itemId]: 0 });
++      } finally {
++        container.remove();
++        stop();
++      }
++
++      expect(diagnostics).toEqual([
++        {
++          version: 1,
++          level: "error",
++          code: "dom.invalid-stream-container",
++          message: `The stream container with id "${containerId}" is missing the phx-update="stream" attribute. Ensure it is set for streams to work properly.`,
++          metadata: { id: containerId, container },
++        },
++      ]);
++    });
++  });
+ });

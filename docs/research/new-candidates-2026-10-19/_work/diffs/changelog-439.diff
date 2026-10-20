@@ -1,0 +1,56 @@
+diff --git a/lib/changelog_web/controllers/person_controller.ex b/lib/changelog_web/controllers/person_controller.ex
+index 7083e521ed..0132dee613 100755
+--- a/lib/changelog_web/controllers/person_controller.ex
++++ b/lib/changelog_web/controllers/person_controller.ex
+@@ -36,8 +36,14 @@ defmodule ChangelogWeb.PersonController do
+     email = Map.get(person_params, "email")
+ 
+     if Captcha.verify(captcha) do
+-      if person = Repo.get_by(Person, email: email) do
+-        welcome_community(conn, person)
++      if _person = Repo.get_by(Person, email: email) do
++        # If the person's email already existed in the DB it isn't safe to update profile info until they have signed in.
++        # Don't populate the form with the existing person's details when returning the error.
++        changeset = Person.insert_changeset(%Person{}, person_params)
++
++        conn
++        |> put_flash(:error, "Member exists with that email address. Please sign in.")
++        |> render(:join, changeset: changeset, person: nil)
+       else
+         changeset = Person.insert_changeset(%Person{public_profile: false}, person_params)
+ 
+diff --git a/test/changelog_web/controllers/person_controller_test.exs b/test/changelog_web/controllers/person_controller_test.exs
+index 1e9664ecc4..b199e0959f 100644
+--- a/test/changelog_web/controllers/person_controller_test.exs
++++ b/test/changelog_web/controllers/person_controller_test.exs
+@@ -84,26 +84,21 @@ defmodule ChangelogWeb.PersonControllerTest do
+       assert count(Person) == count_before + 1
+     end
+ 
+-    test "submission with existing email sends email, redirects, but doesn't create new person",
++    test "submission with existing email re-renders with errors",
+          %{conn: conn} do
+       existing = insert(:person)
+       count_before = count(Person)
+ 
+       conn =
+-        with_mocks([
+-          {Changelog.Captcha, [], [verify: fn _ -> true end]},
+-          {Craisin.Subscriber, [], [subscribe: fn _, _, _ -> nil end]}
+-        ]) do
++        with_mock(Changelog.Captcha, verify: fn _ -> true end) do
+           post(conn, Routes.person_path(conn, :join),
+             person: %{email: existing.email, name: "Joe Blow", handle: "joeblow"}
+           )
+         end
+ 
+-      existing = Repo.one(from p in Person, where: p.email == ^existing.email)
+-
+-      assert_delivered_email(ChangelogWeb.Email.community_welcome(existing))
+-      assert redirected_to(conn) == Routes.root_path(conn, :index)
++      assert html_response(conn, 200) =~ ~r/Member exists with that email address/i
+       assert count(Person) == count_before
++      assert existing.name != "Joe Blow"
+     end
+   end
+ 

@@ -1,0 +1,40 @@
+diff --git a/lib/nimble_options/validation_error.ex b/lib/nimble_options/validation_error.ex
+index 0115cfe..02a4ed0 100644
+--- a/lib/nimble_options/validation_error.ex
++++ b/lib/nimble_options/validation_error.ex
+@@ -51,11 +51,10 @@ defmodule NimbleOptions.ValidationError do
+         |> Map.drop([:__struct__, :__exception__])
+         |> Map.update!(:value, &if(redacted?, do: "**redacted**", else: &1))
+         |> Enum.sort_by(fn {key, _val} -> key end)
+-        |> Enum.map(fn {key, val} -> [string("#{key}:"), break(), to_doc(val, opts)] end)
+-        |> Enum.intersperse([string(","), break()])
+-        |> List.flatten()
++        |> Enum.map(fn {key, val} -> concat([string("#{key}: "), to_doc(val, opts)]) end)
++        |> Enum.intersperse(string(", "))
+ 
+-      concat(["##{inspect(@for)}<"] ++ fields ++ [">"])
++      concat(["##{inspect(@for)}<", concat(fields), ">"])
+     end
+   end
+ end
+diff --git a/test/nimble_options/validation_error_test.exs b/test/nimble_options/validation_error_test.exs
+index 765bc30..0b2fb9c 100644
+--- a/test/nimble_options/validation_error_test.exs
++++ b/test/nimble_options/validation_error_test.exs
+@@ -45,6 +45,16 @@ defmodule NimbleOptions.ValidationErrorTest do
+                ~s(#NimbleOptions.ValidationError<key: :foo, keys_path: [], message: "invalid value for :foo option: expected integer, got: true", redact: false, value: true>)
+     end
+ 
++    test "with syntax colors" do
++      schema = [foo: [type: :integer]]
++      opts = [foo: true]
++
++      {:error, error} = NimbleOptions.validate(opts, schema)
++
++      assert inspect(error, syntax_colors: [atom: :red]) ==
++               ~s(#NimbleOptions.ValidationError<key: \e[31m:foo\e[0m, keys_path: [], message: "invalid value for :foo option: expected integer, got: true", redact: false, value: true>)
++    end
++
+     test "with a redacted option" do
+       schema = [foo: [type: :integer, redact: true]]
+ 

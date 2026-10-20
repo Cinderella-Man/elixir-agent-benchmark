@@ -1,0 +1,76 @@
+diff --git a/lib/ecto/adapters/myxql/connection.ex b/lib/ecto/adapters/myxql/connection.ex
+index c3c45359..33440908 100644
+--- a/lib/ecto/adapters/myxql/connection.ex
++++ b/lib/ecto/adapters/myxql/connection.ex
+@@ -950,6 +950,9 @@ if Code.ensure_loaded?(MyXQL) do
+     defp op_to_binary({:not, _, [_]} = expr, sources, query),
+       do: paren_expr(expr, sources, query)
+ 
++    defp op_to_binary({:in, _, [_, _]} = expr, sources, query),
++      do: paren_expr(expr, sources, query)
++
+     defp op_to_binary(expr, sources, query),
+       do: expr(expr, sources, query)
+ 
+diff --git a/lib/ecto/adapters/postgres/connection.ex b/lib/ecto/adapters/postgres/connection.ex
+index a8d7d5c1..96bf5820 100644
+--- a/lib/ecto/adapters/postgres/connection.ex
++++ b/lib/ecto/adapters/postgres/connection.ex
+@@ -1215,6 +1215,9 @@ if Code.ensure_loaded?(Postgrex) do
+     defp maybe_paren({:not, _, [_]} = expr, sources, query),
+       do: paren_expr(expr, sources, query)
+ 
++    defp maybe_paren({:in, _, [_, _]} = expr, sources, query),
++      do: paren_expr(expr, sources, query)
++
+     defp maybe_paren(expr, sources, query),
+       do: expr(expr, sources, query)
+ 
+diff --git a/test/ecto/adapters/myxql_test.exs b/test/ecto/adapters/myxql_test.exs
+index 373bb6e4..ed5a809e 100644
+--- a/test/ecto/adapters/myxql_test.exs
++++ b/test/ecto/adapters/myxql_test.exs
+@@ -854,7 +854,13 @@ defmodule Ecto.Adapters.MyXQLTest do
+     query = Schema |> select([e], e.x == ^0 or e.x in ^[1, 2, 3] or e.x == ^4) |> plan()
+ 
+     assert all(query) ==
+-             ~s{SELECT ((s0.`x` = ?) OR s0.`x` IN (?,?,?)) OR (s0.`x` = ?) FROM `schema` AS s0}
++             ~s{SELECT ((s0.`x` = ?) OR (s0.`x` IN (?,?,?))) OR (s0.`x` = ?) FROM `schema` AS s0}
++
++    query = "schema" |> select([e], e.x in [1, 2] in [true]) |> plan()
++    assert all(query) == ~s{SELECT (s0.`x` IN (1,2)) IN (TRUE) FROM `schema` AS s0}
++
++    query = "schema" |> select([e], e.x in ^[1, 2] in [true]) |> plan()
++    assert all(query) == ~s{SELECT (s0.`x` IN (?,?)) IN (TRUE) FROM `schema` AS s0}
+   end
+ 
+   test "in subquery" do
+diff --git a/test/ecto/adapters/postgres_test.exs b/test/ecto/adapters/postgres_test.exs
+index deb551f9..00ac5159 100644
+--- a/test/ecto/adapters/postgres_test.exs
++++ b/test/ecto/adapters/postgres_test.exs
+@@ -1123,7 +1123,7 @@ defmodule Ecto.Adapters.PostgresTest do
+     query = Schema |> select([e], e.x == ^0 or e.x in ^[1, 2, 3] or e.x == ^4) |> plan()
+ 
+     assert all(query) ==
+-             ~s{SELECT ((s0."x" = $1) OR s0."x" = ANY($2)) OR (s0."x" = $3) FROM "schema" AS s0}
++             ~s{SELECT ((s0."x" = $1) OR (s0."x" = ANY($2))) OR (s0."x" = $3) FROM "schema" AS s0}
+ 
+     query = "schema" |> select([e], (not e.x) in [true, false]) |> plan()
+     assert all(query) == ~s{SELECT (NOT (s0."x")) IN (TRUE,FALSE) FROM "schema" AS s0}
+@@ -1133,6 +1133,15 @@ defmodule Ecto.Adapters.PostgresTest do
+ 
+     query = "schema" |> select([e], (not e.x) in e.w) |> plan()
+     assert all(query) == ~s{SELECT (NOT (s0."x")) = ANY(s0."w") FROM "schema" AS s0}
++
++    query = "schema" |> select([e], e.x == e.y in ^[1, 2]) |> plan()
++    assert all(query) == ~s{SELECT s0."x" = (s0."y" = ANY($1)) FROM "schema" AS s0}
++
++    query = "schema" |> select([e], e.x == e.y in e.w) |> plan()
++    assert all(query) == ~s{SELECT s0."x" = (s0."y" = ANY(s0."w")) FROM "schema" AS s0}
++
++    query = "schema" |> select([e], e.x in [1, 2] in [true]) |> plan()
++    assert all(query) == ~s{SELECT (s0."x" IN (1,2)) IN (TRUE) FROM "schema" AS s0}
+   end
+ 
+   test "in subquery" do

@@ -1,0 +1,172 @@
+diff --git a/lib/ecto/adapter/queryable.ex b/lib/ecto/adapter/queryable.ex
+index 9d0a62d5c8..8350801232 100644
+--- a/lib/ecto/adapter/queryable.ex
++++ b/lib/ecto/adapter/queryable.ex
+@@ -98,16 +98,19 @@ defmodule Ecto.Adapter.Queryable do
+   @doc """
+   Plans and prepares a query for the given repo, leveraging its query cache.
+ 
+-  This operation uses the query cache if one is available.
++  This operation uses the query cache if one is available, unless
++  `query_cache: false` is passed as option, which bypasses the query cache.
+   """
+-  def prepare_query(operation, repo_name_or_pid, queryable) do
++  def prepare_query(operation, repo_name_or_pid, queryable, opts \\ []) do
+     %{adapter: adapter, cache: cache} = Ecto.Repo.Registry.lookup(repo_name_or_pid)
+ 
++    query_cache? = Keyword.get(opts, :query_cache, true)
++
+     {_meta, prepared, _cast_params, dump_params} =
+       queryable
+       |> Ecto.Queryable.to_query()
+       |> Ecto.Query.Planner.ensure_select(operation == :all)
+-      |> Ecto.Query.Planner.query(operation, cache, adapter, 0)
++      |> Ecto.Query.Planner.query(operation, cache, adapter, 0, query_cache?)
+ 
+     {prepared, dump_params}
+   end
+diff --git a/lib/ecto/query/planner.ex b/lib/ecto/query/planner.ex
+index 424e24f3c7..fa1b8be024 100644
+--- a/lib/ecto/query/planner.ex
++++ b/lib/ecto/query/planner.ex
+@@ -133,9 +133,10 @@ defmodule Ecto.Query.Planner do
+   The cache value is the compiled query by the adapter
+   along-side the select expression.
+   """
+-  def query(query, operation, cache, adapter, counter) do
++  def query(query, operation, cache, adapter, counter, query_cache?) do
+     {query, params, key} = plan(query, operation, adapter)
+     {cast_params, dump_params} = Enum.unzip(params)
++    key = if query_cache?, do: key, else: :nocache
+     query_with_cache(key, query, operation, cache, adapter, counter, cast_params, dump_params)
+   end
+ 
+diff --git a/lib/ecto/repo.ex b/lib/ecto/repo.ex
+index e97545463f..91b6398b45 100644
+--- a/lib/ecto/repo.ex
++++ b/lib/ecto/repo.ex
+@@ -136,6 +136,11 @@ defmodule Ecto.Repo do
+       See the next section for more information
+     * `:telemetry_options` - Extra options to attach to telemetry event name.
+       See the next section for more information
++    * `:query_cache` - When set to `false`, bypasses the Ecto query cache for the current
++      operation. This means the query will not be looked up in the cache, it will not be stored
++      in the cache and no cache update function will not be passed to the adapter. Note that
++      this doesn't necessarily disable the database cache, it only affects Ecto's internal
++      cache of normalized queries and adapter prepared statements. Defaults to `true`.
+ 
+   ## Adapter-Specific Errors
+ 
+diff --git a/lib/ecto/repo/queryable.ex b/lib/ecto/repo/queryable.ex
+index b6b9614f4a..a9fd650c1c 100644
+--- a/lib/ecto/repo/queryable.ex
++++ b/lib/ecto/repo/queryable.ex
+@@ -39,8 +39,10 @@ defmodule Ecto.Repo.Queryable do
+     {query, opts} = repo.prepare_query(:stream, query, opts)
+     query = attach_prefix(query, opts)
+ 
++    query_cache? = Keyword.get(opts, :query_cache, true)
++
+     {query_meta, prepared, cast_params, dump_params} =
+-      Planner.query(query, :all, cache, adapter, 0)
++      Planner.query(query, :all, cache, adapter, 0, query_cache?)
+ 
+     opts = [cast_params: cast_params] ++ opts
+ 
+@@ -223,8 +225,10 @@ defmodule Ecto.Repo.Queryable do
+     {query, opts} = repo.prepare_query(operation, query, opts)
+     query = attach_prefix(query, opts)
+ 
++    query_cache? = Keyword.get(opts, :query_cache, true)
++
+     {query_meta, prepared, cast_params, dump_params} =
+-      Planner.query(query, operation, cache, adapter, 0)
++      Planner.query(query, operation, cache, adapter, 0, query_cache?)
+ 
+     opts = [cast_params: cast_params] ++ opts
+ 
+diff --git a/test/ecto/query/planner_test.exs b/test/ecto/query/planner_test.exs
+index 26e4a191a7..1d02db869c 100644
+--- a/test/ecto/query/planner_test.exs
++++ b/test/ecto/query/planner_test.exs
+@@ -2829,4 +2829,29 @@ defmodule Ecto.Query.PlannerTest do
+       end
+     end
+   end
++
++  describe "query: query_cache option" do
++    setup do
++      cache = Planner.new_query_cache(__MODULE__)
++      {:ok, cache: cache}
++    end
++
++    test "uses cache if true", %{cache: cache} do
++      query = from(p in Post, where: p.title == ^"hello")
++
++      {_meta, {:cache, _update, _prepared}, _cast, _dump} =
++        Planner.query(query, :all, cache, Ecto.CachingTestAdapter, 0, true)
++
++      assert :ets.info(cache, :size) == 1
++    end
++
++    test "bypasses cache if false", %{cache: cache} do
++      query = from(p in Post, where: p.title == ^"hello")
++
++      {_meta1, {:nocache, _prepared}, _cast1, _dump1} =
++        Planner.query(query, :all, cache, Ecto.CachingTestAdapter, 0, false)
++
++      assert :ets.info(cache, :size) == 0
++    end
++  end
+ end
+diff --git a/test/support/test_repo.exs b/test/support/test_repo.exs
+index 4df2752802..7d7b8a322f 100644
+--- a/test/support/test_repo.exs
++++ b/test/support/test_repo.exs
+@@ -161,6 +161,46 @@ defmodule Ecto.TestAdapter do
+   end
+ end
+ 
++defmodule Ecto.CachingTestAdapter do
++  @moduledoc """
++  Test adapter that supports query caching, used for testing the query_cache option.
++  """
++  @behaviour Ecto.Adapter
++  @behaviour Ecto.Adapter.Queryable
++
++  defmacro __before_compile__(_opts), do: :ok
++
++  def ensure_all_started(_, _), do: {:ok, []}
++
++  def init(_opts) do
++    {:ok, Supervisor.child_spec({Task, fn -> :timer.sleep(:infinity) end}, []), %{}}
++  end
++
++  def checkout(_mod, _opts, fun), do: fun.()
++  def checked_out?(_mod), do: false
++
++  def loaders(_primitive, type), do: [type]
++  def dumpers(_primitive, type), do: [type]
++  def autogenerate(:id), do: nil
++  def autogenerate(:embed_id), do: Ecto.UUID.autogenerate()
++  def autogenerate(:binary_id), do: Ecto.UUID.bingenerate()
++
++  # Return :cache to trigger default caching in the planner
++  def prepare(operation, query), do: {:cache, {operation, query}}
++
++  def execute(_adapter_meta, _query_meta, {_cache_status, {:all, _query}}, _dump_params, _opts) do
++    []
++  end
++
++  def execute(_adapter_meta, _query_meta, {_cache_status, {_operation, _query}}, _dump_params, _opts) do
++    {1, nil}
++  end
++
++  def stream(_adapter_meta, _query_meta, _prepared, _dump_params, _opts) do
++    []
++  end
++end
++
+ Application.put_env(:ecto, Ecto.TestRepo, user: "invalid")
+ 
+ defmodule Ecto.TestRepo do

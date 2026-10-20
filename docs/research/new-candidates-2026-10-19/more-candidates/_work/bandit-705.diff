@@ -1,0 +1,290 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 73ed9d89..78cdddae 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,12 @@
++## Unreleased
++
++### Fixes
++
++* Preserve independent error responses on HTTP/1 keep-alive and pipelined requests
++  by discarding completed requests' sent-response notifications
++* Explicitly frame empty HTTP/1 4xx/5xx error responses with `Content-Length: 0`
++  so response completion does not depend on a clean connection close
++
+ ## 1.12.5 (20 Aug 2026)
+ 
+ ### Changes
+diff --git a/lib/bandit/http1/handler.ex b/lib/bandit/http1/handler.ex
+index e258a970..357b91e7 100644
+--- a/lib/bandit/http1/handler.ex
++++ b/lib/bandit/http1/handler.ex
+@@ -34,6 +34,10 @@ defmodule Bandit.HTTP1.Handler do
+   end
+ 
+   defp maybe_keepalive(transport, state) do
++    # Sent notifications belong to the completed request, not the next request
++    # (which may already be buffered and processed without returning to the mailbox).
++    discard_sent_notifications()
++
+     if !transport.close_after_response && transport.keepalive do
+       if Keyword.get(state.opts.http_1, :clear_process_dict, true), do: clear_process_dict()
+       requests_processed = Map.get(state, :requests_processed, 0) + 1
+@@ -54,6 +58,14 @@ defmodule Bandit.HTTP1.Handler do
+     end
+   end
+ 
++  defp discard_sent_notifications do
++    receive do
++      {:plug_conn, :sent} -> discard_sent_notifications()
++    after
++      0 -> :ok
++    end
++  end
++
+   defp request_limit_reached?(state) do
+     requests_processed = Map.get(state, :requests_processed, 0) + 1
+     request_limit = Keyword.get(state.opts.http_1, :max_requests, 0)
+diff --git a/lib/bandit/http1/socket.ex b/lib/bandit/http1/socket.ex
+index 5bd5d03f..a27e60ad 100644
+--- a/lib/bandit/http1/socket.ex
++++ b/lib/bandit/http1/socket.ex
+@@ -658,8 +658,13 @@ defmodule Bandit.HTTP1.Socket do
+         0 ->
+           status = error |> Plug.Exception.status() |> Plug.Conn.Status.code()
+ 
++          # Empty error responses finish at the headers, without relying on a clean
++          # EOF to delimit their body if the connection subsequently fails.
++          headers = [{"connection", "close"}]
++          headers = if status in 400..599, do: [{"content-length", "0"} | headers], else: headers
++
+           try do
+-            send_headers(socket, status, [{"connection", "close"}], :no_body)
++            send_headers(socket, status, headers, :no_body)
+           rescue
+             _e in [Bandit.TransportError, Bandit.HTTPError] -> :ok
+           end
+diff --git a/test/bandit/http1/logging_test.exs b/test/bandit/http1/logging_test.exs
+index de6480a5..ad9b708d 100644
+--- a/test/bandit/http1/logging_test.exs
++++ b/test/bandit/http1/logging_test.exs
+@@ -57,8 +57,7 @@ defmodule HTTP1LoggingTest do
+ 
+       client = SimpleHTTP1Client.tcp_client(context)
+       SimpleHTTP1Client.send(client, "GET", "/sleep_and_send", ["host: localhost"])
+-      Process.sleep(20)
+-      Transport.close(client)
++      close_after_request_started(client)
+ 
+       refute_receive {:log, %{level: :error}}
+     end
+@@ -72,8 +71,7 @@ defmodule HTTP1LoggingTest do
+ 
+       client = SimpleHTTP1Client.tcp_client(context)
+       SimpleHTTP1Client.send(client, "GET", "/sleep_and_send", ["host: localhost"])
+-      Process.sleep(20)
+-      Transport.close(client)
++      close_after_request_started(client)
+ 
+       assert_receive {:log, %{level: :error, msg: {:string, msg}}}, 500
+ 
+@@ -93,8 +91,7 @@ defmodule HTTP1LoggingTest do
+ 
+       client = SimpleHTTP1Client.tcp_client(context)
+       SimpleHTTP1Client.send(client, "GET", "/sleep_and_send", ["host: localhost"])
+-      Process.sleep(20)
+-      Transport.close(client)
++      close_after_request_started(client)
+ 
+       assert_receive {:log, %{level: :error, msg: {:string, msg}}}, 500
+ 
+@@ -131,6 +128,15 @@ defmodule HTTP1LoggingTest do
+       Logger.error("IMPOSSIBLE")
+       conn
+     end
++
++    defp close_after_request_started(client) do
++      # Exercise the response-write failure, not a close during connection setup.
++      assert_receive {:telemetry, [:bandit, :request, :start], _,
++                      %{conn: %Plug.Conn{request_path: "/sleep_and_send"}}},
++                     500
++
++      Transport.close(client)
++    end
+   end
+ 
+   describe "unknown message logging" do
+diff --git a/test/bandit/http1/plug_test.exs b/test/bandit/http1/plug_test.exs
+index 1e788141..566cff31 100644
+--- a/test/bandit/http1/plug_test.exs
++++ b/test/bandit/http1/plug_test.exs
+@@ -434,7 +434,8 @@ defmodule HTTP1PlugTest do
+          context do
+       {:ok, response} = Req.get(context.req, url: "/send_file?offset=100&length=:all")
+       assert response.status == 500
+-      refute Map.has_key?(response.headers, "content-length")
++      assert response.headers["content-length"] == ["0"]
++      assert response.body == ""
+ 
+       assert_receive {:log, %{level: :error, msg: {:string, msg}}}, 500
+       assert msg =~ "** (RuntimeError) Cannot read -94 bytes starting at 100"
+diff --git a/test/bandit/http1/protocol_test.exs b/test/bandit/http1/protocol_test.exs
+index a12e0356..0f621d1a 100644
+--- a/test/bandit/http1/protocol_test.exs
++++ b/test/bandit/http1/protocol_test.exs
+@@ -635,6 +635,42 @@ defmodule HTTP1ProtocolTest do
+       assert_receive {:log, %{level: :error, msg: {:string, msg}}}, 500
+       assert msg == "** (Bandit.HTTPError) Too many headers"
+     end
++
++    @tag :capture_log
++    test "a pipelined header-count rejection sends its own 431 response", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++      headers = for i <- 1..50, do: "header#{i}: foo\r\n"
++
++      Transport.send(client, [
++        "GET /send_ok HTTP/1.1\r\nhost: localhost\r\n\r\n",
++        "GET /send_ok HTTP/1.1\r\nhost: localhost\r\n",
++        headers,
++        "\r\n"
++      ])
++
++      response = recv_until_closed(client)
++      assert response =~ "HTTP/1.1 200 OK\r\n"
++      assert response =~ "431 Request Header Fields Too Large\r\n"
++      assert length(Regex.scan(~r/HTTP\/1\.[01] \d{3}/, response)) == 2
++
++      assert_receive {:log, %{level: :error, msg: {:string, msg}}}, 500
++      assert msg == "** (Bandit.HTTPError) Too many headers"
++    end
++
++    @tag :capture_log
++    test "a header-count rejection is complete at the headers without waiting for EOF",
++         context do
++      {:ok, conn} =
++        Mint.HTTP.connect(:http, "localhost", context.port, mode: :passive, protocols: [:http1])
++
++      on_exit(fn -> Mint.HTTP.close(conn) end)
++      headers = for i <- 1..50, do: {"header#{i}", "foo"}
++      {:ok, conn, ref} = Mint.HTTP.request(conn, "GET", "/send_ok", headers, nil)
++      {:ok, _conn, responses} = Mint.HTTP.recv(conn, 0, 1_000)
++
++      assert {:status, ref, 431} in responses
++      assert {:done, ref} in responses
++    end
+   end
+ 
+   describe "content-length request bodies (RFC9112§6.2, §6.3)" do
+@@ -1145,6 +1181,41 @@ defmodule HTTP1ProtocolTest do
+     def send_401(conn) do
+       send_resp(conn, 401, "")
+     end
++
++    for status <- [400, 408, 414, 418, 431, 500] do
++      @status status
++      @tag :capture_log
++      test "an empty #{@status} error response has explicit zero-length framing", context do
++        client = SimpleHTTP1Client.tcp_client(context)
++        SimpleHTTP1Client.send(client, "GET", "/http_error/#{@status}", ["host: localhost"])
++
++        assert {:ok, status, headers, ""} = SimpleHTTP1Client.recv_reply(client)
++        assert status == "#{@status} #{Plug.Conn.Status.reason_phrase(@status)}"
++        assert Keyword.get_values(headers, :"content-length") == ["0"]
++        assert Keyword.get_values(headers, :connection) == ["close"]
++        assert SimpleHTTP1Client.connection_closed_for_reading?(client)
++      end
++    end
++
++    for status <- [103, 204, 304] do
++      @status status
++      @tag :capture_log
++      test "an empty #{@status} error response does not acquire error-body framing", context do
++        client = SimpleHTTP1Client.tcp_client(context)
++        SimpleHTTP1Client.send(client, "GET", "/http_error/#{@status}", ["host: localhost"])
++
++        assert {:ok, status, headers, ""} = SimpleHTTP1Client.recv_reply(client)
++        assert status == "#{@status} #{Plug.Conn.Status.reason_phrase(@status)}"
++        refute Keyword.has_key?(headers, :"content-length")
++        assert SimpleHTTP1Client.connection_closed_for_reading?(client)
++      end
++    end
++
++    def http_error(conn) do
++      raise Bandit.HTTPError,
++        message: "test error",
++        plug_status: conn.path_info |> List.last() |> String.to_integer()
++    end
+   end
+ 
+   describe "response body — sendfile (RFC9112§6.3, RFC9110§15.3-15.5)" do
+@@ -2930,6 +3001,57 @@ defmodule HTTP1ProtocolTest do
+       end
+     end
+ 
++    @tag :capture_log
++    test "a pipelined malformed request sends its own 400 response", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      Transport.send(
++        client,
++        "GET /send_ok HTTP/1.1\r\nhost: localhost\r\n\r\nGARBAGE\r\n\r\n"
++      )
++
++      response = recv_until_closed(client)
++      assert response =~ "HTTP/1.1 200 OK\r\n"
++      assert response =~ "400 Bad Request\r\n"
++      assert length(Regex.scan(~r/HTTP\/1\.[01] \d{3}/, response)) == 2
++    end
++
++    @tag :capture_log
++    test "a pipelined plug exception sends its own 500 response", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      Transport.send(client, [
++        "GET /send_ok HTTP/1.1\r\nhost: localhost\r\n\r\n",
++        "GET /raise_error HTTP/1.1\r\nhost: localhost\r\n\r\n"
++      ])
++
++      response = recv_until_closed(client)
++      assert response =~ "HTTP/1.1 200 OK\r\n"
++      assert response =~ "HTTP/1.1 500 Internal Server Error\r\n"
++      assert length(Regex.scan(~r/HTTP\/1\.[01] \d{3}/, response)) == 2
++    end
++
++    @tag :capture_log
++    test "an exception after the current response does not send another response", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      Transport.send(client, [
++        "GET /send_ok HTTP/1.1\r\nhost: localhost\r\n\r\n",
++        "GET /send_then_raise HTTP/1.1\r\nhost: localhost\r\n\r\n"
++      ])
++
++      response = recv_until_closed(client)
++      assert length(Regex.scan(~r/HTTP\/1\.1 200 OK\r\n/, response)) == 2
++      refute response =~ "500 Internal Server Error"
++    end
++
++    def raise_error(_conn), do: raise("test error")
++
++    def send_then_raise(conn) do
++      send_resp(conn, 200, "OK")
++      raise("test error after response")
++    end
++
+     def send_ok(conn) do
+       send_resp(conn, 200, "OK")
+     end
+@@ -2962,9 +3084,11 @@ defmodule HTTP1ProtocolTest do
+ 
+       SimpleHTTP1Client.send(client, "GET", "/known_crasher", ["host: banana"])
+ 
+-      assert {:ok, "418 I'm a teapot", [connection: "close"], _} =
++      assert {:ok, "418 I'm a teapot", headers, _} =
+                SimpleHTTP1Client.recv_reply(client)
+ 
++      assert Keyword.get_values(headers, :"content-length") == ["0"]
++      assert Keyword.get_values(headers, :connection) == ["close"]
+       assert SimpleHTTP1Client.connection_closed_for_reading?(client)
+     end
+ 

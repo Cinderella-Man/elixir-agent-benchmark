@@ -1,0 +1,566 @@
+diff --git a/lib/mydia/sync.ex b/lib/mydia/sync.ex
+index 9631e0d91..5ecdea3fe 100644
+--- a/lib/mydia/sync.ex
++++ b/lib/mydia/sync.ex
+@@ -85,6 +85,21 @@ defmodule Mydia.Sync do
+     |> Repo.one()
+   end
+ 
++  @doc """
++  When this user's newest finished, successful run on the instance started.
++
++  A run is inserted as `:ok` before it does any work, so an unfinished row
++  is excluded: it says nothing about what the sync has seen yet.
++  """
++  @spec last_successful_run_started_at(String.t(), String.t(), binary()) :: DateTime.t() | nil
++  def last_successful_run_started_at(provider, instance_id, user_id) do
++    Run
++    |> where([r], r.provider == ^provider and r.provider_instance_id == ^instance_id)
++    |> where([r], r.user_id == ^user_id and r.status == :ok and not is_nil(r.finished_at))
++    |> select([r], max(r.started_at))
++    |> Repo.one()
++  end
++
+   @spec prune(pos_integer()) :: {integer(), nil}
+   def prune(older_than_days) do
+     cutoff =
+diff --git a/lib/mydia/watch_sync/engine.ex b/lib/mydia/watch_sync/engine.ex
+index 6f82f0f09..4a7623422 100644
+--- a/lib/mydia/watch_sync/engine.ex
++++ b/lib/mydia/watch_sync/engine.ex
+@@ -29,8 +29,8 @@ defmodule Mydia.WatchSync.Engine do
+     direction = Keyword.get(opts, :direction, :bidirectional)
+ 
+     with :ok <- maybe_refresh(provider_mod, instance, provider, instance_id, opts),
+-         cursor = cursor(user_scope.user_id, provider, instance_id),
+-         {:ok, changes} <- provider_mod.list_changes(instance, user_scope, cursor) do
++         since = listing_since(user_scope.user_id, provider, instance_id),
++         {:ok, changes} <- provider_mod.list_changes(instance, user_scope, since) do
+       {by_remote, by_content} = mapping_index(provider, instance_id)
+       {mapped, unmapped} = Enum.split_with(changes, &Map.has_key?(by_remote, &1.remote_id))
+       context = {provider, instance_id, origin, direction}
+@@ -253,15 +253,37 @@ defmodule Mydia.WatchSync.Engine do
+   # state, so a snapshot of watched keeps the item watched. Consequence: an
+   # incremental run never unwatches a multi-copy item through a partial
+   # listing; only a full listing (first sync) can.
++  #
++  # A listed copy that looks never played (unwatched, no position, no date)
++  # carries no state of its own while the snapshot is watched, so it is left
++  # out of the merge. A re-ided or freshly mapped copy reports blank, and a
++  # full listing (which a new mapping triggers) would otherwise read that as an
++  # unwatch and delete the local history. It still counts as listed: when every
++  # copy is listed, a dated unwatch on the others is the whole truth.
+   defp remote_side(copies, remote_ids, state_row) do
+-    merged = Reconciler.merge_remotes(copies)
+     listed = copies |> Enum.map(& &1.remote_id) |> Enum.uniq() |> length()
+ 
+-    if state_row && listed < length(remote_ids),
+-      do: %{merged | watched: merged.watched or state_row.synced_watched},
+-      else: merged
++    case drop_blank_copies(copies, state_row) do
++      [] ->
++        snapshot_side(state_row)
++
++      informative ->
++        merged = Reconciler.merge_remotes(informative)
++
++        if state_row && listed < length(remote_ids),
++          do: %{merged | watched: merged.watched or state_row.synced_watched},
++          else: merged
++    end
+   end
+ 
++  defp drop_blank_copies(copies, %State{synced_watched: true}),
++    do: Enum.reject(copies, &blank_copy?/1)
++
++  defp drop_blank_copies(copies, _state_row), do: copies
++
++  defp blank_copy?(copy),
++    do: copy.watched == false and (copy.position_seconds || 0) == 0 and is_nil(copy.at)
++
+   defp push_to_copies(provider_mod, instance, user_scope, remote_ids, resolved) do
+     Enum.flat_map(remote_ids, fn remote_id ->
+       case provider_mod.apply_change(instance, user_scope, remote_id, resolved) do
+@@ -393,6 +415,33 @@ defmodule Mydia.WatchSync.Engine do
+     |> Repo.insert_or_update()
+   end
+ 
++  # A copy mapped after its watch was listed counted as not_found on that run,
++  # and its watch date predates every later cursor, so an incremental listing
++  # never returns it again (#1097). Any mapping added since this user's last
++  # finished, successful run therefore forces one full listing. The marker is
++  # that run's start, not the cursor: the cursor only moves when a run writes
++  # state, so on a quiet library it would force a full listing every run. Using
++  # the start also catches mappings a concurrent crawl inserted mid-run, at the
++  # cost of one redundant full listing after any crawl that added mappings.
++  defp listing_since(user_id, provider, instance_id) do
++    case Mydia.Sync.last_successful_run_started_at(provider, instance_id, user_id) do
++      nil ->
++        nil
++
++      marker ->
++        if mappings_added_since?(provider, instance_id, marker),
++          do: nil,
++          else: cursor(user_id, provider, instance_id)
++    end
++  end
++
++  defp mappings_added_since?(provider, instance_id, marker) do
++    Mapping
++    |> where([m], m.provider == ^provider and m.provider_instance_id == ^instance_id)
++    |> where([m], m.inserted_at >= ^marker)
++    |> Repo.exists?()
++  end
++
+   # Overlap window applied to the incremental cursor.
+   #
+   # `synced_at` is stamped when we write, not when the remote event happened. A
+diff --git a/lib/mydia/watch_sync/providers/jellyfin.ex b/lib/mydia/watch_sync/providers/jellyfin.ex
+index 2ea6ff3b2..9c18db0b8 100644
+--- a/lib/mydia/watch_sync/providers/jellyfin.ex
++++ b/lib/mydia/watch_sync/providers/jellyfin.ex
+@@ -24,7 +24,14 @@ defmodule Mydia.WatchSync.Providers.Jellyfin do
+   unwatch is silently skipped. It is not lost forever: the next full
+   `refresh_mappings/2` crawl (first sync for a mapping, or an explicit forced
+   refresh) re-establishes every item, and any subsequent watch/resume on that
+-  item stamps a fresh `LastPlayedDate` and is picked up normally.
++  item stamps a fresh `LastPlayedDate` and is picked up normally. A full
++  listing likewise does not propagate a blank (never-played-looking) copy as an
++  unwatch while the snapshot is watched; the engine treats it as an absent copy.
++
++  The same date filter would hide a copy mapped after its watch was listed:
++  its `LastPlayedDate` predates every later cursor. The engine covers that by
++  passing `since = nil` whenever mappings were added since the user's last
++  successful run (see `Mydia.WatchSync.Engine`).
+   """
+ 
+   @behaviour Mydia.WatchSync.Provider
+diff --git a/priv/repo/migrations/20261012195307_refresh_watch_sync_mapping_inserted_at.exs b/priv/repo/migrations/20261012195307_refresh_watch_sync_mapping_inserted_at.exs
+new file mode 100644
+index 000000000..1a3da6b2b
+--- /dev/null
++++ b/priv/repo/migrations/20261012195307_refresh_watch_sync_mapping_inserted_at.exs
+@@ -0,0 +1,41 @@
++defmodule Mydia.Repo.Migrations.RefreshWatchSyncMappingInsertedAt do
++  use Ecto.Migration
++  import Ecto.Query
++
++  @moduledoc """
++  Stamps every watch-sync mapping as newly added.
++
++  The engine lists a user's whole library once whenever a mapping was added
++  since that user's last successful run, which is how a copy mapped after its
++  watch was listed finally gets reconciled (#1097). Installs that already
++  crawled the missing copies did so before that rule existed, so their
++  mappings look old and would never trigger it. Restamping them gives every
++  linked user one full listing on the next run.
++  """
++
++  # Irreversible by design: the original insert times carry no meaning the
++  # sync relies on, and restoring them is not possible.
++  def up, do: backfill()
++  def down, do: :ok
++
++  @doc false
++  def backfill do
++    now = DateTime.utc_now() |> DateTime.truncate(:second)
++
++    from(m in "remote_item_mappings",
++      update: [set: [inserted_at: type(^now, :utc_datetime)]]
++    )
++    |> query_repo().update_all([])
++
++    :ok
++  end
++
++  # `repo/0` from Ecto.Migration only works inside a migration runner. Tests
++  # call `backfill/0` directly, so fall back to Mydia.Repo outside that context.
++  defp query_repo do
++    case Process.get(:ecto_migration) do
++      %{runner: _} -> repo()
++      _ -> Mydia.Repo
++    end
++  end
++end
+diff --git a/test/mydia/repo/migrations/refresh_watch_sync_mapping_inserted_at_test.exs b/test/mydia/repo/migrations/refresh_watch_sync_mapping_inserted_at_test.exs
+new file mode 100644
+index 000000000..ffe5ee769
+--- /dev/null
++++ b/test/mydia/repo/migrations/refresh_watch_sync_mapping_inserted_at_test.exs
+@@ -0,0 +1,41 @@
++defmodule Mydia.Repo.Migrations.RefreshWatchSyncMappingInsertedAtTest do
++  use Mydia.DataCase, async: false
++
++  import Mydia.MediaFixtures
++
++  alias Mydia.WatchSync.Mapping
++
++  # Migration modules are not compiled into the app, so load the file
++  # explicitly. Guarded because the test alias may already have loaded it
++  # through ecto.migrate in this VM.
++  unless Code.ensure_loaded?(Mydia.Repo.Migrations.RefreshWatchSyncMappingInsertedAt) do
++    Code.require_file(
++      "priv/repo/migrations/20261012195307_refresh_watch_sync_mapping_inserted_at.exs"
++    )
++  end
++
++  alias Mydia.Repo.Migrations.RefreshWatchSyncMappingInsertedAt
++
++  test "every existing mapping looks newly added" do
++    movie = media_item_fixture()
++    a_week_ago = DateTime.utc_now() |> DateTime.add(-7, :day) |> DateTime.truncate(:second)
++
++    mapping =
++      Repo.insert!(%Mapping{
++        provider: "jellyfin",
++        provider_instance_id: "inst-backfill",
++        media_item_id: movie.id,
++        remote_id: "rk-old",
++        last_seen_at: a_week_ago,
++        inserted_at: a_week_ago,
++        updated_at: a_week_ago
++      })
++
++    assert :ok = RefreshWatchSyncMappingInsertedAt.backfill()
++
++    reloaded = Repo.get!(Mapping, mapping.id)
++    assert DateTime.compare(reloaded.inserted_at, a_week_ago) == :gt
++    assert DateTime.diff(DateTime.utc_now(), reloaded.inserted_at) < 60
++    assert reloaded.last_seen_at == a_week_ago
++  end
++end
+diff --git a/test/mydia/sync_test.exs b/test/mydia/sync_test.exs
+index 3154965d1..5229a5829 100644
+--- a/test/mydia/sync_test.exs
++++ b/test/mydia/sync_test.exs
+@@ -92,4 +92,41 @@ defmodule Mydia.SyncTest do
+       assert Mydia.Sync.last_run("plugin:plex", "inst-1").id == run.id
+     end
+   end
++
++  describe "last_successful_run_started_at/3" do
++    setup do
++      {:ok,
++       user: Mydia.AccountsFixtures.user_fixture(), other: Mydia.AccountsFixtures.user_fixture()}
++    end
++
++    defp finished(user, status, started_at) do
++      {:ok, _} =
++        Sync.record_run(%{
++          provider: "jellyfin",
++          provider_instance_id: @instance,
++          user_id: user.id,
++          status: status,
++          started_at: started_at,
++          finished_at: started_at
++        })
++    end
++
++    test "is the newest finished :ok run for that user", %{user: user, other: other} do
++      older = ~U[2026-10-01 10:00:00Z]
++      newer = ~U[2026-10-02 10:00:00Z]
++      finished(user, :ok, older)
++      finished(user, :ok, newer)
++      finished(user, :error, ~U[2026-10-03 10:00:00Z])
++      finished(other, :ok, ~U[2026-10-04 10:00:00Z])
++
++      assert Sync.last_successful_run_started_at("jellyfin", @instance, user.id) == newer
++    end
++
++    test "ignores a run that has not finished", %{user: user} do
++      {:ok, _} =
++        Sync.start_run(%{provider: "jellyfin", provider_instance_id: @instance, user_id: user.id})
++
++      assert Sync.last_successful_run_started_at("jellyfin", @instance, user.id) == nil
++    end
++  end
+ end
+diff --git a/test/mydia/watch_sync/engine_test.exs b/test/mydia/watch_sync/engine_test.exs
+index 06a8e75f8..d81de3306 100644
+--- a/test/mydia/watch_sync/engine_test.exs
++++ b/test/mydia/watch_sync/engine_test.exs
+@@ -17,8 +17,21 @@ defmodule Mydia.WatchSync.EngineTest do
+     @impl true
+     def refresh_mappings(instance, _opts), do: {:ok, instance.mappings}
+ 
++    # Filters the way Providers.Jellyfin.changed_since?/2 does: dated changes
++    # older than the cursor are dropped, and undated ones are listed only when
++    # they carry something (watched or a resume position).
+     @impl true
+-    def list_changes(instance, _scope, _since), do: {:ok, instance.changes}
++    def list_changes(instance, _scope, since) do
++      send(instance.test_pid, {:listed_since, since})
++      {:ok, Enum.filter(instance.changes, &listed_since?(&1, since))}
++    end
++
++    defp listed_since?(_change, nil), do: true
++
++    defp listed_since?(%{at: nil} = change, _since),
++      do: change.watched or (change.position_seconds || 0) > 0
++
++    defp listed_since?(%{at: at}, since), do: DateTime.compare(at, since) != :lt
+ 
+     @impl true
+     def apply_change(instance, _scope, remote_id, change) do
+@@ -387,6 +400,192 @@ defmodule Mydia.WatchSync.EngineTest do
+     end
+   end
+ 
++  describe "a copy mapped after its watch was listed (#1097)" do
++    test "is imported on the next run even though its watch predates the cursor",
++         %{user: user, movie: movie} do
++      two_days_ago = DateTime.utc_now() |> DateTime.add(-2, :day) |> DateTime.truncate(:second)
++      unwatched_1080 = %{remote_id: "rk-1080", watched: false, position_seconds: nil, at: nil}
++      watched_4k = %{remote_id: "rk-4k", watched: true, position_seconds: 0, at: two_days_ago}
++
++      # Only the 1080p copy is mapped at first, so the 4K watch is not_found and
++      # a snapshot (and therefore a cursor) exists for the movie.
++      {:ok, first} =
++        WatchSync.sync(
++          StubProvider,
++          two_copies([unwatched_1080, watched_4k], %{mappings: [copy("rk-1080")]}),
++          scope(user),
++          provider: "stub"
++        )
++
++      assert first.not_found == 1
++      assert_received {:listed_since, nil}
++      settle_history(user, "inst-copies")
++
++      # The next crawl maps the 4K copy. Its watch is two days old, older than
++      # any cursor, so only a full listing can return it.
++      {:ok, counts} =
++        WatchSync.sync(StubProvider, two_copies([unwatched_1080, watched_4k]), scope(user),
++          provider: "stub",
++          refresh_mappings: :force
++        )
++
++      assert_received {:listed_since, nil}
++      assert counts.imported == 1
++      assert %{watched: true} = Playback.get_progress(user.id, media_item_id: movie.id)
++    end
++
++    test "uses the cursor when nothing was mapped since the last successful run",
++         %{user: user} do
++      unwatched = %{remote_id: "rk-1080", watched: false, position_seconds: nil, at: nil}
++
++      {:ok, _} =
++        WatchSync.sync(StubProvider, two_copies([unwatched]), scope(user), provider: "stub")
++
++      assert_received {:listed_since, nil}
++      settle_history(user, "inst-copies")
++
++      {:ok, _} =
++        WatchSync.sync(StubProvider, two_copies([unwatched]), scope(user), provider: "stub")
++
++      assert_received {:listed_since, %DateTime{}}
++    end
++
++    test "a failed run is not a marker", %{user: user} do
++      unwatched = %{remote_id: "rk-1080", watched: false, position_seconds: nil, at: nil}
++
++      {:ok, _} =
++        WatchSync.sync(StubProvider, two_copies([unwatched]), scope(user), provider: "stub")
++
++      assert_received {:listed_since, nil}
++      settle_history(user, "inst-copies", :error)
++
++      {:ok, _} =
++        WatchSync.sync(StubProvider, two_copies([unwatched]), scope(user), provider: "stub")
++
++      assert_received {:listed_since, nil}
++    end
++
++    test "a run still in flight is not a marker", %{user: user} do
++      unwatched = %{remote_id: "rk-1080", watched: false, position_seconds: nil, at: nil}
++
++      {:ok, _} =
++        WatchSync.sync(StubProvider, two_copies([unwatched]), scope(user), provider: "stub")
++
++      assert_received {:listed_since, nil}
++      age_mappings("inst-copies")
++
++      # The job inserts its own run as :ok with no finished_at before syncing.
++      {:ok, _} =
++        Mydia.Sync.start_run(%{
++          provider: "stub",
++          provider_instance_id: "inst-copies",
++          user_id: user.id
++        })
++
++      {:ok, _} =
++        WatchSync.sync(StubProvider, two_copies([unwatched]), scope(user), provider: "stub")
++
++      assert_received {:listed_since, nil}
++    end
++
++    test "a re-ided copy that reports never played does not unwatch",
++         %{user: user, movie: movie} do
++      two_days_ago = DateTime.utc_now() |> DateTime.add(-2, :day) |> DateTime.truncate(:second)
++      old = %{remote_id: "rk-old", watched: true, position_seconds: 0, at: two_days_ago}
++
++      {:ok, first} =
++        WatchSync.sync(
++          StubProvider,
++          two_copies([old], %{mappings: [copy("rk-old")]}),
++          scope(user),
++          provider: "stub"
++        )
++
++      assert first.imported == 1
++      assert_received {:listed_since, nil}
++      settle_history(user, "inst-copies")
++      age_last_seen("inst-copies")
++
++      # The server re-scanned the item under a new id; the new copy has no play
++      # data yet and the old id is pruned by the crawl.
++      blank = %{remote_id: "rk-new", watched: false, position_seconds: nil, at: nil}
++
++      {:ok, counts} =
++        WatchSync.sync(
++          StubProvider,
++          two_copies([blank], %{mappings: [copy("rk-new")]}),
++          scope(user),
++          provider: "stub",
++          refresh_mappings: :force
++        )
++
++      assert mapped_remote_ids("inst-copies") == ["rk-new"]
++      assert_received {:listed_since, nil}
++      assert counts.imported == 0
++      assert %{watched: true} = Playback.get_progress(user.id, media_item_id: movie.id)
++    end
++
++    test "a dated unwatch on a copy still propagates on a full listing",
++         %{user: user, movie: movie} do
++      two_days_ago = DateTime.utc_now() |> DateTime.add(-2, :day) |> DateTime.truncate(:second)
++      now = DateTime.utc_now() |> DateTime.truncate(:second)
++      watched = %{remote_id: "rk-1080", watched: true, position_seconds: 0, at: two_days_ago}
++
++      {:ok, _} =
++        WatchSync.sync(
++          StubProvider,
++          two_copies([watched], %{mappings: [copy("rk-1080")]}),
++          scope(user),
++          provider: "stub"
++        )
++
++      assert %{watched: true} = Playback.get_progress(user.id, media_item_id: movie.id)
++
++      # No finished run is recorded, so the next listing is a full one.
++      unwatched = %{remote_id: "rk-1080", watched: false, position_seconds: 120, at: now}
++
++      {:ok, counts} =
++        WatchSync.sync(
++          StubProvider,
++          two_copies([unwatched], %{mappings: [copy("rk-1080")]}),
++          scope(user),
++          provider: "stub",
++          refresh_mappings: :force
++        )
++
++      assert_received {:listed_since, nil}
++      assert counts.imported == 1
++      # An unwatch is a delete in Mydia.
++      assert Playback.get_progress(user.id, media_item_id: movie.id) == nil
++    end
++
++    test "a dated unwatch propagates when the other listed copy is blank",
++         %{user: user, movie: movie} do
++      two_days_ago = DateTime.utc_now() |> DateTime.add(-2, :day) |> DateTime.truncate(:second)
++      now = DateTime.utc_now() |> DateTime.truncate(:second)
++      blank = %{remote_id: "rk-4k", watched: false, position_seconds: nil, at: nil}
++      watched = %{remote_id: "rk-1080", watched: true, position_seconds: 0, at: two_days_ago}
++
++      {:ok, _} =
++        WatchSync.sync(StubProvider, two_copies([watched, blank]), scope(user), provider: "stub")
++
++      assert %{watched: true} = Playback.get_progress(user.id, media_item_id: movie.id)
++
++      # Both copies are listed and neither is watched any more, so the blank
++      # copy must not be mistaken for an absent one that still holds the watch.
++      unwatched = %{remote_id: "rk-1080", watched: false, position_seconds: 120, at: now}
++
++      {:ok, counts} =
++        WatchSync.sync(StubProvider, two_copies([unwatched, blank]), scope(user),
++          provider: "stub"
++        )
++
++      assert_received {:listed_since, nil}
++      assert counts.imported == 1
++      assert Playback.get_progress(user.id, media_item_id: movie.id) == nil
++    end
++  end
++
+   defp scope(user), do: %{user_id: user.id, access_token: nil}
+ 
+   defp copy(remote_id) do
+@@ -420,4 +619,39 @@ defmodule Mydia.WatchSync.EngineTest do
+     |> Repo.all()
+     |> Enum.sort()
+   end
++
++  # Pretends the mappings were created an hour ago and a run finished half an
++  # hour ago, as on a long-running install.
++  defp settle_history(user, instance_id, status \\ :ok) do
++    age_mappings(instance_id)
++    half_an_hour_ago = DateTime.utc_now() |> DateTime.add(-1800) |> DateTime.truncate(:second)
++
++    {:ok, _} =
++      Mydia.Sync.record_run(%{
++        provider: "stub",
++        provider_instance_id: instance_id,
++        user_id: user.id,
++        status: status,
++        started_at: half_an_hour_ago,
++        finished_at: half_an_hour_ago
++      })
++
++    :ok
++  end
++
++  defp age_mappings(instance_id) do
++    an_hour_ago = DateTime.utc_now() |> DateTime.add(-3600) |> DateTime.truncate(:second)
++
++    Mapping
++    |> where([m], m.provider_instance_id == ^instance_id)
++    |> Repo.update_all(set: [inserted_at: an_hour_ago])
++  end
++
++  defp age_last_seen(instance_id) do
++    an_hour_ago = DateTime.utc_now() |> DateTime.add(-3600) |> DateTime.truncate(:second)
++
++    Mapping
++    |> where([m], m.provider_instance_id == ^instance_id)
++    |> Repo.update_all(set: [last_seen_at: an_hour_ago])
++  end
+ end
+diff --git a/test/mydia/watch_sync/incremental_test.exs b/test/mydia/watch_sync/incremental_test.exs
+index 7743ce9e4..48e27bb90 100644
+--- a/test/mydia/watch_sync/incremental_test.exs
++++ b/test/mydia/watch_sync/incremental_test.exs
+@@ -53,6 +53,24 @@ defmodule Mydia.WatchSync.IncrementalTest do
+     {:ok, _} = WatchSync.sync(CountingProvider, instance, scope, provider: "counting")
+     assert_received {:since, nil}
+ 
++    # The job records a finished run per sync; the incremental listing keys off
++    # it, so settle one after the mappings it already knew about.
++    an_hour_ago = DateTime.utc_now() |> DateTime.add(-3600) |> DateTime.truncate(:second)
++    half_an_hour_ago = DateTime.add(an_hour_ago, 1800)
++
++    Mydia.WatchSync.Mapping
++    |> Mydia.Repo.update_all(set: [inserted_at: an_hour_ago])
++
++    {:ok, _} =
++      Mydia.Sync.record_run(%{
++        provider: "counting",
++        provider_instance_id: "inst-1",
++        user_id: user.id,
++        status: :ok,
++        started_at: half_an_hour_ago,
++        finished_at: half_an_hour_ago
++      })
++
+     {:ok, _} = WatchSync.sync(CountingProvider, instance, scope, provider: "counting")
+     # The second run asks only for changes since the last sync, and does not
+     # re-crawl the library.

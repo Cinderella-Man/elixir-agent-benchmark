@@ -1,0 +1,341 @@
+diff --git a/lib/ecto/migration.ex b/lib/ecto/migration.ex
+index 18c0e777c..5415c8b19 100644
+--- a/lib/ecto/migration.ex
++++ b/lib/ecto/migration.ex
+@@ -405,6 +405,37 @@ defmodule Ecto.Migration do
+   Then in your migrations you can `use MyApp.Migration` to share this behavior
+   among all your migrations.
+ 
++  ### Before and after the transaction
++
++  Some commands only work outside of a transaction. For example, SQLite
++  ignores `PRAGMA foreign_keys` inside one, but its
++  [procedure for changing a table](https://sqlite.org/lang_altertable.html#making_other_kinds_of_table_schema_changes)
++  requires it to be off. `c:before_transaction/1` and `c:after_transaction/1`
++  run around the migration transaction, on the same connection, so a setting
++  made in the first applies to the transaction and the second can restore it:
++
++      defmodule MyApp.Migration do
++        defmacro __using__(_) do
++          quote do
++            use Ecto.Migration
++
++            def before_transaction(repo) do
++              repo.query!("PRAGMA foreign_keys = OFF")
++            end
++
++            def after_transaction(repo) do
++              # Restore the configured value, do not turn it on unconditionally
++              if Keyword.get(repo.config(), :foreign_keys, :on) == :on do
++                repo.query!("PRAGMA foreign_keys = ON")
++              end
++            end
++          end
++        end
++      end
++
++  Like `c:after_begin/0` and `c:before_commit/0`, they are not run when the
++  migration does not run in a transaction.
++
+   ## Additional resources
+ 
+     * The [Safe Ecto Migrations guide](safe_migrations.md)
+@@ -426,7 +457,30 @@ defmodule Ecto.Migration do
+   consider both the up *and* down cases of the migration.
+   """
+   @callback before_commit() :: term
+-  @optional_callbacks after_begin: 0, before_commit: 0
++
++  @doc """
++  Code to run before the migration transaction is opened.
++
++  It runs on the same connection as the transaction and receives the repo.
++  `repo/0`, `prefix/0`, `direction/0`, `execute/1` and `flush/0` are not
++  available.
++  """
++  @callback before_transaction(repo :: Ecto.Repo.t()) :: term
++
++  @doc """
++  Code to run after the migration transaction is closed.
++
++  It runs on the same connection as the transaction, whether the transaction
++  was committed or rolled back and even if `c:before_transaction/1` raised,
++  so that what it changed can always be restored. `repo/0`, `prefix/0`,
++  `direction/0`, `execute/1` and `flush/0` are not available.
++  """
++  @callback after_transaction(repo :: Ecto.Repo.t()) :: term
++
++  @optional_callbacks after_begin: 0,
++                      before_commit: 0,
++                      before_transaction: 1,
++                      after_transaction: 1
+ 
+   defmodule Index do
+     @moduledoc """
+diff --git a/lib/ecto/migrator.ex b/lib/ecto/migrator.ex
+index 1fc2fd1bf..7118ff687 100644
+--- a/lib/ecto/migrator.ex
++++ b/lib/ecto/migrator.ex
+@@ -353,15 +353,40 @@ defmodule Ecto.Migrator do
+          not repo.__adapter__().supports_ddl_transaction?() do
+       fun.()
+     else
+-      {:ok, result} = repo.transaction(fun, log: migrator_log(opts), timeout: :infinity)
+-
+-      result
++      run_in_transaction(repo, module, fun, opts)
+     end
+   catch
+     kind, reason ->
+       {kind, reason, __STACKTRACE__}
+   end
+ 
++  defp run_in_transaction(repo, module, fun, opts) do
++    transaction = fn ->
++      {:ok, result} = repo.transaction(fun, log: migrator_log(opts), timeout: :infinity)
++      result
++    end
++
++    if function_exported?(module, :before_transaction, 1) or
++         function_exported?(module, :after_transaction, 1) do
++      repo.checkout(
++        fn ->
++          try do
++            if function_exported?(module, :before_transaction, 1),
++              do: module.before_transaction(repo)
++
++            transaction.()
++          after
++            if function_exported?(module, :after_transaction, 1),
++              do: module.after_transaction(repo)
++          end
++        end,
++        timeout: :infinity
++      )
++    else
++      transaction.()
++    end
++  end
++
+   defp attempt(repo, config, version, module, direction, operation, reference, opts) do
+     if Code.ensure_loaded?(module) and function_exported?(module, operation, 0) do
+       Runner.run(repo, config, version, module, direction, operation, reference, opts)
+diff --git a/test/ecto/migrator_test.exs b/test/ecto/migrator_test.exs
+index 39a583c77..21ac0b8ff 100644
+--- a/test/ecto/migrator_test.exs
++++ b/test/ecto/migrator_test.exs
+@@ -130,6 +130,77 @@ defmodule Ecto.MigratorTest do
+     end
+   end
+ 
++  defmodule Events do
++    def record(name, repo \\ nil) do
++      notify(
++        {:migration_event, {name, repo, TestRepo.in_transaction?(), TestRepo.checked_out?()}}
++      )
++    end
++
++    def notify(message) do
++      config = Application.get_env(:ecto_sql, EctoSQL.TestAdapter, [])
++      send(Keyword.fetch!(config, :test_process), message)
++    end
++  end
++
++  defmodule MigrationWithBeforeAndAfterTransaction do
++    use Ecto.Migration
++
++    def before_transaction(repo), do: Events.record(:before_transaction, repo)
++    def after_begin, do: Events.record(:after_begin)
++    def up, do: Events.record(:up)
++    def down, do: Events.record(:down)
++    def before_commit, do: Events.record(:before_commit)
++    def after_transaction(repo), do: Events.record(:after_transaction, repo)
++  end
++
++  defmodule MigrationWithBeforeAndAfterTransactionAndNoTransaction do
++    use Ecto.Migration
++
++    @disable_ddl_transaction true
++
++    def before_transaction(repo), do: Events.record(:before_transaction, repo)
++    def up, do: Events.record(:up)
++    def after_transaction(repo), do: Events.record(:after_transaction, repo)
++  end
++
++  defmodule MigrationWithoutBeforeAndAfterTransaction do
++    use Ecto.Migration
++
++    def up, do: Events.record(:up)
++  end
++
++  defmodule MigrationWithAfterTransactionOnly do
++    use Ecto.Migration
++
++    def up, do: Events.record(:up)
++    def after_transaction(repo), do: Events.record(:after_transaction, repo)
++  end
++
++  defmodule MigrationWithFailingUp do
++    use Ecto.Migration
++
++    def before_transaction(repo), do: Events.record(:before_transaction, repo)
++    def up, do: raise("up failed")
++    def after_transaction(repo), do: Events.record(:after_transaction, repo)
++  end
++
++  defmodule MigrationWithFailingBeforeTransaction do
++    use Ecto.Migration
++
++    def before_transaction(_repo), do: raise("before_transaction failed")
++    def up, do: Events.record(:up)
++    def after_transaction(repo), do: Events.record(:after_transaction, repo)
++  end
++
++  defmodule MigrationWithDynamicRepoCallbacks do
++    use Ecto.Migration
++
++    def before_transaction(repo), do: Events.notify({:dynamic_repo, repo.get_dynamic_repo()})
++
++    def up, do: :ok
++  end
++
+   defmodule ExecuteOneAnonymousFunctionMigration do
+     use Ecto.Migration
+ 
+@@ -920,6 +991,107 @@ defmodule Ecto.MigratorTest do
+     end
+   end
+ 
++  describe "migration callbacks around the transaction" do
++    setup do
++      put_test_adapter_config(supports_ddl_transaction?: true, test_process: self())
++    end
++
++    defp events(acc \\ []) do
++      receive do
++        {:migration_event, event} -> events([event | acc])
++      after
++        0 -> Enum.reverse(acc)
++      end
++    end
++
++    test "run around the transaction, on a checked out connection, going up" do
++      assert up(TestRepo, 10, MigrationWithBeforeAndAfterTransaction, log: false) == :ok
++
++      assert events() == [
++               {:before_transaction, TestRepo, false, true},
++               {:after_begin, nil, true, true},
++               {:up, nil, true, true},
++               {:before_commit, nil, true, true},
++               {:after_transaction, TestRepo, false, true}
++             ]
++
++      assert {10, nil} in MigrationsAgent.get()
++    end
++
++    test "run around the transaction, on a checked out connection, going down" do
++      assert up(TestRepo, 10, MigrationWithBeforeAndAfterTransaction, log: false) == :ok
++      events()
++
++      assert down(TestRepo, 10, MigrationWithBeforeAndAfterTransaction, log: false) == :ok
++
++      assert events() == [
++               {:before_transaction, TestRepo, false, true},
++               {:after_begin, nil, true, true},
++               {:down, nil, true, true},
++               {:before_commit, nil, true, true},
++               {:after_transaction, TestRepo, false, true}
++             ]
++
++      refute {10, nil} in MigrationsAgent.get()
++    end
++
++    test "run for the dynamic repo" do
++      assert up(TestRepo, 10, MigrationWithDynamicRepoCallbacks,
++               log: false,
++               dynamic_repo: :tenant_db
++             ) == :ok
++
++      assert_received {:dynamic_repo, :tenant_db}
++    end
++
++    test "do not check out a connection when there are none" do
++      assert up(TestRepo, 10, MigrationWithoutBeforeAndAfterTransaction, log: false) == :ok
++      assert events() == [{:up, nil, true, false}]
++    end
++
++    test "run when only after_transaction is defined" do
++      assert up(TestRepo, 10, MigrationWithAfterTransactionOnly, log: false) == :ok
++
++      assert events() == [
++               {:up, nil, true, true},
++               {:after_transaction, TestRepo, false, true}
++             ]
++    end
++
++    test "are not run when the transaction is disabled" do
++      assert up(TestRepo, 10, MigrationWithBeforeAndAfterTransactionAndNoTransaction, log: false) ==
++               :ok
++
++      assert events() == [{:up, nil, false, false}]
++    end
++
++    test "are not run when the adapter does not support transactions" do
++      put_test_adapter_config(supports_ddl_transaction?: false, test_process: self())
++
++      assert up(TestRepo, 10, MigrationWithBeforeAndAfterTransaction, log: false) == :ok
++      assert events() == [{:up, nil, false, false}]
++    end
++
++    test "still run after_transaction when the migration fails" do
++      assert_raise RuntimeError, "up failed", fn ->
++        up(TestRepo, 10, MigrationWithFailingUp, log: false)
++      end
++
++      assert events() == [
++               {:before_transaction, TestRepo, false, true},
++               {:after_transaction, TestRepo, false, true}
++             ]
++    end
++
++    test "run after_transaction but not the migration when before_transaction fails" do
++      assert_raise RuntimeError, "before_transaction failed", fn ->
++        up(TestRepo, 10, MigrationWithFailingBeforeTransaction, log: false)
++      end
++
++      assert events() == [{:after_transaction, TestRepo, false, true}]
++    end
++  end
++
+   describe "migrations_path" do
+     test "is inferred from the repository name" do
+       path = migrations_path(TestRepo)
+diff --git a/test/support/test_repo.exs b/test/support/test_repo.exs
+index 7a0ae541d..299f941ac 100644
+--- a/test/support/test_repo.exs
++++ b/test/support/test_repo.exs
+@@ -33,8 +33,6 @@ defmodule EctoSQL.TestAdapter do
+     {:ok, child_spec, %{meta: :meta}}
+   end
+ 
+-  def checkout(_, _, _), do: raise("not implemented")
+-  def checked_out?(_), do: raise("not implemented")
+   def delete(_, _, _, _, _), do: raise("not implemented")
+   def insert_all(_, _, _, _, _, _, _, _), do: raise("not implemented")
+   def rollback(_, _), do: raise("not implemented")
+@@ -75,6 +73,15 @@ defmodule EctoSQL.TestAdapter do
+     {:ok, []}
+   end
+ 
++  def checked_out?(_), do: Process.get(:checked_out?) || false
++
++  def checkout(_, _opts, fun) do
++    Process.put(:checked_out?, true)
++    fun.()
++  after
++    Process.put(:checked_out?, false)
++  end
++
+   def in_transaction?(_), do: Process.get(:in_transaction?) || false
+ 
+   def transaction(mod, _opts, fun) do

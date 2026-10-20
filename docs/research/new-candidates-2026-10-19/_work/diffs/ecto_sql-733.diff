@@ -1,0 +1,614 @@
+diff --git a/lib/mix/tasks/ecto.query.ex b/lib/mix/tasks/ecto.query.ex
+new file mode 100644
+index 000000000..1739a3983
+--- /dev/null
++++ b/lib/mix/tasks/ecto.query.ex
+@@ -0,0 +1,235 @@
++defmodule Mix.Tasks.Ecto.Query do
++  use Mix.Task
++  import Inspect.Algebra
++  import Mix.Ecto
++
++  @shortdoc "Runs a query against the repository"
++
++  @switches [
++    limit: :integer,
++    repo: [:string, :keep],
++    sql: :boolean,
++    no_compile: :boolean,
++    no_deps_check: :boolean
++  ]
++
++  @aliases [
++    r: :repo
++  ]
++
++  @moduledoc """
++  Runs the given query against the repository.
++
++  The query is evaluated as Elixir code after importing `Ecto.Query`.
++  If a local `.iex.exs` file exists, only aliases from the file are made
++  available to the query.
++
++  The query runs inside a read-only transaction.
++
++  ## Examples
++
++      $ mix ecto.query "from p in Post, where: p.published"
++      $ mix ecto.query -r Custom.Repo "from p in Post, limit: 10"
++      $ mix ecto.query --sql "from p in Post, where: p.published"
++
++  ## Command line options
++
++    * `-r`, `--repo` - the repo to query
++    * `--limit` - limits the number of printed entries. Defaults to 100.
++    * `--sql` - prints the generated SQL and parameters instead of running the query
++
++  """
++
++  @default_limit 100
++
++  @impl true
++  def run(args) do
++    repos = parse_repo(args)
++    {opts, query_args} = OptionParser.parse!(args, strict: @switches, aliases: @aliases)
++
++    repo =
++      case repos do
++        [repo] ->
++          repo
++
++        [] ->
++          Mix.raise("ecto.query expects a repository to be configured or given as -r MyApp.Repo")
++
++        [_ | _] ->
++          Mix.raise("ecto.query found multiple repositories, please pass one with -r")
++      end
++
++    query =
++      case query_args do
++        [query] -> query
++        [] -> Mix.raise("ecto.query expects a query to be given")
++        [_ | _] -> Mix.raise("ecto.query expects a single query to be given")
++      end
++
++    limit = Keyword.get(opts, :limit, @default_limit)
++
++    if limit < 0 do
++      Mix.raise("ecto.query expects --limit to be greater than or equal to zero")
++    end
++
++    Mix.Task.run("app.start", args)
++    ensure_repo(repo, args)
++
++    query = eval_query(query)
++
++    result =
++      if opts[:sql] do
++        {:ok, format_sql(repo, query)}
++      else
++        read_only_transaction(repo, fn ->
++          query
++          |> repo.all()
++          |> Enum.take(limit)
++          |> inspect_entries()
++        end)
++      end
++
++    result
++    |> case do
++      {:ok, output} ->
++        Mix.shell().info(output)
++
++      {:error, reason} ->
++        Mix.raise("ecto.query failed: #{inspect(reason)}")
++    end
++  end
++
++  defp eval_query(query) do
++    query = Code.string_to_quoted!(query, file: "ecto.query")
++
++    code =
++      {:__block__, [],
++       dot_iex_aliases() ++
++         [
++           quote(do: import(Ecto.Query)),
++           query
++         ]}
++
++    {queryable, _binding} = Code.eval_quoted(code, [], file: "ecto.query")
++
++    to_query!(queryable)
++  end
++
++  defp to_query!(queryable) do
++    Ecto.Queryable.to_query(queryable)
++  rescue
++    Protocol.UndefinedError ->
++      Mix.raise(
++        "Expected ecto.query to evaluate to a queryable expression, got: #{inspect(queryable)}"
++      )
++  end
++
++  defp dot_iex_aliases do
++    with true <- File.regular?(".iex.exs"),
++         {:ok, quoted} <- ".iex.exs" |> File.read!() |> Code.string_to_quoted(file: ".iex.exs") do
++      collect_aliases(quoted)
++    else
++      _ -> []
++    end
++  end
++
++  defp collect_aliases({:__block__, _, expressions}) do
++    Enum.filter(expressions, &alias?/1)
++  end
++
++  defp collect_aliases(expression) do
++    if alias?(expression), do: [expression], else: []
++  end
++
++  defp alias?({:alias, _, [_aliases]}), do: true
++  defp alias?({:alias, _, [_aliases, _opts]}), do: true
++  defp alias?(_), do: false
++
++  defp read_only_transaction(repo, fun) do
++    do_read_only_transaction(repo.__adapter__(), repo, fun)
++  end
++
++  defp do_read_only_transaction(Ecto.Adapters.Postgres, repo, fun) do
++    repo.transaction(fn ->
++      repo.query!("SET TRANSACTION READ ONLY", [], log: false)
++      fun.()
++    end)
++  end
++
++  defp do_read_only_transaction(Ecto.Adapters.MyXQL, repo, fun) do
++    repo.checkout(fn ->
++      repo.query!("START TRANSACTION READ ONLY", [], log: false)
++
++      try do
++        {:ok, fun.()}
++      after
++        repo.query!("ROLLBACK", [], log: false)
++      end
++    end)
++  end
++
++  defp do_read_only_transaction(adapter, _repo, _fun) do
++    Mix.raise(
++      "ecto.query requires read-only transactions, which are not supported by #{inspect(adapter)}"
++    )
++  end
++
++  defp format_sql(repo, query) do
++    {sql, params} = repo.to_sql(:all, query)
++
++    """
++    SQL:
++    #{sql}
++
++    Params:
++    #{inspect(params, limit: :infinity, pretty: true)}
++    """
++  end
++
++  defp inspect_entries(entries) do
++    previous_fun = Inspect.Opts.default_inspect_fun()
++
++    inspect_fun = fn
++      %{__struct__: schema, __meta__: %Ecto.Schema.Metadata{}} = struct, opts ->
++        inspect_schema(struct, schema, opts)
++
++      term, opts ->
++        previous_fun.(term, opts)
++    end
++
++    inspect(entries, limit: :infinity, pretty: true, inspect_fun: inspect_fun)
++  end
++
++  defp inspect_schema(struct, schema, opts) do
++    drop_fields =
++      [:__meta__ | unloaded_associations(schema, struct)] ++ schema.__schema__(:redact_fields)
++
++    infos =
++      for %{field: field} = info <- schema.__info__(:struct),
++          field not in [:__struct__, :__exception__ | drop_fields],
++          do: info
++
++    inspect_map(struct, Macro.inspect_atom(:literal, schema), infos, opts)
++  end
++
++  defp inspect_map(map, name, infos, opts) do
++    fun = fn %{field: field}, opts -> inspect_keyword({field, Map.get(map, field)}, opts) end
++    open = color("%" <> name <> "{", :map, opts)
++    sep = color(",", :map, opts)
++    close = color("}", :map, opts)
++
++    container_doc(open, infos, close, opts, fun, separator: sep, break: :strict)
++  end
++
++  defp inspect_keyword({key, value}, opts) do
++    key = color(Macro.inspect_atom(:key, key), :atom, opts)
++    concat(key, concat(" ", to_doc(value, opts)))
++  end
++
++  defp unloaded_associations(schema, struct) do
++    for assoc <- schema.__schema__(:associations),
++        match?(%Ecto.Association.NotLoaded{}, Map.get(struct, assoc)) do
++      assoc
++    end
++  end
++end
+diff --git a/test/mix/tasks/ecto.query_test.exs b/test/mix/tasks/ecto.query_test.exs
+new file mode 100644
+index 000000000..aa49f7295
+--- /dev/null
++++ b/test/mix/tasks/ecto.query_test.exs
+@@ -0,0 +1,367 @@
++defmodule Mix.Tasks.Ecto.QueryTest do
++  use ExUnit.Case
++
++  import Mix.Tasks.Ecto.Query, only: [run: 1]
++
++  defmodule Comment do
++    use Ecto.Schema
++
++    schema "comments" do
++      field :text, :string
++    end
++  end
++
++  defmodule Metadata do
++    use Ecto.Schema
++
++    embedded_schema do
++      field :author, :string
++      field :views, :integer
++    end
++  end
++
++  defmodule Tag do
++    use Ecto.Schema
++
++    embedded_schema do
++      field :name, :string
++    end
++  end
++
++  defmodule Post do
++    use Ecto.Schema
++
++    schema "posts" do
++      field :title, :string
++      field :secret, :string, redact: true
++      field :inserted_at, :utc_datetime_usec
++      embeds_one :metadata, Metadata
++      embeds_many :tags, Tag
++      has_many :comments, Comment
++    end
++  end
++
++  test "runs a query against the repo in a read-only transaction" do
++    Process.put(:test_repo_all_results, [
++      [1, "first", "hunter2"],
++      [2, "second", "swordfish"]
++    ])
++
++    in_tmp("read_only", fn ->
++      File.write!(".iex.exs", "alias #{inspect(Post)}\n")
++
++      run(["-r", to_string(__MODULE__.PostgresRepo), "from(p in Post)"])
++
++      assert_received {:transaction, __MODULE__.PostgresRepo, _fun}
++      assert_received {:query!, "SET TRANSACTION READ ONLY", [], opts}
++      assert opts[:log] == false
++      assert_received {:all, %Ecto.Query{}}
++      assert_received {:mix_shell, :info, [output]}
++
++      assert output =~ "%Mix.Tasks.Ecto.QueryTest.Post{"
++      assert output =~ ~s(title: "first")
++      refute output =~ "__meta__"
++      refute output =~ "comments:"
++      refute output =~ "secret:"
++      refute output =~ "hunter2"
++    end)
++  end
++
++  test "uses the configured default repo" do
++    Application.put_env(:ecto_sql, :ecto_repos, [__MODULE__.PostgresRepo])
++    on_exit(fn -> Application.delete_env(:ecto_sql, :ecto_repos) end)
++
++    Process.put(:test_repo_all_results, [[1, "first", "hunter2"]])
++
++    in_tmp("default_repo", fn ->
++      File.write!(".iex.exs", "alias #{inspect(Post)}\n")
++
++      run(["from(p in Post)"])
++
++      assert_received {:query!, "SET TRANSACTION READ ONLY", [], _opts}
++    end)
++  end
++
++  test "uses only aliases from .iex.exs" do
++    Process.put(:test_repo_all_results, [[1, "first", "hunter2"]])
++
++    in_tmp("dot_iex_aliases", fn ->
++      File.write!(".iex.exs", """
++      alias #{inspect(__MODULE__)}.{Post, Comment}
++      Process.put(:dot_iex_was_evaluated, true)
++      """)
++
++      run(["-r", to_string(__MODULE__.PostgresRepo), "from(p in Post)"])
++
++      refute Process.get(:dot_iex_was_evaluated)
++      assert_received {:all, %Ecto.Query{}}
++    end)
++  end
++
++  test "accepts a schema module queryable" do
++    Process.put(:test_repo_all_results, [[1, "first", "hunter2"]])
++
++    run(["-r", to_string(__MODULE__.PostgresRepo), inspect(Post)])
++
++    assert_received {:all, %Ecto.Query{}}
++    assert_received {:mix_shell, :info, [output]}
++    assert output =~ ~s(title: "first")
++  end
++
++  test "limits printed entries" do
++    Process.put(:test_repo_all_results, [
++      [1, "first", "hunter2"],
++      [2, "second", "swordfish"]
++    ])
++
++    in_tmp("limit", fn ->
++      File.write!(".iex.exs", "alias #{inspect(Post)}\n")
++
++      run(["-r", to_string(__MODULE__.PostgresRepo), "--limit", "1", "from(p in Post)"])
++
++      assert_received {:all, %Ecto.Query{} = query}
++      refute query.limit
++      assert_received {:mix_shell, :info, [output]}
++      assert output =~ ~s(title: "first")
++      refute output =~ ~s(title: "second")
++    end)
++  end
++
++  test "preserves query-level limits" do
++    Process.put(:test_repo_all_results, [
++      [1, "first", "hunter2"],
++      [2, "second", "swordfish"]
++    ])
++
++    in_tmp("query_limit", fn ->
++      File.write!(".iex.exs", "alias #{inspect(Post)}\n")
++
++      run(["-r", to_string(__MODULE__.PostgresRepo), "from(p in Post, limit: 2)"])
++
++      assert_received {:all, %Ecto.Query{} = query}
++      assert inspect(query) =~ "limit: 2"
++    end)
++  end
++
++  test "renders regular structs in schema fields" do
++    inserted_at = ~U[2023-04-19 10:28:17.036648Z]
++    Process.put(:test_repo_all_results, [[1, "first", "hunter2", inserted_at]])
++
++    run(["-r", to_string(__MODULE__.PostgresRepo), inspect(Post)])
++
++    assert_received {:mix_shell, :info, [output]}
++    assert output =~ ~s(inserted_at: ~U[2023-04-19 10:28:17.036648Z])
++  end
++
++  test "renders embeds" do
++    Process.put(:test_repo_all_results, [
++      [1, "first", "hunter2", %Metadata{author: "mary", views: 3}, [%Tag{name: "elixir"}]]
++    ])
++
++    run(["-r", to_string(__MODULE__.PostgresRepo), inspect(Post)])
++
++    assert_received {:mix_shell, :info, [output]}
++    assert output =~ "metadata: %Mix.Tasks.Ecto.QueryTest.Metadata{"
++    assert output =~ ~s(author: "mary")
++    assert output =~ "views: 3"
++    assert output =~ "tags: ["
++    assert output =~ "%Mix.Tasks.Ecto.QueryTest.Tag{"
++    assert output =~ ~s(name: "elixir")
++  end
++
++  test "does not change the default inspect function" do
++    previous_fun = Inspect.Opts.default_inspect_fun()
++    Process.put(:test_repo_all_results, [[1, "first", "hunter2"]])
++
++    run(["-r", to_string(__MODULE__.PostgresRepo), inspect(Post)])
++
++    assert Inspect.Opts.default_inspect_fun() == previous_fun
++  end
++
++  test "prints SQL and params with --sql" do
++    Process.put(
++      :test_repo_to_sql,
++      {"SELECT p0.\"id\" FROM \"posts\" AS p0 WHERE (p0.\"id\" = $1)", [1]}
++    )
++
++    in_tmp("sql", fn ->
++      File.write!(".iex.exs", "alias #{inspect(Post)}\n")
++
++      run([
++        "-r",
++        to_string(__MODULE__.PostgresRepo),
++        "--sql",
++        "from(p in Post, where: p.id == ^1)"
++      ])
++
++      assert_received {:to_sql, :all, %Ecto.Query{}, []}
++      refute_received {:all, _query}
++      refute_received {:query!, "SET TRANSACTION READ ONLY", [], _opts}
++      assert_received {:mix_shell, :info, [output]}
++
++      assert output =~ ~s[SQL:\nSELECT p0."id" FROM "posts" AS p0 WHERE (p0."id" = $1)]
++      assert output =~ "Params:\n[1]"
++    end)
++  end
++
++  test "starts MySQL read-only transactions explicitly" do
++    Process.put(:test_repo_all_results, [[1, "first", "hunter2"]])
++
++    run(["-r", to_string(__MODULE__.MyXQLRepo), inspect(Post)])
++
++    assert_received {:checkout, __MODULE__.MyXQLRepo}
++    assert_received {:myxql_query!, "START TRANSACTION READ ONLY", [], opts}
++    assert opts[:log] == false
++    assert_received {:myxql_all, %Ecto.Query{}}
++    assert_received {:myxql_query!, "ROLLBACK", [], rollback_opts}
++    assert rollback_opts[:log] == false
++    assert_received {:mix_shell, :info, [output]}
++    assert output =~ ~s(title: "first")
++  end
++
++  test "prints MySQL SQL without starting a transaction" do
++    Process.put(:test_repo_to_sql, {"SELECT p0.`id` FROM `posts` AS p0", []})
++
++    run(["-r", to_string(__MODULE__.MyXQLRepo), "--sql", inspect(Post)])
++
++    refute_received {:checkout, __MODULE__.MyXQLRepo}
++    refute_received {:myxql_query!, "START TRANSACTION READ ONLY", [], _opts}
++    refute_received {:myxql_query!, "ROLLBACK", [], _opts}
++    assert_received {:myxql_to_sql, :all, %Ecto.Query{}, []}
++    assert_received {:mix_shell, :info, [output]}
++    assert output =~ ~s[SQL:\nSELECT p0.`id` FROM `posts` AS p0]
++    assert output =~ "Params:\n[]"
++  end
++
++  test "raises when the evaluated expression is not queryable" do
++    for query <- ["1", "%{}", "[]", ":ok"] do
++      assert_raise Mix.Error,
++                   ~r/Expected ecto\.query to evaluate to a queryable expression, got:/,
++                   fn ->
++                     run(["-r", to_string(__MODULE__.PostgresRepo), query])
++                   end
++    end
++  end
++
++  test "raises when multiple repos are given" do
++    assert_raise Mix.Error,
++                 "ecto.query found multiple repositories, please pass one with -r",
++                 fn ->
++                   run([
++                     "-r",
++                     to_string(__MODULE__.PostgresRepo),
++                     "-r",
++                     to_string(__MODULE__.PostgresRepo),
++                     "from(p in Post)"
++                   ])
++                 end
++  end
++
++  test "raises when a query is not given" do
++    assert_raise Mix.Error, "ecto.query expects a query to be given", fn ->
++      run(["-r", to_string(__MODULE__.PostgresRepo)])
++    end
++  end
++
++  test "raises when multiple queries are given" do
++    assert_raise Mix.Error, "ecto.query expects a single query to be given", fn ->
++      run(["-r", to_string(__MODULE__.PostgresRepo), inspect(Post), inspect(Post)])
++    end
++  end
++
++  test "raises when limit is negative" do
++    assert_raise Mix.Error,
++                 "ecto.query expects --limit to be greater than or equal to zero",
++                 fn ->
++                   run(["-r", to_string(__MODULE__.PostgresRepo), "--limit", "-1", inspect(Post)])
++                 end
++  end
++
++  test "raises when the adapter does not support read-only transactions" do
++    assert_raise Mix.Error, ~r/read-only transactions.*Ecto.Adapters.Tds/s, fn ->
++      run(["-r", to_string(__MODULE__.NoReadOnlyRepo), inspect(Post)])
++    end
++  end
++
++  defmodule NoReadOnlyRepo do
++    def __adapter__, do: Ecto.Adapters.Tds
++  end
++
++  defmodule PostgresRepo do
++    def __adapter__, do: Ecto.Adapters.Postgres
++
++    def transaction(fun, _opts \\ []) do
++      send(self(), {:transaction, __MODULE__, fun})
++      {:ok, fun.()}
++    end
++
++    def query!(sql, params \\ [], opts \\ []) do
++      send(self(), {:query!, sql, params, opts})
++      %{rows: [], num_rows: 0}
++    end
++
++    def all(query) do
++      send(self(), {:all, query})
++
++      rows = Process.get(:test_repo_all_results, [])
++
++      Enum.map(rows, fn
++        [id, title, secret] ->
++          %Post{id: id, title: title, secret: secret}
++
++        [id, title, secret, inserted_at] ->
++          %Post{id: id, title: title, secret: secret, inserted_at: inserted_at}
++
++        [id, title, secret, %Metadata{} = metadata, tags] ->
++          %Post{id: id, title: title, secret: secret, metadata: metadata, tags: tags}
++      end)
++    end
++
++    def to_sql(operation, queryable, opts \\ []) do
++      send(self(), {:to_sql, operation, queryable, opts})
++      Process.get(:test_repo_to_sql, {"SELECT s0.\"id\" FROM \"posts\" AS s0", []})
++    end
++  end
++
++  defmodule MyXQLRepo do
++    def __adapter__, do: Ecto.Adapters.MyXQL
++
++    def checkout(fun, _opts \\ []) do
++      send(test_process(), {:checkout, __MODULE__})
++      fun.()
++    end
++
++    def query!(sql, params \\ [], opts \\ []) do
++      send(test_process(), {:myxql_query!, sql, params, opts})
++      %{rows: [], num_rows: 0}
++    end
++
++    def all(query) do
++      send(test_process(), {:myxql_all, query})
++
++      rows = Process.get(:test_repo_all_results, [])
++
++      Enum.map(rows, fn [id, title, secret] ->
++        %Post{id: id, title: title, secret: secret}
++      end)
++    end
++
++    def to_sql(operation, queryable, opts \\ []) do
++      send(test_process(), {:myxql_to_sql, operation, queryable, opts})
++      Process.get(:test_repo_to_sql, {"SELECT p0.`id` FROM `posts` AS p0", []})
++    end
++
++    defp test_process do
++      self()
++    end
++  end
++
++  @tmp_path Path.expand("../../../tmp", __DIR__)
++
++  defp in_tmp(path, fun) do
++    path = Path.join(@tmp_path, path)
++    File.rm_rf!(path)
++    File.mkdir_p!(path)
++    File.cd!(path, fun)
++  end
++end

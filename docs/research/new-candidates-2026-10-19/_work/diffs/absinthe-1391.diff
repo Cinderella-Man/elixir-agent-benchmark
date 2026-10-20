@@ -1,0 +1,98 @@
+diff --git a/lib/absinthe/formatter.ex b/lib/absinthe/formatter.ex
+index 6aeaf703c9..b4c8129337 100644
+--- a/lib/absinthe/formatter.ex
++++ b/lib/absinthe/formatter.ex
+@@ -26,7 +26,7 @@ defmodule Absinthe.Formatter do
+   """
+ 
+   def features(_opts) do
+-    [sigils: [], extensions: [".graphql", ".gql"]]
++    [sigils: [:GQL], extensions: [".graphql", ".gql"]]
+   end
+ 
+   def format(contents, _opts \\ []) do
+diff --git a/lib/absinthe/sigil.ex b/lib/absinthe/sigil.ex
+new file mode 100644
+index 0000000000..523fb70e0e
+--- /dev/null
++++ b/lib/absinthe/sigil.ex
+@@ -0,0 +1,30 @@
++defmodule Absinthe.Sigil do
++  @moduledoc """
++  Provides the ~GQL sigil
++  """
++
++  def sigil_GQL(string, []) do
++    with {:ok, blueprint} <- Absinthe.Phase.Parse.run(string, []) do
++      inspect(blueprint.input, pretty: true)
++    else
++      {:error, %Absinthe.Blueprint{execution: %{validation_errors: [_ | _] = errors}}} ->
++        {:current_stacktrace, [_process_info, _absinthe_sigil, {_, _, _, loc} | _]} =
++          Process.info(self(), :current_stacktrace)
++
++        err_string =
++          Enum.join(
++            [
++              "~GQL sigil validation error at " <> inspect(loc)
++              | Enum.map(errors, &"#{&1.message} (#{inspect(&1.locations)})")
++            ],
++            "\n"
++          )
++
++        IO.puts(:stderr, err_string)
++        string
++
++      other ->
++        other
++    end
++  end
++end
+diff --git a/test/absinthe/sigil_test.exs b/test/absinthe/sigil_test.exs
+new file mode 100644
+index 0000000000..cc2a901058
+--- /dev/null
++++ b/test/absinthe/sigil_test.exs
+@@ -0,0 +1,31 @@
++defmodule Absinthe.SigilTest do
++  use Absinthe.Case, async: true
++  import ExUnit.CaptureIO
++
++  test "~GQL sigil formatting" do
++    assert ~GQL"{version}" == "{\n  version\n}\n"
++  end
++
++  test "~GQL sigil validation error reporting" do
++    this_file = __ENV__.file |> String.split("/") |> List.last()
++    # ENV gives full path, but error message is relative path
++
++    err_out =
++      capture_io(:stderr, fn ->
++        assert ~GQL"{version" == "{version"
++      end)
++
++    assert err_out =~ "~GQL sigil validation error"
++    assert err_out =~ this_file
++    assert err_out =~ "syntax error"
++
++    err_out =
++      capture_io(:stderr, fn ->
++        assert ~GQL"query { item(this-won't-lex) }" == "query { item(this-won't-lex) }"
++      end)
++
++    assert err_out =~ "~GQL sigil validation error"
++    assert err_out =~ this_file
++    assert err_out =~ "Parsing failed at `-won't-lex`"
++  end
++end
+diff --git a/test/support/case.ex b/test/support/case.ex
+index e1006c9bf5..9c3fe5f116 100644
+--- a/test/support/case.ex
++++ b/test/support/case.ex
+@@ -8,6 +8,7 @@ defmodule Absinthe.Case do
+       import Absinthe.Case.Helpers.Run
+       import Absinthe.Case.Assertions.Result
+       import Absinthe.Case.Assertions.Schema
++      import Absinthe.Sigil
+     end
+   end
+ end

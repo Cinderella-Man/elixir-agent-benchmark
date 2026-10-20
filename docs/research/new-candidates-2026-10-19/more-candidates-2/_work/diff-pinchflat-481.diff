@@ -1,0 +1,1186 @@
+diff --git a/assets/js/alpine_helpers.js b/assets/js/alpine_helpers.js
+index 56a7d9309..2d8bd93e7 100644
+--- a/assets/js/alpine_helpers.js
++++ b/assets/js/alpine_helpers.js
+@@ -35,3 +35,10 @@ window.markVersionAsSeen = (versionString) => {
+ window.isVersionSeen = (versionString) => {
+   return localStorage.getItem('seenVersion') === versionString
+ }
++
++window.dispatchFor = (elementOrId, eventName, detail = {}) => {
++  const element =
++    typeof elementOrId === 'string' ? document.getElementById(elementOrId) : elementOrId
++
++  element.dispatchEvent(new CustomEvent(eventName, { detail }))
++}
+diff --git a/assets/js/app.js b/assets/js/app.js
+index 2be596dbd..f9accf3bc 100644
+--- a/assets/js/app.js
++++ b/assets/js/app.js
+@@ -39,7 +39,7 @@ let liveSocket = new LiveSocket(document.body.dataset.socketPath, Socket, {
+     }
+   },
+   hooks: {
+-    supressEnterSubmission: {
++    'supress-enter-submission': {
+       mounted() {
+         this.el.addEventListener('keypress', (event) => {
+           if (event.key === 'Enter') {
+@@ -47,6 +47,29 @@ let liveSocket = new LiveSocket(document.body.dataset.socketPath, Socket, {
+           }
+         })
+       }
++    },
++    'formless-input': {
++      mounted() {
++        const subscribedEvents = this.el.dataset.subscribe.split(' ')
++        const eventName = this.el.dataset.eventName || ''
++        const identifier = this.el.dataset.identifier || ''
++
++        subscribedEvents.forEach((domEvent) => {
++          this.el.addEventListener(domEvent, () => {
++            // This ensures that the event is pushed to the server after the input value has been updated
++            // so that the server has the most up-to-date value
++            setTimeout(() => {
++              this.pushEvent('formless-input', {
++                value: this.el.value,
++                id: identifier,
++                event: eventName,
++                dom_id: this.el.id,
++                dom_event: domEvent
++              })
++            }, 0)
++          })
++        })
++      }
+     }
+   }
+ })
+diff --git a/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex b/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex
+index 9daeda1e5..c31388deb 100644
+--- a/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex
++++ b/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex
+@@ -11,14 +11,27 @@ defmodule Pinchflat.FastIndexing.FastIndexingHelpers do
+ 
+   alias Pinchflat.Repo
+   alias Pinchflat.Media
++  alias Pinchflat.Tasks
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.FastIndexing.YoutubeRss
+   alias Pinchflat.FastIndexing.YoutubeApi
+   alias Pinchflat.Downloading.DownloadingHelpers
++  alias Pinchflat.FastIndexing.FastIndexingWorker
+   alias Pinchflat.Downloading.DownloadOptionBuilder
+ 
+   alias Pinchflat.YtDlp.Media, as: YtDlpMedia
+ 
++  @doc """
++  Kicks off a new fast indexing task for a source. This will delete any existing fast indexing
++  tasks for the source before starting a new one.
++
++  Returns {:ok, %Task{}}
++  """
++  def kickoff_indexing_task(%Source{} = source) do
++    Tasks.delete_pending_tasks_for(source, "FastIndexingWorker", include_executing: true)
++    FastIndexingWorker.kickoff_with_task(source)
++  end
++
+   @doc """
+   Fetches new media IDs for a source from YT's API or RSS, indexes them, and kicks off downloading
+   tasks for any pending media items. See comments in `FastIndexingWorker` for more info on the
+diff --git a/lib/pinchflat/profiles/profiles_query.ex b/lib/pinchflat/profiles/profiles_query.ex
+new file mode 100644
+index 000000000..caa13159f
+--- /dev/null
++++ b/lib/pinchflat/profiles/profiles_query.ex
+@@ -0,0 +1,29 @@
++defmodule Pinchflat.Profiles.ProfilesQuery do
++  @moduledoc """
++  Query helpers for the Profiles context.
++
++  These methods are made to be one-ish liners used
++  to compose queries. Each method should strive to do
++  _one_ thing. These don't need to be tested as
++  they are just building blocks for other functionality
++  which, itself, will be tested.
++  """
++  import Ecto.Query, warn: false
++
++  alias Pinchflat.Profiles.MediaProfile
++
++  # This allows the module to be aliased and query methods to be used
++  # all in one go
++  # usage: use Pinchflat.Profiles.ProfilesQuery
++  defmacro __using__(_opts) do
++    quote do
++      import Ecto.Query, warn: false
++
++      alias unquote(__MODULE__)
++    end
++  end
++
++  def new do
++    MediaProfile
++  end
++end
+diff --git a/lib/pinchflat/slow_indexing/slow_indexing_helpers.ex b/lib/pinchflat/slow_indexing/slow_indexing_helpers.ex
+index 74e5f4c34..61ba89737 100644
+--- a/lib/pinchflat/slow_indexing/slow_indexing_helpers.ex
++++ b/lib/pinchflat/slow_indexing/slow_indexing_helpers.ex
+@@ -25,13 +25,28 @@ defmodule Pinchflat.SlowIndexing.SlowIndexingHelpers do
+   Starts tasks for indexing a source's media regardless of the source's indexing
+   frequency. It's assumed the caller will check for indexing frequency.
+ 
+-  Returns {:ok, %Task{}}.
++  Returns {:ok, %Task{}}
+   """
+   def kickoff_indexing_task(%Source{} = source, job_args \\ %{}, job_opts \\ []) do
++    job_offset_seconds = calculate_job_offset_seconds(source)
++
+     Tasks.delete_pending_tasks_for(source, "FastIndexingWorker")
+     Tasks.delete_pending_tasks_for(source, "MediaCollectionIndexingWorker", include_executing: true)
+ 
+-    MediaCollectionIndexingWorker.kickoff_with_task(source, job_args, job_opts)
++    MediaCollectionIndexingWorker.kickoff_with_task(source, job_args, job_opts ++ [schedule_in: job_offset_seconds])
++  end
++
++  @doc """
++  A helper method to delete all indexing-related tasks for a source.
++  Optionally, you can include executing tasks in the deletion process.
++
++  Returns :ok
++  """
++  def delete_indexing_tasks(%Source{} = source, opts \\ []) do
++    include_executing = Keyword.get(opts, :include_executing, false)
++
++    Tasks.delete_pending_tasks_for(source, "FastIndexingWorker", include_executing: include_executing)
++    Tasks.delete_pending_tasks_for(source, "MediaCollectionIndexingWorker", include_executing: include_executing)
+   end
+ 
+   @doc """
+@@ -141,4 +156,14 @@ defmodule Pinchflat.SlowIndexing.SlowIndexingHelpers do
+         changeset
+     end
+   end
++
++  # Find the difference between the current time and the last time the source was indexed
++  defp calculate_job_offset_seconds(%Source{last_indexed_at: nil}), do: 0
++
++  defp calculate_job_offset_seconds(source) do
++    offset_seconds = DateTime.diff(DateTime.utc_now(), source.last_indexed_at, :second)
++    index_frequency_seconds = source.index_frequency_minutes * 60
++
++    max(0, index_frequency_seconds - offset_seconds)
++  end
+ end
+diff --git a/lib/pinchflat/sources/source.ex b/lib/pinchflat/sources/source.ex
+index 99ff2d4a6..38da139ff 100644
+--- a/lib/pinchflat/sources/source.ex
++++ b/lib/pinchflat/sources/source.ex
+@@ -15,6 +15,7 @@ defmodule Pinchflat.Sources.Source do
+   alias Pinchflat.Metadata.SourceMetadata
+ 
+   @allowed_fields ~w(
++    enabled
+     collection_name
+     collection_id
+     collection_type
+@@ -64,6 +65,7 @@ defmodule Pinchflat.Sources.Source do
+                                 )a
+ 
+   schema "sources" do
++    field :enabled, :boolean, default: true
+     # This is _not_ used as the primary key or internally in the database
+     # relations. This is only used to prevent an enumeration attack on the streaming
+     # and RSS feed endpoints since those _must_ be public (ie: no basic auth)
+diff --git a/lib/pinchflat/sources/sources.ex b/lib/pinchflat/sources/sources.ex
+index 161b9574e..ecbe7d412 100644
+--- a/lib/pinchflat/sources/sources.ex
++++ b/lib/pinchflat/sources/sources.ex
+@@ -15,8 +15,8 @@ defmodule Pinchflat.Sources do
+   alias Pinchflat.Metadata.SourceMetadata
+   alias Pinchflat.Utils.FilesystemUtils
+   alias Pinchflat.Downloading.DownloadingHelpers
+-  alias Pinchflat.FastIndexing.FastIndexingWorker
+   alias Pinchflat.SlowIndexing.SlowIndexingHelpers
++  alias Pinchflat.FastIndexing.FastIndexingHelpers
+   alias Pinchflat.Metadata.SourceMetadataStorageWorker
+ 
+   @doc """
+@@ -255,19 +255,40 @@ defmodule Pinchflat.Sources do
+     end
+   end
+ 
+-  # If the source is NOT new (ie: updated) and the download_media flag has changed,
++  # If the source is new (ie: not persisted), do nothing
++  defp maybe_handle_media_tasks(%{data: %{__meta__: %{state: state}}}, _source) when state != :loaded do
++    :ok
++  end
++
++  # If the source is NOT new (ie: updated),
+   # enqueue or dequeue media download tasks as necessary.
+   defp maybe_handle_media_tasks(changeset, source) do
+-    case {changeset.data, changeset.changes} do
+-      {%{__meta__: %{state: :loaded}}, %{download_media: true}} ->
++    current_changes = changeset.changes
++    applied_changes = Ecto.Changeset.apply_changes(changeset)
++
++    # We need both current_changes and applied_changes to determine
++    # the course of action to take. For example, we only care if a source is supposed
++    # to be `enabled` or not - we don't care if that information comes from the
++    # current changes or if that's how it already was in the database.
++    # Rephrased, we're essentially using it in place of `get_field/2`
++    case {current_changes, applied_changes} do
++      {%{download_media: true}, %{enabled: true}} ->
++        DownloadingHelpers.enqueue_pending_download_tasks(source)
++
++      {%{enabled: true}, %{download_media: true}} ->
+         DownloadingHelpers.enqueue_pending_download_tasks(source)
+ 
+-      {%{__meta__: %{state: :loaded}}, %{download_media: false}} ->
++      {%{download_media: false}, _} ->
++        DownloadingHelpers.dequeue_pending_download_tasks(source)
++
++      {%{enabled: false}, _} ->
+         DownloadingHelpers.dequeue_pending_download_tasks(source)
+ 
+       _ ->
+-        :ok
++        nil
+     end
++
++    :ok
+   end
+ 
+   defp maybe_run_indexing_task(changeset, source) do
+@@ -301,13 +322,22 @@ defmodule Pinchflat.Sources do
+   end
+ 
+   defp maybe_update_slow_indexing_task(changeset, source) do
+-    case changeset.changes do
+-      %{index_frequency_minutes: mins} when mins > 0 ->
++    # See comment in `maybe_handle_media_tasks` as to why we need these
++    current_changes = changeset.changes
++    applied_changes = Ecto.Changeset.apply_changes(changeset)
++
++    case {current_changes, applied_changes} do
++      {%{index_frequency_minutes: mins}, %{enabled: true}} when mins > 0 ->
++        SlowIndexingHelpers.kickoff_indexing_task(source)
++
++      {%{enabled: true}, %{index_frequency_minutes: mins}} when mins > 0 ->
+         SlowIndexingHelpers.kickoff_indexing_task(source)
+ 
+-      %{index_frequency_minutes: _} ->
+-        Tasks.delete_pending_tasks_for(source, "FastIndexingWorker")
+-        Tasks.delete_pending_tasks_for(source, "MediaCollectionIndexingWorker")
++      {%{index_frequency_minutes: _}, _} ->
++        SlowIndexingHelpers.delete_indexing_tasks(source, include_executing: true)
++
++      {%{enabled: false}, _} ->
++        SlowIndexingHelpers.delete_indexing_tasks(source, include_executing: true)
+ 
+       _ ->
+         :ok
+@@ -315,13 +345,25 @@ defmodule Pinchflat.Sources do
+   end
+ 
+   defp maybe_update_fast_indexing_task(changeset, source) do
+-    case changeset.changes do
+-      %{fast_index: true} ->
+-        Tasks.delete_pending_tasks_for(source, "FastIndexingWorker")
+-        FastIndexingWorker.kickoff_with_task(source)
++    # See comment in `maybe_handle_media_tasks` as to why we need these
++    current_changes = changeset.changes
++    applied_changes = Ecto.Changeset.apply_changes(changeset)
++
++    # This technically could be simplified since `maybe_update_slow_indexing_task`
++    # has some overlap re: deleting pending tasks, but I'm keeping it separate
++    # for clarity and explicitness.
++    case {current_changes, applied_changes} do
++      {%{fast_index: true}, %{enabled: true}} ->
++        FastIndexingHelpers.kickoff_indexing_task(source)
++
++      {%{enabled: true}, %{fast_index: true}} ->
++        FastIndexingHelpers.kickoff_indexing_task(source)
++
++      {%{fast_index: false}, _} ->
++        Tasks.delete_pending_tasks_for(source, "FastIndexingWorker", include_executing: true)
+ 
+-      %{fast_index: false} ->
+-        Tasks.delete_pending_tasks_for(source, "FastIndexingWorker")
++      {%{enabled: false}, _} ->
++        Tasks.delete_pending_tasks_for(source, "FastIndexingWorker", include_executing: true)
+ 
+       _ ->
+         :ok
+diff --git a/lib/pinchflat_web/components/core_components.ex b/lib/pinchflat_web/components/core_components.ex
+index 0bad772be..8f5ff7594 100644
+--- a/lib/pinchflat_web/components/core_components.ex
++++ b/lib/pinchflat_web/components/core_components.ex
+@@ -340,14 +340,15 @@ defmodule PinchflatWeb.CoreComponents do
+       end)
+ 
+     ~H"""
+-    <div x-data={"{ enabled: #{@checked}}"}>
+-      <.label for={@id}>
++    <div x-data={"{ enabled: #{@checked} }"} class="" phx-update="ignore" id={"#{@id}-wrapper"}>
++      <.label :if={@label} for={@id}>
+         <%= @label %>
+         <span :if={@label_suffix} class="text-xs text-bodydark"><%= @label_suffix %></span>
+       </.label>
+-      <div class="relative">
++      <div class="relative flex flex-col">
+         <input type="hidden" id={@id} name={@name} x-bind:value="enabled" {@rest} />
+-        <div class="inline-block cursor-pointer" @click="enabled = !enabled">
++        <%!-- This triggers a `change` event on the hidden input when the toggle is clicked --%>
++        <div class="inline-block cursor-pointer" @click={"enabled = !enabled; dispatchFor('#{@id}', 'change')"}>
+           <div x-bind:class="enabled && '!bg-primary'" class="block h-8 w-14 rounded-full bg-black"></div>
+           <div
+             x-bind:class="enabled && '!right-1 !translate-x-full'"
+diff --git a/lib/pinchflat_web/components/layouts/partials/upgrade_button_live.ex b/lib/pinchflat_web/components/layouts/partials/upgrade_button_live.ex
+index b120191fe..9641564b3 100644
+--- a/lib/pinchflat_web/components/layouts/partials/upgrade_button_live.ex
++++ b/lib/pinchflat_web/components/layouts/partials/upgrade_button_live.ex
+@@ -3,7 +3,7 @@ defmodule Pinchflat.UpgradeButtonLive do
+ 
+   def render(assigns) do
+     ~H"""
+-    <form id="upgradeForm" phx-change="check_matching_text" phx-hook="supressEnterSubmission">
++    <form id="upgradeForm" phx-change="check_matching_text" phx-hook="supress-enter-submission">
+       <.input type="text" name="unlock-pro-textbox" value="" />
+     </form>
+ 
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_controller.ex b/lib/pinchflat_web/controllers/media_profiles/media_profile_controller.ex
+index 34b7bf817..32a0a06b9 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_controller.ex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_controller.ex
+@@ -1,20 +1,31 @@
+ defmodule PinchflatWeb.MediaProfiles.MediaProfileController do
+   use PinchflatWeb, :controller
+   use Pinchflat.Sources.SourcesQuery
++  use Pinchflat.Profiles.ProfilesQuery
+ 
+   alias Pinchflat.Repo
+   alias Pinchflat.Profiles
++  alias Pinchflat.Sources.Source
+   alias Pinchflat.Profiles.MediaProfile
+   alias Pinchflat.Profiles.MediaProfileDeletionWorker
+ 
+   def index(conn, _params) do
+-    media_profiles =
+-      MediaProfile
+-      |> where([mp], is_nil(mp.marked_for_deletion_at))
+-      |> order_by(asc: :name)
+-      |> Repo.all()
+-
+-    render(conn, :index, media_profiles: media_profiles)
++    media_profiles_query =
++      from mp in MediaProfile,
++        as: :media_profile,
++        where: is_nil(mp.marked_for_deletion_at),
++        order_by: [asc: mp.name],
++        select: map(mp, ^MediaProfile.__schema__(:fields)),
++        select_merge: %{
++          source_count:
++            subquery(
++              from s in Source,
++                where: s.media_profile_id == parent_as(:media_profile).id,
++                select: count(s.id)
++            )
++        }
++
++    render(conn, :index, media_profiles: Repo.all(media_profiles_query))
+   end
+ 
+   def new(conn, _params) do
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/index.html.heex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/index.html.heex
+index e3a2deea9..cff9635c9 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/index.html.heex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/index.html.heex
+@@ -10,7 +10,6 @@
+     </.link>
+   </nav>
+ </div>
+-
+ <div class="rounded-sm border border-stroke bg-white shadow-default dark:border-strokedark dark:bg-boxdark">
+   <div class="max-w-full overflow-x-auto">
+     <div class="flex flex-col gap-10 min-w-max">
+@@ -23,6 +22,11 @@
+         <:col :let={media_profile} label="Preferred Resolution">
+           <%= media_profile.preferred_resolution %>
+         </:col>
++        <:col :let={media_profile} label="Sources">
++          <.subtle_link href={~p"/media_profiles/#{media_profile.id}/#tab-sources"}>
++            <.localized_number number={media_profile.source_count} />
++          </.subtle_link>
++        </:col>
+         <:col :let={media_profile} label="" class="flex justify-end">
+           <.icon_link href={~p"/media_profiles/#{media_profile.id}/edit"} icon="hero-pencil-square" class="mr-4" />
+         </:col>
+diff --git a/lib/pinchflat_web/controllers/sources/source_controller.ex b/lib/pinchflat_web/controllers/sources/source_controller.ex
+index 9c48cec6c..08af6d1ac 100644
+--- a/lib/pinchflat_web/controllers/sources/source_controller.ex
++++ b/lib/pinchflat_web/controllers/sources/source_controller.ex
+@@ -1,12 +1,11 @@
+ defmodule PinchflatWeb.Sources.SourceController do
+   use PinchflatWeb, :controller
+-  use Pinchflat.Media.MediaQuery
++  use Pinchflat.Sources.SourcesQuery
+ 
+   alias Pinchflat.Repo
+   alias Pinchflat.Tasks
+   alias Pinchflat.Sources
+   alias Pinchflat.Sources.Source
+-  alias Pinchflat.Media.MediaItem
+   alias Pinchflat.Profiles.MediaProfile
+   alias Pinchflat.Media.FileSyncingWorker
+   alias Pinchflat.Sources.SourceDeletionWorker
+@@ -15,33 +14,7 @@ defmodule PinchflatWeb.Sources.SourceController do
+   alias Pinchflat.Metadata.SourceMetadataStorageWorker
+ 
+   def index(conn, _params) do
+-    source_query =
+-      from s in Source,
+-        as: :source,
+-        inner_join: mp in assoc(s, :media_profile),
+-        where: is_nil(s.marked_for_deletion_at) and is_nil(mp.marked_for_deletion_at),
+-        preload: [media_profile: mp],
+-        order_by: [asc: s.custom_name],
+-        select: map(s, ^Source.__schema__(:fields)),
+-        select_merge: %{
+-          downloaded_count:
+-            subquery(
+-              from m in MediaItem,
+-                where: m.source_id == parent_as(:source).id,
+-                where: ^MediaQuery.downloaded(),
+-                select: count(m.id)
+-            ),
+-          pending_count:
+-            subquery(
+-              from m in MediaItem,
+-                join: s in assoc(m, :source),
+-                where: m.source_id == parent_as(:source).id,
+-                where: ^MediaQuery.pending(),
+-                select: count(m.id)
+-            )
+-        }
+-
+-    render(conn, :index, sources: Repo.all(source_query))
++    render(conn, :index)
+   end
+ 
+   def new(conn, params) do
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/index.html.heex b/lib/pinchflat_web/controllers/sources/source_html/index.html.heex
+index 5913d30d7..55cd45a0c 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/index.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/index.html.heex
+@@ -12,32 +12,7 @@
+ <div class="rounded-sm border border-stroke bg-white shadow-default dark:border-strokedark dark:bg-boxdark">
+   <div class="max-w-full overflow-x-auto">
+     <div class="flex flex-col gap-10 min-w-max">
+-      <.table rows={@sources} table_class="text-black dark:text-white">
+-        <:col :let={source} label="Name">
+-          <.subtle_link href={~p"/sources/#{source.id}"}>
+-            <%= StringUtils.truncate(source.custom_name || source.collection_name, 35) %>
+-          </.subtle_link>
+-        </:col>
+-        <:col :let={source} label="Type"><%= source.collection_type %></:col>
+-        <:col :let={source} label="Pending"><.localized_number number={source.pending_count} /></:col>
+-        <:col :let={source} label="Downloaded"><.localized_number number={source.downloaded_count} /></:col>
+-        <:col :let={source} label="Retention">
+-          <%= if source.retention_period_days && source.retention_period_days > 0 do %>
+-            <.localized_number number={source.retention_period_days} />
+-            <.pluralize count={source.retention_period_days} word="day" />
+-          <% else %>
+-            <span class="text-lg">∞</span>
+-          <% end %>
+-        </:col>
+-        <:col :let={source} label="Media Profile">
+-          <.subtle_link href={~p"/media_profiles/#{source.media_profile_id}"}>
+-            <%= source.media_profile.name %>
+-          </.subtle_link>
+-        </:col>
+-        <:col :let={source} label="" class="flex place-content-evenly">
+-          <.icon_link href={~p"/sources/#{source.id}/edit"} icon="hero-pencil-square" class="mx-1" />
+-        </:col>
+-      </.table>
++      <%= live_render(@conn, PinchflatWeb.Sources.IndexTableLive) %>
+     </div>
+   </div>
+ </div>
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/index_table_live.ex b/lib/pinchflat_web/controllers/sources/source_html/index_table_live.ex
+new file mode 100644
+index 000000000..9c4992d19
+--- /dev/null
++++ b/lib/pinchflat_web/controllers/sources/source_html/index_table_live.ex
+@@ -0,0 +1,103 @@
++defmodule PinchflatWeb.Sources.IndexTableLive do
++  use PinchflatWeb, :live_view
++  use Pinchflat.Media.MediaQuery
++  use Pinchflat.Sources.SourcesQuery
++
++  alias Pinchflat.Repo
++  alias Pinchflat.Sources
++  alias Pinchflat.Sources.Source
++  alias Pinchflat.Media.MediaItem
++
++  def render(assigns) do
++    ~H"""
++    <.table rows={@sources} table_class="text-white">
++      <:col :let={source} label="Name">
++        <.subtle_link href={~p"/sources/#{source.id}"}>
++          <%= StringUtils.truncate(source.custom_name || source.collection_name, 35) %>
++        </.subtle_link>
++      </:col>
++      <:col :let={source} label="Pending">
++        <.subtle_link href={~p"/sources/#{source.id}/#tab-pending"}>
++          <.localized_number number={source.pending_count} />
++        </.subtle_link>
++      </:col>
++      <:col :let={source} label="Downloaded">
++        <.subtle_link href={~p"/sources/#{source.id}/#tab-downloaded"}>
++          <.localized_number number={source.downloaded_count} />
++        </.subtle_link>
++      </:col>
++      <:col :let={source} label="Retention">
++        <%= if source.retention_period_days && source.retention_period_days > 0 do %>
++          <.localized_number number={source.retention_period_days} />
++          <.pluralize count={source.retention_period_days} word="day" />
++        <% else %>
++          <span class="text-lg">∞</span>
++        <% end %>
++      </:col>
++      <:col :let={source} label="Media Profile">
++        <.subtle_link href={~p"/media_profiles/#{source.media_profile_id}"}>
++          <%= source.media_profile.name %>
++        </.subtle_link>
++      </:col>
++      <:col :let={source} label="Enabled?">
++        <.input
++          name={"source[#{source.id}][enabled]"}
++          value={source.enabled}
++          id={"source_#{source.id}_enabled"}
++          phx-hook="formless-input"
++          data-subscribe="change"
++          data-event-name="toggle_enabled"
++          data-identifier={source.id}
++          type="toggle"
++        />
++      </:col>
++      <:col :let={source} label="" class="flex place-content-evenly">
++        <.icon_link href={~p"/sources/#{source.id}/edit"} icon="hero-pencil-square" class="mx-1" />
++      </:col>
++    </.table>
++    """
++  end
++
++  def mount(_params, _session, socket) do
++    {:ok, assign(socket, %{sources: get_sources()})}
++  end
++
++  def handle_event("formless-input", %{"event" => "toggle_enabled"} = params, socket) do
++    source = Sources.get_source!(params["id"])
++    should_enable = params["value"] == "true"
++
++    {:ok, _} = Sources.update_source(source, %{enabled: should_enable})
++
++    {:noreply, assign(socket, %{sources: get_sources()})}
++  end
++
++  defp get_sources do
++    query =
++      from s in Source,
++        as: :source,
++        inner_join: mp in assoc(s, :media_profile),
++        where: is_nil(s.marked_for_deletion_at) and is_nil(mp.marked_for_deletion_at),
++        preload: [media_profile: mp],
++        order_by: [asc: s.custom_name],
++        select: map(s, ^Source.__schema__(:fields)),
++        select_merge: %{
++          downloaded_count:
++            subquery(
++              from m in MediaItem,
++                where: m.source_id == parent_as(:source).id,
++                where: ^MediaQuery.downloaded(),
++                select: count(m.id)
++            ),
++          pending_count:
++            subquery(
++              from m in MediaItem,
++                join: s in assoc(m, :source),
++                where: m.source_id == parent_as(:source).id,
++                where: ^MediaQuery.pending(),
++                select: count(m.id)
++            )
++        }
++
++    Repo.all(query)
++  end
++end
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex b/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex
+index fd14a3a65..678bf5539 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex
++++ b/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex
+@@ -1,4 +1,4 @@
+-defmodule Pinchflat.Sources.MediaItemTableLive do
++defmodule PinchflatWeb.Sources.MediaItemTableLive do
+   use PinchflatWeb, :live_view
+   use Pinchflat.Media.MediaQuery
+ 
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/show.html.heex b/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
+index 0e9459adb..f232f4207 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
+@@ -39,21 +39,21 @@
+       <:tab title="Pending" id="pending">
+         <%= live_render(
+           @conn,
+-          Pinchflat.Sources.MediaItemTableLive,
++          PinchflatWeb.Sources.MediaItemTableLive,
+           session: %{"source_id" => @source.id, "media_state" => "pending"}
+         ) %>
+       </:tab>
+       <:tab title="Downloaded" id="downloaded">
+         <%= live_render(
+           @conn,
+-          Pinchflat.Sources.MediaItemTableLive,
++          PinchflatWeb.Sources.MediaItemTableLive,
+           session: %{"source_id" => @source.id, "media_state" => "downloaded"}
+         ) %>
+       </:tab>
+       <:tab title="Other" id="other">
+         <%= live_render(
+           @conn,
+-          Pinchflat.Sources.MediaItemTableLive,
++          PinchflatWeb.Sources.MediaItemTableLive,
+           session: %{"source_id" => @source.id, "media_state" => "other"}
+         ) %>
+       </:tab>
+diff --git a/priv/repo/erd.png b/priv/repo/erd.png
+index c6566d803..6237757a8 100644
+Binary files a/priv/repo/erd.png and b/priv/repo/erd.png differ
+diff --git a/priv/repo/migrations/20241120204407_add_enabled_to_sources.exs b/priv/repo/migrations/20241120204407_add_enabled_to_sources.exs
+new file mode 100644
+index 000000000..e98150bcd
+--- /dev/null
++++ b/priv/repo/migrations/20241120204407_add_enabled_to_sources.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddEnabledToSources do
++  use Ecto.Migration
++
++  def change do
++    alter table(:sources) do
++      add :enabled, :boolean, default: true, null: false
++    end
++  end
++end
+diff --git a/test/pinchflat/fast_indexing/fast_indexing_helpers_test.exs b/test/pinchflat/fast_indexing/fast_indexing_helpers_test.exs
+index 54220183c..34f59520d 100644
+--- a/test/pinchflat/fast_indexing/fast_indexing_helpers_test.exs
++++ b/test/pinchflat/fast_indexing/fast_indexing_helpers_test.exs
+@@ -1,6 +1,7 @@
+ defmodule Pinchflat.FastIndexing.FastIndexingHelpersTest do
+   use Pinchflat.DataCase
+ 
++  import Pinchflat.TasksFixtures
+   import Pinchflat.MediaFixtures
+   import Pinchflat.SourcesFixtures
+   import Pinchflat.ProfilesFixtures
+@@ -8,6 +9,7 @@ defmodule Pinchflat.FastIndexing.FastIndexingHelpersTest do
+   alias Pinchflat.Tasks
+   alias Pinchflat.Settings
+   alias Pinchflat.Media.MediaItem
++  alias Pinchflat.FastIndexing.FastIndexingWorker
+   alias Pinchflat.Downloading.MediaDownloadWorker
+   alias Pinchflat.FastIndexing.FastIndexingHelpers
+ 
+@@ -19,6 +21,23 @@ defmodule Pinchflat.FastIndexing.FastIndexingHelpersTest do
+     {:ok, [source: source_fixture()]}
+   end
+ 
++  describe "kickoff_indexing_task/1" do
++    test "deletes any existing fast indexing tasks", %{source: source} do
++      {:ok, job} = Oban.insert(FastIndexingWorker.new(%{"id" => source.id}))
++      task = task_fixture(source_id: source.id, job_id: job.id)
++
++      assert Repo.reload!(task)
++      assert {:ok, _} = FastIndexingHelpers.kickoff_indexing_task(source)
++      assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task) end
++    end
++
++    test "kicks off a new fast indexing task", %{source: source} do
++      assert {:ok, _} = FastIndexingHelpers.kickoff_indexing_task(source)
++      assert [worker] = all_enqueued(worker: FastIndexingWorker)
++      assert worker.args["id"] == source.id
++    end
++  end
++
+   describe "kickoff_download_tasks_from_youtube_rss_feed/1" do
+     test "enqueues a new worker for each new media_id in the source's RSS feed", %{source: source} do
+       expect(HTTPClientMock, :get, fn _url -> {:ok, "<yt:videoId>test_1</yt:videoId>"} end)
+diff --git a/test/pinchflat/slow_indexing/slow_indexing_helpers_test.exs b/test/pinchflat/slow_indexing/slow_indexing_helpers_test.exs
+index 36abcd716..b3e800434 100644
+--- a/test/pinchflat/slow_indexing/slow_indexing_helpers_test.exs
++++ b/test/pinchflat/slow_indexing/slow_indexing_helpers_test.exs
+@@ -23,6 +23,36 @@ defmodule Pinchflat.SlowIndexing.SlowIndexingHelpersTest do
+       assert_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
+     end
+ 
++    test "schedules a job for the future based on when the source was last indexed" do
++      source = source_fixture(index_frequency_minutes: 30, last_indexed_at: now_minus(5, :minutes))
++
++      assert {:ok, _} = SlowIndexingHelpers.kickoff_indexing_task(source)
++
++      [job] = all_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
++
++      assert_in_delta DateTime.diff(job.scheduled_at, DateTime.utc_now(), :minute), 25, 1
++    end
++
++    test "schedules a job immediately if the source was indexed far in the past" do
++      source = source_fixture(index_frequency_minutes: 30, last_indexed_at: now_minus(60, :minutes))
++
++      assert {:ok, _} = SlowIndexingHelpers.kickoff_indexing_task(source)
++
++      [job] = all_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
++
++      assert_in_delta DateTime.diff(job.scheduled_at, DateTime.utc_now(), :second), 0, 1
++    end
++
++    test "schedules a job immediately if the source has never been indexed" do
++      source = source_fixture(index_frequency_minutes: 30, last_indexed_at: nil)
++
++      assert {:ok, _} = SlowIndexingHelpers.kickoff_indexing_task(source)
++
++      [job] = all_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
++
++      assert_in_delta DateTime.diff(job.scheduled_at, DateTime.utc_now(), :second), 0, 1
++    end
++
+     test "creates and attaches a task" do
+       source = source_fixture(index_frequency_minutes: 1)
+ 
+@@ -92,6 +122,56 @@ defmodule Pinchflat.SlowIndexing.SlowIndexingHelpersTest do
+     end
+   end
+ 
++  describe "delete_indexing_tasks/2" do
++    setup do
++      source = source_fixture()
++
++      {:ok, %{source: source}}
++    end
++
++    test "deletes slow indexing tasks for the source", %{source: source} do
++      {:ok, job} = Oban.insert(MediaCollectionIndexingWorker.new(%{"id" => source.id}))
++      _task = task_fixture(source_id: source.id, job_id: job.id)
++
++      assert_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
++      assert :ok = SlowIndexingHelpers.delete_indexing_tasks(source)
++      refute_enqueued(worker: MediaCollectionIndexingWorker)
++    end
++
++    test "deletes fast indexing tasks for the source", %{source: source} do
++      {:ok, job} = Oban.insert(FastIndexingWorker.new(%{"id" => source.id}))
++      _task = task_fixture(source_id: source.id, job_id: job.id)
++
++      assert_enqueued(worker: FastIndexingWorker, args: %{"id" => source.id})
++      assert :ok = SlowIndexingHelpers.delete_indexing_tasks(source)
++      refute_enqueued(worker: FastIndexingWorker)
++    end
++
++    test "doesn't normally delete currently executing tasks", %{source: source} do
++      {:ok, job} = Oban.insert(MediaCollectionIndexingWorker.new(%{"id" => source.id}))
++      task = task_fixture(source_id: source.id, job_id: job.id)
++
++      from(Oban.Job, where: [id: ^job.id], update: [set: [state: "executing"]])
++      |> Repo.update_all([])
++
++      assert Repo.reload!(task)
++      assert :ok = SlowIndexingHelpers.delete_indexing_tasks(source)
++      assert Repo.reload!(task)
++    end
++
++    test "can optionally delete currently executing tasks", %{source: source} do
++      {:ok, job} = Oban.insert(MediaCollectionIndexingWorker.new(%{"id" => source.id}))
++      task = task_fixture(source_id: source.id, job_id: job.id)
++
++      from(Oban.Job, where: [id: ^job.id], update: [set: [state: "executing"]])
++      |> Repo.update_all([])
++
++      assert Repo.reload!(task)
++      assert :ok = SlowIndexingHelpers.delete_indexing_tasks(source, include_executing: true)
++      assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task) end
++    end
++  end
++
+   describe "index_and_enqueue_download_for_media_items/1" do
+     setup do
+       stub(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts ->
+diff --git a/test/pinchflat/sources_test.exs b/test/pinchflat/sources_test.exs
+index ee57e178c..a87917e6e 100644
+--- a/test/pinchflat/sources_test.exs
++++ b/test/pinchflat/sources_test.exs
+@@ -418,6 +418,100 @@ defmodule Pinchflat.SourcesTest do
+       assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
+     end
+ 
++    test "updates with invalid data returns error changeset" do
++      source = source_fixture()
++
++      assert {:error, %Ecto.Changeset{}} =
++               Sources.update_source(source, @invalid_source_attrs)
++
++      assert source == Sources.get_source!(source.id)
++    end
++
++    test "updating will kickoff a metadata storage worker if the original_url changes" do
++      expect(YtDlpRunnerMock, :run, &playlist_mock/4)
++      source = source_fixture()
++      update_attrs = %{original_url: "https://www.youtube.com/channel/cba321"}
++
++      assert {:ok, %Source{} = source} = Sources.update_source(source, update_attrs)
++
++      assert_enqueued(worker: SourceMetadataStorageWorker, args: %{"id" => source.id})
++    end
++
++    test "updating will not kickoff a metadata storage worker other attrs change" do
++      source = source_fixture()
++      update_attrs = %{name: "some new name"}
++
++      assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
++
++      refute_enqueued(worker: SourceMetadataStorageWorker)
++    end
++  end
++
++  describe "update_source/3 when testing media download tasks" do
++    test "enabling the download_media attribute will schedule a download task" do
++      source = source_fixture(download_media: false)
++      media_item = media_item_fixture(source_id: source.id, media_filepath: nil)
++      update_attrs = %{download_media: true}
++
++      refute_enqueued(worker: MediaDownloadWorker)
++      assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
++      assert_enqueued(worker: MediaDownloadWorker, args: %{"id" => media_item.id})
++    end
++
++    test "disabling the download_media attribute will cancel the download task" do
++      source = source_fixture(download_media: true, enabled: true)
++      media_item = media_item_fixture(source_id: source.id, media_filepath: nil)
++      update_attrs = %{download_media: false}
++      DownloadingHelpers.enqueue_pending_download_tasks(source)
++
++      assert_enqueued(worker: MediaDownloadWorker, args: %{"id" => media_item.id})
++      assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
++      refute_enqueued(worker: MediaDownloadWorker)
++    end
++
++    test "enabling download_media will not schedule a task if the source is disabled" do
++      source = source_fixture(download_media: false, enabled: false)
++      _media_item = media_item_fixture(source_id: source.id, media_filepath: nil)
++      update_attrs = %{download_media: true}
++
++      refute_enqueued(worker: MediaDownloadWorker)
++      assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
++      refute_enqueued(worker: MediaDownloadWorker)
++    end
++
++    test "disabling a source will cancel any pending download tasks" do
++      source = source_fixture(download_media: true, enabled: true)
++      media_item = media_item_fixture(source_id: source.id, media_filepath: nil)
++      update_attrs = %{enabled: false}
++      DownloadingHelpers.enqueue_pending_download_tasks(source)
++
++      assert_enqueued(worker: MediaDownloadWorker, args: %{"id" => media_item.id})
++      assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
++      refute_enqueued(worker: MediaDownloadWorker)
++    end
++
++    test "enabling a source will schedule a download task if download_media is true" do
++      source = source_fixture(download_media: true, enabled: false)
++      media_item = media_item_fixture(source_id: source.id, media_filepath: nil)
++      update_attrs = %{enabled: true}
++
++      refute_enqueued(worker: MediaDownloadWorker)
++      assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
++      assert_enqueued(worker: MediaDownloadWorker, args: %{"id" => media_item.id})
++    end
++
++    test "enabling a source will not schedule a download task if download_media is false" do
++      source = source_fixture(download_media: false, enabled: false)
++      _media_item = media_item_fixture(source_id: source.id, media_filepath: nil)
++      update_attrs = %{enabled: true}
++
++      refute_enqueued(worker: MediaDownloadWorker)
++      assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
++      refute_enqueued(worker: MediaDownloadWorker)
++    end
++  end
++
++  describe "update_source/3 when testing slow indexing" do
+     test "updating the index frequency to >0 will re-schedule the indexing task" do
+       source = source_fixture()
+       update_attrs = %{index_frequency_minutes: 123}
+@@ -462,27 +556,47 @@ defmodule Pinchflat.SourcesTest do
+       refute_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
+     end
+ 
+-    test "enabling the download_media attribute will schedule a download task" do
+-      source = source_fixture(download_media: false)
+-      media_item = media_item_fixture(source_id: source.id, media_filepath: nil)
+-      update_attrs = %{download_media: true}
++    test "disabling a source will delete any pending tasks" do
++      source = source_fixture()
++      update_attrs = %{enabled: false}
++
++      {:ok, job} = Oban.insert(MediaCollectionIndexingWorker.new(%{"id" => source.id}))
++      task = task_fixture(source_id: source.id, job_id: job.id)
+ 
+-      refute_enqueued(worker: MediaDownloadWorker)
+       assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
+-      assert_enqueued(worker: MediaDownloadWorker, args: %{"id" => media_item.id})
++
++      assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task) end
+     end
+ 
+-    test "disabling the download_media attribute will cancel the download task" do
+-      source = source_fixture(download_media: true)
+-      media_item = media_item_fixture(source_id: source.id, media_filepath: nil)
+-      update_attrs = %{download_media: false}
+-      DownloadingHelpers.enqueue_pending_download_tasks(source)
++    test "updating the index frequency will not create a task if the source is disabled" do
++      source = source_fixture(enabled: false)
++      update_attrs = %{index_frequency_minutes: 123}
+ 
+-      assert_enqueued(worker: MediaDownloadWorker, args: %{"id" => media_item.id})
++      refute_enqueued(worker: MediaCollectionIndexingWorker)
+       assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
+-      refute_enqueued(worker: MediaDownloadWorker)
++      refute_enqueued(worker: MediaCollectionIndexingWorker)
++    end
++
++    test "enabling a source will create a task if the index frequency is >0" do
++      source = source_fixture(enabled: false, index_frequency_minutes: 123)
++      update_attrs = %{enabled: true}
++
++      refute_enqueued(worker: MediaCollectionIndexingWorker)
++      assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
++      assert_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
+     end
+ 
++    test "enabling a source will not create a task if the index frequency is 0" do
++      source = source_fixture(enabled: false, index_frequency_minutes: 0)
++      update_attrs = %{enabled: true}
++
++      refute_enqueued(worker: MediaCollectionIndexingWorker)
++      assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
++      refute_enqueued(worker: MediaCollectionIndexingWorker)
++    end
++  end
++
++  describe "update_source/3 when testing fast indexing" do
+     test "enabling fast_index will schedule a fast indexing task" do
+       source = source_fixture(fast_index: false)
+       update_attrs = %{fast_index: true}
+@@ -503,15 +617,6 @@ defmodule Pinchflat.SourcesTest do
+       refute_enqueued(worker: FastIndexingWorker)
+     end
+ 
+-    test "updates with invalid data returns error changeset" do
+-      source = source_fixture()
+-
+-      assert {:error, %Ecto.Changeset{}} =
+-               Sources.update_source(source, @invalid_source_attrs)
+-
+-      assert source == Sources.get_source!(source.id)
+-    end
+-
+     test "fast_index forces the index frequency to be a default value" do
+       source = source_fixture(%{fast_index: true})
+       update_attrs = %{index_frequency_minutes: 0}
+@@ -530,23 +635,43 @@ defmodule Pinchflat.SourcesTest do
+       assert source.index_frequency_minutes == 0
+     end
+ 
+-    test "updating will kickoff a metadata storage worker if the original_url changes" do
+-      expect(YtDlpRunnerMock, :run, &playlist_mock/4)
++    test "disabling a source will delete any pending tasks" do
+       source = source_fixture()
+-      update_attrs = %{original_url: "https://www.youtube.com/channel/cba321"}
++      update_attrs = %{enabled: false}
+ 
+-      assert {:ok, %Source{} = source} = Sources.update_source(source, update_attrs)
++      {:ok, job} = Oban.insert(FastIndexingWorker.new(%{"id" => source.id}))
++      task = task_fixture(source_id: source.id, job_id: job.id)
+ 
+-      assert_enqueued(worker: SourceMetadataStorageWorker, args: %{"id" => source.id})
++      assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
++
++      assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task) end
+     end
+ 
+-    test "updating will not kickoff a metadata storage worker other attrs change" do
+-      source = source_fixture()
+-      update_attrs = %{name: "some new name"}
++    test "updating fast indexing will not create a task if the source is disabled" do
++      source = source_fixture(enabled: false, fast_index: false)
++      update_attrs = %{fast_index: true}
+ 
++      refute_enqueued(worker: FastIndexingWorker)
+       assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
++      refute_enqueued(worker: FastIndexingWorker)
++    end
+ 
+-      refute_enqueued(worker: SourceMetadataStorageWorker)
++    test "enabling a source will create a task if fast_index is true" do
++      source = source_fixture(enabled: false, fast_index: true)
++      update_attrs = %{enabled: true}
++
++      refute_enqueued(worker: FastIndexingWorker)
++      assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
++      assert_enqueued(worker: FastIndexingWorker, args: %{"id" => source.id})
++    end
++
++    test "enabling a source will not create a task if fast_index is false" do
++      source = source_fixture(enabled: false, fast_index: false)
++      update_attrs = %{enabled: true}
++
++      refute_enqueued(worker: FastIndexingWorker)
++      assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
++      refute_enqueued(worker: FastIndexingWorker)
+     end
+   end
+ 
+diff --git a/test/pinchflat/tasks_test.exs b/test/pinchflat/tasks_test.exs
+index 4b99f1232..53d1c3262 100644
+--- a/test/pinchflat/tasks_test.exs
++++ b/test/pinchflat/tasks_test.exs
+@@ -247,7 +247,7 @@ defmodule Pinchflat.TasksTest do
+       assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task) end
+     end
+ 
+-    test "deletion can optionall include executing tasks" do
++    test "deletion can optionally include executing tasks" do
+       source = source_fixture()
+       task = task_fixture(source_id: source.id)
+ 
+diff --git a/test/pinchflat_web/controllers/source_controller_test.exs b/test/pinchflat_web/controllers/source_controller_test.exs
+index 5a6e0e787..42b574d37 100644
+--- a/test/pinchflat_web/controllers/source_controller_test.exs
++++ b/test/pinchflat_web/controllers/source_controller_test.exs
+@@ -34,27 +34,10 @@ defmodule PinchflatWeb.SourceControllerTest do
+   end
+ 
+   describe "index" do
+-    test "lists all sources", %{conn: conn} do
+-      source = source_fixture()
++    # Most of the tests are in `index_table_list_test.exs`
++    test "returns 200", %{conn: conn} do
+       conn = get(conn, ~p"/sources")
+-
+       assert html_response(conn, 200) =~ "Sources"
+-      assert html_response(conn, 200) =~ source.custom_name
+-    end
+-
+-    test "omits sources that have marked_for_deletion_at set", %{conn: conn} do
+-      source = source_fixture(marked_for_deletion_at: DateTime.utc_now())
+-      conn = get(conn, ~p"/sources")
+-
+-      refute html_response(conn, 200) =~ source.custom_name
+-    end
+-
+-    test "omits sources who's media profile has marked_for_deletion_at set", %{conn: conn} do
+-      media_profile = media_profile_fixture(marked_for_deletion_at: DateTime.utc_now())
+-      source = source_fixture(media_profile_id: media_profile.id)
+-      conn = get(conn, ~p"/sources")
+-
+-      refute html_response(conn, 200) =~ source.custom_name
+     end
+   end
+ 
+diff --git a/test/pinchflat_web/controllers/sources/index_table_live_test.exs b/test/pinchflat_web/controllers/sources/index_table_live_test.exs
+new file mode 100644
+index 000000000..659bd041b
+--- /dev/null
++++ b/test/pinchflat_web/controllers/sources/index_table_live_test.exs
+@@ -0,0 +1,55 @@
++defmodule PinchflatWeb.Sources.IndexTableLiveTest do
++  use PinchflatWeb.ConnCase
++
++  import Phoenix.LiveViewTest
++  import Pinchflat.SourcesFixtures
++  import Pinchflat.ProfilesFixtures
++
++  alias Pinchflat.Sources.Source
++  alias PinchflatWeb.Sources.IndexTableLive
++
++  describe "initial rendering" do
++    test "lists all sources", %{conn: conn} do
++      source = source_fixture()
++
++      {:ok, _view, html} = live_isolated(conn, IndexTableLive)
++
++      assert html =~ source.custom_name
++    end
++
++    test "omits sources that have marked_for_deletion_at set", %{conn: conn} do
++      source = source_fixture(marked_for_deletion_at: DateTime.utc_now())
++
++      {:ok, _view, html} = live_isolated(conn, IndexTableLive)
++
++      refute html =~ source.custom_name
++    end
++
++    test "omits sources who's media profile has marked_for_deletion_at set", %{conn: conn} do
++      media_profile = media_profile_fixture(marked_for_deletion_at: DateTime.utc_now())
++      source = source_fixture(media_profile_id: media_profile.id)
++
++      {:ok, _view, html} = live_isolated(conn, IndexTableLive)
++
++      refute html =~ source.custom_name
++    end
++  end
++
++  describe "when a source is enabled or disabled" do
++    test "updates the source's enabled status", %{conn: conn} do
++      source = source_fixture(enabled: true)
++      {:ok, view, _html} = live_isolated(conn, IndexTableLive)
++
++      params = %{
++        "event" => "toggle_enabled",
++        "id" => source.id,
++        "value" => "false"
++      }
++
++      # Send an event to the server directly
++      render_change(view, "formless-input", params)
++
++      assert %{enabled: false} = Repo.get!(Source, source.id)
++    end
++  end
++end
+diff --git a/test/pinchflat_web/controllers/sources/media_item_table_live_test.exs b/test/pinchflat_web/controllers/sources/media_item_table_live_test.exs
+index 772e305a8..b941f8405 100644
+--- a/test/pinchflat_web/controllers/sources/media_item_table_live_test.exs
++++ b/test/pinchflat_web/controllers/sources/media_item_table_live_test.exs
+@@ -6,7 +6,7 @@ defmodule PinchflatWeb.Sources.MediaItemTableLiveTest do
+   import Pinchflat.SourcesFixtures
+   import Pinchflat.ProfilesFixtures
+ 
+-  alias Pinchflat.Sources.MediaItemTableLive
++  alias PinchflatWeb.Sources.MediaItemTableLive
+ 
+   setup do
+     source = source_fixture()
+diff --git a/test/support/fixtures/sources_fixtures.ex b/test/support/fixtures/sources_fixtures.ex
+index d54ba5f99..9d699dc70 100644
+--- a/test/support/fixtures/sources_fixtures.ex
++++ b/test/support/fixtures/sources_fixtures.ex
+@@ -20,6 +20,7 @@ defmodule Pinchflat.SourcesFixtures do
+         Enum.into(
+           attrs,
+           %{
++            enabled: true,
+             collection_name: "Source ##{:rand.uniform(1_000_000)}",
+             collection_id: Base.encode16(:crypto.hash(:md5, "#{:rand.uniform(1_000_000)}")),
+             collection_type: "channel",

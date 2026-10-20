@@ -1,0 +1,704 @@
+diff --git a/lib/pinchflat/downloading/media_download_worker.ex b/lib/pinchflat/downloading/media_download_worker.ex
+index ca6915390..a59da41fd 100644
+--- a/lib/pinchflat/downloading/media_download_worker.ex
++++ b/lib/pinchflat/downloading/media_download_worker.ex
+@@ -19,27 +19,29 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+ 
+   Returns {:ok, %Task{}} | {:error, :duplicate_job} | {:error, %Ecto.Changeset{}}
+   """
+-  def kickoff_with_task(media_item, opts \\ []) do
++  def kickoff_with_task(media_item, job_args \\ %{}, job_opts \\ []) do
+     %{id: media_item.id}
+-    |> MediaDownloadWorker.new(opts)
++    |> Map.merge(job_args)
++    |> MediaDownloadWorker.new(job_opts)
+     |> Tasks.create_job_with_task(media_item)
+   end
+ 
+   @doc """
+   For a given media item, download the media alongside any options.
+-  Does not download media if its source is set to not download media.
++  Does not download media if its source is set to not download media
++  (unless forced).
+ 
+   Returns :ok | {:ok, %MediaItem{}} | {:error, any, ...any}
+   """
+   @impl Oban.Worker
+-  def perform(%Oban.Job{args: %{"id" => media_item_id}}) do
++  def perform(%Oban.Job{args: %{"id" => media_item_id} = args}) do
+     media_item =
+       media_item_id
+       |> Media.get_media_item!()
+       |> Repo.preload(:source)
+ 
+     # If the source is set to not download media, perform a no-op
+-    if media_item.source.download_media do
++    if media_item.source.download_media || args["force"] do
+       download_media_and_schedule_jobs(media_item)
+     else
+       :ok
+diff --git a/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex b/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex
+index 6fdf8e22a..70f9c2e4c 100644
+--- a/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex
++++ b/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex
+@@ -20,9 +20,10 @@ defmodule Pinchflat.SlowIndexing.MediaCollectionIndexingWorker do
+ 
+   Returns {:ok, %Task{}} | {:error, :duplicate_job} | {:error, %Ecto.Changeset{}}
+   """
+-  def kickoff_with_task(source, opts \\ []) do
++  def kickoff_with_task(source, job_args \\ %{}, job_opts \\ []) do
+     %{id: source.id}
+-    |> MediaCollectionIndexingWorker.new(opts)
++    |> Map.merge(job_args)
++    |> MediaCollectionIndexingWorker.new(job_opts)
+     |> Tasks.create_job_with_task(source)
+   end
+ 
+@@ -30,8 +31,8 @@ defmodule Pinchflat.SlowIndexing.MediaCollectionIndexingWorker do
+   The ID is that of a source _record_, not a YouTube channel/playlist ID. Indexes
+   the provided source, kicks off downloads for each new MediaItem, and
+   reschedules the job to run again in the future. It will ALWAYS index a source
+-  if it's never been indexed before, but rescheduling is determined by the
+-  `index_frequency_minutes` field.
++  if it's never been indexed before or if `force` is set to `true`, but rescheduling
++  is determined by the `index_frequency_minutes` field.
+ 
+   README: Re-scheduling here works a little different than you may expect.
+   The reschedule time is relative to the time the job has actually _completed_.
+@@ -71,7 +72,7 @@ defmodule Pinchflat.SlowIndexing.MediaCollectionIndexingWorker do
+   Returns :ok | {:ok, %Task{}}
+   """
+   @impl Oban.Worker
+-  def perform(%Oban.Job{args: %{"id" => source_id}}) do
++  def perform(%Oban.Job{args: %{"id" => source_id} = args}) do
+     source = Sources.get_source!(source_id)
+ 
+     case {source.index_frequency_minutes, source.last_indexed_at} do
+@@ -89,7 +90,11 @@ defmodule Pinchflat.SlowIndexing.MediaCollectionIndexingWorker do
+ 
+       _ ->
+         # If the source HAS been indexed and is not meant to reschedule,
+-        # perform a no-op
++        # perform a no-op (unless forced)
++        if args["force"] do
++          SlowIndexingHelpers.index_and_enqueue_download_for_media_items(source)
++        end
++
+         :ok
+     end
+   rescue
+diff --git a/lib/pinchflat/slow_indexing/slow_indexing_helpers.ex b/lib/pinchflat/slow_indexing/slow_indexing_helpers.ex
+index bb5760844..c95306c61 100644
+--- a/lib/pinchflat/slow_indexing/slow_indexing_helpers.ex
++++ b/lib/pinchflat/slow_indexing/slow_indexing_helpers.ex
+@@ -27,12 +27,12 @@ defmodule Pinchflat.SlowIndexing.SlowIndexingHelpers do
+ 
+   Returns {:ok, %Task{}}.
+   """
+-  def kickoff_indexing_task(%Source{} = source) do
++  def kickoff_indexing_task(%Source{} = source, job_args \\ %{}, job_opts \\ []) do
+     Tasks.delete_pending_tasks_for(source, "FastIndexingWorker")
+     Tasks.delete_pending_tasks_for(source, "MediaIndexingWorker")
+     Tasks.delete_pending_tasks_for(source, "MediaCollectionIndexingWorker")
+ 
+-    MediaCollectionIndexingWorker.kickoff_with_task(source)
++    MediaCollectionIndexingWorker.kickoff_with_task(source, job_args, job_opts)
+   end
+ 
+   @doc """
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_controller.ex b/lib/pinchflat_web/controllers/media_items/media_item_controller.ex
+index bfcb3d272..d348fee77 100644
+--- a/lib/pinchflat_web/controllers/media_items/media_item_controller.ex
++++ b/lib/pinchflat_web/controllers/media_items/media_item_controller.ex
+@@ -6,6 +6,7 @@ defmodule PinchflatWeb.MediaItems.MediaItemController do
+   alias Pinchflat.Repo
+   alias Pinchflat.Media
+   alias Pinchflat.Media.MediaItem
++  alias Pinchflat.Downloading.MediaDownloadWorker
+ 
+   def show(conn, %{"id" => id}) do
+     media_item =
+@@ -47,6 +48,15 @@ defmodule PinchflatWeb.MediaItems.MediaItemController do
+     |> redirect(to: ~p"/sources/#{media_item.source_id}")
+   end
+ 
++  def force_download(conn, %{"media_item_id" => id}) do
++    media_item = Media.get_media_item!(id)
++    {:ok, _} = MediaDownloadWorker.kickoff_with_task(media_item, %{force: true})
++
++    conn
++    |> put_flash(:info, "Download task enqueued.")
++    |> redirect(to: ~p"/sources/#{media_item.source_id}/media/#{media_item}")
++  end
++
+   # See here for details on streaming files and range requests:
+   # https://www.zeng.dev/post/2023-http-range-and-play-mp4-in-browser/
+   #
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_html/actions_dropdown.html.heex b/lib/pinchflat_web/controllers/media_items/media_item_html/actions_dropdown.html.heex
+new file mode 100644
+index 000000000..537872e5c
+--- /dev/null
++++ b/lib/pinchflat_web/controllers/media_items/media_item_html/actions_dropdown.html.heex
+@@ -0,0 +1,32 @@
++<.button_dropdown text="Actions" class="justify-center w-full sm:w-50">
++  <:option>
++    <.link
++      href={~p"/sources/#{@media_item.source_id}/media/#{@media_item}/force_download"}
++      method="post"
++      data-confirm="Are you sure you force a download of this media?"
++    >
++      Force Download
++    </.link>
++  </:option>
++  <:option>
++    <div class="h-px w-full bg-bodydark2"></div>
++  </:option>
++  <:option>
++    <.link
++      href={~p"/sources/#{@media_item.source_id}/media/#{@media_item}"}
++      method="delete"
++      data-confirm="Are you sure you want to delete all files for this media item? This cannot be undone."
++    >
++      Delete Files
++    </.link>
++  </:option>
++  <:option>
++    <.link
++      href={~p"/sources/#{@media_item.source_id}/media/#{@media_item}?prevent_download=true"}
++      method="delete"
++      data-confirm="Are you sure you want to delete all files for this media item and prevent it from re-downloading in the future? This cannot be undone."
++    >
++      Delete and Ignore
++    </.link>
++  </:option>
++</.button_dropdown>
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_html/media_item_form.html.heex b/lib/pinchflat_web/controllers/media_items/media_item_html/media_item_form.html.heex
+index 13113465b..9e61673e0 100644
+--- a/lib/pinchflat_web/controllers/media_items/media_item_html/media_item_form.html.heex
++++ b/lib/pinchflat_web/controllers/media_items/media_item_html/media_item_form.html.heex
+@@ -17,7 +17,7 @@
+     field={f[:prevent_download]}
+     type="toggle"
+     label="Prevent Download"
+-    help="Checking excludes this media item from being downloaded"
++    help="Checking excludes this media item from automatic download. Download can still be manually forced"
+   />
+ 
+   <.input
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex b/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
+index 6de101f75..3c02ba183 100644
+--- a/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
+@@ -20,26 +20,7 @@
+   <div class="max-w-full overflow-x-auto">
+     <.tabbed_layout>
+       <:tab_append>
+-        <.button_dropdown text="Actions" class="justify-center w-full sm:w-50">
+-          <:option>
+-            <.link
+-              href={~p"/sources/#{@media_item.source_id}/media/#{@media_item}"}
+-              method="delete"
+-              data-confirm="Are you sure you want to delete all files for this media item? This cannot be undone."
+-            >
+-              Delete Files
+-            </.link>
+-          </:option>
+-          <:option>
+-            <.link
+-              href={~p"/sources/#{@media_item.source_id}/media/#{@media_item}?prevent_download=true"}
+-              method="delete"
+-              data-confirm="Are you sure you want to delete all files for this media item and prevent it from re-downloading in the future? This cannot be undone."
+-            >
+-              Delete and Ignore
+-            </.link>
+-          </:option>
+-        </.button_dropdown>
++        <.actions_dropdown media_item={@media_item} />
+       </:tab_append>
+ 
+       <:tab title="Attributes">
+@@ -53,9 +34,9 @@
+           <h3 class="font-bold text-xl">Attributes</h3>
+           <section>
+             <strong>Source:</strong>
+-            <.inline_link href={~p"/sources/#{@media_item.source_id}"}>
++            <.subtle_link href={~p"/sources/#{@media_item.source_id}"}>
+               <%= @media_item.source.custom_name %>
+-            </.inline_link>
++            </.subtle_link>
+           </section>
+ 
+           <.list_items_from_map map={Map.from_struct(@media_item)} />
+diff --git a/lib/pinchflat_web/controllers/sources/source_controller.ex b/lib/pinchflat_web/controllers/sources/source_controller.ex
+index 407f35c4f..168c148d8 100644
+--- a/lib/pinchflat_web/controllers/sources/source_controller.ex
++++ b/lib/pinchflat_web/controllers/sources/source_controller.ex
+@@ -10,6 +10,8 @@ defmodule PinchflatWeb.Sources.SourceController do
+   alias Pinchflat.Profiles
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.Media.MediaQuery
++  alias Pinchflat.Downloading.DownloadingHelpers
++  alias Pinchflat.SlowIndexing.SlowIndexingHelpers
+ 
+   def index(conn, _params) do
+     sources = Repo.preload(Sources.list_sources(), :media_profile)
+@@ -49,7 +51,11 @@ defmodule PinchflatWeb.Sources.SourceController do
+   def show(conn, %{"id" => id}) do
+     source = Repo.preload(Sources.get_source!(id), :media_profile)
+ 
+-    pending_tasks = Repo.preload(Tasks.list_pending_tasks_for(source), :job)
++    pending_tasks =
++      source
++      |> Tasks.list_tasks_for(nil, [:executing, :available, :scheduled, :retryable])
++      |> Repo.preload(:job)
++
+     pending_media = Media.list_pending_media_items_for(source, limit: 100)
+     downloaded_media = Media.list_downloaded_media_items_for(source, limit: 100)
+ 
+@@ -104,12 +110,28 @@ defmodule PinchflatWeb.Sources.SourceController do
+     |> redirect(to: ~p"/sources")
+   end
+ 
++  def force_download(conn, %{"source_id" => id}) do
++    source = Sources.get_source!(id)
++    DownloadingHelpers.enqueue_pending_download_tasks(source)
++
++    conn
++    |> put_flash(:info, "Forced download of pending media items.")
++    |> redirect(to: ~p"/sources/#{source}")
++  end
++
++  def force_index(conn, %{"source_id" => id}) do
++    source = Sources.get_source!(id)
++    SlowIndexingHelpers.kickoff_indexing_task(source, %{force: true})
++
++    conn
++    |> put_flash(:info, "Index enqueued.")
++    |> redirect(to: ~p"/sources/#{source}")
++  end
++
+   defp media_profiles do
+     Profiles.list_media_profiles()
+   end
+ 
+-  # NOTE: should move this out of the controller
+-  # once I finally add some query fragment layer
+   defp total_downloaded_for(source) do
+     MediaQuery.new()
+     |> MediaQuery.for_source(source)
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex b/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex
+new file mode 100644
+index 000000000..16a0829df
+--- /dev/null
++++ b/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex
+@@ -0,0 +1,55 @@
++<.button_dropdown text="Actions" class="justify-center w-full sm:w-50">
++  <:option>
++    <span
++      x-data="{ copied: false }"
++      x-on:click={"
++                window.copyTextToClipboard('#{rss_feed_url(@conn, @source)}')
++                copied = true
++                setTimeout(() => copied = false, 4000)
++              "}
++    >
++      Copy RSS Feed
++      <span x-show="copied" x-transition.duration.150ms><.icon name="hero-check" class="ml-2 h-4 w-4" /></span>
++    </span>
++  </:option>
++  <:option :if={@source.download_media}>
++    <.link
++      href={~p"/sources/#{@source}/force_download"}
++      method="post"
++      data-confirm="Are you sure you want to force a download of all *pending* media items? This isn't normally needed."
++    >
++      Force Download
++    </.link>
++  </:option>
++  <:option>
++    <.link
++      href={~p"/sources/#{@source}/force_index"}
++      method="post"
++      data-confirm="Are you sure you want to force an index of this source? This isn't normally needed."
++    >
++      Force Index
++    </.link>
++  </:option>
++  <:option>
++    <div class="h-px w-full bg-bodydark2"></div>
++  </:option>
++  <:option>
++    <.link
++      href={~p"/sources/#{@source}"}
++      method="delete"
++      data-confirm="Are you sure you want to delete this source (leaving files in place)? This cannot be undone."
++    >
++      Delete Source
++    </.link>
++  </:option>
++  <:option>
++    <.link
++      href={~p"/sources/#{@source}?delete_files=true"}
++      method="delete"
++      data-confirm="Are you sure you want to delete this source and it's files on disk? This cannot be undone."
++      class="mt-5 md:mt-0"
++    >
++      Delete Source + Files
++    </.link>
++  </:option>
++</.button_dropdown>
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/show.html.heex b/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
+index 9a2e6789c..d9687a17e 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
+@@ -20,43 +20,7 @@
+   <div class="max-w-full overflow-x-auto">
+     <.tabbed_layout>
+       <:tab_append>
+-        <.button_dropdown text="Actions" class="justify-center w-full sm:w-50">
+-          <:option>
+-            <span
+-              x-data="{ copied: false }"
+-              x-on:click={"
+-                window.copyTextToClipboard('#{rss_feed_url(@conn, @source)}')
+-                copied = true
+-                setTimeout(() => copied = false, 4000)
+-              "}
+-            >
+-              Copy RSS Feed
+-              <span x-show="copied" x-transition.duration.150ms><.icon name="hero-check" class="ml-2 h-4 w-4" /></span>
+-            </span>
+-          </:option>
+-          <:option>
+-            <div class="h-px w-full bg-bodydark2"></div>
+-          </:option>
+-          <:option>
+-            <.link
+-              href={~p"/sources/#{@source}"}
+-              method="delete"
+-              data-confirm="Are you sure you want to delete this source (leaving files in place)? This cannot be undone."
+-            >
+-              Delete Source
+-            </.link>
+-          </:option>
+-          <:option>
+-            <.link
+-              href={~p"/sources/#{@source}?delete_files=true"}
+-              method="delete"
+-              data-confirm="Are you sure you want to delete this source and it's files on disk? This cannot be undone."
+-              class="mt-5 md:mt-0"
+-            >
+-              Delete Source + Files
+-            </.link>
+-          </:option>
+-        </.button_dropdown>
++        <.actions_dropdown source={@source} conn={@conn} />
+       </:tab_append>
+ 
+       <:tab title="Attributes">
+@@ -64,9 +28,9 @@
+           <h3 class="font-bold text-lg">Attributes</h3>
+           <section>
+             <strong>Media Profile:</strong>
+-            <.inline_link href={~p"/media_profiles/#{@source.media_profile_id}"}>
++            <.subtle_link href={~p"/media_profiles/#{@source.media_profile_id}"}>
+               <%= @source.media_profile.name %>
+-            </.inline_link>
++            </.subtle_link>
+           </section>
+ 
+           <.list_items_from_map map={Map.from_struct(@source)} />
+diff --git a/lib/pinchflat_web/router.ex b/lib/pinchflat_web/router.ex
+index e56a4f25d..b83e6d850 100644
+--- a/lib/pinchflat_web/router.ex
++++ b/lib/pinchflat_web/router.ex
+@@ -32,7 +32,12 @@ defmodule PinchflatWeb.Router do
+     resources "/search", Searches.SearchController, only: [:show], singleton: true
+ 
+     resources "/sources", Sources.SourceController do
+-      resources "/media", MediaItems.MediaItemController, only: [:show, :edit, :update, :delete]
++      post "/force_download", Sources.SourceController, :force_download
++      post "/force_index", Sources.SourceController, :force_index
++
++      resources "/media", MediaItems.MediaItemController, only: [:show, :edit, :update, :delete] do
++        post "/force_download", MediaItems.MediaItemController, :force_download
++      end
+     end
+   end
+ 
+diff --git a/test/pinchflat/downloading/media_download_worker_test.exs b/test/pinchflat/downloading/media_download_worker_test.exs
+index 1f3ed5c9f..90a7cd5fe 100644
+--- a/test/pinchflat/downloading/media_download_worker_test.exs
++++ b/test/pinchflat/downloading/media_download_worker_test.exs
+@@ -34,6 +34,23 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+       assert {:ok, task} = MediaDownloadWorker.kickoff_with_task(media_item)
+       assert task.media_item_id == media_item.id
+     end
++
++    test "can be called with additional job arguments", %{media_item: media_item} do
++      job_args = %{"force" => true}
++
++      assert {:ok, _} = MediaDownloadWorker.kickoff_with_task(media_item, job_args)
++
++      assert_enqueued(worker: MediaDownloadWorker, args: %{"id" => media_item.id, "force" => true})
++    end
++
++    test "can be called with additional job options", %{media_item: media_item} do
++      job_opts = [max_attempts: 5]
++
++      assert {:ok, _} = MediaDownloadWorker.kickoff_with_task(media_item, %{}, job_opts)
++
++      [job] = all_enqueued(worker: MediaDownloadWorker, args: %{"id" => media_item.id})
++      assert job.max_attempts == 5
++    end
+   end
+ 
+   describe "perform/1" do
+@@ -88,6 +105,14 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+       perform_job(MediaDownloadWorker, %{id: media_item.id})
+     end
+ 
++    test "downloads anyway if forced", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot -> :ok end)
++
++      Sources.update_source(media_item.source, %{download_media: false})
++
++      perform_job(MediaDownloadWorker, %{id: media_item.id, force: true})
++    end
++
+     test "it saves the file's size to the database", %{media_item: media_item} do
+       expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
+         metadata = render_parsed_metadata(:media_metadata)
+diff --git a/test/pinchflat/slow_indexing/media_collection_indexing_worker_test.exs b/test/pinchflat/slow_indexing/media_collection_indexing_worker_test.exs
+index 6037c54b0..6a3c14091 100644
+--- a/test/pinchflat/slow_indexing/media_collection_indexing_worker_test.exs
++++ b/test/pinchflat/slow_indexing/media_collection_indexing_worker_test.exs
+@@ -14,6 +14,42 @@ defmodule Pinchflat.SlowIndexing.MediaCollectionIndexingWorkerTest do
+ 
+   setup :verify_on_exit!
+ 
++  describe "kickoff_with_task/3" do
++    setup do
++      source = source_fixture(index_frequency_minutes: 10)
++
++      {:ok, %{source: source}}
++    end
++
++    test "starts the worker", %{source: source} do
++      assert [] = all_enqueued(worker: MediaCollectionIndexingWorker)
++      assert {:ok, _} = MediaCollectionIndexingWorker.kickoff_with_task(source)
++      assert [_] = all_enqueued(worker: MediaCollectionIndexingWorker)
++    end
++
++    test "attaches a task", %{source: source} do
++      assert {:ok, task} = MediaCollectionIndexingWorker.kickoff_with_task(source)
++      assert task.source_id == source.id
++    end
++
++    test "can be called with additional job arguments", %{source: source} do
++      job_args = %{"force" => true}
++
++      assert {:ok, _} = MediaCollectionIndexingWorker.kickoff_with_task(source, job_args)
++
++      assert_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id, "force" => true})
++    end
++
++    test "can be called with additional job options", %{source: source} do
++      job_opts = [max_attempts: 5]
++
++      assert {:ok, _} = MediaCollectionIndexingWorker.kickoff_with_task(source, %{}, job_opts)
++
++      [job] = all_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
++      assert job.max_attempts == 5
++    end
++  end
++
+   describe "perform/1" do
+     test "it indexes the source if it should be indexed" do
+       expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
+@@ -31,6 +67,14 @@ defmodule Pinchflat.SlowIndexing.MediaCollectionIndexingWorkerTest do
+       perform_job(MediaCollectionIndexingWorker, %{id: source.id})
+     end
+ 
++    test "it indexes the source no matter what if the 'force' arg is passed" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
++
++      source = source_fixture(index_frequency_minutes: 0, last_indexed_at: DateTime.utc_now())
++
++      perform_job(MediaCollectionIndexingWorker, %{id: source.id, force: true})
++    end
++
+     test "it does not do any indexing if the source has been indexed and shouldn't be rescheduled" do
+       expect(YtDlpRunnerMock, :run, 0, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
+ 
+diff --git a/test/pinchflat/slow_indexing/slow_indexing_helpers_test.exs b/test/pinchflat/slow_indexing/slow_indexing_helpers_test.exs
+index f183a1e87..80e7959c4 100644
+--- a/test/pinchflat/slow_indexing/slow_indexing_helpers_test.exs
++++ b/test/pinchflat/slow_indexing/slow_indexing_helpers_test.exs
+@@ -18,7 +18,7 @@ defmodule Pinchflat.SlowIndexing.SlowIndexingHelpersTest do
+ 
+   setup :verify_on_exit!
+ 
+-  describe "kickoff_indexing_task/1" do
++  describe "kickoff_indexing_task/3" do
+     test "it schedules a job" do
+       source = source_fixture(index_frequency_minutes: 1)
+ 
+@@ -64,6 +64,25 @@ defmodule Pinchflat.SlowIndexing.SlowIndexingHelpersTest do
+ 
+       assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task) end
+     end
++
++    test "can be called with additional job arguments" do
++      source = source_fixture(index_frequency_minutes: 1)
++      job_args = %{"force" => true}
++
++      assert {:ok, _} = SlowIndexingHelpers.kickoff_indexing_task(source, job_args)
++
++      assert_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id, "force" => true})
++    end
++
++    test "can be called with additional job options" do
++      source = source_fixture(index_frequency_minutes: 1)
++      job_opts = [max_attempts: 5]
++
++      assert {:ok, _} = SlowIndexingHelpers.kickoff_indexing_task(source, %{}, job_opts)
++
++      [job] = all_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
++      assert job.max_attempts == 5
++    end
+   end
+ 
+   describe "index_and_enqueue_download_for_media_items/1" do
+diff --git a/test/pinchflat_web/controllers/media_item_controller_test.exs b/test/pinchflat_web/controllers/media_item_controller_test.exs
+index e8e035a44..b0c884716 100644
+--- a/test/pinchflat_web/controllers/media_item_controller_test.exs
++++ b/test/pinchflat_web/controllers/media_item_controller_test.exs
+@@ -4,6 +4,7 @@ defmodule PinchflatWeb.MediaItemControllerTest do
+   import Pinchflat.MediaFixtures
+ 
+   alias Pinchflat.Repo
++  alias Pinchflat.Downloading.MediaDownloadWorker
+ 
+   describe "show media" do
+     setup [:create_media_item]
+@@ -87,6 +88,31 @@ defmodule PinchflatWeb.MediaItemControllerTest do
+     end
+   end
+ 
++  describe "force_download" do
++    test "enqueues download task", %{conn: conn} do
++      media_item = media_item_fixture()
++
++      assert [] = all_enqueued(worker: MediaDownloadWorker)
++      post(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item.id}/force_download")
++      assert [_] = all_enqueued(worker: MediaDownloadWorker)
++    end
++
++    test "forces a download even if one wouldn't normally run", %{conn: conn} do
++      media_item = media_item_fixture(%{media_filepath: nil})
++
++      post(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item.id}/force_download")
++      assert [_] = all_enqueued(worker: MediaDownloadWorker, args: %{"id" => media_item.id, "force" => true})
++    end
++
++    test "redirects to the show page", %{conn: conn} do
++      media_item = media_item_fixture()
++
++      conn = post(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item.id}/force_download")
++
++      assert redirected_to(conn) == ~p"/sources/#{media_item.source_id}/media/#{media_item.id}"
++    end
++  end
++
+   describe "streaming media" do
+     test "returns 404 if the media isn't found", %{conn: conn} do
+       media_item = media_item_fixture()
+diff --git a/test/pinchflat_web/controllers/source_controller_test.exs b/test/pinchflat_web/controllers/source_controller_test.exs
+index 8282656c5..016a01aa3 100644
+--- a/test/pinchflat_web/controllers/source_controller_test.exs
++++ b/test/pinchflat_web/controllers/source_controller_test.exs
+@@ -8,6 +8,8 @@ defmodule PinchflatWeb.SourceControllerTest do
+ 
+   alias Pinchflat.Repo
+   alias Pinchflat.Settings
++  alias Pinchflat.Downloading.MediaDownloadWorker
++  alias Pinchflat.SlowIndexing.MediaCollectionIndexingWorker
+ 
+   setup do
+     media_profile = media_profile_fixture()
+@@ -160,6 +162,59 @@ defmodule PinchflatWeb.SourceControllerTest do
+     end
+   end
+ 
++  describe "force_download" do
++    test "enqueues pending download tasks", %{conn: conn} do
++      source = source_fixture()
++      _media_item = media_item_fixture(%{source_id: source.id, media_filepath: nil})
++
++      assert [] = all_enqueued(worker: MediaDownloadWorker)
++      post(conn, ~p"/sources/#{source.id}/force_download")
++      assert [_] = all_enqueued(worker: MediaDownloadWorker)
++    end
++
++    test "redirects to the source page", %{conn: conn} do
++      source = source_fixture()
++
++      conn = post(conn, ~p"/sources/#{source.id}/force_download")
++      assert redirected_to(conn) == ~p"/sources/#{source.id}"
++    end
++  end
++
++  describe "force_index" do
++    test "forces an index", %{conn: conn} do
++      source = source_fixture()
++
++      assert [] = all_enqueued(worker: MediaCollectionIndexingWorker)
++      post(conn, ~p"/sources/#{source.id}/force_index")
++      assert [_] = all_enqueued(worker: MediaCollectionIndexingWorker)
++    end
++
++    test "forces an index even if one wouldn't normally run", %{conn: conn} do
++      source = source_fixture(index_frequency_minutes: 0, last_indexed_at: DateTime.utc_now())
++
++      post(conn, ~p"/sources/#{source.id}/force_index")
++      assert [job] = all_enqueued(worker: MediaCollectionIndexingWorker)
++      assert job.args == %{"id" => source.id, "force" => true}
++    end
++
++    test "deletes pending indexing tasks", %{conn: conn} do
++      source = source_fixture()
++      {:ok, task} = MediaCollectionIndexingWorker.kickoff_with_task(source)
++      job = Repo.preload(task, :job).job
++
++      assert job.state == "available"
++      post(conn, ~p"/sources/#{source.id}/force_index")
++      assert Repo.reload!(job).state == "cancelled"
++    end
++
++    test "redirects to the source page", %{conn: conn} do
++      source = source_fixture()
++
++      conn = post(conn, ~p"/sources/#{source.id}/force_index")
++      assert redirected_to(conn) == ~p"/sources/#{source.id}"
++    end
++  end
++
+   defp create_source(_) do
+     source = source_fixture()
+     media_item = media_item_with_attachments(%{source_id: source.id})
+diff --git a/test/support/conn_case.ex b/test/support/conn_case.ex
+index 1408762c4..ebf98145c 100644
+--- a/test/support/conn_case.ex
++++ b/test/support/conn_case.ex
+@@ -21,8 +21,10 @@ defmodule PinchflatWeb.ConnCase do
+     quote do
+       # The default endpoint for testing
+       @endpoint PinchflatWeb.Endpoint
++      alias Pinchflat.Repo
+ 
+       use PinchflatWeb, :verified_routes
++      use Oban.Testing, repo: Repo
+ 
+       # Import conveniences for testing with connections
+       import Plug.Conn

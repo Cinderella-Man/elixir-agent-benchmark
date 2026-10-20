@@ -1,0 +1,1146 @@
+diff --git a/README.md b/README.md
+index c10dc8dd7..be086d3e6 100644
+--- a/README.md
++++ b/README.md
+@@ -48,6 +48,7 @@ If it doesn't work for your use case, please make a feature request! You can als
+   - Uses a novel approach to download new content more quickly than other apps
+ - Supports downloading audio content
+ - Custom rules for handling YouTube Shorts and livestreams
++- Optionally automatically delete old content ([docs](https://github.com/kieraneglin/pinchflat/wiki/Automatically-Delete-Media))
+ - Advanced options like setting cutoff dates and filtering by title
+ - Reliable hands-off operation
+ - Can pass cookies to YouTube to download your private playlists ([docs](https://github.com/kieraneglin/pinchflat/wiki/YouTube-Cookies))
+diff --git a/config/config.exs b/config/config.exs
+index 9c60df47f..8e3cd83d4 100644
+--- a/config/config.exs
++++ b/config/config.exs
+@@ -46,7 +46,13 @@ config :pinchflat, Oban,
+   engine: Oban.Engines.Lite,
+   repo: Pinchflat.Repo,
+   # Keep old jobs for 30 days for display in the UI
+-  plugins: [{Oban.Plugins.Pruner, max_age: 30 * 24 * 60 * 60}],
++  plugins: [
++    {Oban.Plugins.Pruner, max_age: 30 * 24 * 60 * 60},
++    {Oban.Plugins.Cron,
++     crontab: [
++       {"@daily", Pinchflat.Downloading.MediaRetentionWorker}
++     ]}
++  ],
+   # TODO: consider making this an env var or something?
+   queues: [
+     default: 10,
+diff --git a/lib/pinchflat/boot/data_backfill_worker.ex b/lib/pinchflat/boot/data_backfill_worker.ex
+deleted file mode 100644
+index 37cd94656..000000000
+--- a/lib/pinchflat/boot/data_backfill_worker.ex
++++ /dev/null
+@@ -1,62 +0,0 @@
+-defmodule Pinchflat.Boot.DataBackfillWorker do
+-  @moduledoc false
+-
+-  use Oban.Worker,
+-    queue: :local_metadata,
+-    unique: [period: :infinity, states: [:available, :scheduled, :retryable]],
+-    tags: ["media_item", "media_metadata", "local_metadata", "data_backfill"]
+-
+-  # This one is going to be a little more self-contained
+-  # instead of relying on outside modules for the methods.
+-  # That's because, for now, these methods are not intended
+-  # to be used elsewhere.
+-  #
+-  # I'm just trying out that pattern and seeing if I like it better
+-  # so this may change.
+-  import Ecto.Query, warn: false
+-  require Logger
+-
+-  alias __MODULE__
+-  alias Pinchflat.Repo
+-
+-  @doc """
+-  Cancels all pending backfill jobs. Useful for ensuring worker runs immediately
+-  on app boot.
+-
+-  Returns {:ok, integer()}
+-  """
+-  def cancel_pending_backfill_jobs do
+-    Oban.Job
+-    |> where(worker: "Pinchflat.Boot.DataBackfillWorker")
+-    |> Oban.cancel_all_jobs()
+-  end
+-
+-  @impl Oban.Worker
+-  @doc """
+-  Performs one-off tasks to get data in the right shape.
+-  This can be needed when we add new features or change the way
+-  we store data. Must be idempotent. All new data should already
+-  conform to the expected schema so this should only be needed
+-  for existing data. Still runs periodically to be safe.
+-
+-  Returns :ok
+-  """
+-  def perform(%Oban.Job{}) do
+-    Logger.info("Running data backfill worker")
+-    # Nothing to do for now - just reschedule
+-    # Keeping in-place because we _will_ need it in the future
+-
+-    reschedule_backfill()
+-
+-    :ok
+-  end
+-
+-  defp reschedule_backfill do
+-    # Run hourly
+-    next_run_in = 60 * 60
+-
+-    %{}
+-    |> DataBackfillWorker.new(schedule_in: next_run_in)
+-    |> Repo.insert_unique_job()
+-  end
+-end
+diff --git a/lib/pinchflat/boot/post_job_startup_tasks.ex b/lib/pinchflat/boot/post_job_startup_tasks.ex
+index 4d11159ec..867c30074 100644
+--- a/lib/pinchflat/boot/post_job_startup_tasks.ex
++++ b/lib/pinchflat/boot/post_job_startup_tasks.ex
+@@ -11,9 +11,6 @@ defmodule Pinchflat.Boot.PostJobStartupTasks do
+   use GenServer, restart: :temporary
+   import Ecto.Query, warn: false
+ 
+-  alias Pinchflat.Repo
+-  alias Pinchflat.Boot.DataBackfillWorker
+-
+   def start_link(opts \\ []) do
+     GenServer.start_link(__MODULE__, %{}, opts)
+   end
+@@ -29,16 +26,7 @@ defmodule Pinchflat.Boot.PostJobStartupTasks do
+   """
+   @impl true
+   def init(state) do
+-    enqueue_backfill_worker()
+-
++    # Empty for now, keeping because tasks _will_ be added in future
+     {:ok, state}
+   end
+-
+-  defp enqueue_backfill_worker do
+-    DataBackfillWorker.cancel_pending_backfill_jobs()
+-
+-    %{}
+-    |> DataBackfillWorker.new()
+-    |> Repo.insert_unique_job()
+-  end
+ end
+diff --git a/lib/pinchflat/downloading/media_retention_worker.ex b/lib/pinchflat/downloading/media_retention_worker.ex
+new file mode 100644
+index 000000000..3e5c0d0f8
+--- /dev/null
++++ b/lib/pinchflat/downloading/media_retention_worker.ex
+@@ -0,0 +1,33 @@
++defmodule Pinchflat.Downloading.MediaRetentionWorker do
++  @moduledoc false
++
++  use Oban.Worker,
++    queue: :local_metadata,
++    unique: [period: :infinity, states: [:available, :scheduled, :retryable, :executing]],
++    tags: ["media_item", "local_metadata"]
++
++  require Logger
++
++  alias Pinchflat.Media
++
++  @doc """
++  Deletes media items that are past their retention date and prevents
++  them from being re-downloaded.
++
++  This worker is scheduled to run daily via the Oban Cron plugin.
++
++  Returns :ok
++  """
++  @impl Oban.Worker
++  def perform(%Oban.Job{}) do
++    cullable_media = Media.list_cullable_media_items()
++    Logger.info("Culling #{length(cullable_media)} media items past their retention date")
++
++    Enum.each(cullable_media, fn media_item ->
++      Media.delete_media_files(media_item, %{
++        prevent_download: true,
++        culled_at: DateTime.utc_now()
++      })
++    end)
++  end
++end
+diff --git a/lib/pinchflat/media/media.ex b/lib/pinchflat/media/media.ex
+index 346029bee..d58f65794 100644
+--- a/lib/pinchflat/media/media.ex
++++ b/lib/pinchflat/media/media.ex
+@@ -22,13 +22,28 @@ defmodule Pinchflat.Media do
+     Repo.all(MediaItem)
+   end
+ 
++  @doc """
++  Returns a list of media_items that are cullable based on the retention period
++  of the source they belong to.
++
++  Returns [%MediaItem{}, ...]
++  """
++  def list_cullable_media_items do
++    MediaQuery.new()
++    |> MediaQuery.join_sources()
++    |> MediaQuery.with_media_filepath()
++    |> MediaQuery.with_passed_retention_period()
++    |> MediaQuery.with_no_culling_prevention()
++    |> Repo.all()
++  end
++
+   @doc """
+   Returns a list of pending media_items for a given source, where
+   pending means the `media_filepath` is `nil` AND the media_item
+   matches the format selection rules of the parent media_profile.
+ 
+-  See `build_format_clauses` but tl;dr is it _may_ filter based
+-  on shorts or livestreams depending on the media_profile settings.
++  See `matching_download_criteria_for` but tl;dr is it _may_ filter based
++  on shorts livestreams depending on the media_profile settings.
+ 
+   Returns [%MediaItem{}, ...].
+   """
+@@ -161,7 +176,7 @@ defmodule Pinchflat.Media do
+     Tasks.delete_tasks_for(media_item)
+ 
+     if delete_files do
+-      {:ok, _} = delete_media_files(media_item)
++      {:ok, _} = do_delete_media_files(media_item)
+     end
+ 
+     # Should delete these no matter what
+@@ -169,6 +184,25 @@ defmodule Pinchflat.Media do
+     Repo.delete(media_item)
+   end
+ 
++  @doc """
++  Deletes the tasks and media files associated with a media_item but leaves the
++  media_item in the database. Does not delete anything to do with associated metadata.
++
++  Optionally accepts a second argument `addl_attrs` which will be merged into the
++  media_item before it is updated. Useful for setting things like `prevent_download`
++  and `culled_at`, if wanted
++
++  Returns {:ok, %MediaItem{}} | {:error, %Ecto.Changeset{}}
++  """
++  def delete_media_files(%MediaItem{} = media_item, addl_attrs \\ %{}) do
++    filepath_attrs = MediaItem.filepath_attribute_defaults()
++
++    Tasks.delete_tasks_for(media_item)
++    {:ok, _} = do_delete_media_files(media_item)
++
++    update_media_item(media_item, Map.merge(filepath_attrs, addl_attrs))
++  end
++
+   @doc """
+   Returns an `%Ecto.Changeset{}` for tracking media_item changes.
+   """
+@@ -176,7 +210,7 @@ defmodule Pinchflat.Media do
+     MediaItem.changeset(media_item, attrs)
+   end
+ 
+-  defp delete_media_files(media_item) do
++  defp do_delete_media_files(media_item) do
+     mapped_struct = Map.from_struct(media_item)
+ 
+     MediaItem.filepath_attributes()
+@@ -203,6 +237,7 @@ defmodule Pinchflat.Media do
+ 
+   defp matching_download_criteria_for(query, source_with_preloads) do
+     query
++    |> MediaQuery.with_no_prevented_download()
+     |> MediaQuery.with_no_media_filepath()
+     |> MediaQuery.with_upload_date_after(source_with_preloads.download_cutoff_date)
+     |> MediaQuery.with_format_preference(source_with_preloads.media_profile)
+diff --git a/lib/pinchflat/media/media_item.ex b/lib/pinchflat/media/media_item.ex
+index 40353db24..52633b280 100644
+--- a/lib/pinchflat/media/media_item.ex
++++ b/lib/pinchflat/media/media_item.ex
+@@ -30,7 +30,11 @@ defmodule Pinchflat.Media.MediaItem do
+     :subtitle_filepaths,
+     :thumbnail_filepath,
+     :metadata_filepath,
+-    :nfo_filepath
++    :nfo_filepath,
++    # These are user or system controlled fields
++    :prevent_download,
++    :prevent_culling,
++    :culled_at
+   ]
+   # Pretty much all the fields captured at index are required.
+   @required_fields ~w(
+@@ -42,7 +46,7 @@ defmodule Pinchflat.Media.MediaItem do
+     source_id
+     upload_date
+     short_form_content
+-    )a
++  )a
+ 
+   schema "media_items" do
+     # This is _not_ used as the primary key or internally in the database
+@@ -70,6 +74,10 @@ defmodule Pinchflat.Media.MediaItem do
+     # Will very likely revisit because I can't leave well-enough alone.
+     field :subtitle_filepaths, {:array, {:array, :string}}, default: []
+ 
++    field :prevent_download, :boolean, default: false
++    field :prevent_culling, :boolean, default: false
++    field :culled_at, :utc_datetime
++
+     field :matching_search_term, :string, virtual: true
+ 
+     belongs_to :source, Source
+@@ -96,4 +104,14 @@ defmodule Pinchflat.Media.MediaItem do
+   def filepath_attributes do
+     ~w(media_filepath thumbnail_filepath metadata_filepath subtitle_filepaths nfo_filepath)a
+   end
++
++  @doc false
++  def filepath_attribute_defaults do
++    filepath_attributes()
++    |> Enum.map(fn
++      :subtitle_filepaths -> {:subtitle_filepaths, []}
++      field -> {field, nil}
++    end)
++    |> Enum.into(%{})
++  end
+ end
+diff --git a/lib/pinchflat/media/media_query.ex b/lib/pinchflat/media/media_query.ex
+index c43b5eb41..7b7a3c7f5 100644
+--- a/lib/pinchflat/media/media_query.ex
++++ b/lib/pinchflat/media/media_query.ex
+@@ -17,6 +17,7 @@ defmodule Pinchflat.Media.MediaQuery do
+ 
+   # Prefixes:
+   # - for_* - belonging to a certain record
++  # - join_* - for joining on a certain record
+   # - with_* - for filtering based on full, concrete attributes
+   # - matching_* - for filtering based on partial attributes (e.g. LIKE, regex, full-text search)
+   #
+@@ -31,6 +32,27 @@ defmodule Pinchflat.Media.MediaQuery do
+     where(query, [mi], mi.source_id == ^source.id)
+   end
+ 
++  def join_sources(query) do
++    from(mi in query, join: s in assoc(mi, :source), as: :sources)
++  end
++
++  def with_passed_retention_period(query) do
++    where(
++      query,
++      [mi, sources],
++      fragment(
++        "IFNULL(?, 0) > 0 AND DATETIME('now', '-' || ? || ' day') > ?",
++        sources.retention_period_days,
++        sources.retention_period_days,
++        mi.media_downloaded_at
++      )
++    )
++  end
++
++  def with_no_culling_prevention(query) do
++    where(query, [mi], mi.prevent_culling == false)
++  end
++
+   def with_id(query, id) do
+     where(query, [mi], mi.id == ^id)
+   end
+@@ -53,6 +75,10 @@ defmodule Pinchflat.Media.MediaQuery do
+     where(query, [mi], mi.upload_date >= ^date)
+   end
+ 
++  def with_no_prevented_download(query) do
++    where(query, [mi], mi.prevent_download == false)
++  end
++
+   def matching_title_regex(query, nil), do: query
+ 
+   def matching_title_regex(query, regex) do
+diff --git a/lib/pinchflat/sources/source.ex b/lib/pinchflat/sources/source.ex
+index 58e7ec02c..c2ef216b8 100644
+--- a/lib/pinchflat/sources/source.ex
++++ b/lib/pinchflat/sources/source.ex
+@@ -29,6 +29,7 @@ defmodule Pinchflat.Sources.Source do
+     last_indexed_at
+     original_url
+     download_cutoff_date
++    retention_period_days
+     title_filter_regex
+     media_profile_id
+   )a
+@@ -72,6 +73,7 @@ defmodule Pinchflat.Sources.Source do
+     field :last_indexed_at, :utc_datetime
+     # Only download media items that were published after this date
+     field :download_cutoff_date, :date
++    field :retention_period_days, :integer
+     field :original_url, :string
+     field :title_filter_regex, :string
+ 
+@@ -106,6 +108,7 @@ defmodule Pinchflat.Sources.Source do
+     |> dynamic_default(:custom_name, fn cs -> get_field(cs, :collection_name) end)
+     |> dynamic_default(:uuid, fn _ -> Ecto.UUID.generate() end)
+     |> validate_required(required_fields)
++    |> validate_number(:retention_period_days, greater_than_or_equal_to: 0)
+     |> cast_assoc(:metadata, with: &SourceMetadata.changeset/2, required: false)
+     |> unique_constraint([:collection_id, :media_profile_id, :title_filter_regex], error_key: :original_url)
+   end
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_controller.ex b/lib/pinchflat_web/controllers/media_items/media_item_controller.ex
+index 31a9ef402..bfcb3d272 100644
+--- a/lib/pinchflat_web/controllers/media_items/media_item_controller.ex
++++ b/lib/pinchflat_web/controllers/media_items/media_item_controller.ex
+@@ -16,20 +16,34 @@ defmodule PinchflatWeb.MediaItems.MediaItemController do
+     render(conn, :show, media_item: media_item)
+   end
+ 
+-  def delete(conn, %{"id" => id} = params) do
+-    delete_files = Map.get(params, "delete_files", false)
++  def edit(conn, %{"id" => id}) do
+     media_item = Media.get_media_item!(id)
+-    {:ok, _} = Media.delete_media_item(media_item, delete_files: delete_files)
++    changeset = Media.change_media_item(media_item)
+ 
+-    flash_message =
+-      if delete_files do
+-        "Record and files deleted successfully."
+-      else
+-        "Record deleted successfully. Files were not deleted."
+-      end
++    render(conn, :edit, media_item: media_item, changeset: changeset)
++  end
++
++  def update(conn, %{"id" => id, "media_item" => params}) do
++    media_item = Media.get_media_item!(id)
++
++    case Media.update_media_item(media_item, params) do
++      {:ok, media_item} ->
++        conn
++        |> put_flash(:info, "Media Item updated successfully.")
++        |> redirect(to: ~p"/sources/#{media_item.source_id}/media/#{media_item}")
++
++      {:error, %Ecto.Changeset{} = changeset} ->
++        render(conn, :edit, media_item: media_item, changeset: changeset)
++    end
++  end
++
++  def delete(conn, %{"id" => id} = params) do
++    prevent_download = Map.get(params, "prevent_download", false)
++    media_item = Media.get_media_item!(id)
++    {:ok, _} = Media.delete_media_files(media_item, %{prevent_download: prevent_download})
+ 
+     conn
+-    |> put_flash(:info, flash_message)
++    |> put_flash(:info, "Files deleted successfully.")
+     |> redirect(to: ~p"/sources/#{media_item.source_id}")
+   end
+ 
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_html.ex b/lib/pinchflat_web/controllers/media_items/media_item_html.ex
+index 12d7ffa36..659e74268 100644
+--- a/lib/pinchflat_web/controllers/media_items/media_item_html.ex
++++ b/lib/pinchflat_web/controllers/media_items/media_item_html.ex
+@@ -3,6 +3,14 @@ defmodule PinchflatWeb.MediaItems.MediaItemHTML do
+ 
+   embed_templates "media_item_html/*"
+ 
++  @doc """
++  Renders a media item form.
++  """
++  attr :changeset, Ecto.Changeset, required: true
++  attr :action, :string, required: true
++
++  def media_item_form(assigns)
++
+   def media_file_exists?(media_item) do
+     !!media_item.media_filepath and File.exists?(media_item.media_filepath)
+   end
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_html/edit.html.heex b/lib/pinchflat_web/controllers/media_items/media_item_html/edit.html.heex
+new file mode 100644
+index 000000000..5b1818c3d
+--- /dev/null
++++ b/lib/pinchflat_web/controllers/media_items/media_item_html/edit.html.heex
+@@ -0,0 +1,13 @@
++<div class="mb-6 flex gap-3 flex-row items-center">
++  <h2 class="text-title-md2 font-bold text-black dark:text-white ml-4">
++    Editing "<%= StringUtils.truncate(@media_item.title, 35) %>"
++  </h2>
++</div>
++
++<div class="rounded-sm border border-stroke bg-white px-5 pb-2.5 pt-6 shadow-default dark:border-strokedark dark:bg-boxdark sm:px-7.5 xl:pb-1">
++  <div class="max-w-full overflow-x-auto">
++    <div class="flex flex-col gap-10">
++      <.media_item_form changeset={@changeset} action={~p"/sources/#{@media_item.source_id}/media/#{@media_item}"} />
++    </div>
++  </div>
++</div>
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_html/media_item_form.html.heex b/lib/pinchflat_web/controllers/media_items/media_item_html/media_item_form.html.heex
+new file mode 100644
+index 000000000..13113465b
+--- /dev/null
++++ b/lib/pinchflat_web/controllers/media_items/media_item_html/media_item_form.html.heex
+@@ -0,0 +1,31 @@
++<.simple_form
++  :let={f}
++  for={@changeset}
++  action={@action}
++  x-data="{ advancedMode: !!JSON.parse(localStorage.getItem('advancedMode')) }"
++  x-init="$watch('advancedMode', value => localStorage.setItem('advancedMode', JSON.stringify(value)))"
++>
++  <.error :if={@changeset.action}>
++    Oops, something went wrong! Please check the errors below.
++  </.error>
++
++  <h3 class=" text-2xl text-black dark:text-white">
++    General Options
++  </h3>
++
++  <.input
++    field={f[:prevent_download]}
++    type="toggle"
++    label="Prevent Download"
++    help="Checking excludes this media item from being downloaded"
++  />
++
++  <.input
++    field={f[:prevent_culling]}
++    type="toggle"
++    label="Prevent Automatic Deletion"
++    help="Checking excludes media from being automatically deleted based on media retention rules"
++  />
++
++  <.button class="my-10 sm:mb-7.5 w-full sm:w-auto" rounding="rounded-lg">Save Media Item</.button>
++</.simple_form>
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex b/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
+index fb81b1a85..6de101f75 100644
+--- a/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
+@@ -4,9 +4,17 @@
+       <.icon name="hero-arrow-left" class="w-10 h-10 hover:dark:text-white" />
+     </.link>
+     <h2 class="text-title-md2 font-bold text-black dark:text-white ml-4">
+-      Media Item #<%= @media_item.id %>
++      <%= StringUtils.truncate(@media_item.title, 35) %>
+     </h2>
+   </div>
++
++  <nav>
++    <.link href={~p"/sources/#{@media_item.source_id}/media/#{@media_item}/edit"}>
++      <.button color="bg-primary" rounding="rounded-lg">
++        <.icon name="hero-pencil-square" class="mr-2" /> Edit
++      </.button>
++    </.link>
++  </nav>
+ </div>
+ <div class="rounded-sm border border-stroke bg-white py-5 pt-6 shadow-default dark:border-strokedark dark:bg-boxdark px-7.5">
+   <div class="max-w-full overflow-x-auto">
+@@ -15,13 +23,22 @@
+         <.button_dropdown text="Actions" class="justify-center w-full sm:w-50">
+           <:option>
+             <.link
+-              href={~p"/sources/#{@media_item.source_id}/media/#{@media_item}?delete_files=true"}
++              href={~p"/sources/#{@media_item.source_id}/media/#{@media_item}"}
+               method="delete"
+-              data-confirm="Are you sure you want to delete this record and all associated files on disk? This cannot be undone."
++              data-confirm="Are you sure you want to delete all files for this media item? This cannot be undone."
+             >
+               Delete Files
+             </.link>
+           </:option>
++          <:option>
++            <.link
++              href={~p"/sources/#{@media_item.source_id}/media/#{@media_item}?prevent_download=true"}
++              method="delete"
++              data-confirm="Are you sure you want to delete all files for this media item and prevent it from re-downloading in the future? This cannot be undone."
++            >
++              Delete and Ignore
++            </.link>
++          </:option>
+         </.button_dropdown>
+       </:tab_append>
+ 
+@@ -32,6 +49,7 @@
+             <.media_preview media_item={@media_item} />
+           <% end %>
+ 
++          <h2 class="font-bold text-2xl"><%= @media_item.title %></h2>
+           <h3 class="font-bold text-xl">Attributes</h3>
+           <section>
+             <strong>Source:</strong>
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/index.html.heex b/lib/pinchflat_web/controllers/sources/source_html/index.html.heex
+index 3f6672007..c912cfb85 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/index.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/index.html.heex
+@@ -22,6 +22,13 @@
+         <:col :let={source} label="Should Download?">
+           <.icon name={if source.download_media, do: "hero-check", else: "hero-x-mark"} />
+         </:col>
++        <:col :let={source} label="Retention">
++          <%= if source.retention_period_days && source.retention_period_days > 0 do %>
++            <%= source.retention_period_days %> day(s)
++          <% else %>
++            <span class="text-lg">∞</span>
++          <% end %>
++        </:col>
+         <:col :let={source} label="Media Profile">
+           <.subtle_link href={~p"/media_profiles/#{source.media_profile_id}"}>
+             <%= source.media_profile.name %>
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/show.html.heex b/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
+index 8572f22f2..9a2e6789c 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
+@@ -77,10 +77,17 @@
+           <h4 class="text-white text-lg mb-6">Shows a maximum of 100 media items</h4>
+           <.table rows={@pending_media} table_class="text-black dark:text-white">
+             <:col :let={media_item} label="Title">
+-              <%= StringUtils.truncate(media_item.title, 50) %>
++              <.subtle_link href={~p"/sources/#{@source.id}/media/#{media_item.id}"}>
++                <%= StringUtils.truncate(media_item.title, 50) %>
++              </.subtle_link>
+             </:col>
+             <:col :let={media_item} label="" class="flex place-content-evenly">
+-              <.icon_link href={~p"/sources/#{@source.id}/media/#{media_item.id}"} icon="hero-eye" />
++              <.icon_link href={~p"/sources/#{@source.id}/media/#{media_item.id}"} icon="hero-eye" class="mx-1" />
++              <.icon_link
++                href={~p"/sources/#{@source.id}/media/#{media_item.id}/edit"}
++                icon="hero-pencil-square"
++                class="mx-1"
++              />
+             </:col>
+           </.table>
+         <% else %>
+@@ -92,10 +99,17 @@
+           <h4 class="text-white text-lg mb-6">Shows a maximum of 100 media items (<%= @total_downloaded %> total)</h4>
+           <.table rows={@downloaded_media} table_class="text-black dark:text-white">
+             <:col :let={media_item} label="Title">
+-              <%= StringUtils.truncate(media_item.title, 50) %>
++              <.subtle_link href={~p"/sources/#{@source.id}/media/#{media_item.id}"}>
++                <%= StringUtils.truncate(media_item.title, 50) %>
++              </.subtle_link>
+             </:col>
+             <:col :let={media_item} label="" class="flex place-content-evenly">
+-              <.icon_link href={~p"/sources/#{@source.id}/media/#{media_item.id}"} icon="hero-eye" />
++              <.icon_link href={~p"/sources/#{@source.id}/media/#{media_item.id}"} icon="hero-eye" class="mx-1" />
++              <.icon_link
++                href={~p"/sources/#{@source.id}/media/#{media_item.id}/edit"}
++                icon="hero-pencil-square"
++                class="mx-1"
++              />
+             </:col>
+           </.table>
+         <% else %>
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex b/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
+index f430cf226..e94ebe676 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
+@@ -88,6 +88,14 @@
+     help="Only download media uploaded after this date. Leave blank to download all media. Must be in YYYY-MM-DD format"
+   />
+ 
++  <.input
++    field={f[:retention_period_days]}
++    type="number"
++    label="Retention Period (days)"
++    min="0"
++    help="Days between when media is *downloaded* and when it's deleted. Leave blank to keep media indefinitely"
++  />
++
+   <section x-show="advancedMode">
+     <h3 class="mt-8 text-2xl text-black dark:text-white">
+       Advanced Options
+diff --git a/lib/pinchflat_web/router.ex b/lib/pinchflat_web/router.ex
+index 202f46005..e56a4f25d 100644
+--- a/lib/pinchflat_web/router.ex
++++ b/lib/pinchflat_web/router.ex
+@@ -32,7 +32,7 @@ defmodule PinchflatWeb.Router do
+     resources "/search", Searches.SearchController, only: [:show], singleton: true
+ 
+     resources "/sources", Sources.SourceController do
+-      resources "/media", MediaItems.MediaItemController, only: [:show, :delete]
++      resources "/media", MediaItems.MediaItemController, only: [:show, :edit, :update, :delete]
+     end
+   end
+ 
+diff --git a/priv/repo/migrations/20240402192417_add_prevent_download_to_media_items.exs b/priv/repo/migrations/20240402192417_add_prevent_download_to_media_items.exs
+new file mode 100644
+index 000000000..c43f91f7f
+--- /dev/null
++++ b/priv/repo/migrations/20240402192417_add_prevent_download_to_media_items.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddPreventDownloadToMediaItems do
++  use Ecto.Migration
++
++  def change do
++    alter table(:media_items) do
++      add :prevent_download, :boolean, default: false, null: false
++    end
++  end
++end
+diff --git a/priv/repo/migrations/20240402221638_add_retention_period_to_sources.exs b/priv/repo/migrations/20240402221638_add_retention_period_to_sources.exs
+new file mode 100644
+index 000000000..a738678a8
+--- /dev/null
++++ b/priv/repo/migrations/20240402221638_add_retention_period_to_sources.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddRetentionPeriodToSources do
++  use Ecto.Migration
++
++  def change do
++    alter table(:sources) do
++      add :retention_period_days, :integer
++    end
++  end
++end
+diff --git a/priv/repo/migrations/20240403164943_add_culled_at_to_media_items.exs b/priv/repo/migrations/20240403164943_add_culled_at_to_media_items.exs
+new file mode 100644
+index 000000000..284dc4094
+--- /dev/null
++++ b/priv/repo/migrations/20240403164943_add_culled_at_to_media_items.exs
+@@ -0,0 +1,10 @@
++defmodule Pinchflat.Repo.Migrations.AddCulledAtToMediaItems do
++  use Ecto.Migration
++
++  def change do
++    alter table(:media_items) do
++      add :culled_at, :utc_datetime
++      add :prevent_culling, :boolean, default: false
++    end
++  end
++end
+diff --git a/test/pinchflat/boot/data_backfill_worker_test.exs b/test/pinchflat/boot/data_backfill_worker_test.exs
+deleted file mode 100644
+index 485f28147..000000000
+--- a/test/pinchflat/boot/data_backfill_worker_test.exs
++++ /dev/null
+@@ -1,46 +0,0 @@
+-defmodule Pinchflat.Boot.DataBackfillWorkerTest do
+-  use Pinchflat.DataCase
+-
+-  alias Pinchflat.Boot.DataBackfillWorker
+-  alias Pinchflat.JobFixtures.TestJobWorker
+-
+-  describe "cancel_pending_backfill_jobs/0" do
+-    test "cancels all pending backfill jobs" do
+-      %{}
+-      |> DataBackfillWorker.new()
+-      |> Repo.insert_unique_job()
+-
+-      assert_enqueued(worker: DataBackfillWorker)
+-
+-      DataBackfillWorker.cancel_pending_backfill_jobs()
+-
+-      refute_enqueued(worker: DataBackfillWorker)
+-    end
+-
+-    test "does not cancel jobs for other workers" do
+-      %{id: 0}
+-      |> TestJobWorker.new()
+-      |> Repo.insert_unique_job()
+-
+-      assert_enqueued(worker: TestJobWorker)
+-
+-      DataBackfillWorker.cancel_pending_backfill_jobs()
+-
+-      assert_enqueued(worker: TestJobWorker)
+-    end
+-  end
+-
+-  describe "perform/1" do
+-    setup do
+-      DataBackfillWorker.cancel_pending_backfill_jobs()
+-
+-      :ok
+-    end
+-
+-    test "reschedules itself once complete" do
+-      perform_job(DataBackfillWorker, %{})
+-
+-      assert_enqueued(worker: DataBackfillWorker, scheduled_at: now_plus(60, :minutes))
+-    end
+-  end
+-end
+diff --git a/test/pinchflat/downloading/media_retention_worker_test.exs b/test/pinchflat/downloading/media_retention_worker_test.exs
+new file mode 100644
+index 000000000..a77fd76b5
+--- /dev/null
++++ b/test/pinchflat/downloading/media_retention_worker_test.exs
+@@ -0,0 +1,70 @@
++defmodule Pinchflat.Downloading.MediaRetentionWorkerTest do
++  use Pinchflat.DataCase
++
++  import Pinchflat.MediaFixtures
++  import Pinchflat.SourcesFixtures
++
++  alias Pinchflat.Media
++  alias Pinchflat.Downloading.MediaRetentionWorker
++
++  describe "perform/1" do
++    test "deletes media files that are past their retention date" do
++      {_source, old_media_item, new_media_item} = prepare_records()
++
++      perform_job(MediaRetentionWorker, %{})
++
++      assert File.exists?(new_media_item.media_filepath)
++      refute File.exists?(old_media_item.media_filepath)
++      assert Repo.reload!(new_media_item).media_filepath
++      refute Repo.reload!(old_media_item).media_filepath
++    end
++
++    test "sets deleted media to not re-download" do
++      {_source, old_media_item, new_media_item} = prepare_records()
++
++      perform_job(MediaRetentionWorker, %{})
++
++      refute Repo.reload!(new_media_item).prevent_download
++      assert Repo.reload!(old_media_item).prevent_download
++    end
++
++    test "sets culled_at timestamp on deleted media" do
++      {_source, old_media_item, new_media_item} = prepare_records()
++
++      perform_job(MediaRetentionWorker, %{})
++
++      refute Repo.reload!(new_media_item).culled_at
++      assert Repo.reload!(old_media_item).culled_at
++      assert DateTime.diff(now(), Repo.reload!(old_media_item).culled_at) < 1
++    end
++
++    test "doesn't cull media items that have prevent_culling set" do
++      {_source, old_media_item, _new_media_item} = prepare_records()
++
++      Media.update_media_item(old_media_item, %{prevent_culling: true})
++
++      perform_job(MediaRetentionWorker, %{})
++
++      assert File.exists?(old_media_item.media_filepath)
++      assert Repo.reload!(old_media_item).media_filepath
++    end
++  end
++
++  defp prepare_records do
++    source = source_fixture(%{retention_period_days: 2})
++
++    old_media_item =
++      media_item_with_attachments(%{
++        source_id: source.id,
++        media_downloaded_at: now_minus(3, :days)
++      })
++
++    new_media_item =
++      media_item_with_attachments(%{
++        source_id: source.id,
++        media_downloaded_at: now_minus(1, :day)
++      })
++
++    {source, old_media_item, new_media_item}
++  end
++end
+diff --git a/test/pinchflat/media_test.exs b/test/pinchflat/media_test.exs
+index c73c42178..3d4657164 100644
+--- a/test/pinchflat/media_test.exs
++++ b/test/pinchflat/media_test.exs
+@@ -38,6 +38,98 @@ defmodule Pinchflat.MediaTest do
+     end
+   end
+ 
++  describe "list_cullable_media_items/0" do
++    test "returns media items where the source has a retention period" do
++      source_one = source_fixture(%{retention_period_days: 2})
++      source_two = source_fixture(%{retention_period_days: 0})
++      source_three = source_fixture(%{retention_period_days: nil})
++
++      _media_item =
++        media_item_fixture(%{
++          source_id: source_two.id,
++          media_filepath: "/video/#{Faker.File.file_name(:video)}",
++          media_downloaded_at: now_minus(3, :days)
++        })
++
++      _media_item =
++        media_item_fixture(%{
++          source_id: source_three.id,
++          media_filepath: "/video/#{Faker.File.file_name(:video)}",
++          media_downloaded_at: now_minus(3, :days)
++        })
++
++      expected_media_item =
++        media_item_fixture(%{
++          source_id: source_one.id,
++          media_filepath: "/video/#{Faker.File.file_name(:video)}",
++          media_downloaded_at: now_minus(3, :days)
++        })
++
++      assert Media.list_cullable_media_items() == [expected_media_item]
++    end
++
++    test "returns media_items with a media_filepath" do
++      source = source_fixture(%{retention_period_days: 2})
++
++      _media_item =
++        media_item_fixture(%{
++          source_id: source.id,
++          media_filepath: nil,
++          media_downloaded_at: now_minus(3, :days)
++        })
++
++      expected_media_item =
++        media_item_fixture(%{
++          source_id: source.id,
++          media_filepath: "/video/#{Faker.File.file_name(:video)}",
++          media_downloaded_at: now_minus(3, :days)
++        })
++
++      assert Media.list_cullable_media_items() == [expected_media_item]
++    end
++
++    test "returns items that have passed their retention period" do
++      source = source_fixture(%{retention_period_days: 2})
++
++      _media_item =
++        media_item_fixture(%{
++          source_id: source.id,
++          media_filepath: "/video/#{Faker.File.file_name(:video)}",
++          media_downloaded_at: now_minus(2, :days)
++        })
++
++      expected_media_item =
++        media_item_fixture(%{
++          source_id: source.id,
++          media_filepath: "/video/#{Faker.File.file_name(:video)}",
++          media_downloaded_at: now_minus(3, :days)
++        })
++
++      assert Media.list_cullable_media_items() == [expected_media_item]
++    end
++
++    test "doesn't return items that are set to prevent culling" do
++      source = source_fixture(%{retention_period_days: 2})
++
++      _media_item =
++        media_item_fixture(%{
++          source_id: source.id,
++          media_filepath: "/video/#{Faker.File.file_name(:video)}",
++          media_downloaded_at: now_minus(3, :days),
++          prevent_culling: true
++        })
++
++      expected_media_item =
++        media_item_fixture(%{
++          source_id: source.id,
++          media_filepath: "/video/#{Faker.File.file_name(:video)}",
++          media_downloaded_at: now_minus(3, :days)
++        })
++
++      assert Media.list_cullable_media_items() == [expected_media_item]
++    end
++  end
++
+   describe "list_pending_media_items_for/1" do
+     test "it returns pending without a filepath for a given source" do
+       source = source_fixture()
+@@ -233,6 +325,16 @@ defmodule Pinchflat.MediaTest do
+     end
+   end
+ 
++  describe "list_pending_media_items_for/1 when testing download prevention" do
++    test "returns only media items that are not prevented from downloading" do
++      source = source_fixture()
++      _prevented_media_item = media_item_fixture(%{source_id: source.id, media_filepath: nil, prevent_download: true})
++      media_item = media_item_fixture(%{source_id: source.id, media_filepath: nil, prevent_download: false})
++
++      assert Media.list_pending_media_items_for(source) == [media_item]
++    end
++  end
++
+   describe "list_downloaded_media_items_for/1" do
+     test "returns only media items with a media_filepath" do
+       source = source_fixture()
+@@ -320,6 +422,18 @@ defmodule Pinchflat.MediaTest do
+ 
+       assert Media.pending_download?(media_item)
+     end
++
++    test "returns true if the media item is not prevented from downloading" do
++      media_item = media_item_fixture(%{media_filepath: nil, prevent_download: false})
++
++      assert Media.pending_download?(media_item)
++    end
++
++    test "returns false if the media item is prevented from downloading" do
++      media_item = media_item_fixture(%{media_filepath: nil, prevent_download: true})
++
++      refute Media.pending_download?(media_item)
++    end
+   end
+ 
+   describe "search/1" do
+@@ -587,6 +701,63 @@ defmodule Pinchflat.MediaTest do
+     end
+   end
+ 
++  describe "delete_media_files/2" do
++    test "does not delete the media_item" do
++      media_item = media_item_fixture()
++
++      assert {:ok, %MediaItem{}} = Media.delete_media_files(media_item)
++      assert Repo.reload!(media_item)
++    end
++
++    test "deletes attached tasks" do
++      media_item = media_item_fixture()
++      task = task_fixture(%{media_item_id: media_item.id})
++
++      assert {:ok, %MediaItem{}} = Media.delete_media_files(media_item)
++      assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task) end
++    end
++
++    test "deletes the media_item's files" do
++      media_item = media_item_with_attachments()
++
++      assert File.exists?(media_item.media_filepath)
++      assert {:ok, _} = Media.delete_media_files(media_item)
++      refute File.exists?(media_item.media_filepath)
++    end
++
++    test "does not delete the media item's metadata files" do
++      stub(HTTPClientMock, :get, fn _url, _headers, _opts -> {:ok, ""} end)
++      media_item = Repo.preload(media_item_with_attachments(), :metadata)
++
++      update_attrs = %{
++        metadata: %{
++          metadata_filepath: MetadataFileHelpers.compress_and_store_metadata_for(media_item, %{}),
++          thumbnail_filepath:
++            MetadataFileHelpers.download_and_store_thumbnail_for(media_item, %{
++              "thumbnail" => "https://example.com/thumbnail.jpg"
++            })
++        }
++      }
++
++      {:ok, updated_media_item} = Media.update_media_item(media_item, update_attrs)
++      metadata = Repo.preload(updated_media_item, :metadata).metadata
++
++      assert {:ok, _} = Media.delete_media_files(updated_media_item)
++      assert Repo.reload(metadata)
++      assert File.exists?(updated_media_item.metadata.metadata_filepath)
++
++      # cleanup
++      Media.delete_media_item(updated_media_item, delete_files: true)
++    end
++
++    test "can take additional attributes update media item" do
++      media_item = media_item_with_attachments()
++
++      assert {:ok, updated_media_item} = Media.delete_media_files(media_item, %{prevent_download: true})
++      assert updated_media_item.prevent_download
++    end
++  end
++
+   describe "change_media_item/1" do
+     test "change_media_item/1 returns a media_item changeset" do
+       media_item = media_item_fixture()
+diff --git a/test/pinchflat_web/controllers/media_item_controller_test.exs b/test/pinchflat_web/controllers/media_item_controller_test.exs
+index 428d337c5..e8e035a44 100644
+--- a/test/pinchflat_web/controllers/media_item_controller_test.exs
++++ b/test/pinchflat_web/controllers/media_item_controller_test.exs
+@@ -10,60 +10,81 @@ defmodule PinchflatWeb.MediaItemControllerTest do
+ 
+     test "renders the page", %{conn: conn, media_item: media_item} do
+       conn = get(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item}")
+-      assert html_response(conn, 200) =~ "Media Item ##{media_item.id}"
++
++      assert html_response(conn, 200) =~ "#{media_item.title}"
+     end
+   end
+ 
+-  describe "delete media when just deleting the records" do
+-    setup do
+-      media_item = media_item_with_attachments()
++  describe "edit media" do
++    setup [:create_media_item]
+ 
+-      %{media_item: media_item}
++    test "renders form for editing chosen media_item", %{conn: conn, media_item: media_item} do
++      conn = get(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item}/edit")
++
++      assert html_response(conn, 200) =~ "Editing"
+     end
++  end
+ 
+-    test "the media item is deleted", %{conn: conn, media_item: media_item} do
+-      delete(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item.id}")
++  describe "update media" do
++    setup [:create_media_item]
+ 
+-      assert_raise Ecto.NoResultsError, fn -> Repo.reload!(media_item) end
+-    end
++    test "redirects when data is valid", %{conn: conn, media_item: media_item} do
++      update_attrs = %{title: "New Title"}
+ 
+-    test "the files are not deleted", %{conn: conn, media_item: media_item} do
+-      delete(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item.id}")
++      conn = put(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item}", media_item: update_attrs)
++      assert redirected_to(conn) == ~p"/sources/#{media_item.source_id}/media/#{media_item}"
+ 
+-      assert File.exists?(media_item.media_filepath)
++      conn = get(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item}")
++      assert html_response(conn, 200) =~ update_attrs[:title]
+     end
+ 
+-    test "redirects to the source page", %{conn: conn, media_item: media_item} do
+-      conn = delete(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item.id}")
++    test "renders errors when data is invalid", %{conn: conn, media_item: media_item} do
++      conn = put(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item}", media_item: %{title: nil})
+ 
+-      assert redirected_to(conn) == ~p"/sources/#{media_item.source_id}"
++      assert html_response(conn, 200) =~ "Editing"
+     end
+   end
+ 
+-  describe "delete media when deleting the records and files" do
++  describe "delete media" do
+     setup do
+       media_item = media_item_with_attachments()
+ 
+       %{media_item: media_item}
+     end
+ 
+-    test "the media item is deleted", %{conn: conn, media_item: media_item} do
+-      delete(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item.id}?delete_files=true")
++    test "the media item not is deleted", %{conn: conn, media_item: media_item} do
++      delete(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item.id}")
+ 
+-      assert_raise Ecto.NoResultsError, fn -> Repo.reload!(media_item) end
++      assert Repo.reload!(media_item)
+     end
+ 
+     test "the files are deleted", %{conn: conn, media_item: media_item} do
+-      delete(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item.id}?delete_files=true")
++      delete(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item.id}")
+ 
+       refute File.exists?(media_item.media_filepath)
+     end
+ 
+     test "redirects to the source page", %{conn: conn, media_item: media_item} do
+-      conn = delete(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item.id}?delete_files=true")
++      conn = delete(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item.id}")
+ 
+       assert redirected_to(conn) == ~p"/sources/#{media_item.source_id}"
+     end
++
++    test "doesn't prevent re-download by default", %{conn: conn, media_item: media_item} do
++      delete(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item.id}")
++
++      media_item = Repo.reload(media_item)
++
++      refute media_item.prevent_download
++    end
++
++    test "can optionally prevent re-download", %{conn: conn, media_item: media_item} do
++      delete(conn, ~p"/sources/#{media_item.source_id}/media/#{media_item.id}?prevent_download=true")
++
++      media_item = Repo.reload(media_item)
++
++      assert media_item.prevent_download
++    end
+   end
+ 
+   describe "streaming media" do

@@ -1,0 +1,274 @@
+diff --git a/lib/redix/cluster/manager.ex b/lib/redix/cluster/manager.ex
+index c9d57e5..860212f 100644
+--- a/lib/redix/cluster/manager.ex
++++ b/lib/redix/cluster/manager.ex
+@@ -1139,6 +1139,7 @@ defmodule Redix.Cluster.Manager do
+   # Callers that only care about the updated data can discard the result.
+   defp start_and_monitor_connection(data, node_id, index, host, port, role) do
+     case start_connection(
++           data.cluster_name,
+            data.pool_supervisor,
+            data.registry,
+            node_id,
+@@ -1181,6 +1182,7 @@ defmodule Redix.Cluster.Manager do
+   end
+ 
+   defp start_connection(
++         cluster_name,
+          pool_supervisor,
+          registry,
+          node_id,
+@@ -1200,7 +1202,7 @@ defmodule Redix.Cluster.Manager do
+         # The Registry value records the node's role and live connection state so
+         # routing can skip a pool member while it reconnects.
+         name: {:via, Registry, {registry, {node_id, index}, {role, :disconnected}}},
+-        __cluster_member__: {registry, {node_id, index}}
++        __cluster_member__: {cluster_name, registry, {node_id, index}}
+       )
+       |> maybe_put_readonly(role)
+ 
+diff --git a/lib/redix/connection.ex b/lib/redix/connection.ex
+index c593704..3bfc7a3 100644
+--- a/lib/redix/connection.ex
++++ b/lib/redix/connection.ex
+@@ -153,9 +153,7 @@ defmodule Redix.Connection do
+       # connect/3 down the pipe.
+       receive do
+         {:connected, ^socket_owner, socket, address} ->
+-          :telemetry.execute([:redix, :connection], %{}, %{
+-            connection: self(),
+-            connection_name: data.opts[:name],
++          execute_telemetry_connection_event(data, :connection, %{
+             address: address,
+             reconnection: false
+           })
+@@ -211,9 +209,7 @@ defmodule Redix.Connection do
+   # the socket owner to die so that it can finish processing the data it's processing. When it's
+   # dead, we go ahead and notify the remaining clients, setup backoff, and so on.
+   def disconnected(:info, {:stopped, owner, reason}, %__MODULE__{socket_owner: owner} = data) do
+-    :telemetry.execute([:redix, :disconnection], %{}, %{
+-      connection: self(),
+-      connection_name: data.opts[:name],
++    execute_telemetry_connection_event(data, :disconnection, %{
+       address: data.connected_address,
+       reason: %ConnectionError{reason: reason}
+     })
+@@ -227,9 +223,7 @@ defmodule Redix.Connection do
+         {:connected, owner, socket, address},
+         %__MODULE__{socket_owner: owner} = data
+       ) do
+-    :telemetry.execute([:redix, :connection], %{}, %{
+-      connection: self(),
+-      connection_name: data.opts[:name],
++    execute_telemetry_connection_event(data, :connection, %{
+       address: address,
+       reconnection: not is_nil(data.backoff_current)
+     })
+@@ -253,9 +247,7 @@ defmodule Redix.Connection do
+ 
+   def connecting(:info, {:stopped, owner, reason}, %__MODULE__{socket_owner: owner} = data) do
+     # We log this when the socket owner stopped while connecting.
+-    :telemetry.execute([:redix, :failed_connection], %{}, %{
+-      connection: self(),
+-      connection_name: data.opts[:name],
++    execute_telemetry_connection_event(data, :failed_connection, %{
+       address: format_address(data),
+       reason: %ConnectionError{reason: reason}
+     })
+@@ -293,9 +285,7 @@ defmodule Redix.Connection do
+   end
+ 
+   def connected(:info, {:stopped, owner, reason}, %__MODULE__{socket_owner: owner} = data) do
+-    :telemetry.execute([:redix, :disconnection], %{}, %{
+-      connection: self(),
+-      connection_name: data.opts[:name],
++    execute_telemetry_connection_event(data, :disconnection, %{
+       address: data.connected_address,
+       reason: %ConnectionError{reason: reason}
+     })
+@@ -345,6 +335,18 @@ defmodule Redix.Connection do
+ 
+   ## Helpers
+ 
++  defp execute_telemetry_connection_event(data, event, metadata) do
++    metadata = Map.merge(%{connection: self(), connection_name: data.opts[:name]}, metadata)
++
++    metadata =
++      case data.opts[:__cluster_member__] do
++        {cluster, _registry, _key} -> Map.put(metadata, :cluster, cluster)
++        nil -> metadata
++      end
++
++    :telemetry.execute([:redix, event], %{}, metadata)
++  end
++
+   defp maybe_put_cluster_member(opts, nil), do: opts
+ 
+   defp maybe_put_cluster_member(opts, cluster_member) do
+@@ -353,7 +355,7 @@ defmodule Redix.Connection do
+ 
+   defp update_cluster_connection_state(data, state) do
+     case data.opts[:__cluster_member__] do
+-      {registry, key} ->
++      {_cluster, registry, key} ->
+         Registry.update_value(registry, key, fn {role, _old_state} -> {role, state} end)
+         data
+ 
+diff --git a/lib/redix/telemetry.ex b/lib/redix/telemetry.ex
+index 931b41f..ab84426 100644
+--- a/lib/redix/telemetry.ex
++++ b/lib/redix/telemetry.ex
+@@ -9,6 +9,9 @@ defmodule Redix.Telemetry do
+       connection to Redis. There are no measurements associated with this event.
+       Metadata are:
+ 
++      * `:cluster` - the cluster name (the atom passed as `:name` to
++        `Redix.Cluster.start_link/1`). Only cluster connections include this field.
++        *Available since v1.9.0*.
+       * `:connection` - the PID of the Redix connection that emitted the event.
+       * `:connection_name` - the name (passed to the `:name` option when the
+       connection is started) of the Redix connection that emitted the event.
+@@ -22,6 +25,9 @@ defmodule Redix.Telemetry do
+       with the Redis server. There are no measurements associated with
+       this event. Metadata are:
+ 
++      * `:cluster` - the cluster name (the atom passed as `:name` to
++        `Redix.Cluster.start_link/1`). Only cluster connections include this field.
++        *Available since v1.9.0*.
+       * `:connection` - the PID of the Redix connection that emitted the event.
+       * `:connection_name` - the name (passed to the `:name` option when the
+       * `:address` - the address the connection was connected to.
+@@ -34,6 +40,9 @@ defmodule Redix.Telemetry do
+       after a disconnection. There are no measurements associated with this event.
+       Metadata are:
+ 
++      * `:cluster` - the cluster name (the atom passed as `:name` to
++        `Redix.Cluster.start_link/1`). Only cluster connections include this field.
++        *Available since v1.9.0*.
+       * `:connection` - the PID of the Redix connection that emitted the event.
+       * `:connection_name` - the name (passed to the `:name` option when the
+         connection is started) of the Redix connection that emitted the event.
+diff --git a/test/redix/cluster/connection_telemetry_test.exs b/test/redix/cluster/connection_telemetry_test.exs
+new file mode 100644
+index 0000000..231ea6a
+--- /dev/null
++++ b/test/redix/cluster/connection_telemetry_test.exs
+@@ -0,0 +1,118 @@
++defmodule Redix.Cluster.ConnectionTelemetryTest do
++  use ExUnit.Case, async: true
++
++  alias Redix.Cluster.FakeNode
++
++  setup do
++    ref =
++      :telemetry_test.attach_event_handlers(self(), [
++        [:redix, :connection],
++        [:redix, :disconnection],
++        [:redix, :failed_connection]
++      ])
++
++    on_exit(fn -> :telemetry.detach(ref) end)
++
++    :ok
++  end
++
++  @tag :capture_log
++  test "primary and replica events keep the cluster name across reconnects and restarts" do
++    cluster = :"connection_telemetry_#{System.unique_integer([:positive])}"
++    primary = FakeNode.reserve()
++    replica = FakeNode.start(fn _command -> "+OK\r\n" end)
++
++    FakeNode.serve(primary, fn
++      ["CLUSTER", "SLOTS"] -> FakeNode.cluster_slots([{0, 16_383, primary, [replica]}])
++      _command -> "+OK\r\n"
++    end)
++
++    start_supervised!(
++      {Redix.Cluster,
++       name: cluster,
++       nodes: ["redis://#{primary}"],
++       password: "secret",
++       read_from_replicas: true,
++       primary_pool_size: 1,
++       replica_pool_size: 1,
++       backoff_initial: 10,
++       backoff_max: 10,
++       sync_connect: true}
++    )
++
++    registry = :"#{cluster}_registry"
++
++    for {node, role} <- [{primary, :primary}, {replica, :replica}] do
++      address = node.id
++
++      assert_receive {[:redix, :connection], _ref, %{},
++                      %{
++                        cluster: ^cluster,
++                        address: ^address,
++                        connection: conn,
++                        reconnection: false
++                      }}
++
++      assert Redix.command(conn, ["PING"]) == {:ok, "OK"}
++      assert [{^conn, {^role, :connected}}] = Registry.lookup(registry, {node.id, 0})
++
++      FakeNode.set_status(node, :down)
++      {:connected, data} = :sys.get_state(conn)
++      send(data.socket_owner, {:force_disconnect, conn, :test_socket_drop})
++
++      assert_receive {[:redix, :disconnection], _ref, %{},
++                      %{cluster: ^cluster, connection: ^conn, address: ^address}}
++
++      assert_receive {[:redix, :failed_connection], _ref, %{},
++                      %{cluster: ^cluster, connection: ^conn, address: ^address}}
++
++      FakeNode.set_status(node, :up)
++
++      assert_receive {[:redix, :connection], _ref, %{},
++                      %{cluster: ^cluster, connection: ^conn, reconnection: true}}
++
++      Process.exit(conn, :kill)
++
++      assert_receive {[:redix, :connection], _ref, %{},
++                      %{
++                        cluster: ^cluster,
++                        address: ^address,
++                        connection: replacement,
++                        reconnection: false
++                      }}
++
++      assert replacement != conn
++      assert Redix.command(replacement, ["PING"]) == {:ok, "OK"}
++      assert [{^replacement, {^role, :connected}}] = Registry.lookup(registry, {node.id, 0})
++    end
++  end
++
++  for sync_connect <- [true, false] do
++    test "standalone events omit the cluster name with sync_connect: #{sync_connect}" do
++      node = FakeNode.start(fn _command -> "+OK\r\n" end)
++
++      conn =
++        start_supervised!(
++          {Redix,
++           host: node.host,
++           port: node.port,
++           password: "secret",
++           backoff_initial: 10,
++           sync_connect: unquote(sync_connect)}
++        )
++
++      assert_receive {[:redix, :connection], _ref, %{}, %{connection: ^conn} = metadata}
++      refute Map.has_key?(metadata, :cluster)
++
++      FakeNode.set_status(node, :down)
++      {:connected, data} = :sys.get_state(conn)
++      send(data.socket_owner, {:force_disconnect, conn, :test_socket_drop})
++
++      assert_receive {[:redix, :disconnection], _ref, %{}, %{connection: ^conn} = metadata}
++      refute Map.has_key?(metadata, :cluster)
++
++      assert_receive {[:redix, :failed_connection], _ref, %{}, %{connection: ^conn} = metadata}
++      refute Map.has_key?(metadata, :cluster)
++    end
++  end
++end

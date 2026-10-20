@@ -1,0 +1,111 @@
+diff --git a/lib/ecto/uuid.ex b/lib/ecto/uuid.ex
+index 5473972eac..c74ff19200 100644
+--- a/lib/ecto/uuid.ex
++++ b/lib/ecto/uuid.ex
+@@ -374,4 +374,42 @@ defmodule Ecto.UUID do
+   defp e(13), do: ?d
+   defp e(14), do: ?e
+   defp e(15), do: ?f
++
++  @doc """
++  Converts the timestamp in the UUID to a datetime. Only works for UUID v7.
++
++  Raises `ArgumentError` for non-v7 UUIDs.
++  """
++  @spec to_datetime(binary()) :: DateTime.t()
++  def to_datetime(<<milliseconds::48, @version_7::4, _::76>>),
++    do: DateTime.from_unix!(milliseconds, :millisecond)
++
++  def to_datetime(<<_::48, version::4, _::76>>),
++    do: raise(ArgumentError, "to_datetime doesn't support UUID v#{version}")
++
++  def to_datetime(uuid), do: uuid |> dump!() |> to_datetime()
++
++  @doc """
++  Extracts the unix timestamp from the UUID. Only works for v7 UUIDs.
++
++  Raises `ArgumentError` for non-v7 UUIDs.
++  """
++  @spec to_unix(binary(), System.time_unit()) :: integer()
++  def to_unix(uuid, precision \\ :second)
++
++  def to_unix(<<unix::48, @version_7::4, _::76>>, precision),
++    do: System.convert_time_unit(unix, :millisecond, precision)
++
++  def to_unix(<<_::48, version::4, _::76>>, _precision),
++    do: raise(ArgumentError, "to_unix doesn't support UUID v#{version}")
++
++  def to_unix(uuid, precision),
++    do: uuid |> dump!() |> to_unix(precision)
++
++  @doc """
++  Returns the version number for the UUID.
++  """
++  @spec version(binary()) :: 1..8
++  def version(<<_::48, version::4, _::76>>), do: version
++  def version(<<_::288>> = uuid), do: uuid |> dump!() |> version()
+ end
+diff --git a/test/ecto/uuid_test.exs b/test/ecto/uuid_test.exs
+index b50cc1409c..98af0fb838 100644
+--- a/test/ecto/uuid_test.exs
++++ b/test/ecto/uuid_test.exs
+@@ -135,4 +135,59 @@ defmodule Ecto.UUIDTest do
+       Ecto.UUID.generate(version: 7, precision: :monotonic, foo: :bar)
+     end
+   end
++
++  test "to_datetime from uuid v7" do
++    {uuid, now} = uuidv7_now()
++    assert now == Ecto.UUID.to_datetime(uuid)
++
++    uuid = Ecto.UUID.generate(version: 7, precision: :monotonic)
++    assert %DateTime{} = Ecto.UUID.to_datetime(uuid)
++  end
++
++  test "to_datetime raises ArgumentError on UUID v4" do
++    assert_raise ArgumentError, "to_datetime doesn't support UUID v4", fn ->
++      Ecto.UUID.to_datetime(Ecto.UUID.generate())
++    end
++  end
++
++  test "to_unix" do
++    {uuid, now} = uuidv7_now()
++    assert DateTime.to_unix(now, :millisecond) == Ecto.UUID.to_unix(uuid, :millisecond)
++
++    assert num = Ecto.UUID.to_unix(Ecto.UUID.generate(version: 7), :millisecond)
++    assert {:ok, %DateTime{}} = DateTime.from_unix(num, :millisecond)
++
++    uuid = Ecto.UUID.generate(version: 7, precision: :monotonic)
++    assert num = Ecto.UUID.to_unix(uuid, :millisecond)
++
++    assert {:ok, %DateTime{}} = DateTime.from_unix(num, :millisecond)
++  end
++
++  test "to_unix with precision argument" do
++    {uuid, now} = uuidv7_now()
++    assert DateTime.to_unix(now, :second) == Ecto.UUID.to_unix(uuid, :second)
++  end
++
++  test "to_unix raises ArgumentError on UUID v4" do
++    assert_raise ArgumentError, "to_unix doesn't support UUID v4", fn ->
++      Ecto.UUID.to_unix(Ecto.UUID.generate())
++    end
++  end
++
++  test "extract version" do
++    assert 4 = Ecto.UUID.version(Ecto.UUID.generate())
++    assert 7 = Ecto.UUID.version(Ecto.UUID.generate(version: 7))
++
++    # It generalizes to other versions
++    assert 1 = Ecto.UUID.version("1df7a830-76ee-11f1-ab07-0242ac120002")
++    assert 8 = Ecto.UUID.version("10b0e08c-acaf-81c1-be47-8e84b7ea32ce")
++  end
++
++  defp uuidv7_now() do
++    now = DateTime.utc_now() |> DateTime.truncate(:millisecond)
++    timestamp = DateTime.to_unix(now, :millisecond)
++    <<rand_a::12, _::6, rand_b::62>> = :crypto.strong_rand_bytes(10)
++    uuid = <<timestamp::48, 7::4, rand_a::12, 2::2, rand_b::62>>
++    {uuid, now}
++  end
+ end

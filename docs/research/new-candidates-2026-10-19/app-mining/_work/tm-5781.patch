@@ -1,0 +1,3507 @@
+From ed1affed8c397958f11ca13b07bf522388fcfd91 Mon Sep 17 00:00:00 2001
+From: Jakob Lichterfeld <jakob-lichterfeld@gmx.de>
+Date: Thu, 24 Sep 2026 16:34:31 +0200
+Subject: [PATCH 1/5] fix(auth): no longer follow redirects when refreshing the
+ token, so the refresh token and the fleet token are never sent to another
+ host
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The token endpoint answers directly (RFC 6749 §5.1). Following a redirect resent the refresh token in the request body, and in fleet mode FleetAuth, listed after the redirect middleware, re-added the fleet token on every hop.
+A 3xx from the auth host now means a failed refresh and is logged as an error.
+
+Removes the copied FollowRedirects middleware together with its `except` option and TeslaApi.Auth.redirect_uri/0, both left over from the removed login flow.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md                                  |   1 +
+ elixir/lib/tesla_api/auth.ex                  |   5 +-
+ .../tesla_api/middleware/follow_redirects.ex  | 114 ------------------
+ elixir/test/tesla_api/auth/refresh_test.exs   |  39 ++++++
+ .../middleware/follow_redirects_test.exs      |  45 -------
+ 5 files changed, 41 insertions(+), 163 deletions(-)
+ delete mode 100644 elixir/lib/tesla_api/middleware/follow_redirects.ex
+ create mode 100644 elixir/test/tesla_api/auth/refresh_test.exs
+ delete mode 100644 elixir/test/tesla_api/middleware/follow_redirects_test.exs
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1b189598e7..f0bac0d367 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -34,6 +34,7 @@ Upgrading directly from 4.1.x no longer preserves entity registry customizations
+ - fix(web): show VIN and trim tooltips below the car title on mobile, so they no longer get cut off at the left edge (#5774 - @JakobLichterfeld)
+ - legal: add NOTICE and state AGPL-3.0-or-later consistently (#5777 - @JakobLichterfeld)
+ - legal: rewrite the trademark policy with definitions and an exhaustive list of permitted uses (#5777 - @JakobLichterfeld)
++- fix(auth): no longer follow redirects when refreshing the token, so the refresh token and the fleet token are never sent to another host (#5781 - @JakobLichterfeld)
+ 
+ #### Build, CI, internal
+ 
+diff --git a/elixir/lib/tesla_api/auth.ex b/elixir/lib/tesla_api/auth.ex
+index e7cb24923f..207ccd9bcd 100644
+--- a/elixir/lib/tesla_api/auth.ex
++++ b/elixir/lib/tesla_api/auth.ex
+@@ -2,10 +2,8 @@ defmodule TeslaApi.Auth do
+   alias TeslaApi.Error
+ 
+   @web_client_id "ownerapi"
+-  @redirect_uri "https://auth.tesla.com/void/callback"
+ 
+   def web_client_id, do: @web_client_id
+-  def redirect_uri, do: @redirect_uri
+ 
+   @default_headers [
+     {"user-agent", "TeslaMate/#{Mix.Project.config()[:version]}"},
+@@ -16,7 +14,6 @@ defmodule TeslaApi.Auth do
+   def client do
+     Tesla.client(
+       [
+-        {TeslaApi.Middleware.FollowRedirects, except: [@redirect_uri]},
+         {Tesla.Middleware.BaseUrl, System.get_env("TESLA_AUTH_HOST", "https://auth.tesla.com")},
+         {Tesla.Middleware.Headers, @default_headers},
+         Tesla.Middleware.JSON,
+@@ -101,7 +98,7 @@ defmodule TeslaApi.Auth do
+     end
+   end
+ 
+-  defp log_level({:ok, %Tesla.Env{} = env}) when env.status >= 400, do: :error
++  defp log_level({:ok, %Tesla.Env{} = env}) when env.status >= 300, do: :error
+   defp log_level({:ok, %Tesla.Env{}}), do: :info
+   defp log_level({:error, _reason}), do: :error
+ end
+diff --git a/elixir/lib/tesla_api/middleware/follow_redirects.ex b/elixir/lib/tesla_api/middleware/follow_redirects.ex
+deleted file mode 100644
+index 21d0aaf30f..0000000000
+--- a/elixir/lib/tesla_api/middleware/follow_redirects.ex
++++ /dev/null
+@@ -1,114 +0,0 @@
+-defmodule TeslaApi.Middleware.FollowRedirects do
+-  @moduledoc """
+-  Follow 3xx redirects
+-
+-  Source: https://github.com/teamon/tesla/blob/master/lib/tesla/middleware/follow_redirects.ex
+-
+-  ## Example
+-
+-  ```
+-  defmodule MyClient do
+-    use Tesla
+-
+-    plug Tesla.Middleware.FollowRedirects, max_redirects: 3, except: ["http:/www.example.com"]
+-  end
+-  ```
+-
+-  ## Options
+-
+-  - `:max_redirects` - limit number of redirects (default: `3`)
+-  - `:except` - redirect locations which should not be followed (default: `[]`)
+-
+-  """
+-
+-  @behaviour Tesla.Middleware
+-
+-  @max_redirects 3
+-  @redirect_statuses [301, 302, 303, 307, 308]
+-
+-  @impl Tesla.Middleware
+-  def call(env, next, opts \\ []) do
+-    max = Keyword.get([], :max_redirects, @max_redirects)
+-    except = opts[:except] || []
+-
+-    redirect(env, next, except, max)
+-  end
+-
+-  defp redirect(env, next, _except, left) when left == 0 do
+-    case Tesla.run(env, next) do
+-      {:ok, %{status: status} = env} when status not in @redirect_statuses ->
+-        {:ok, env}
+-
+-      {:ok, _env} ->
+-        {:error, {__MODULE__, :too_many_redirects}}
+-
+-      error ->
+-        error
+-    end
+-  end
+-
+-  defp redirect(env, next, except, left) do
+-    case Tesla.run(env, next) do
+-      {:ok, %{status: status} = res} when status in @redirect_statuses ->
+-        case Tesla.get_header(res, "location") do
+-          nil ->
+-            {:ok, res}
+-
+-          location ->
+-            if Enum.any?(except, &String.starts_with?(location, &1)) do
+-              {:ok, res}
+-            else
+-              prev_uri = URI.parse(env.url)
+-              next_uri = parse_location(location, res)
+-
+-              # Copy opts and query params from the response env,
+-              # these are not modified in the adapters, but middlewares
+-              # that come after might store state there
+-              env = %{env | opts: res.opts}
+-
+-              env
+-              |> filter_headers(prev_uri, next_uri)
+-              |> new_request(status, URI.to_string(next_uri))
+-              |> redirect(next, except, left - 1)
+-            end
+-        end
+-
+-      other ->
+-        other
+-    end
+-  end
+-
+-  # The 303 (See Other) redirect was added in HTTP/1.1 to indicate that the originally
+-  # requested resource is not available, however a related resource (or another redirect)
+-  # available via GET is available at the specified location.
+-  # https://tools.ietf.org/html/rfc7231#section-6.4.4
+-  defp new_request(env, 303, location), do: %{env | url: location, method: :get, query: []}
+-
+-  # The 307 (Temporary Redirect) status code indicates that the target
+-  # resource resides temporarily under a different URI and the user agent
+-  # MUST NOT change the request method (...)
+-  # https://tools.ietf.org/html/rfc7231#section-6.4.7
+-  defp new_request(env, 307, location), do: %{env | url: location}
+-
+-  defp new_request(env, _, location), do: %{env | url: location, query: []}
+-
+-  defp parse_location("https://" <> _rest = location, _env), do: URI.parse(location)
+-  defp parse_location("http://" <> _rest = location, _env), do: URI.parse(location)
+-  defp parse_location(location, env), do: env.url |> URI.parse() |> URI.merge(location)
+-
+-  # See https://github.com/teamon/tesla/issues/362
+-  # See https://github.com/teamon/tesla/issues/360
+-  @filter_headers ["authorization", "host"]
+-  defp filter_headers(env, prev, next) do
+-    if next.host != prev.host || next.port != prev.port || next.scheme != prev.scheme do
+-      %{env | headers: Enum.reject(env.headers, &filtered_header?/1)}
+-    else
+-      env
+-    end
+-  end
+-
+-  defp filtered_header?({key, _value}) when is_binary(key),
+-    do: key |> String.downcase() |> then(&(&1 in @filter_headers))
+-
+-  defp filtered_header?(_header), do: false
+-end
+diff --git a/elixir/test/tesla_api/auth/refresh_test.exs b/elixir/test/tesla_api/auth/refresh_test.exs
+new file mode 100644
+index 0000000000..a376b80d37
+--- /dev/null
++++ b/elixir/test/tesla_api/auth/refresh_test.exs
+@@ -0,0 +1,39 @@
++defmodule TeslaApi.Auth.RefreshTest do
++  use ExUnit.Case, async: false
++
++  import ExUnit.CaptureLog
++  import Mock
++
++  alias TeslaApi.Auth
++
++  @auth %Auth{token: "qts-access-token", refresh_token: "refresh-token"}
++
++  # The token endpoint answers directly (RFC 6749 §5.1). Following a redirect
++  # would resend the refresh token in the request body to the redirect target.
++  defp redirect_mock(pid) do
++    {Tesla.Adapter.Finch, [],
++     call: fn %Tesla.Env{} = env, _opts ->
++       send(pid, :request)
++       {:ok, %Tesla.Env{env | status: 302, headers: [{"location", "https://example.com/token"}]}}
++     end}
++  end
++
++  test "does not follow a redirect from the token endpoint" do
++    with_mocks [redirect_mock(self())] do
++      capture_log(fn ->
++        assert {:error, %TeslaApi.Error{reason: :token_refresh}} = Auth.refresh(@auth)
++      end)
++
++      assert_received :request
++      refute_received :request
++    end
++  end
++
++  test "logs a redirect from the token endpoint as a failed request" do
++    with_mocks [redirect_mock(self())] do
++      log = capture_log(fn -> Auth.refresh(@auth) end)
++
++      assert log =~ "-> 302"
++    end
++  end
++end
+diff --git a/elixir/test/tesla_api/middleware/follow_redirects_test.exs b/elixir/test/tesla_api/middleware/follow_redirects_test.exs
+deleted file mode 100644
+index 0382e144cc..0000000000
+--- a/elixir/test/tesla_api/middleware/follow_redirects_test.exs
++++ /dev/null
+@@ -1,45 +0,0 @@
+-defmodule TeslaApi.Middleware.FollowRedirectsTest do
+-  use ExUnit.Case, async: true
+-
+-  alias TeslaApi.Middleware.FollowRedirects
+-
+-  test "strips authorization and host headers case-insensitively on cross-origin redirects" do
+-    parent = self()
+-    secret = "secret-access-token"
+-
+-    adapter = fn
+-      %Tesla.Env{url: "https://owner-api.teslamotors.com/start"} = env ->
+-        {:ok,
+-         %{
+-           env
+-           | status: 302,
+-             headers: [{"location", "https://fleet-api.prd.na.vn.cloud.tesla.com/next"}]
+-         }}
+-
+-      %Tesla.Env{url: "https://fleet-api.prd.na.vn.cloud.tesla.com/next"} = env ->
+-        send(parent, {:redirected_headers, env.headers})
+-        {:ok, %{env | status: 200, headers: [], body: nil}}
+-    end
+-
+-    env = %Tesla.Env{
+-      method: :get,
+-      url: "https://owner-api.teslamotors.com/start",
+-      headers: [
+-        {"Authorization", "Bearer #{secret}"},
+-        {"authorization", "Bearer lowercase-token"},
+-        {"Host", "owner-api.teslamotors.com"},
+-        {"host", "owner-api.teslamotors.com"},
+-        {"x-request-id", "request-id"}
+-      ]
+-    }
+-
+-    assert {:ok, %Tesla.Env{status: 200}} = FollowRedirects.call(env, fn: adapter)
+-    assert_receive {:redirected_headers, headers}
+-
+-    refute {"Authorization", "Bearer #{secret}"} in headers
+-    refute {"authorization", "Bearer lowercase-token"} in headers
+-    refute {"Host", "owner-api.teslamotors.com"} in headers
+-    refute {"host", "owner-api.teslamotors.com"} in headers
+-    assert {"x-request-id", "request-id"} in headers
+-  end
+-end
+
+From 79f6a5da2d147eb5035e5f3569ad473bd114f0af Mon Sep 17 00:00:00 2001
+From: Jakob Lichterfeld <jakob-lichterfeld@gmx.de>
+Date: Thu, 24 Sep 2026 16:57:49 +0200
+Subject: [PATCH 2/5] fix(auth): tell rejected tokens apart from every other
+ refresh failure, so the sign-in page names the actual cause
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Only login_required (Tesla) and invalid_grant (RFC 6749 §5.2) now mean invalid tokens. Every other failure keeps its cause: another OAuth error, a redirect with its target, an HTTP status, a transport error, or a response without access token and lifetime, which previously raised or returned an empty token. Without a new refresh token the current one stays (RFC 6749 §6).
+
+The sign-in page shows "Token refresh failed: <cause>" for those, and goes to the vehicles instead of crashing when another tab signed in first. The unreachable account-locked message is removed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md                                  |   1 +
+ elixir/lib/tesla_api/auth/refresh.ex          |  85 +++++++++++--
+ .../teslamate_web/live/signin_live/index.ex   |  20 +--
+ elixir/priv/gettext/ca/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/da/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/de/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/default.pot               |  12 +-
+ elixir/priv/gettext/en/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/es/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/fi/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/fr/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/hu/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/it/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/ja/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/ko/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/nb/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/nl/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/sv/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/th/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/tr/LC_MESSAGES/default.po |  12 +-
+ elixir/priv/gettext/uk/LC_MESSAGES/default.po |  12 +-
+ .../gettext/zh_Hans/LC_MESSAGES/default.po    |  12 +-
+ .../gettext/zh_Hant/LC_MESSAGES/default.po    |  12 +-
+ elixir/test/support/mocks/api.ex              |   6 +-
+ elixir/test/tesla_api/auth/refresh_test.exs   | 119 +++++++++++++++---
+ .../test/teslamate_web/live/sign_in_test.exs  |  44 ++++++-
+ 26 files changed, 348 insertions(+), 167 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f0bac0d367..14af98a533 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -35,6 +35,7 @@ Upgrading directly from 4.1.x no longer preserves entity registry customizations
+ - legal: add NOTICE and state AGPL-3.0-or-later consistently (#5777 - @JakobLichterfeld)
+ - legal: rewrite the trademark policy with definitions and an exhaustive list of permitted uses (#5777 - @JakobLichterfeld)
+ - fix(auth): no longer follow redirects when refreshing the token, so the refresh token and the fleet token are never sent to another host (#5781 - @JakobLichterfeld)
++- fix(auth): tell rejected tokens apart from every other refresh failure, so the sign-in page names the actual cause (#5781 - @JakobLichterfeld)
+ 
+ #### Build, CI, internal
+ 
+diff --git a/elixir/lib/tesla_api/auth/refresh.ex b/elixir/lib/tesla_api/auth/refresh.ex
+index b98c8211b7..ff5dcf5dc3 100644
+--- a/elixir/lib/tesla_api/auth/refresh.ex
++++ b/elixir/lib/tesla_api/auth/refresh.ex
+@@ -5,6 +5,11 @@ defmodule TeslaApi.Auth.Refresh do
+ 
+   @web_client_id TeslaApi.Auth.web_client_id()
+ 
++  # OAuth error codes meaning the refresh token can no longer be used:
++  # invalid_grant per RFC 6749 §5.2, and login_required, which Tesla documents
++  # for an expired or cycled-out refresh token and after a password reset.
++  @invalid_token_errors ~w(invalid_grant login_required)
++
+   def refresh(%Auth{} = auth) do
+     issuer_url =
+       if System.get_env("TESLA_AUTH_HOST", "") == "" do
+@@ -20,20 +25,76 @@ defmodule TeslaApi.Auth.Refresh do
+       refresh_token: auth.refresh_token
+     }
+ 
+-    case post("#{issuer_url}/token", data) do
+-      {:ok, %Tesla.Env{status: 200, body: body}} ->
+-        auth = %Auth{
+-          token: body["access_token"],
+-          type: body["token_type"],
+-          expires_in: body["expires_in"],
+-          refresh_token: body["refresh_token"],
+-          created_at: body["created_at"]
+-        }
++    "#{issuer_url}/token"
++    |> post(data)
++    |> handle_response(auth)
++  end
++
++  defp handle_response(
++         {:ok,
++          %Tesla.Env{
++            status: 200,
++            body: %{"access_token" => token, "expires_in" => expires_in} = body
++          }},
++         auth
++       )
++       when is_binary(token) and is_integer(expires_in) do
++    {:ok,
++     %Auth{
++       token: token,
++       type: body["token_type"],
++       expires_in: expires_in,
++       # RFC 6749 §6: without a new refresh token the current one stays valid.
++       refresh_token: body["refresh_token"] || auth.refresh_token,
++       created_at: body["created_at"]
++     }}
++  end
++
++  defp handle_response({:ok, %Tesla.Env{body: %{"error" => code} = body} = env}, _auth)
++       when code in @invalid_token_errors,
++       do: error(:invalid_tokens, oauth_message(code, body), env)
++
++  defp handle_response({:ok, %Tesla.Env{status: status} = env}, _auth) when status in 300..399,
++    do: error(:token_refresh, redirect_message(env), env)
++
++  defp handle_response({:ok, %Tesla.Env{status: 200} = env}, _auth),
++    do: error(:token_refresh, "invalid token response", env)
++
++  defp handle_response({:ok, %Tesla.Env{body: %{"error" => code} = body} = env}, _auth)
++       when is_binary(code),
++       do: error(:token_refresh, oauth_message(code, body), env)
+ 
+-        {:ok, auth}
++  defp handle_response({:ok, %Tesla.Env{status: status} = env}, _auth),
++    do: error(:token_refresh, "HTTP #{status}", env)
+ 
+-      error ->
+-        Error.into(error, :token_refresh)
++  defp handle_response({:error, {Tesla.Middleware.JSON, :decode, _reason}}, _auth),
++    do: error(:token_refresh, "invalid token response", nil)
++
++  defp handle_response({:error, reason}, _auth),
++    do: error(:token_refresh, transport_message(reason), nil)
++
++  defp error(reason, message, env) do
++    {:error, Error.redacted(%Error{reason: reason, message: message, env: env})}
++  end
++
++  defp oauth_message(code, %{"error_description" => description}) when is_binary(description),
++    do: "#{code}: #{description}"
++
++  defp oauth_message(code, _body), do: code
++
++  # Without query and fragment, which can carry credentials.
++  defp redirect_message(%Tesla.Env{} = env) do
++    case Tesla.get_header(env, "location") do
++      nil ->
++        "HTTP #{env.status}"
++
++      location ->
++        %URI{} = target = URI.merge(env.url, location)
++        "redirected to #{%URI{target | query: nil, fragment: nil}}"
+     end
+   end
++
++  defp transport_message(reason) when is_exception(reason), do: Exception.message(reason)
++  defp transport_message(reason) when is_atom(reason), do: Atom.to_string(reason)
++  defp transport_message(reason), do: inspect(reason)
+ end
+diff --git a/elixir/lib/teslamate_web/live/signin_live/index.ex b/elixir/lib/teslamate_web/live/signin_live/index.ex
+index d66d43fd2a..9fd85acf76 100644
+--- a/elixir/lib/teslamate_web/live/signin_live/index.ex
++++ b/elixir/lib/teslamate_web/live/signin_live/index.ex
+@@ -51,22 +51,14 @@ defmodule TeslaMateWeb.SignInLive.Index do
+         Process.sleep(250)
+         {:noreply, redirect_to_carlive(socket)}
+ 
+-      {:error, %TeslaApi.Error{} = e} ->
+-        message =
+-          case e.reason do
+-            :token_refresh ->
+-              gettext("Tokens are invalid")
+-
+-            :account_locked ->
+-              gettext(
+-                "Your Tesla account is locked due to too many failed sign in attempts. " <>
+-                  "To unlock your account, reset your password"
+-              )
++      {:error, :already_signed_in} ->
++        {:noreply, redirect(socket, to: Routes.car_path(socket, :index))}
+ 
+-            _ ->
+-              Exception.message(e)
+-          end
++      {:error, %TeslaApi.Error{reason: :invalid_tokens}} ->
++        {:noreply, assign(socket, error: gettext("Tokens are invalid"), task: nil)}
+ 
++      {:error, %TeslaApi.Error{} = e} ->
++        message = gettext("Token refresh failed: %{reason}", reason: Exception.message(e))
+         {:noreply, assign(socket, error: message, task: nil)}
+     end
+   end
+diff --git a/elixir/priv/gettext/ca/LC_MESSAGES/default.po b/elixir/priv/gettext/ca/LC_MESSAGES/default.po
+index 910beb1645..57afc1fd12 100644
+--- a/elixir/priv/gettext/ca/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/ca/LC_MESSAGES/default.po
+@@ -194,7 +194,7 @@ msgstr "Temps intentant entrar en repòs"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Autenticat correctament"
+@@ -603,11 +603,6 @@ msgstr "Per a obtenir tokens a través de l'API de Tesla cal tenir experiència
+ msgid "here"
+ msgstr "aquí"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr "El vostre compte de Tesla s'ha bloquejat per massa intents d'accés. Per a recuperar l'accés, restabliu la contrasenya."
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -954,3 +949,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/da/LC_MESSAGES/default.po b/elixir/priv/gettext/da/LC_MESSAGES/default.po
+index e13c991b0a..89ac7d6d99 100644
+--- a/elixir/priv/gettext/da/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/da/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Tid indtil forsøg på at sove"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Logget ind"
+@@ -602,11 +602,6 @@ msgstr ""
+ msgid "here"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr ""
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -951,3 +946,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/de/LC_MESSAGES/default.po b/elixir/priv/gettext/de/LC_MESSAGES/default.po
+index c1ef5b528b..fd011859df 100644
+--- a/elixir/priv/gettext/de/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/de/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Dauer des Schlafversuchs"
+ msgid "min"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Erfolgreich angemeldet"
+@@ -602,11 +602,6 @@ msgstr "Der Abruf von Tokens über die Tesla-API erfordert Programmierkenntnisse
+ msgid "here"
+ msgstr "hier"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr "Dein Tesla-Konto ist aufgrund von zu vielen fehlgeschlagenen Anmeldeversuchen gesperrt. Um das Konto zu entsperren, setze dein Kennwort zurück"
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -951,3 +946,8 @@ msgstr "Ein Fahrzeug konnte nicht in der Datenbank gespeichert werden. Bitte pr
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr "Freie Software unter der AGPL-3.0-or-later, OHNE JEGLICHE GEWÄHRLEISTUNG; du darfst sie unter ihren Bedingungen weitergeben"
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr "Token-Aktualisierung fehlgeschlagen: %{reason}"
+diff --git a/elixir/priv/gettext/default.pot b/elixir/priv/gettext/default.pot
+index a239e8d679..6bee24ed14 100644
+--- a/elixir/priv/gettext/default.pot
++++ b/elixir/priv/gettext/default.pot
+@@ -195,7 +195,7 @@ msgstr ""
+ msgid "min"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr ""
+@@ -602,11 +602,6 @@ msgstr ""
+ msgid "here"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr ""
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -951,3 +946,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/en/LC_MESSAGES/default.po b/elixir/priv/gettext/en/LC_MESSAGES/default.po
+index cc9212fdfd..45db39a4bb 100644
+--- a/elixir/priv/gettext/en/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/en/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr ""
+ msgid "min"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr ""
+@@ -602,11 +602,6 @@ msgstr ""
+ msgid "here"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr ""
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -951,3 +946,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/es/LC_MESSAGES/default.po b/elixir/priv/gettext/es/LC_MESSAGES/default.po
+index 0972a77e59..982033bf1a 100644
+--- a/elixir/priv/gettext/es/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/es/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Duración del intento de reposo"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Sesión iniciada correctamente"
+@@ -602,11 +602,6 @@ msgstr "La generación de tokens por medio del API de Tesla requiere habilidades
+ msgid "here"
+ msgstr "aquí"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr "Su cuenta de Tesla se ha bloqueado por demasiados intentos fallidos de inicio de sesión. Para desbloquearla debe crear una nueva contraseña."
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -951,3 +946,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/fi/LC_MESSAGES/default.po b/elixir/priv/gettext/fi/LC_MESSAGES/default.po
+index 010875cb41..f721b34fe4 100644
+--- a/elixir/priv/gettext/fi/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/fi/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Lepotilaan menon kesto"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Kirjauduttu sisään onnistuneesti"
+@@ -602,11 +602,6 @@ msgstr ""
+ msgid "here"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr ""
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -951,3 +946,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/fr/LC_MESSAGES/default.po b/elixir/priv/gettext/fr/LC_MESSAGES/default.po
+index ca27ed9ce3..422a03e939 100644
+--- a/elixir/priv/gettext/fr/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/fr/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Temps avant d'essayer de dormir"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Connecté avec succès"
+@@ -602,11 +602,6 @@ msgstr "L'obtention de jetons via l'API Tesla nécessite une expérience de prog
+ msgid "here"
+ msgstr "ici"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr "Votre compte Tesla est verrouillé en raison d'un trop grand nombre de tentatives de connexion infructueuses. Pour déverrouiller votre compte, réinitialisez votre mot de passe"
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -951,3 +946,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/hu/LC_MESSAGES/default.po b/elixir/priv/gettext/hu/LC_MESSAGES/default.po
+index f9d2c40dc8..1e125d963e 100644
+--- a/elixir/priv/gettext/hu/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/hu/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Idő az elalvási próbálkozásig"
+ msgid "min"
+ msgstr "perc"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Sikeres bejelentkezés"
+@@ -602,11 +602,6 @@ msgstr "A Tesla API-n keresztüli tokenek beszerzéséhez programozási tapaszta
+ msgid "here"
+ msgstr "itt"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr "A Tesla-fiókod túl sok sikertelen bejelentkezési kísérlet miatt zárolva van. A feloldáshoz állítsd vissza a jelszavadat"
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -951,3 +946,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/it/LC_MESSAGES/default.po b/elixir/priv/gettext/it/LC_MESSAGES/default.po
+index d9bce345b6..e2e3c5098b 100644
+--- a/elixir/priv/gettext/it/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/it/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Tempo prima di tentare la sospensione"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Accesso effettuato"
+@@ -602,11 +602,6 @@ msgstr "Ottenere i token tramite le API Tesla richede esperienza nel campo della
+ msgid "here"
+ msgstr "qui"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr "Il tuo account Tesla è bloccato a causa di troppi tentativi di accesso. Per sbloccare il tuo account, esegui il reset della tua password"
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -951,3 +946,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/ja/LC_MESSAGES/default.po b/elixir/priv/gettext/ja/LC_MESSAGES/default.po
+index f9749b0559..9d768429ce 100644
+--- a/elixir/priv/gettext/ja/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/ja/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "スリープ実行時間"
+ msgid "min"
+ msgstr "分"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "サインイン成功"
+@@ -602,11 +602,6 @@ msgstr "Tesla APIを介してトークンを取得するには、プログラミ
+ msgid "here"
+ msgstr "ここ"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr "サインインの試行に失敗した回数が多すぎるため、Teslaアカウントがロックされています。 アカウントのロックを解除するには、パスワードをリセットしてください"
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -950,3 +945,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/ko/LC_MESSAGES/default.po b/elixir/priv/gettext/ko/LC_MESSAGES/default.po
+index e0d7803457..8da4d7ec2a 100644
+--- a/elixir/priv/gettext/ko/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/ko/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "절전 시도 시간"
+ msgid "min"
+ msgstr "분"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "로그인 성공"
+@@ -602,11 +602,6 @@ msgstr "Tesla API 토큰을 얻으러면 프로그래밍 경험이나 서드파
+ msgid "here"
+ msgstr "이곳"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr "너무 많은 로그인 실패로 Tesla 계정이 잠겼습니다. 계정 잠금을 해제하려면 비밀번호를 재설정하세요."
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -950,3 +945,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/nb/LC_MESSAGES/default.po b/elixir/priv/gettext/nb/LC_MESSAGES/default.po
+index eda1ab98da..bdebbc4d31 100644
+--- a/elixir/priv/gettext/nb/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/nb/LC_MESSAGES/default.po
+@@ -196,7 +196,7 @@ msgstr "Tid for forsøk på dvale"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Innlogget"
+@@ -603,11 +603,6 @@ msgstr ""
+ msgid "here"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr ""
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -952,3 +947,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/nl/LC_MESSAGES/default.po b/elixir/priv/gettext/nl/LC_MESSAGES/default.po
+index c7053130d2..f2e2077daf 100644
+--- a/elixir/priv/gettext/nl/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/nl/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Tijd om te proberen te slapen"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Succesvol ingelogd"
+@@ -602,11 +602,6 @@ msgstr ""
+ msgid "here"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr ""
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -951,3 +946,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/sv/LC_MESSAGES/default.po b/elixir/priv/gettext/sv/LC_MESSAGES/default.po
+index fdb2c4be34..a24592da15 100644
+--- a/elixir/priv/gettext/sv/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/sv/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Tid för försök att gå ner i vila"
+ msgid "min"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Inloggad"
+@@ -602,11 +602,6 @@ msgstr "För att få tokens via Tesla API krävs programmeringserfarenhet eller
+ msgid "here"
+ msgstr "här"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr "Ditt Tesla-konto är låst på grund av för många misslyckade inloggningsförsök. Återställ ditt lösenord för att låsa upp ditt konto"
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -951,3 +946,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/th/LC_MESSAGES/default.po b/elixir/priv/gettext/th/LC_MESSAGES/default.po
+index 6aa428fd50..25fef52ace 100644
+--- a/elixir/priv/gettext/th/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/th/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "จำนวนครั้งที่รถพยายามเข้
+ msgid "min"
+ msgstr "นาที"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "ลงชื่อเข้าใช้เรียบร้อย"
+@@ -601,11 +601,6 @@ msgstr "การได้รับโทเค็นผ่าน Tesla API ต
+ msgid "here"
+ msgstr "ที่นี่"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr "บัญชี Tesla ของคุณถูกล็อคเนื่องจากการพยายามลงชื่อเข้าใช้ที่ล้มเหลวหลายครั้งเกินไป หากต้องการปลดล็อคบัญชีของคุณ ให้รีเซ็ตรหัสผ่านของคุณ"
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -949,3 +944,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/tr/LC_MESSAGES/default.po b/elixir/priv/gettext/tr/LC_MESSAGES/default.po
+index b1092b0474..cc567ec4f7 100644
+--- a/elixir/priv/gettext/tr/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/tr/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Uykuya Dalmayı Deneme Zamanı"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Oturum başarıyla açıldı"
+@@ -602,11 +602,6 @@ msgstr ""
+ msgid "here"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr ""
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -951,3 +946,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/uk/LC_MESSAGES/default.po b/elixir/priv/gettext/uk/LC_MESSAGES/default.po
+index 5e97082208..c543ff1423 100644
+--- a/elixir/priv/gettext/uk/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/uk/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Час до спроби заснути"
+ msgid "min"
+ msgstr "мінімум"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Вхід успішний"
+@@ -604,11 +604,6 @@ msgstr "Для отримання токенів через API Tesla вимаг
+ msgid "here"
+ msgstr "тут"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr "Ваш аккаунт Тесла заблоковано через дуже велику кількість невдалих спроб входу. Щоб розблокувати свій аккаунт, відновіть свій пароль"
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -954,3 +949,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po b/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po
+index ce823b8b65..23f1f040e3 100644
+--- a/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po
+@@ -196,7 +196,7 @@ msgstr "尝试进入睡眠用时"
+ msgid "min"
+ msgstr "分钟"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "登录成功"
+@@ -603,11 +603,6 @@ msgstr "通过 Tesla API 获得令牌需要有编程经验或者借助第三方
+ msgid "here"
+ msgstr "这里"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr "您的 Tesla 帐户因登录尝试失败次数过多而被锁定。要解锁您的帐户，请重置您的密码"
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -951,3 +946,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po b/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po
+index 4e2e8dffc8..fdd26fae0c 100644
+--- a/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "嘗試休眠前的等待時間"
+ msgid "min"
+ msgstr "分鐘"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:83
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "登入成功"
+@@ -600,11 +600,6 @@ msgstr "透過 Tesla API 取得權杖，需要具備程式設計經驗或使用
+ msgid "here"
+ msgstr "這裡"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
+-#, elixir-autogen, elixir-format
+-msgid "Your Tesla account is locked due to too many failed sign in attempts. To unlock your account, reset your password"
+-msgstr "您的 Tesla 帳號因登入失敗次數過多而被鎖定。若要解除鎖定，請重設密碼。"
+-
+ #: lib/teslamate_web/live/car_live/summary.ex:160
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+@@ -948,3 +943,8 @@ msgstr ""
+ #, elixir-autogen, elixir-format
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:61
++#, elixir-autogen, elixir-format
++msgid "Token refresh failed: %{reason}"
++msgstr ""
+diff --git a/elixir/test/support/mocks/api.ex b/elixir/test/support/mocks/api.ex
+index bfd60fd876..cc6fbe3601 100644
+--- a/elixir/test/support/mocks/api.ex
++++ b/elixir/test/support/mocks/api.ex
+@@ -11,6 +11,7 @@ defmodule ApiMock do
+       :last_served,
+       :stub,
+       :stub_ref,
++      sign_in: :ok,
+       calls: [],
+       interactions: []
+     ]
+@@ -46,7 +47,8 @@ defmodule ApiMock do
+     state = %State{
+       pid: Keyword.fetch!(opts, :pid),
+       events: Keyword.get(opts, :events, []),
+-      vehicle: Keyword.get(opts, :vehicle)
++      vehicle: Keyword.get(opts, :vehicle),
++      sign_in: Keyword.get(opts, :sign_in, :ok)
+     }
+ 
+     {:ok, state}
+@@ -135,7 +137,7 @@ defmodule ApiMock do
+ 
+   def handle_call({:sign_in, _tokens} = event, _from, %State{pid: pid} = state) do
+     send(pid, {ApiMock, event})
+-    {:reply, :ok, state}
++    {:reply, state.sign_in, state}
+   end
+ 
+   def handle_call({:stream, _vid, receiver} = event, _from, %State{} = state) do
+diff --git a/elixir/test/tesla_api/auth/refresh_test.exs b/elixir/test/tesla_api/auth/refresh_test.exs
+index a376b80d37..14486008db 100644
+--- a/elixir/test/tesla_api/auth/refresh_test.exs
++++ b/elixir/test/tesla_api/auth/refresh_test.exs
+@@ -4,36 +4,127 @@ defmodule TeslaApi.Auth.RefreshTest do
+   import ExUnit.CaptureLog
+   import Mock
+ 
+-  alias TeslaApi.Auth
++  alias TeslaApi.{Auth, Error}
+ 
+   @auth %Auth{token: "qts-access-token", refresh_token: "refresh-token"}
+ 
+-  # The token endpoint answers directly (RFC 6749 §5.1). Following a redirect
+-  # would resend the refresh token in the request body to the redirect target.
+-  defp redirect_mock(pid) do
++  defp adapter_mock(pid, response) do
+     {Tesla.Adapter.Finch, [],
+      call: fn %Tesla.Env{} = env, _opts ->
+        send(pid, :request)
+-       {:ok, %Tesla.Env{env | status: 302, headers: [{"location", "https://example.com/token"}]}}
++
++       case response do
++         {:error, _reason} = error -> error
++         fields -> {:ok, struct(env, Keyword.merge([headers: []], fields))}
++       end
+      end}
+   end
+ 
+-  test "does not follow a redirect from the token endpoint" do
+-    with_mocks [redirect_mock(self())] do
+-      capture_log(fn ->
+-        assert {:error, %TeslaApi.Error{reason: :token_refresh}} = Auth.refresh(@auth)
+-      end)
++  # Returns the result and the log of one refresh against the given response.
++  defp refresh(response) do
++    with_mocks [adapter_mock(self(), response)] do
++      with_log(fn -> Auth.refresh(@auth) end)
++    end
++  end
++
++  describe "a successful response" do
++    test "returns the new tokens" do
++      body = %{
++        "access_token" => "access",
++        "refresh_token" => "new-refresh",
++        "expires_in" => 28_800
++      }
++
++      assert {{:ok, %Auth{token: "access", refresh_token: "new-refresh", expires_in: 28_800}}, _} =
++               refresh(status: 200, body: body)
++    end
++
++    # RFC 6749 §6
++    test "keeps the current refresh token if the response brings no new one" do
++      body = %{"access_token" => "access", "expires_in" => 28_800}
++
++      assert {{:ok, %Auth{token: "access", refresh_token: "refresh-token"}}, _} =
++               refresh(status: 200, body: body)
++    end
+ 
++    test "without an access token or its lifetime is an invalid response" do
++      for response <- [
++            [status: 200, body: %{"expires_in" => 28_800}],
++            [status: 200, body: %{"access_token" => "access"}],
++            [status: 200, headers: [{"content-type", "text/html"}], body: "<html></html>"],
++            [status: 200, headers: [{"content-type", "application/json"}], body: "<html>"]
++          ] do
++        assert {{:error, %Error{reason: :token_refresh, message: "invalid token response"}}, _} =
++                 refresh(response)
++      end
++    end
++  end
++
++  describe "rejected tokens" do
++    test "login_required, which Tesla answers for an expired or cycled-out refresh token" do
++      body = %{
++        "error" => "login_required",
++        "error_description" => "The refresh_token is invalid."
++      }
++
++      assert {{:error, %Error{reason: :invalid_tokens} = error}, _} =
++               refresh(status: 401, body: body)
++
++      assert error.message == "login_required: The refresh_token is invalid."
++    end
++
++    test "invalid_grant" do
++      assert {{:error, %Error{reason: :invalid_tokens, message: "invalid_grant"}}, _} =
++               refresh(status: 400, body: %{"error" => "invalid_grant"})
++    end
++  end
++
++  describe "any other failure names its cause" do
++    test "another OAuth error" do
++      body = %{"error" => "invalid_client", "error_description" => "Unknown client."}
++
++      assert {{:error,
++               %Error{reason: :token_refresh, message: "invalid_client: Unknown client."}}, _} =
++               refresh(status: 401, body: body)
++    end
++
++    # The token endpoint answers directly (RFC 6749 §5.1). Following a redirect
++    # would resend the refresh token in the request body to the redirect target.
++    test "a redirect is not followed" do
++      location = "https://example.com/token?refresh_token=secret"
++
++      assert {{:error, %Error{reason: :token_refresh, message: message}}, _} =
++               refresh(status: 302, headers: [{"location", location}])
++
++      assert message == "redirected to https://example.com/token"
+       assert_received :request
+       refute_received :request
+     end
+-  end
+ 
+-  test "logs a redirect from the token endpoint as a failed request" do
+-    with_mocks [redirect_mock(self())] do
+-      log = capture_log(fn -> Auth.refresh(@auth) end)
++    test "a relative redirect names the resolved target" do
++      assert {{:error, %Error{message: "redirected to https://auth.tesla.com/moved"}}, _} =
++               refresh(status: 301, headers: [{"location", "/moved"}])
++    end
++
++    test "a redirect without a location names the status" do
++      assert {{:error, %Error{reason: :token_refresh, message: "HTTP 307"}}, _} =
++               refresh(status: 307, headers: [])
++    end
++
++    test "a redirect is logged as a failed request" do
++      {_result, log} = refresh(status: 302, headers: [{"location", "https://example.com/token"}])
+ 
+       assert log =~ "-> 302"
+     end
++
++    test "a server error" do
++      assert {{:error, %Error{reason: :token_refresh, message: "HTTP 503"}}, _} =
++               refresh(status: 503, body: "")
++    end
++
++    test "a transport error" do
++      assert {{:error, %Error{reason: :token_refresh, message: "timeout"}}, _} =
++               refresh({:error, %Mint.TransportError{reason: :timeout}})
++    end
+   end
+ end
+diff --git a/elixir/test/teslamate_web/live/sign_in_test.exs b/elixir/test/teslamate_web/live/sign_in_test.exs
+index dc0ca82dbe..31425069db 100644
+--- a/elixir/test/teslamate_web/live/sign_in_test.exs
++++ b/elixir/test/teslamate_web/live/sign_in_test.exs
+@@ -1,21 +1,24 @@
+ defmodule TeslaMateWeb.SignInLiveTest do
+   use TeslaMateWeb.ConnCase
+ 
+-  defp start_api(name) do
++  import TestHelper, only: [eventually: 1]
++
++  defp start_api(name, sign_in) do
+     api_name = :"api_#{name}"
+ 
+-    {:ok, _pid} = start_supervised({ApiMock, name: api_name, pid: self()})
++    {:ok, _pid} = start_supervised({ApiMock, name: api_name, pid: self(), sign_in: sign_in})
+ 
+     %{api: {ApiMock, api_name}}
+   end
+ 
+-  setup %{test: name, conn: conn} do
+-    params = start_api(name)
++  # The reply of the API's sign-in comes from the test's :sign_in tag.
++  setup %{test: name, conn: conn} = context do
++    params = start_api(name, Map.get(context, :sign_in, :ok))
+     conn = put_connect_params(conn, params)
+     [conn: conn]
+   end
+ 
+-  test "signs in with api tokens", %{conn: conn} do
++  defp submit_tokens(conn) do
+     assert {:ok, view, _html} = live(conn, "/sign_in")
+ 
+     render_change(view, :validate, %{tokens: %{access: "$access", refresh: "$refresh"}})
+@@ -24,6 +27,37 @@ defmodule TeslaMateWeb.SignInLiveTest do
+     assert_receive {ApiMock,
+                     {:sign_in, %TeslaMate.Auth.Tokens{access: "$access", refresh: "$refresh"}}}
+ 
++    view
++  end
++
++  test "signs in with api tokens", %{conn: conn} do
++    view = submit_tokens(conn)
++
++    assert_redirect(view, "/", 1000)
++  end
++
++  @tag sign_in: {:error, %TeslaApi.Error{reason: :invalid_tokens, message: "login_required"}}
++  test "says the tokens are invalid if the auth server rejects them", %{conn: conn} do
++    view = submit_tokens(conn)
++
++    eventually(fn -> assert render(view) =~ "Tokens are invalid" end)
++  end
++
++  @tag sign_in:
++         {:error,
++          %TeslaApi.Error{reason: :token_refresh, message: "redirected to https://example.com"}}
++  test "names the cause if the tokens could not be checked", %{conn: conn} do
++    view = submit_tokens(conn)
++
++    eventually(fn ->
++      assert render(view) =~ "Token refresh failed: redirected to https://example.com"
++    end)
++  end
++
++  @tag sign_in: {:error, :already_signed_in}
++  test "goes to the vehicles if already signed in", %{conn: conn} do
++    view = submit_tokens(conn)
++
+     assert_redirect(view, "/", 1000)
+   end
+ end
+
+From 311bdb12f78f539fab25a136735462aa66014fd5 Mon Sep 17 00:00:00 2001
+From: Jakob Lichterfeld <jakob-lichterfeld@gmx.de>
+Date: Thu, 24 Sep 2026 17:05:37 +0200
+Subject: [PATCH 3/5] fix(web): report a sign-in that exits instead of crashing
+ the sign-in page
+
+The sign-in ran in a linked Task.async, so an exit of the API call took the page down with it, and a second submit left the first result without a matching clause. It now runs through start_async: an exit is logged and the page says "Sign in failed, see the logs for details"; a submit while signing in is ignored.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md                                  |  1 +
+ .../teslamate_web/live/signin_live/index.ex   | 52 ++++++++++++-------
+ .../live/signin_live/index.html.heex          |  6 +--
+ elixir/priv/gettext/ca/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/da/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/de/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/default.pot               | 13 +++--
+ elixir/priv/gettext/en/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/es/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/fi/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/fr/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/hu/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/it/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/ja/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/ko/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/nb/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/nl/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/sv/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/th/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/tr/LC_MESSAGES/default.po | 13 +++--
+ elixir/priv/gettext/uk/LC_MESSAGES/default.po | 13 +++--
+ .../gettext/zh_Hans/LC_MESSAGES/default.po    | 13 +++--
+ .../gettext/zh_Hant/LC_MESSAGES/default.po    | 13 +++--
+ elixir/test/support/mocks/api.ex              |  6 ++-
+ .../test/teslamate_web/live/sign_in_test.exs  |  8 +++
+ 25 files changed, 229 insertions(+), 104 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 14af98a533..ba3b0c735e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -36,6 +36,7 @@ Upgrading directly from 4.1.x no longer preserves entity registry customizations
+ - legal: rewrite the trademark policy with definitions and an exhaustive list of permitted uses (#5777 - @JakobLichterfeld)
+ - fix(auth): no longer follow redirects when refreshing the token, so the refresh token and the fleet token are never sent to another host (#5781 - @JakobLichterfeld)
+ - fix(auth): tell rejected tokens apart from every other refresh failure, so the sign-in page names the actual cause (#5781 - @JakobLichterfeld)
++- fix(web): report a sign-in that exits instead of crashing the sign-in page (#5781 - @JakobLichterfeld)
+ 
+ #### Build, CI, internal
+ 
+diff --git a/elixir/lib/teslamate_web/live/signin_live/index.ex b/elixir/lib/teslamate_web/live/signin_live/index.ex
+index 9fd85acf76..b937e7c393 100644
+--- a/elixir/lib/teslamate_web/live/signin_live/index.ex
++++ b/elixir/lib/teslamate_web/live/signin_live/index.ex
+@@ -4,6 +4,8 @@ defmodule TeslaMateWeb.SignInLive.Index do
+   import Core.Dependency, only: [call: 3]
+   alias TeslaMate.{Auth, Api}
+ 
++  require Logger
++
+   on_mount {TeslaMateWeb.InitAssigns, :locale}
+ 
+   @impl true
+@@ -12,7 +14,7 @@ defmodule TeslaMateWeb.SignInLive.Index do
+       api: get_api(socket),
+       page_title: gettext("Sign in"),
+       error: nil,
+-      task: nil,
++      signing_in: false,
+       changeset: Auth.change_tokens(),
+       token: System.get_env("TOKEN", ""),
+       provider: System.get_env("TESLA_AUTH_HOST", "https://auth.tesla.com")
+@@ -31,36 +33,46 @@ defmodule TeslaMateWeb.SignInLive.Index do
+     {:noreply, assign(socket, changeset: changeset, error: nil)}
+   end
+ 
++  # One sign-in at a time.
++  def handle_event("sign_in", _, %{assigns: %{signing_in: true}} = socket), do: {:noreply, socket}
++
+   def handle_event("sign_in", _, socket) do
+     tokens = Ecto.Changeset.apply_changes(socket.assigns.changeset)
++    api = socket.assigns.api
+ 
+-    task =
+-      Task.async(fn ->
+-        call(socket.assigns.api, :sign_in, [tokens])
+-      end)
++    socket =
++      socket
++      |> assign(signing_in: true)
++      |> start_async(:sign_in, fn -> call(api, :sign_in, [tokens]) end)
+ 
+-    {:noreply, assign(socket, task: task)}
++    {:noreply, socket}
+   end
+ 
+   @impl true
+-  def handle_info({ref, result}, %{assigns: %{task: %Task{ref: ref}}} = socket) do
+-    Process.demonitor(ref, [:flush])
++  def handle_async(:sign_in, {:ok, :ok}, socket) do
++    Process.sleep(250)
++    {:noreply, redirect_to_carlive(socket)}
++  end
+ 
+-    case result do
+-      :ok ->
+-        Process.sleep(250)
+-        {:noreply, redirect_to_carlive(socket)}
++  def handle_async(:sign_in, {:ok, {:error, :already_signed_in}}, socket) do
++    {:noreply, redirect(socket, to: Routes.car_path(socket, :index))}
++  end
+ 
+-      {:error, :already_signed_in} ->
+-        {:noreply, redirect(socket, to: Routes.car_path(socket, :index))}
++  def handle_async(:sign_in, {:ok, {:error, %TeslaApi.Error{reason: :invalid_tokens}}}, socket) do
++    {:noreply, assign(socket, error: gettext("Tokens are invalid"), signing_in: false)}
++  end
+ 
+-      {:error, %TeslaApi.Error{reason: :invalid_tokens}} ->
+-        {:noreply, assign(socket, error: gettext("Tokens are invalid"), task: nil)}
++  def handle_async(:sign_in, {:ok, {:error, %TeslaApi.Error{} = e}}, socket) do
++    message = gettext("Token refresh failed: %{reason}", reason: Exception.message(e))
++    {:noreply, assign(socket, error: message, signing_in: false)}
++  end
+ 
+-      {:error, %TeslaApi.Error{} = e} ->
+-        message = gettext("Token refresh failed: %{reason}", reason: Exception.message(e))
+-        {:noreply, assign(socket, error: message, task: nil)}
+-    end
++  # The exit reason is internal and can span several lines, so it goes to the
++  # log; the tokens in it are redacted by their schema.
++  def handle_async(:sign_in, {:exit, reason}, socket) do
++    Logger.error("Sign in failed: " <> Exception.format_exit(reason))
++    message = gettext("Sign in failed, see the logs for details")
++    {:noreply, assign(socket, error: message, signing_in: false)}
+   end
+ 
+   defp get_api(socket) do
+diff --git a/elixir/lib/teslamate_web/live/signin_live/index.html.heex b/elixir/lib/teslamate_web/live/signin_live/index.html.heex
+index 3eeb4de852..96a2e33d03 100644
+--- a/elixir/lib/teslamate_web/live/signin_live/index.html.heex
++++ b/elixir/lib/teslamate_web/live/signin_live/index.html.heex
+@@ -24,7 +24,7 @@
+               autocorrect: "off",
+               autocapitalize: "none",
+               spellcheck: "false",
+-              disabled: !!@task
++              disabled: @signing_in
+             )}
+             <span class="icon is-small is-left">
+               <i class="mdi mdi-api"></i>
+@@ -40,7 +40,7 @@
+               autocorrect: "off",
+               autocapitalize: "none",
+               spellcheck: "false",
+-              disabled: !!@task
++              disabled: @signing_in
+             )}
+             <span class="icon is-small is-left">
+               <i class="mdi mdi-cloud-refresh"></i>
+@@ -74,7 +74,7 @@
+               "is-rounded",
+               "is-fullwidth",
+               "is-link",
+-              if(!!@task, do: "is-loading")
++              if(@signing_in, do: "is-loading")
+             ],
+             disabled:
+               if @token == "" do
+diff --git a/elixir/priv/gettext/ca/LC_MESSAGES/default.po b/elixir/priv/gettext/ca/LC_MESSAGES/default.po
+index 57afc1fd12..1a1b49642e 100644
+--- a/elixir/priv/gettext/ca/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/ca/LC_MESSAGES/default.po
+@@ -194,7 +194,7 @@ msgstr "Temps intentant entrar en repòs"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Autenticat correctament"
+@@ -462,7 +462,7 @@ msgstr "Importa"
+ msgid "Time zone"
+ msgstr "Zona horària"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -588,7 +588,7 @@ msgstr "Token d'accés"
+ msgid "Refresh Token"
+ msgstr "Token de refresc"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "Tokens invàlids"
+@@ -950,7 +950,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/da/LC_MESSAGES/default.po b/elixir/priv/gettext/da/LC_MESSAGES/default.po
+index 89ac7d6d99..6db32cdc39 100644
+--- a/elixir/priv/gettext/da/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/da/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Tid indtil forsøg på at sove"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Logget ind"
+@@ -461,7 +461,7 @@ msgstr "Importér"
+ msgid "Time zone"
+ msgstr "Tidszone"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -587,7 +587,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr ""
+@@ -947,7 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/de/LC_MESSAGES/default.po b/elixir/priv/gettext/de/LC_MESSAGES/default.po
+index fd011859df..41b7415eaf 100644
+--- a/elixir/priv/gettext/de/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/de/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Dauer des Schlafversuchs"
+ msgid "min"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Erfolgreich angemeldet"
+@@ -461,7 +461,7 @@ msgstr "Importieren"
+ msgid "Time zone"
+ msgstr "Zeitzone"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -587,7 +587,7 @@ msgstr "Access Token"
+ msgid "Refresh Token"
+ msgstr "Refresh Token"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "Tokens sind ungültig"
+@@ -947,7 +947,12 @@ msgstr "Ein Fahrzeug konnte nicht in der Datenbank gespeichert werden. Bitte pr
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr "Freie Software unter der AGPL-3.0-or-later, OHNE JEGLICHE GEWÄHRLEISTUNG; du darfst sie unter ihren Bedingungen weitergeben"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr "Token-Aktualisierung fehlgeschlagen: %{reason}"
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr "Anmeldung fehlgeschlagen, Details stehen im Log"
+diff --git a/elixir/priv/gettext/default.pot b/elixir/priv/gettext/default.pot
+index 6bee24ed14..e9b7e3f2ee 100644
+--- a/elixir/priv/gettext/default.pot
++++ b/elixir/priv/gettext/default.pot
+@@ -195,7 +195,7 @@ msgstr ""
+ msgid "min"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr ""
+@@ -461,7 +461,7 @@ msgstr ""
+ msgid "Time zone"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -587,7 +587,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr ""
+@@ -947,7 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/en/LC_MESSAGES/default.po b/elixir/priv/gettext/en/LC_MESSAGES/default.po
+index 45db39a4bb..2ae96d9ec0 100644
+--- a/elixir/priv/gettext/en/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/en/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr ""
+ msgid "min"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr ""
+@@ -461,7 +461,7 @@ msgstr ""
+ msgid "Time zone"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -587,7 +587,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr ""
+@@ -947,7 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/es/LC_MESSAGES/default.po b/elixir/priv/gettext/es/LC_MESSAGES/default.po
+index 982033bf1a..2b86b42819 100644
+--- a/elixir/priv/gettext/es/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/es/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Duración del intento de reposo"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Sesión iniciada correctamente"
+@@ -461,7 +461,7 @@ msgstr "Importar"
+ msgid "Time zone"
+ msgstr "Zona horaria"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -587,7 +587,7 @@ msgstr "Token de acceso"
+ msgid "Refresh Token"
+ msgstr "Token de renovación"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "Tokens no válidos"
+@@ -947,7 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/fi/LC_MESSAGES/default.po b/elixir/priv/gettext/fi/LC_MESSAGES/default.po
+index f721b34fe4..614e05d8d2 100644
+--- a/elixir/priv/gettext/fi/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/fi/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Lepotilaan menon kesto"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Kirjauduttu sisään onnistuneesti"
+@@ -461,7 +461,7 @@ msgstr "Tuo"
+ msgid "Time zone"
+ msgstr "Aikavyöhyke"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -587,7 +587,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr ""
+@@ -947,7 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/fr/LC_MESSAGES/default.po b/elixir/priv/gettext/fr/LC_MESSAGES/default.po
+index 422a03e939..c54dbe8dca 100644
+--- a/elixir/priv/gettext/fr/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/fr/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Temps avant d'essayer de dormir"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Connecté avec succès"
+@@ -461,7 +461,7 @@ msgstr "Importer"
+ msgid "Time zone"
+ msgstr "Fuseau horaire"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -587,7 +587,7 @@ msgstr "Jeton d'accès"
+ msgid "Refresh Token"
+ msgstr "Jeton d'actualisation"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "Les jetons ne sont pas valides"
+@@ -947,7 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/hu/LC_MESSAGES/default.po b/elixir/priv/gettext/hu/LC_MESSAGES/default.po
+index 1e125d963e..9c4e0b36a9 100644
+--- a/elixir/priv/gettext/hu/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/hu/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Idő az elalvási próbálkozásig"
+ msgid "min"
+ msgstr "perc"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Sikeres bejelentkezés"
+@@ -461,7 +461,7 @@ msgstr "Importálás"
+ msgid "Time zone"
+ msgstr "Időzóna"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -587,7 +587,7 @@ msgstr "Hozzáférési token"
+ msgid "Refresh Token"
+ msgstr "Frissítési token"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "A tokenek érvénytelenek"
+@@ -947,7 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/it/LC_MESSAGES/default.po b/elixir/priv/gettext/it/LC_MESSAGES/default.po
+index e2e3c5098b..f0afcd2401 100644
+--- a/elixir/priv/gettext/it/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/it/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Tempo prima di tentare la sospensione"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Accesso effettuato"
+@@ -461,7 +461,7 @@ msgstr "Importare"
+ msgid "Time zone"
+ msgstr "Fuso orario"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -587,7 +587,7 @@ msgstr "Access Token"
+ msgid "Refresh Token"
+ msgstr "Aggiorna Token"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "Token non validi"
+@@ -947,7 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/ja/LC_MESSAGES/default.po b/elixir/priv/gettext/ja/LC_MESSAGES/default.po
+index 9d768429ce..413795b3b9 100644
+--- a/elixir/priv/gettext/ja/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/ja/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "スリープ実行時間"
+ msgid "min"
+ msgstr "分"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "サインイン成功"
+@@ -461,7 +461,7 @@ msgstr "インポート"
+ msgid "Time zone"
+ msgstr "タイムゾーン"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -587,7 +587,7 @@ msgstr "Access Token"
+ msgid "Refresh Token"
+ msgstr "Refresh Token"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "トークンが無効です"
+@@ -946,7 +946,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/ko/LC_MESSAGES/default.po b/elixir/priv/gettext/ko/LC_MESSAGES/default.po
+index 8da4d7ec2a..159e2eb157 100644
+--- a/elixir/priv/gettext/ko/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/ko/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "절전 시도 시간"
+ msgid "min"
+ msgstr "분"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "로그인 성공"
+@@ -461,7 +461,7 @@ msgstr "가져오기"
+ msgid "Time zone"
+ msgstr "시간대"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -587,7 +587,7 @@ msgstr "엑세스 토큰"
+ msgid "Refresh Token"
+ msgstr "리프레시 토큰"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "토큰이 잘못되었습니다."
+@@ -946,7 +946,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/nb/LC_MESSAGES/default.po b/elixir/priv/gettext/nb/LC_MESSAGES/default.po
+index bdebbc4d31..9c91b21dcf 100644
+--- a/elixir/priv/gettext/nb/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/nb/LC_MESSAGES/default.po
+@@ -196,7 +196,7 @@ msgstr "Tid for forsøk på dvale"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Innlogget"
+@@ -462,7 +462,7 @@ msgstr "Importere"
+ msgid "Time zone"
+ msgstr "Tidssone"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -588,7 +588,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr ""
+@@ -948,7 +948,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/nl/LC_MESSAGES/default.po b/elixir/priv/gettext/nl/LC_MESSAGES/default.po
+index f2e2077daf..a0401ebb22 100644
+--- a/elixir/priv/gettext/nl/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/nl/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Tijd om te proberen te slapen"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Succesvol ingelogd"
+@@ -461,7 +461,7 @@ msgstr "Importeren"
+ msgid "Time zone"
+ msgstr "Tijdzone"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -587,7 +587,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr ""
+@@ -947,7 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/sv/LC_MESSAGES/default.po b/elixir/priv/gettext/sv/LC_MESSAGES/default.po
+index a24592da15..ae2ce25422 100644
+--- a/elixir/priv/gettext/sv/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/sv/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Tid för försök att gå ner i vila"
+ msgid "min"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Inloggad"
+@@ -461,7 +461,7 @@ msgstr "Importera"
+ msgid "Time zone"
+ msgstr "Tidszon"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -587,7 +587,7 @@ msgstr "Åtkomsttoken"
+ msgid "Refresh Token"
+ msgstr "Uppdatera token"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "Tokens är ogiltiga"
+@@ -947,7 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/th/LC_MESSAGES/default.po b/elixir/priv/gettext/th/LC_MESSAGES/default.po
+index 25fef52ace..6e296d1c1f 100644
+--- a/elixir/priv/gettext/th/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/th/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "จำนวนครั้งที่รถพยายามเข้
+ msgid "min"
+ msgstr "นาที"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "ลงชื่อเข้าใช้เรียบร้อย"
+@@ -460,7 +460,7 @@ msgstr "นำเข้า"
+ msgid "Time zone"
+ msgstr "เขตเวลา"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -586,7 +586,7 @@ msgstr "โทเค็นการเข้าถึง"
+ msgid "Refresh Token"
+ msgstr "รีเฟรชโทเค็น"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "โทเค็นไม่ถูกต้อง"
+@@ -945,7 +945,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/tr/LC_MESSAGES/default.po b/elixir/priv/gettext/tr/LC_MESSAGES/default.po
+index cc567ec4f7..492f63058f 100644
+--- a/elixir/priv/gettext/tr/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/tr/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Uykuya Dalmayı Deneme Zamanı"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Oturum başarıyla açıldı"
+@@ -461,7 +461,7 @@ msgstr "İçe Aktar"
+ msgid "Time zone"
+ msgstr "Saat dilimi"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -587,7 +587,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr ""
+@@ -947,7 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/uk/LC_MESSAGES/default.po b/elixir/priv/gettext/uk/LC_MESSAGES/default.po
+index c543ff1423..b9e0d1c788 100644
+--- a/elixir/priv/gettext/uk/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/uk/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Час до спроби заснути"
+ msgid "min"
+ msgstr "мінімум"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Вхід успішний"
+@@ -462,7 +462,7 @@ msgstr "Імпорт"
+ msgid "Time zone"
+ msgstr "Часовий пояс"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -589,7 +589,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "Токени не дійсні"
+@@ -950,7 +950,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po b/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po
+index 23f1f040e3..1404a37ac2 100644
+--- a/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po
+@@ -196,7 +196,7 @@ msgstr "尝试进入睡眠用时"
+ msgid "min"
+ msgstr "分钟"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "登录成功"
+@@ -462,7 +462,7 @@ msgstr "导入"
+ msgid "Time zone"
+ msgstr "时区"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -588,7 +588,7 @@ msgstr "令牌"
+ msgid "Refresh Token"
+ msgstr "刷新令牌"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "令牌 无效"
+@@ -947,7 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po b/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po
+index fdd26fae0c..f51aad3418 100644
+--- a/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "嘗試休眠前的等待時間"
+ msgid "min"
+ msgstr "分鐘"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:75
++#: lib/teslamate_web/live/signin_live/index.ex:87
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "登入成功"
+@@ -460,7 +460,7 @@ msgstr "匯入"
+ msgid "Time zone"
+ msgstr "時區"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:13
++#: lib/teslamate_web/live/signin_live/index.ex:15
+ #: lib/teslamate_web/live/signin_live/index.html.heex:71
+ #, elixir-autogen, elixir-format
+ msgid "Sign in"
+@@ -585,7 +585,7 @@ msgstr "存取權杖（Access Token）"
+ msgid "Refresh Token"
+ msgstr "更新權杖（Refresh Token）"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:58
++#: lib/teslamate_web/live/signin_live/index.ex:62
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "權杖無效"
+@@ -944,7 +944,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:61
++#: lib/teslamate_web/live/signin_live/index.ex:66
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
++
++#: lib/teslamate_web/live/signin_live/index.ex:74
++#, elixir-autogen, elixir-format
++msgid "Sign in failed, see the logs for details"
++msgstr ""
+diff --git a/elixir/test/support/mocks/api.ex b/elixir/test/support/mocks/api.ex
+index cc6fbe3601..c78d8c9a62 100644
+--- a/elixir/test/support/mocks/api.ex
++++ b/elixir/test/support/mocks/api.ex
+@@ -137,7 +137,11 @@ defmodule ApiMock do
+ 
+   def handle_call({:sign_in, _tokens} = event, _from, %State{pid: pid} = state) do
+     send(pid, {ApiMock, event})
+-    {:reply, state.sign_in, state}
++
++    case state.sign_in do
++      {:exit, reason} -> {:stop, reason, state}
++      reply -> {:reply, reply, state}
++    end
+   end
+ 
+   def handle_call({:stream, _vid, receiver} = event, _from, %State{} = state) do
+diff --git a/elixir/test/teslamate_web/live/sign_in_test.exs b/elixir/test/teslamate_web/live/sign_in_test.exs
+index 31425069db..45ec9635e8 100644
+--- a/elixir/test/teslamate_web/live/sign_in_test.exs
++++ b/elixir/test/teslamate_web/live/sign_in_test.exs
+@@ -60,4 +60,12 @@ defmodule TeslaMateWeb.SignInLiveTest do
+ 
+     assert_redirect(view, "/", 1000)
+   end
++
++  @tag sign_in: {:exit, :boom}
++  @tag :capture_log
++  test "reports a sign-in that exits instead of crashing the page", %{conn: conn} do
++    view = submit_tokens(conn)
++
++    eventually(fn -> assert render(view) =~ "Sign in failed, see the logs for details" end)
++  end
+ end
+
+From 1c140cf13b2113d3bf2d788d5325d7d21bc876c7 Mon Sep 17 00:00:00 2001
+From: Jakob Lichterfeld <jakob-lichterfeld@gmx.de>
+Date: Thu, 24 Sep 2026 17:19:09 +0200
+Subject: [PATCH 4/5] test(web): pin that a submit while signing in is ignored
+
+A second sign-in would refresh with the refresh token that the first one rotates out, so Tesla would answer login_required although the first sign-in succeeded. ApiMock can now hold a sign-in reply until the test releases it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../teslamate_web/live/signin_live/index.ex   |  3 ++-
+ elixir/priv/gettext/ca/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/da/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/de/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/default.pot               |  8 ++++----
+ elixir/priv/gettext/en/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/es/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/fi/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/fr/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/hu/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/it/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/ja/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/ko/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/nb/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/nl/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/sv/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/th/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/tr/LC_MESSAGES/default.po |  8 ++++----
+ elixir/priv/gettext/uk/LC_MESSAGES/default.po |  8 ++++----
+ .../gettext/zh_Hans/LC_MESSAGES/default.po    |  8 ++++----
+ .../gettext/zh_Hant/LC_MESSAGES/default.po    |  8 ++++----
+ elixir/test/support/mocks/api.ex              | 11 +++++++++-
+ .../test/teslamate_web/live/sign_in_test.exs  | 20 +++++++++++++++----
+ 23 files changed, 108 insertions(+), 86 deletions(-)
+
+diff --git a/elixir/lib/teslamate_web/live/signin_live/index.ex b/elixir/lib/teslamate_web/live/signin_live/index.ex
+index b937e7c393..cbe4864027 100644
+--- a/elixir/lib/teslamate_web/live/signin_live/index.ex
++++ b/elixir/lib/teslamate_web/live/signin_live/index.ex
+@@ -33,7 +33,8 @@ defmodule TeslaMateWeb.SignInLive.Index do
+     {:noreply, assign(socket, changeset: changeset, error: nil)}
+   end
+ 
+-  # One sign-in at a time.
++  # One sign-in at a time: a second one would refresh with the refresh token
++  # that the first one rotates out.
+   def handle_event("sign_in", _, %{assigns: %{signing_in: true}} = socket), do: {:noreply, socket}
+ 
+   def handle_event("sign_in", _, socket) do
+diff --git a/elixir/priv/gettext/ca/LC_MESSAGES/default.po b/elixir/priv/gettext/ca/LC_MESSAGES/default.po
+index 1a1b49642e..0a18a26226 100644
+--- a/elixir/priv/gettext/ca/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/ca/LC_MESSAGES/default.po
+@@ -194,7 +194,7 @@ msgstr "Temps intentant entrar en repòs"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Autenticat correctament"
+@@ -588,7 +588,7 @@ msgstr "Token d'accés"
+ msgid "Refresh Token"
+ msgstr "Token de refresc"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "Tokens invàlids"
+@@ -950,12 +950,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/da/LC_MESSAGES/default.po b/elixir/priv/gettext/da/LC_MESSAGES/default.po
+index 6db32cdc39..7c6ac7deac 100644
+--- a/elixir/priv/gettext/da/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/da/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Tid indtil forsøg på at sove"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Logget ind"
+@@ -587,7 +587,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr ""
+@@ -947,12 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/de/LC_MESSAGES/default.po b/elixir/priv/gettext/de/LC_MESSAGES/default.po
+index 41b7415eaf..56b05897a3 100644
+--- a/elixir/priv/gettext/de/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/de/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Dauer des Schlafversuchs"
+ msgid "min"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Erfolgreich angemeldet"
+@@ -587,7 +587,7 @@ msgstr "Access Token"
+ msgid "Refresh Token"
+ msgstr "Refresh Token"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "Tokens sind ungültig"
+@@ -947,12 +947,12 @@ msgstr "Ein Fahrzeug konnte nicht in der Datenbank gespeichert werden. Bitte pr
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr "Freie Software unter der AGPL-3.0-or-later, OHNE JEGLICHE GEWÄHRLEISTUNG; du darfst sie unter ihren Bedingungen weitergeben"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr "Token-Aktualisierung fehlgeschlagen: %{reason}"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr "Anmeldung fehlgeschlagen, Details stehen im Log"
+diff --git a/elixir/priv/gettext/default.pot b/elixir/priv/gettext/default.pot
+index e9b7e3f2ee..ea7c6f98d5 100644
+--- a/elixir/priv/gettext/default.pot
++++ b/elixir/priv/gettext/default.pot
+@@ -195,7 +195,7 @@ msgstr ""
+ msgid "min"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr ""
+@@ -587,7 +587,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr ""
+@@ -947,12 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/en/LC_MESSAGES/default.po b/elixir/priv/gettext/en/LC_MESSAGES/default.po
+index 2ae96d9ec0..c4714d9564 100644
+--- a/elixir/priv/gettext/en/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/en/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr ""
+ msgid "min"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr ""
+@@ -587,7 +587,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr ""
+@@ -947,12 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/es/LC_MESSAGES/default.po b/elixir/priv/gettext/es/LC_MESSAGES/default.po
+index 2b86b42819..d9da9e5abf 100644
+--- a/elixir/priv/gettext/es/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/es/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Duración del intento de reposo"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Sesión iniciada correctamente"
+@@ -587,7 +587,7 @@ msgstr "Token de acceso"
+ msgid "Refresh Token"
+ msgstr "Token de renovación"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "Tokens no válidos"
+@@ -947,12 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/fi/LC_MESSAGES/default.po b/elixir/priv/gettext/fi/LC_MESSAGES/default.po
+index 614e05d8d2..204b37cec8 100644
+--- a/elixir/priv/gettext/fi/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/fi/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Lepotilaan menon kesto"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Kirjauduttu sisään onnistuneesti"
+@@ -587,7 +587,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr ""
+@@ -947,12 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/fr/LC_MESSAGES/default.po b/elixir/priv/gettext/fr/LC_MESSAGES/default.po
+index c54dbe8dca..07a66859e3 100644
+--- a/elixir/priv/gettext/fr/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/fr/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Temps avant d'essayer de dormir"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Connecté avec succès"
+@@ -587,7 +587,7 @@ msgstr "Jeton d'accès"
+ msgid "Refresh Token"
+ msgstr "Jeton d'actualisation"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "Les jetons ne sont pas valides"
+@@ -947,12 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/hu/LC_MESSAGES/default.po b/elixir/priv/gettext/hu/LC_MESSAGES/default.po
+index 9c4e0b36a9..4e9c3d5358 100644
+--- a/elixir/priv/gettext/hu/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/hu/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Idő az elalvási próbálkozásig"
+ msgid "min"
+ msgstr "perc"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Sikeres bejelentkezés"
+@@ -587,7 +587,7 @@ msgstr "Hozzáférési token"
+ msgid "Refresh Token"
+ msgstr "Frissítési token"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "A tokenek érvénytelenek"
+@@ -947,12 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/it/LC_MESSAGES/default.po b/elixir/priv/gettext/it/LC_MESSAGES/default.po
+index f0afcd2401..52ca0e0276 100644
+--- a/elixir/priv/gettext/it/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/it/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Tempo prima di tentare la sospensione"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Accesso effettuato"
+@@ -587,7 +587,7 @@ msgstr "Access Token"
+ msgid "Refresh Token"
+ msgstr "Aggiorna Token"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "Token non validi"
+@@ -947,12 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/ja/LC_MESSAGES/default.po b/elixir/priv/gettext/ja/LC_MESSAGES/default.po
+index 413795b3b9..f6f1bbb4b6 100644
+--- a/elixir/priv/gettext/ja/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/ja/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "スリープ実行時間"
+ msgid "min"
+ msgstr "分"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "サインイン成功"
+@@ -587,7 +587,7 @@ msgstr "Access Token"
+ msgid "Refresh Token"
+ msgstr "Refresh Token"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "トークンが無効です"
+@@ -946,12 +946,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/ko/LC_MESSAGES/default.po b/elixir/priv/gettext/ko/LC_MESSAGES/default.po
+index 159e2eb157..137de1c0cf 100644
+--- a/elixir/priv/gettext/ko/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/ko/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "절전 시도 시간"
+ msgid "min"
+ msgstr "분"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "로그인 성공"
+@@ -587,7 +587,7 @@ msgstr "엑세스 토큰"
+ msgid "Refresh Token"
+ msgstr "리프레시 토큰"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "토큰이 잘못되었습니다."
+@@ -946,12 +946,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/nb/LC_MESSAGES/default.po b/elixir/priv/gettext/nb/LC_MESSAGES/default.po
+index 9c91b21dcf..021788e51f 100644
+--- a/elixir/priv/gettext/nb/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/nb/LC_MESSAGES/default.po
+@@ -196,7 +196,7 @@ msgstr "Tid for forsøk på dvale"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Innlogget"
+@@ -588,7 +588,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr ""
+@@ -948,12 +948,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/nl/LC_MESSAGES/default.po b/elixir/priv/gettext/nl/LC_MESSAGES/default.po
+index a0401ebb22..0c2057a526 100644
+--- a/elixir/priv/gettext/nl/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/nl/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Tijd om te proberen te slapen"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Succesvol ingelogd"
+@@ -587,7 +587,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr ""
+@@ -947,12 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/sv/LC_MESSAGES/default.po b/elixir/priv/gettext/sv/LC_MESSAGES/default.po
+index ae2ce25422..8effea52cb 100644
+--- a/elixir/priv/gettext/sv/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/sv/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Tid för försök att gå ner i vila"
+ msgid "min"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Inloggad"
+@@ -587,7 +587,7 @@ msgstr "Åtkomsttoken"
+ msgid "Refresh Token"
+ msgstr "Uppdatera token"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "Tokens är ogiltiga"
+@@ -947,12 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/th/LC_MESSAGES/default.po b/elixir/priv/gettext/th/LC_MESSAGES/default.po
+index 6e296d1c1f..08b36bbffb 100644
+--- a/elixir/priv/gettext/th/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/th/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "จำนวนครั้งที่รถพยายามเข้
+ msgid "min"
+ msgstr "นาที"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "ลงชื่อเข้าใช้เรียบร้อย"
+@@ -586,7 +586,7 @@ msgstr "โทเค็นการเข้าถึง"
+ msgid "Refresh Token"
+ msgstr "รีเฟรชโทเค็น"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "โทเค็นไม่ถูกต้อง"
+@@ -945,12 +945,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/tr/LC_MESSAGES/default.po b/elixir/priv/gettext/tr/LC_MESSAGES/default.po
+index 492f63058f..48dac9bf7f 100644
+--- a/elixir/priv/gettext/tr/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/tr/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Uykuya Dalmayı Deneme Zamanı"
+ msgid "min"
+ msgstr "min"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Oturum başarıyla açıldı"
+@@ -587,7 +587,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr ""
+@@ -947,12 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/uk/LC_MESSAGES/default.po b/elixir/priv/gettext/uk/LC_MESSAGES/default.po
+index b9e0d1c788..a5a3760d71 100644
+--- a/elixir/priv/gettext/uk/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/uk/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "Час до спроби заснути"
+ msgid "min"
+ msgstr "мінімум"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "Вхід успішний"
+@@ -589,7 +589,7 @@ msgstr ""
+ msgid "Refresh Token"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "Токени не дійсні"
+@@ -950,12 +950,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po b/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po
+index 1404a37ac2..80786c0004 100644
+--- a/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po
+@@ -196,7 +196,7 @@ msgstr "尝试进入睡眠用时"
+ msgid "min"
+ msgstr "分钟"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "登录成功"
+@@ -588,7 +588,7 @@ msgstr "令牌"
+ msgid "Refresh Token"
+ msgstr "刷新令牌"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "令牌 无效"
+@@ -947,12 +947,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po b/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po
+index f51aad3418..a8174d9523 100644
+--- a/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po
+@@ -195,7 +195,7 @@ msgstr "嘗試休眠前的等待時間"
+ msgid "min"
+ msgstr "分鐘"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:87
++#: lib/teslamate_web/live/signin_live/index.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Signed in successfully"
+ msgstr "登入成功"
+@@ -585,7 +585,7 @@ msgstr "存取權杖（Access Token）"
+ msgid "Refresh Token"
+ msgstr "更新權杖（Refresh Token）"
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:62
++#: lib/teslamate_web/live/signin_live/index.ex:63
+ #, elixir-autogen, elixir-format
+ msgid "Tokens are invalid"
+ msgstr "權杖無效"
+@@ -944,12 +944,12 @@ msgstr ""
+ msgid "Free software under the AGPL-3.0-or-later, with ABSOLUTELY NO WARRANTY; you may redistribute it under its terms"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:66
++#: lib/teslamate_web/live/signin_live/index.ex:67
+ #, elixir-autogen, elixir-format
+ msgid "Token refresh failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/signin_live/index.ex:74
++#: lib/teslamate_web/live/signin_live/index.ex:75
+ #, elixir-autogen, elixir-format
+ msgid "Sign in failed, see the logs for details"
+ msgstr ""
+diff --git a/elixir/test/support/mocks/api.ex b/elixir/test/support/mocks/api.ex
+index c78d8c9a62..2a164ee018 100644
+--- a/elixir/test/support/mocks/api.ex
++++ b/elixir/test/support/mocks/api.ex
+@@ -11,6 +11,7 @@ defmodule ApiMock do
+       :last_served,
+       :stub,
+       :stub_ref,
++      :held_sign_in,
+       sign_in: :ok,
+       calls: [],
+       interactions: []
+@@ -135,11 +136,14 @@ defmodule ApiMock do
+     {:reply, :ok, note_interaction(state, interaction)}
+   end
+ 
+-  def handle_call({:sign_in, _tokens} = event, _from, %State{pid: pid} = state) do
++  # A {:held, reply} sign-in answers only on :release_sign_in, so a test can
++  # act while the sign-in is still running.
++  def handle_call({:sign_in, _tokens} = event, from, %State{pid: pid} = state) do
+     send(pid, {ApiMock, event})
+ 
+     case state.sign_in do
+       {:exit, reason} -> {:stop, reason, state}
++      {:held, reply} -> {:noreply, %State{state | held_sign_in: {from, reply}}}
+       reply -> {:reply, reply, state}
+     end
+   end
+@@ -150,6 +154,11 @@ defmodule ApiMock do
+   end
+ 
+   @impl true
++  def handle_info(:release_sign_in, %State{held_sign_in: {from, reply}} = state) do
++    GenServer.reply(from, reply)
++    {:noreply, %State{state | held_sign_in: nil}}
++  end
++
+   def handle_info({:DOWN, ref, :process, _stub, _reason}, %State{stub_ref: ref} = state) do
+     {:noreply, %State{state | stub: nil, stub_ref: nil}}
+   end
+diff --git a/elixir/test/teslamate_web/live/sign_in_test.exs b/elixir/test/teslamate_web/live/sign_in_test.exs
+index 45ec9635e8..4c253c13c6 100644
+--- a/elixir/test/teslamate_web/live/sign_in_test.exs
++++ b/elixir/test/teslamate_web/live/sign_in_test.exs
+@@ -8,14 +8,14 @@ defmodule TeslaMateWeb.SignInLiveTest do
+ 
+     {:ok, _pid} = start_supervised({ApiMock, name: api_name, pid: self(), sign_in: sign_in})
+ 
+-    %{api: {ApiMock, api_name}}
++    api_name
+   end
+ 
+   # The reply of the API's sign-in comes from the test's :sign_in tag.
+   setup %{test: name, conn: conn} = context do
+-    params = start_api(name, Map.get(context, :sign_in, :ok))
+-    conn = put_connect_params(conn, params)
+-    [conn: conn]
++    api = start_api(name, Map.get(context, :sign_in, :ok))
++    conn = put_connect_params(conn, %{api: {ApiMock, api}})
++    [conn: conn, api: api]
+   end
+ 
+   defp submit_tokens(conn) do
+@@ -68,4 +68,16 @@ defmodule TeslaMateWeb.SignInLiveTest do
+ 
+     eventually(fn -> assert render(view) =~ "Sign in failed, see the logs for details" end)
+   end
++
++  # A second sign-in would refresh with the refresh token the first one rotates out.
++  @tag sign_in: {:held, :ok}
++  test "ignores a submit while signing in", %{conn: conn, api: api} do
++    view = submit_tokens(conn)
++
++    render_submit(view, :sign_in, %{})
++    refute_receive {ApiMock, {:sign_in, _tokens}}, 100
++
++    send(api, :release_sign_in)
++    assert_redirect(view, "/", 1000)
++  end
+ end
+
+From b8186618f5330c9278e57518e6548b4c5ca0ba73 Mon Sep 17 00:00:00 2001
+From: Jakob Lichterfeld <jakob-lichterfeld@gmx.de>
+Date: Thu, 24 Sep 2026 18:02:08 +0200
+Subject: [PATCH 5/5] fix(auth): name the OAuth error of a 200 and strip
+ userinfo from a redirect target
+
+A 200 carrying an OAuth error body reported "invalid token response" and lost the actual error. A redirect target kept its userinfo, and the error's location header kept userinfo, query and fragment, which reach the log through the "Token refresh failed" warning. The relative-redirect test no longer depends on TESLA_AUTH_HOST.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ elixir/lib/tesla_api/auth/refresh.ex        | 27 ++++++++++++------
+ elixir/test/tesla_api/auth/refresh_test.exs | 31 ++++++++++++++-------
+ 2 files changed, 39 insertions(+), 19 deletions(-)
+
+diff --git a/elixir/lib/tesla_api/auth/refresh.ex b/elixir/lib/tesla_api/auth/refresh.ex
+index ff5dcf5dc3..f846b3e265 100644
+--- a/elixir/lib/tesla_api/auth/refresh.ex
++++ b/elixir/lib/tesla_api/auth/refresh.ex
+@@ -55,15 +55,15 @@ defmodule TeslaApi.Auth.Refresh do
+        do: error(:invalid_tokens, oauth_message(code, body), env)
+ 
+   defp handle_response({:ok, %Tesla.Env{status: status} = env}, _auth) when status in 300..399,
+-    do: error(:token_refresh, redirect_message(env), env)
+-
+-  defp handle_response({:ok, %Tesla.Env{status: 200} = env}, _auth),
+-    do: error(:token_refresh, "invalid token response", env)
++    do: redirect_error(env)
+ 
+   defp handle_response({:ok, %Tesla.Env{body: %{"error" => code} = body} = env}, _auth)
+        when is_binary(code),
+        do: error(:token_refresh, oauth_message(code, body), env)
+ 
++  defp handle_response({:ok, %Tesla.Env{status: 200} = env}, _auth),
++    do: error(:token_refresh, "invalid token response", env)
++
+   defp handle_response({:ok, %Tesla.Env{status: status} = env}, _auth),
+     do: error(:token_refresh, "HTTP #{status}", env)
+ 
+@@ -82,15 +82,24 @@ defmodule TeslaApi.Auth.Refresh do
+ 
+   defp oauth_message(code, _body), do: code
+ 
+-  # Without query and fragment, which can carry credentials.
+-  defp redirect_message(%Tesla.Env{} = env) do
++  # The target goes without userinfo, query and fragment, which can carry
++  # credentials, into the message and, as the error gets logged, into its
++  # location header.
++  defp redirect_error(%Tesla.Env{} = env) do
+     case Tesla.get_header(env, "location") do
+       nil ->
+-        "HTTP #{env.status}"
++        error(:token_refresh, "HTTP #{env.status}", env)
+ 
+       location ->
+-        %URI{} = target = URI.merge(env.url, location)
+-        "redirected to #{%URI{target | query: nil, fragment: nil}}"
++        %URI{} = uri = URI.merge(env.url, location)
++        target = URI.to_string(%URI{uri | userinfo: nil, query: nil, fragment: nil})
++
++        env =
++          env
++          |> Tesla.delete_header("location")
++          |> Tesla.put_header("location", target)
++
++        error(:token_refresh, "redirected to #{target}", env)
+     end
+   end
+ 
+diff --git a/elixir/test/tesla_api/auth/refresh_test.exs b/elixir/test/tesla_api/auth/refresh_test.exs
+index 14486008db..7e094b57dd 100644
+--- a/elixir/test/tesla_api/auth/refresh_test.exs
++++ b/elixir/test/tesla_api/auth/refresh_test.exs
+@@ -80,30 +80,41 @@ defmodule TeslaApi.Auth.RefreshTest do
+   end
+ 
+   describe "any other failure names its cause" do
+-    test "another OAuth error" do
++    test "another OAuth error, also in a 200" do
+       body = %{"error" => "invalid_client", "error_description" => "Unknown client."}
+ 
+-      assert {{:error,
+-               %Error{reason: :token_refresh, message: "invalid_client: Unknown client."}}, _} =
+-               refresh(status: 401, body: body)
++      for status <- [401, 200] do
++        assert {{:error,
++                 %Error{reason: :token_refresh, message: "invalid_client: Unknown client."}}, _} =
++                 refresh(status: status, body: body)
++      end
+     end
+ 
+     # The token endpoint answers directly (RFC 6749 §5.1). Following a redirect
+     # would resend the refresh token in the request body to the redirect target.
+     test "a redirect is not followed" do
+-      location = "https://example.com/token?refresh_token=secret"
++      assert {{:error, %Error{reason: :token_refresh}}, _} =
++               refresh(status: 302, headers: [{"location", "https://example.com/token"}])
+ 
+-      assert {{:error, %Error{reason: :token_refresh, message: message}}, _} =
+-               refresh(status: 302, headers: [{"location", location}])
+-
+-      assert message == "redirected to https://example.com/token"
+       assert_received :request
+       refute_received :request
+     end
+ 
++    test "a redirect target loses userinfo, query and fragment in message and header" do
++      location = "https://user:secret@example.com/token?refresh_token=secret#secret"
++
++      assert {{:error, %Error{message: "redirected to https://example.com/token"} = error}, _} =
++               refresh(status: 302, headers: [{"location", location}])
++
++      assert Tesla.get_headers(error.env, "location") == ["https://example.com/token"]
++    end
++
+     test "a relative redirect names the resolved target" do
+-      assert {{:error, %Error{message: "redirected to https://auth.tesla.com/moved"}}, _} =
++      assert {{:error, %Error{message: message}}, _} =
+                refresh(status: 301, headers: [{"location", "/moved"}])
++
++      # The base is the auth host, which the environment may override.
++      assert message =~ ~r"^redirected to https?://[^/]+/moved$"
+     end
+ 
+     test "a redirect without a location names the status" do

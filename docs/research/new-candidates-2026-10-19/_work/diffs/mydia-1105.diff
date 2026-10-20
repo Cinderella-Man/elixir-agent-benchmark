@@ -1,0 +1,845 @@
+diff --git a/lib/mydia/media/bulk_writes.ex b/lib/mydia/media/bulk_writes.ex
+index 1306c96ca..5e7e82818 100644
+--- a/lib/mydia/media/bulk_writes.ex
++++ b/lib/mydia/media/bulk_writes.ex
+@@ -6,7 +6,7 @@ defmodule Mydia.Media.BulkWrites do
+   import Ecto.Query, warn: false
+   alias Mydia.Repo
+   alias Mydia.Accounts.Scope
+-  alias Mydia.Media.MediaItem
++  alias Mydia.Media.{MediaItem, Restrictions}
+   alias Mydia.Events
+ 
+   @doc """
+@@ -21,19 +21,16 @@ defmodule Mydia.Media.BulkWrites do
+   """
+   @spec update_media_items_monitored(Scope.t(), [binary()], boolean(), keyword()) ::
+           {:ok, non_neg_integer()} | {:error, term()}
+-  def update_media_items_monitored(%Scope{} = _scope, ids, monitored, opts \\ [])
++  def update_media_items_monitored(%Scope{} = scope, ids, monitored, opts \\ [])
+       when is_list(ids) do
+     Repo.transaction(fn ->
+       # Fetch media items before update to track events
+-      media_items =
+-        MediaItem
+-        |> where([m], m.id in ^ids)
+-        |> Repo.all()
++      media_items = scope |> scoped_items(ids) |> Repo.all()
+ 
+       # Perform the update
+       {count, _} =
+-        MediaItem
+-        |> where([m], m.id in ^ids)
++        scope
++        |> scoped_items(ids)
+         |> Repo.update_all(set: [monitored: monitored, updated_at: DateTime.utc_now()])
+ 
+       # Track events for each media item
+@@ -68,16 +65,26 @@ defmodule Mydia.Media.BulkWrites do
+     - `:actor_id` - The ID of the actor (user_id, job name, etc.)
+   """
+   @spec update_media_items_batch(Scope.t(), [binary()], map(), keyword()) ::
+-          {:ok, non_neg_integer()} | {:error, :not_found | term()}
+-  def update_media_items_batch(%Scope{} = _scope, ids, attrs, opts \\ [])
++          {:ok, non_neg_integer()} | {:error, :not_found | :invalid_monitored | term()}
++  def update_media_items_batch(%Scope{} = scope, ids, attrs, opts \\ [])
+       when is_list(ids) and is_map(attrs) do
+-    if referenced_foreign_keys_exist?(attrs) do
+-      do_update_media_items_batch(ids, attrs, opts)
+-    else
+-      {:error, :not_found}
++    cond do
++      not valid_monitored?(attrs[:monitored]) -> {:error, :invalid_monitored}
++      not referenced_foreign_keys_exist?(attrs) -> {:error, :not_found}
++      true -> do_update_media_items_batch(scope, ids, attrs, opts)
+     end
+   end
+ 
++  # Only items the scope can see are touched; the rest of `ids` is skipped
++  # without an error, so a restricted account cannot probe for hidden ids.
++  defp scoped_items(%Scope{} = scope, ids) do
++    MediaItem
++    |> where([m], m.id in ^ids)
++    |> Restrictions.apply(scope)
++  end
++
++  defp valid_monitored?(value), do: value in [nil, true, false, "true", "false"]
++
+   # Repo.update_all/3 takes no changeset, so Mydia.Repo.ForeignKeyGuard cannot
+   # turn a foreign key violation below into a changeset error: it raises on
+   # both SQLite and PostgreSQL, unlike the changeset-backed writes elsewhere
+@@ -97,7 +104,7 @@ defmodule Mydia.Media.BulkWrites do
+     Ecto.Query.CastError -> false
+   end
+ 
+-  defp do_update_media_items_batch(ids, attrs, opts) do
++  defp do_update_media_items_batch(scope, ids, attrs, opts) do
+     Repo.transaction(fn ->
+       # Build the update list, only including non-nil values
+       updates =
+@@ -114,16 +121,14 @@ defmodule Mydia.Media.BulkWrites do
+         # record and should pay no extra query.
+         media_items =
+           if Map.has_key?(updates, :monitored) do
+-            MediaItem
+-            |> where([m], m.id in ^ids)
+-            |> Repo.all()
++            scope |> scoped_items(ids) |> Repo.all()
+           else
+             []
+           end
+ 
+         {count, _} =
+-          MediaItem
+-          |> where([m], m.id in ^ids)
++          scope
++          |> scoped_items(ids)
+           |> Repo.update_all(set: Map.to_list(updates))
+ 
+         unless media_items == [] do
+diff --git a/lib/mydia/media/deletion.ex b/lib/mydia/media/deletion.ex
+index 74f20d91f..312006e96 100644
+--- a/lib/mydia/media/deletion.ex
++++ b/lib/mydia/media/deletion.ex
+@@ -7,7 +7,7 @@ defmodule Mydia.Media.Deletion do
+   require Logger
+   alias Mydia.Repo
+   alias Mydia.Accounts.Scope
+-  alias Mydia.Media.{DiskRemoval, Episode, MediaItem}
++  alias Mydia.Media.{DiskRemoval, Episode, MediaItem, Restrictions}
+   alias Mydia.Events
+   alias Mydia.Library.{MediaFile, MediaFileEpisode}
+ 
+@@ -149,9 +149,18 @@ defmodule Mydia.Media.Deletion do
+   """
+   @spec delete_media_items(Scope.t(), [binary()], keyword()) ::
+           {:ok, non_neg_integer(), DiskRemoval.t()} | {:error, term()}
+-  def delete_media_items(%Scope{} = _scope, ids, opts \\ []) when is_list(ids) do
++  def delete_media_items(%Scope{} = scope, ids, opts \\ []) when is_list(ids) do
+     delete_files = Keyword.get(opts, :delete_files, false)
+ 
++    # Narrow to what the caller may see before anything else: the disk plan
++    # below is built from these ids, so a hidden item's files must never reach it.
++    ids =
++      MediaItem
++      |> where([m], m.id in ^ids)
++      |> Restrictions.apply(scope)
++      |> select([m], m.id)
++      |> Repo.all()
++
+     # One plan for every item, run once after the commit. Finishing folders
+     # item by item would let a second item's not-yet-deleted files keep a
+     # folder the two share. See `delete_media_item/2` for why the plan comes
+diff --git a/lib/mydia_web/live/media_live/index.ex b/lib/mydia_web/live/media_live/index.ex
+index 96afc463f..3c8828b55 100644
+--- a/lib/mydia_web/live/media_live/index.ex
++++ b/lib/mydia_web/live/media_live/index.ex
+@@ -19,7 +19,9 @@ defmodule MydiaWeb.MediaLive.Index do
+   alias MydiaWeb.Live.Helpers.GridDensity
+   alias MydiaWeb.Live.Helpers.PosterFields, as: PosterFieldsPref
+   alias MydiaWeb.MediaLive.DiskRemovalFlash
++  alias MydiaWeb.MediaLive.Index.LibraryActions
+   alias MydiaWeb.MediaLive.Index.ListingParams
++  alias MydiaWeb.MediaLive.Index.ReclassifyFlash
+ 
+   import MydiaWeb.Formatters, only: [format_file_size: 1]
+   import MydiaWeb.GridDensityComponents
+@@ -373,70 +375,15 @@ defmodule MydiaWeb.MediaLive.Index do
+   end
+ 
+   def handle_event("batch_monitor", _params, socket) do
+-    selected_ids = MapSet.to_list(socket.assigns.selected_ids)
+-
+-    case Media.update_media_items_monitored(socket.assigns.current_scope, selected_ids, true) do
+-      {:ok, count} ->
+-        {:noreply,
+-         socket
+-         |> put_flash(:info, "#{count} #{pluralize_items(count)} set to monitored")
+-         |> assign(:selection_mode, false)
+-         |> assign(:selected_ids, MapSet.new())
+-         |> load_media_items()}
+-
+-      {:error, _reason} ->
+-        {:noreply, put_flash(socket, :error, "Failed to update items")}
+-    end
++    with_media_permission(socket, :update, &batch_set_monitored(&1, true))
+   end
+ 
+   def handle_event("batch_unmonitor", _params, socket) do
+-    selected_ids = MapSet.to_list(socket.assigns.selected_ids)
+-
+-    case Media.update_media_items_monitored(socket.assigns.current_scope, selected_ids, false) do
+-      {:ok, count} ->
+-        {:noreply,
+-         socket
+-         |> put_flash(:info, "#{count} #{pluralize_items(count)} set to unmonitored")
+-         |> assign(:selection_mode, false)
+-         |> assign(:selected_ids, MapSet.new())
+-         |> load_media_items()}
+-
+-      {:error, _reason} ->
+-        {:noreply, put_flash(socket, :error, "Failed to update items")}
+-    end
++    with_media_permission(socket, :update, &batch_set_monitored(&1, false))
+   end
+ 
+   def handle_event("toggle_item_monitored", %{"id" => id}, socket) do
+-    media_item = Media.get_media_item!(socket.assigns.current_scope, id)
+-    new_monitored_status = !media_item.monitored
+-
+-    case Media.update_media_item(
+-           socket.assigns.current_scope,
+-           media_item,
+-           %{monitored: new_monitored_status},
+-           reason: if(new_monitored_status, do: "Monitoring enabled", else: "Monitoring disabled")
+-         ) do
+-      {:ok, _updated_item} ->
+-        socket =
+-          case LibraryListing.row(
+-                 socket.assigns.current_scope,
+-                 id,
+-                 socket.assigns.current_user.id
+-               ) do
+-            nil -> socket
+-            row -> stream_insert(socket, :media_items, row)
+-          end
+-
+-        {:noreply,
+-         put_flash(
+-           socket,
+-           :info,
+-           "Monitoring #{if new_monitored_status, do: "enabled", else: "disabled"}"
+-         )}
+-
+-      {:error, _changeset} ->
+-        {:noreply, put_flash(socket, :error, "Failed to update monitoring status")}
+-    end
++    with_media_permission(socket, :update, &LibraryActions.toggle_monitored(&1, id))
+   end
+ 
+   def handle_event("batch_auto_search", _params, socket) do
+@@ -467,31 +414,7 @@ defmodule MydiaWeb.MediaLive.Index do
+   end
+ 
+   def handle_event("batch_reclassify", _params, socket) do
+-    selected_ids = MapSet.to_list(socket.assigns.selected_ids)
+-
+-    {:ok, summary} = Media.reclassify_media_items(selected_ids)
+-
+-    message =
+-      cond do
+-        summary.updated > 0 && summary.skipped > 0 ->
+-          "Reclassified #{summary.updated} #{pluralize_items(summary.updated)}, #{summary.skipped} skipped (category override)"
+-
+-        summary.updated > 0 ->
+-          "Reclassified #{summary.updated} #{pluralize_items(summary.updated)}"
+-
+-        summary.skipped > 0 ->
+-          "No changes - #{summary.skipped} #{pluralize_items(summary.skipped)} have category override"
+-
+-        true ->
+-          "No category changes detected"
+-      end
+-
+-    {:noreply,
+-     socket
+-     |> put_flash(:info, message)
+-     |> assign(:selection_mode, false)
+-     |> assign(:selected_ids, MapSet.new())
+-     |> load_media_items()}
++    with_media_permission(socket, :update, &batch_reclassify/1)
+   end
+ 
+   def handle_event("show_delete_confirmation", _params, socket) do
+@@ -517,31 +440,7 @@ defmodule MydiaWeb.MediaLive.Index do
+   end
+ 
+   def handle_event("batch_delete_confirmed", _params, socket) do
+-    selected_ids = MapSet.to_list(socket.assigns.selected_ids)
+-    delete_files = socket.assigns.delete_files
+-
+-    case Media.delete_media_items(socket.assigns.current_scope, selected_ids,
+-           delete_files: delete_files
+-         ) do
+-      {:ok, count, %DiskRemoval{} = removal} ->
+-        {kind, message} = DiskRemovalFlash.for_items(count, delete_files, removal)
+-
+-        {:noreply,
+-         socket
+-         |> put_flash(kind, message)
+-         |> assign(:selection_mode, false)
+-         |> assign(:selected_ids, MapSet.new())
+-         |> assign(:show_delete_modal, false)
+-         |> assign(:delete_files, false)
+-         |> load_media_items()}
+-
+-      {:error, _reason} ->
+-        {:noreply,
+-         socket
+-         |> put_flash(:error, "Failed to delete items")
+-         |> assign(:show_delete_modal, false)
+-         |> assign(:delete_files, false)}
+-    end
++    with_media_permission(socket, :delete, &batch_delete_selected/1)
+   end
+ 
+   def handle_event("show_batch_edit", _params, socket) do
+@@ -559,30 +458,7 @@ defmodule MydiaWeb.MediaLive.Index do
+   end
+ 
+   def handle_event("batch_edit_submit", %{"batch_edit" => params}, socket) do
+-    selected_ids = MapSet.to_list(socket.assigns.selected_ids)
+-
+-    # Build attrs map with only non-empty values
+-    attrs =
+-      %{}
+-      |> maybe_add_attr(:quality_profile_id, params["quality_profile_id"])
+-      |> maybe_add_attr(:monitored, params["monitored"])
+-
+-    case Media.update_media_items_batch(socket.assigns.current_scope, selected_ids, attrs) do
+-      {:ok, count} ->
+-        {:noreply,
+-         socket
+-         |> put_flash(:info, "#{count} #{pluralize_items(count)} updated successfully")
+-         |> assign(:selection_mode, false)
+-         |> assign(:selected_ids, MapSet.new())
+-         |> assign(:show_batch_edit_modal, false)
+-         |> load_media_items()}
+-
+-      {:error, _reason} ->
+-        {:noreply,
+-         socket
+-         |> put_flash(:error, "Failed to update items")
+-         |> assign(:show_batch_edit_modal, false)}
+-    end
++    with_media_permission(socket, :update, &batch_edit_selected(&1, params))
+   end
+ 
+   def handle_event("show_add_to_collection", _params, socket) do
+@@ -640,27 +516,7 @@ defmodule MydiaWeb.MediaLive.Index do
+   end
+ 
+   def handle_event("trigger_rescan", _params, socket) do
+-    alias Mydia.Library
+-
+-    case Library.trigger_full_library_scan() do
+-      # The scan job is unique, so this insert can be deduped into a scan that is
+-      # already queued (the boot-time repair scan waits out a jitter delay before
+-      # it runs). Don't claim a scan started, and don't switch the UI into a
+-      # scanning state that no broadcast will ever clear.
+-      {:ok, %Oban.Job{conflict?: true}} ->
+-        {:noreply, put_flash(socket, :info, "A library scan is already queued")}
+-
+-      {:ok, _job} ->
+-        {:noreply,
+-         socket
+-         |> assign(:scanning, true)
+-         |> assign(:scan_result, nil)
+-         |> assign(:scan_progress, nil)
+-         |> put_flash(:info, "Library scan started...")}
+-
+-      {:error, _reason} ->
+-        {:noreply, put_flash(socket, :error, "Failed to start library scan")}
+-    end
++    with_media_permission(socket, :update, &LibraryActions.start_scan/1)
+   end
+ 
+   def handle_event("open_section_settings", _params, socket) do
+@@ -854,6 +710,110 @@ defmodule MydiaWeb.MediaLive.Index do
+     {:noreply, socket}
+   end
+ 
++  # Library write events arrive over the socket from any authenticated role,
++  # including guests and readonly users, so each one checks the role itself.
++  defp with_media_permission(socket, permission, fun) do
++    with :ok <- authorize_media(permission, socket) do
++      fun.(socket)
++    else
++      {:unauthorized, socket} -> {:noreply, socket}
++    end
++  end
++
++  defp authorize_media(:update, socket), do: Authorization.authorize_update_media(socket)
++  defp authorize_media(:delete, socket), do: Authorization.authorize_delete_media(socket)
++
++  defp batch_set_monitored(socket, monitored) do
++    selected_ids = MapSet.to_list(socket.assigns.selected_ids)
++    label = if monitored, do: "monitored", else: "unmonitored"
++
++    case Media.update_media_items_monitored(socket.assigns.current_scope, selected_ids, monitored) do
++      {:ok, count} ->
++        {:noreply,
++         socket
++         |> put_flash(:info, "#{count} #{pluralize_items(count)} set to #{label}")
++         |> assign(:selection_mode, false)
++         |> assign(:selected_ids, MapSet.new())
++         |> load_media_items()}
++
++      {:error, _reason} ->
++        {:noreply, put_flash(socket, :error, "Failed to update items")}
++    end
++  end
++
++  defp batch_reclassify(socket) do
++    selected_ids = MapSet.to_list(socket.assigns.selected_ids)
++
++    visible_ids =
++      socket.assigns.current_scope
++      |> Media.list_media_items(ids: selected_ids)
++      |> Enum.map(& &1.id)
++
++    {:ok, summary} = Media.reclassify_media_items(visible_ids)
++
++    {:noreply,
++     socket
++     |> put_flash(:info, ReclassifyFlash.message(summary))
++     |> assign(:selection_mode, false)
++     |> assign(:selected_ids, MapSet.new())
++     |> load_media_items()}
++  end
++
++  defp batch_delete_selected(socket) do
++    selected_ids = MapSet.to_list(socket.assigns.selected_ids)
++    delete_files = socket.assigns.delete_files
++
++    case Media.delete_media_items(socket.assigns.current_scope, selected_ids,
++           delete_files: delete_files
++         ) do
++      {:ok, count, %DiskRemoval{} = removal} ->
++        {kind, message} = DiskRemovalFlash.for_items(count, delete_files, removal)
++
++        {:noreply,
++         socket
++         |> put_flash(kind, message)
++         |> assign(:selection_mode, false)
++         |> assign(:selected_ids, MapSet.new())
++         |> assign(:show_delete_modal, false)
++         |> assign(:delete_files, false)
++         |> load_media_items()}
++
++      {:error, _reason} ->
++        {:noreply,
++         socket
++         |> put_flash(:error, "Failed to delete items")
++         |> assign(:show_delete_modal, false)
++         |> assign(:delete_files, false)}
++    end
++  end
++
++  defp batch_edit_selected(socket, params) do
++    selected_ids = MapSet.to_list(socket.assigns.selected_ids)
++
++    # Build attrs map with only non-empty values
++    attrs =
++      %{}
++      |> maybe_add_attr(:quality_profile_id, params["quality_profile_id"])
++      |> maybe_add_attr(:monitored, params["monitored"])
++
++    case Media.update_media_items_batch(socket.assigns.current_scope, selected_ids, attrs) do
++      {:ok, count} ->
++        {:noreply,
++         socket
++         |> put_flash(:info, "#{count} #{pluralize_items(count)} updated successfully")
++         |> assign(:selection_mode, false)
++         |> assign(:selected_ids, MapSet.new())
++         |> assign(:show_batch_edit_modal, false)
++         |> load_media_items()}
++
++      {:error, _reason} ->
++        {:noreply,
++         socket
++         |> put_flash(:error, "Failed to update items")
++         |> assign(:show_batch_edit_modal, false)}
++    end
++  end
++
+   # Guards event handlers that only make sense on a section page. A
+   # hand-crafted client event fired from /movies or /tv, where @section is
+   # nil, would otherwise crash the socket instead of being a no-op.
+diff --git a/lib/mydia_web/live/media_live/index/library_actions.ex b/lib/mydia_web/live/media_live/index/library_actions.ex
+new file mode 100644
+index 000000000..af063a975
+--- /dev/null
++++ b/lib/mydia_web/live/media_live/index/library_actions.ex
+@@ -0,0 +1,78 @@
++defmodule MydiaWeb.MediaLive.Index.LibraryActions do
++  @moduledoc """
++  The library page's single-purpose write actions, split out of
++  `MydiaWeb.MediaLive.Index`. Callers check the user's role first; nothing
++  here does.
++  """
++
++  import Phoenix.Component, only: [assign: 3]
++  import Phoenix.LiveView, only: [put_flash: 3, stream_insert: 3]
++
++  alias Mydia.Media
++  alias Mydia.Media.LibraryListing
++
++  @spec toggle_monitored(Phoenix.LiveView.Socket.t(), String.t()) ::
++          {:noreply, Phoenix.LiveView.Socket.t()}
++  def toggle_monitored(socket, id) do
++    case Media.list_media_items(socket.assigns.current_scope, ids: [id]) do
++      [media_item] -> toggle_item(socket, media_item)
++      [] -> {:noreply, put_flash(socket, :error, "Failed to update monitoring status")}
++    end
++  end
++
++  defp toggle_item(socket, media_item) do
++    id = media_item.id
++    new_monitored_status = !media_item.monitored
++
++    case Media.update_media_item(
++           socket.assigns.current_scope,
++           media_item,
++           %{monitored: new_monitored_status},
++           reason: if(new_monitored_status, do: "Monitoring enabled", else: "Monitoring disabled")
++         ) do
++      {:ok, _updated_item} ->
++        socket =
++          case LibraryListing.row(
++                 socket.assigns.current_scope,
++                 id,
++                 socket.assigns.current_user.id
++               ) do
++            nil -> socket
++            row -> stream_insert(socket, :media_items, row)
++          end
++
++        {:noreply,
++         put_flash(
++           socket,
++           :info,
++           "Monitoring #{if new_monitored_status, do: "enabled", else: "disabled"}"
++         )}
++
++      {:error, _changeset} ->
++        {:noreply, put_flash(socket, :error, "Failed to update monitoring status")}
++    end
++  end
++
++  @spec start_scan(Phoenix.LiveView.Socket.t()) :: {:noreply, Phoenix.LiveView.Socket.t()}
++  def start_scan(socket) do
++    case Mydia.Library.trigger_full_library_scan() do
++      # The scan job is unique, so this insert can be deduped into a scan that is
++      # already queued (the boot-time repair scan waits out a jitter delay before
++      # it runs). Don't claim a scan started, and don't switch the UI into a
++      # scanning state that no broadcast will ever clear.
++      {:ok, %Oban.Job{conflict?: true}} ->
++        {:noreply, put_flash(socket, :info, "A library scan is already queued")}
++
++      {:ok, _job} ->
++        {:noreply,
++         socket
++         |> assign(:scanning, true)
++         |> assign(:scan_result, nil)
++         |> assign(:scan_progress, nil)
++         |> put_flash(:info, "Library scan started...")}
++
++      {:error, _reason} ->
++        {:noreply, put_flash(socket, :error, "Failed to start library scan")}
++    end
++  end
++end
+diff --git a/lib/mydia_web/live/media_live/index/reclassify_flash.ex b/lib/mydia_web/live/media_live/index/reclassify_flash.ex
+new file mode 100644
+index 000000000..fe8a22410
+--- /dev/null
++++ b/lib/mydia_web/live/media_live/index/reclassify_flash.ex
+@@ -0,0 +1,23 @@
++defmodule MydiaWeb.MediaLive.Index.ReclassifyFlash do
++  @moduledoc """
++  The flash message for the library's bulk reclassify action.
++  """
++
++  @spec message(%{updated: non_neg_integer(), skipped: non_neg_integer()}) :: String.t()
++  def message(%{updated: updated, skipped: skipped}) when updated > 0 and skipped > 0,
++    do: "Reclassified #{updated} #{items(updated)}, #{skipped} skipped (category override)"
++
++  def message(%{updated: updated}) when updated > 0,
++    do: "Reclassified #{updated} #{items(updated)}"
++
++  def message(%{skipped: skipped}) when skipped > 0,
++    do: "No changes - #{skipped} #{items(skipped)} #{verb(skipped)} category override"
++
++  def message(_summary), do: "No category changes detected"
++
++  defp verb(1), do: "has"
++  defp verb(_), do: "have"
++
++  defp items(1), do: "item"
++  defp items(_), do: "items"
++end
+diff --git a/test/mydia/media/bulk_writes_scope_test.exs b/test/mydia/media/bulk_writes_scope_test.exs
+new file mode 100644
+index 000000000..24987632a
+--- /dev/null
++++ b/test/mydia/media/bulk_writes_scope_test.exs
+@@ -0,0 +1,102 @@
++defmodule Mydia.Media.BulkWritesScopeTest do
++  @moduledoc """
++  The bulk media writes honour the caller's access restrictions: ids outside
++  the scope are skipped, not modified, and the returned count only covers the
++  items the caller can see.
++  """
++  use Mydia.DataCase, async: true
++
++  import Ecto.Query
++  import Mydia.MediaFixtures
++
++  alias Mydia.Accounts.Scope
++  alias Mydia.Media
++  alias Mydia.Media.MediaItem
++  alias Mydia.Repo
++
++  defp categorized(attrs, category) do
++    item = media_item_fixture(attrs)
++
++    Repo.update_all(from(m in MediaItem, where: m.id == ^item.id),
++      set: [category: category]
++    )
++
++    Repo.get!(MediaItem, item.id)
++  end
++
++  setup do
++    scope = %Scope{user: nil, allowed_categories: ["cartoon_movie"]}
++    visible = categorized(%{title: "Lantern Harbor", monitored: true}, "cartoon_movie")
++    hidden = categorized(%{title: "Ember Tide", monitored: true}, "movie")
++
++    %{scope: scope, visible: visible, hidden: hidden}
++  end
++
++  defp monitored?(item), do: Repo.get!(MediaItem, item.id).monitored
++
++  test "update_media_items_monitored skips items outside the scope", ctx do
++    assert {:ok, 1} =
++             Media.update_media_items_monitored(
++               ctx.scope,
++               [ctx.visible.id, ctx.hidden.id],
++               false
++             )
++
++    refute monitored?(ctx.visible)
++    assert monitored?(ctx.hidden)
++  end
++
++  test "update_media_items_batch skips items outside the scope", ctx do
++    assert {:ok, 1} =
++             Media.update_media_items_batch(
++               ctx.scope,
++               [ctx.visible.id, ctx.hidden.id],
++               %{monitored: false}
++             )
++
++    refute monitored?(ctx.visible)
++    assert monitored?(ctx.hidden)
++  end
++
++  test "delete_media_items skips items outside the scope", ctx do
++    assert {:ok, 1, _removal} =
++             Media.delete_media_items(ctx.scope, [ctx.visible.id, ctx.hidden.id])
++
++    refute Repo.get(MediaItem, ctx.visible.id)
++    assert Repo.get(MediaItem, ctx.hidden.id)
++  end
++
++  test "an unrestricted scope still reaches every item", ctx do
++    assert {:ok, 2} =
++             Media.update_media_items_monitored(
++               Scope.unrestricted(),
++               [ctx.visible.id, ctx.hidden.id],
++               false
++             )
++  end
++
++  describe "update_media_items_batch with :monitored" do
++    test "an unrecognised value returns an error and changes nothing", ctx do
++      assert {:error, :invalid_monitored} =
++               Media.update_media_items_batch(
++                 Scope.unrestricted(),
++                 [ctx.visible.id, ctx.hidden.id],
++                 %{monitored: "on"}
++               )
++
++      assert monitored?(ctx.visible)
++      assert monitored?(ctx.hidden)
++    end
++
++    test "the string forms the batch form posts are accepted", ctx do
++      assert {:ok, 1} =
++               Media.update_media_items_batch(
++                 Scope.unrestricted(),
++                 [ctx.visible.id],
++                 %{monitored: "false"}
++               )
++
++      refute monitored?(ctx.visible)
++    end
++  end
++end
+diff --git a/test/mydia_web/live/media_live/index_authorization_test.exs b/test/mydia_web/live/media_live/index_authorization_test.exs
+new file mode 100644
+index 000000000..f4d75050b
+--- /dev/null
++++ b/test/mydia_web/live/media_live/index_authorization_test.exs
+@@ -0,0 +1,139 @@
++defmodule MydiaWeb.MediaLive.IndexAuthorizationTest do
++  @moduledoc """
++  The library's write handlers are reachable by every authenticated role, so
++  each one has to check the role itself: the UI hiding a button does not stop
++  a socket message.
++  """
++  use MydiaWeb.ConnCase, async: false
++
++  import Ecto.Query
++  import Phoenix.LiveViewTest
++  import Mydia.AccountsFixtures
++  import Mydia.MediaFixtures
++  import MydiaWeb.AuthHelpers
++
++  alias Mydia.Media.MediaItem
++  alias Mydia.Repo
++
++  @denied_flash "#flash-error"
++
++  defp open_library(conn, user, item) do
++    {:ok, view, _html} = live(log_in_user(conn, user), ~p"/movies")
++    render_click(view, "start_selection", %{"id" => item.id})
++    view
++  end
++
++  defp monitored?(item), do: Repo.get!(MediaItem, item.id).monitored
++
++  setup do
++    %{item: media_item_fixture(%{title: "Quiet Orchard", monitored: true})}
++  end
++
++  for role <- ["readonly", "guest"] do
++    describe "as #{role}" do
++      setup %{conn: conn, item: item} do
++        user = user_fixture(%{role: unquote(role)})
++        %{view: open_library(conn, user, item)}
++      end
++
++      test "batch_unmonitor changes nothing", %{view: view, item: item} do
++        render_click(view, "batch_unmonitor", %{})
++        assert monitored?(item)
++        assert has_element?(view, @denied_flash)
++      end
++
++      test "batch_monitor changes nothing", %{view: view, item: item} do
++        Repo.update_all(from(m in MediaItem, where: m.id == ^item.id), set: [monitored: false])
++
++        render_click(view, "batch_monitor", %{})
++        refute monitored?(item)
++        assert has_element?(view, @denied_flash)
++      end
++
++      test "toggle_item_monitored changes nothing", %{view: view, item: item} do
++        render_click(view, "toggle_item_monitored", %{"id" => item.id})
++        assert monitored?(item)
++        assert has_element?(view, @denied_flash)
++      end
++
++      test "batch_edit_submit changes nothing", %{view: view, item: item} do
++        render_click(view, "batch_edit_submit", %{"batch_edit" => %{"monitored" => "false"}})
++        assert monitored?(item)
++        assert has_element?(view, @denied_flash)
++      end
++
++      test "batch_reclassify is refused", %{view: view} do
++        render_click(view, "batch_reclassify", %{})
++        assert has_element?(view, @denied_flash)
++      end
++
++      test "batch_delete_confirmed deletes nothing", %{view: view, item: item} do
++        render_click(view, "batch_delete_confirmed", %{})
++        assert Repo.get(MediaItem, item.id)
++        assert has_element?(view, @denied_flash)
++      end
++
++      test "trigger_rescan is refused", %{view: view} do
++        render_click(view, "trigger_rescan", %{})
++        assert has_element?(view, @denied_flash)
++      end
++    end
++  end
++
++  describe "toggle_item_monitored with an item the caller cannot reach" do
++    test "an out-of-scope id gets the error flash and the view survives", %{conn: conn} do
++      user = restricted_user_fixture(%{role: "user", allowed_categories: ["cartoon_movie"]})
++      hidden = media_item_fixture(%{title: "Ember Tide", type: "movie"})
++      Repo.update_all(from(m in MediaItem, where: m.id == ^hidden.id), set: [category: "movie"])
++
++      view = open_library(conn, user, hidden)
++      render_click(view, "toggle_item_monitored", %{"id" => hidden.id})
++
++      assert has_element?(view, @denied_flash)
++      assert monitored?(hidden)
++    end
++
++    test "an unknown id gets the error flash", %{conn: conn, item: item} do
++      view = open_library(conn, user_fixture(%{role: "user"}), item)
++      render_click(view, "toggle_item_monitored", %{"id" => Ecto.UUID.generate()})
++
++      assert has_element?(view, @denied_flash)
++    end
++  end
++
++  describe "as a user with access restrictions" do
++    test "batch_reclassify leaves items outside the scope alone", %{conn: conn} do
++      user = restricted_user_fixture(%{role: "user", allowed_categories: ["cartoon_movie"]})
++      visible = media_item_fixture(%{title: "Lantern Harbor", type: "movie"})
++      hidden = media_item_fixture(%{title: "Ember Tide", type: "movie"})
++
++      for {item, category} <- [{visible, "cartoon_movie"}, {hidden, "anime_movie"}] do
++        Repo.update_all(from(m in MediaItem, where: m.id == ^item.id), set: [category: category])
++      end
++
++      view = open_library(conn, user, hidden)
++      render_click(view, "start_selection", %{"id" => visible.id})
++      render_click(view, "batch_reclassify", %{})
++
++      assert Repo.get!(MediaItem, hidden.id).category == "anime_movie"
++      refute Repo.get!(MediaItem, visible.id).category == "cartoon_movie"
++    end
++  end
++
++  describe "as a user" do
++    setup %{conn: conn, item: item} do
++      %{view: open_library(conn, user_fixture(%{role: "user"}), item)}
++    end
++
++    test "batch_unmonitor goes through", %{view: view, item: item} do
++      render_click(view, "batch_unmonitor", %{})
++      refute monitored?(item)
++      refute has_element?(view, @denied_flash)
++    end
++
++    test "batch_delete_confirmed goes through", %{view: view, item: item} do
++      render_click(view, "batch_delete_confirmed", %{})
++      refute Repo.get(MediaItem, item.id)
++    end
++  end
++end
+diff --git a/test/mydia_web/live/media_live/reclassify_flash_test.exs b/test/mydia_web/live/media_live/reclassify_flash_test.exs
+new file mode 100644
+index 000000000..f7afc67d2
+--- /dev/null
++++ b/test/mydia_web/live/media_live/reclassify_flash_test.exs
+@@ -0,0 +1,15 @@
++defmodule MydiaWeb.MediaLive.Index.ReclassifyFlashTest do
++  use ExUnit.Case, async: true
++
++  alias MydiaWeb.MediaLive.Index.ReclassifyFlash
++
++  test "a single skipped item takes the singular verb" do
++    assert ReclassifyFlash.message(%{updated: 0, skipped: 1}) ==
++             "No changes - 1 item has category override"
++  end
++
++  test "several skipped items take the plural verb" do
++    assert ReclassifyFlash.message(%{updated: 0, skipped: 2}) ==
++             "No changes - 2 items have category override"
++  end
++end

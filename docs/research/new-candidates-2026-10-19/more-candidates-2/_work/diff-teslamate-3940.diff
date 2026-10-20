@@ -1,0 +1,212 @@
+diff --git a/lib/teslamate/vehicles/vehicle.ex b/lib/teslamate/vehicles/vehicle.ex
+index d75c7a9d7a..1047b715e2 100644
+--- a/lib/teslamate/vehicles/vehicle.ex
++++ b/lib/teslamate/vehicles/vehicle.ex
+@@ -28,11 +28,24 @@ defmodule TeslaMate.Vehicles.Vehicle do
+   end
+ 
+   @asleep_interval 30
+-  @driving_interval 2.5
+ 
+   @drive_timeout_min 15
+ 
+   # Static
++  def interval(env_var, default) do
++    System.get_env(env_var)
++    |> case do
++      nil -> default
++      interval -> String.to_integer(interval) |> max(default)
++    end
++  end
++
++  def asleep_interval, do: interval("POLLING_ASLEEP_INTERVAL", @asleep_interval)
++  def driving_interval, do: interval("POLLING_DRIVING_INTERVAL", 2.5)
++  def default_interval, do: interval("POLLING_DEFAULT_INTERVAL", 15)
++  def online_interval, do: interval("POLLING_ONLINE_INTERVAL", 60)
++  def charging_interval, do: interval("POLLING_CHARGING_INTERVAL", 5)
++  def minimum_interval, do: interval("POLLING_MINIMUM_INTERVAL", 0)
+ 
+   def identify(%Vehicle{display_name: name, vehicle_config: config}) do
+     case config do
+@@ -358,10 +371,14 @@ defmodule TeslaMate.Vehicles.Vehicle do
+             )
+ 
+             {:next_state, :start, %Data{data | last_used: DateTime.utc_now()},
+-             [broadcast_fetch(false), broadcast_summary(), schedule_fetch(60, data)]}
++             [
++               broadcast_fetch(false),
++               broadcast_summary(),
++               schedule_fetch(online_interval(), data)
++             ]}
+ 
+           _ ->
+-            {:keep_state, data, [broadcast_fetch(false), schedule_fetch(60, data)]}
++            {:keep_state, data, [broadcast_fetch(false), schedule_fetch(online_interval(), data)]}
+         end
+ 
+       {:error, :not_signed_in} ->
+@@ -696,7 +713,7 @@ defmodule TeslaMate.Vehicles.Vehicle do
+ 
+     :ok = disconnect_stream(data)
+ 
+-    {:next_state, {:asleep, @asleep_interval},
++    {:next_state, {:asleep, asleep_interval()},
+      %Data{data | last_state_change: last_state_change, stream_pid: nil},
+      [broadcast_summary(), schedule_fetch(data)]}
+   end
+@@ -709,7 +726,7 @@ defmodule TeslaMate.Vehicles.Vehicle do
+ 
+     :ok = disconnect_stream(data)
+ 
+-    {:next_state, {:offline, @asleep_interval},
++    {:next_state, {:offline, asleep_interval()},
+      %Data{data | last_state_change: last_state_change, stream_pid: nil},
+      [broadcast_summary(), schedule_fetch(data)]}
+   end
+@@ -810,7 +827,10 @@ defmodule TeslaMate.Vehicles.Vehicle do
+         {drive, data} = start_drive(create_position(vehicle, data), data)
+ 
+         {:next_state, {:driving, :available, drive}, data,
+-         [broadcast_summary(), schedule_fetch(@driving_interval, data)]}
++         [
++           broadcast_summary(),
++           schedule_fetch(driving_interval(), data)
++         ]}
+ 
+       %V{charge_state: %Charge{charging_state: charging_state, battery_level: lvl}}
+       when charging_state in ["Starting", "Charging"] ->
+@@ -1015,7 +1035,7 @@ defmodule TeslaMate.Vehicles.Vehicle do
+   end
+ 
+   def handle_event(:internal, {:update, {:online, vehicle}}, {:driving, :available, drv}, data) do
+-    interval = if streaming?(data), do: 15, else: @driving_interval
++    interval = if streaming?(data), do: default_interval(), else: driving_interval()
+ 
+     case vehicle do
+       %Vehicle{drive_state: %Drive{shift_state: shift_state}} when shift_state in ~w(D N R) ->
+@@ -1079,7 +1099,8 @@ defmodule TeslaMate.Vehicles.Vehicle do
+         {:keep_state, %Data{data | last_used: DateTime.utc_now()}, schedule_fetch(5, data)}
+ 
+       %VehicleState{software_update: %SW{status: "installing"}} ->
+-        {:keep_state, %Data{data | last_used: DateTime.utc_now()}, schedule_fetch(15, data)}
++        {:keep_state, %Data{data | last_used: DateTime.utc_now()},
++         schedule_fetch(default_interval(), data)}
+ 
+       %VehicleState{software_update: %SW{status: "available"} = update} ->
+         {:ok, %Log.Update{}} = call(data.deps.log, :cancel_update, [update])
+@@ -1118,12 +1139,12 @@ defmodule TeslaMate.Vehicles.Vehicle do
+ 
+   def handle_event(:internal, {:update, {state, _}}, {state, @asleep_interval}, data)
+       when state in [:asleep, :offline] do
+-    {:keep_state_and_data, [schedule_fetch(@asleep_interval, data), broadcast_summary()]}
++    {:keep_state_and_data, [schedule_fetch(asleep_interval(), data), broadcast_summary()]}
+   end
+ 
+   def handle_event(:internal, {:update, {state, _}}, {state, interval}, data)
+       when state in [:asleep, :offline] do
+-    {:next_state, {state, min(interval * 2, @asleep_interval)}, data,
++    {:next_state, {state, min(interval * 2, asleep_interval())}, data,
+      schedule_fetch(interval, data)}
+   end
+ 
+@@ -1380,29 +1401,31 @@ defmodule TeslaMate.Vehicles.Vehicle do
+         if suspend?, do: Logger.warning("User present ...", car_id: car.id)
+ 
+         {:keep_state, %Data{data | last_used: DateTime.utc_now()},
+-         [broadcast_summary(), schedule_fetch(15, data)]}
++         [broadcast_summary(), schedule_fetch(default_interval(), data)]}
+ 
+       {:error, :downloading_update} ->
+         if suspend?, do: Logger.warning("Downloading update ...", car_id: car.id)
+ 
+         {:keep_state, %Data{data | last_used: DateTime.utc_now()},
+-         [broadcast_summary(), schedule_fetch(15 * i, data)]}
++         [broadcast_summary(), schedule_fetch(default_interval() * i, data)]}
+ 
+       {:error, :doors_open} ->
+         if suspend?, do: Logger.warning("Doors open ...", car_id: car.id)
+ 
+         {:keep_state, %Data{data | last_used: DateTime.utc_now()},
+-         [broadcast_summary(), schedule_fetch(15 * i, data)]}
++         [broadcast_summary(), schedule_fetch(default_interval() * i, data)]}
+ 
+       {:error, :trunk_open} ->
+         if suspend?, do: Logger.warning("Trunk open ...", car_id: car.id)
+ 
+         {:keep_state, %Data{data | last_used: DateTime.utc_now()},
+-         [broadcast_summary(), schedule_fetch(15 * i, data)]}
++         [broadcast_summary(), schedule_fetch(default_interval() * i, data)]}
+ 
+       {:error, :unlocked} ->
+         if suspend?, do: Logger.warning("Unlocked ...", car_id: car.id)
+-        {:keep_state_and_data, [broadcast_summary(), schedule_fetch(15 * i, data)]}
++
++        {:keep_state_and_data,
++         [broadcast_summary(), schedule_fetch(default_interval() * i, data)]}
+ 
+       :ok ->
+         if suspend? do
+@@ -1422,7 +1445,8 @@ defmodule TeslaMate.Vehicles.Vehicle do
+                %Data{data | last_state_change: DateTime.utc_now()}, events}
+           end
+         else
+-          {:keep_state_and_data, [broadcast_summary(), schedule_fetch(15 * i, data)]}
++          {:keep_state_and_data,
++           [broadcast_summary(), schedule_fetch(default_interval() * i, data)]}
+         end
+     end
+   end
+@@ -1617,7 +1641,7 @@ defmodule TeslaMate.Vehicles.Vehicle do
+   defp fetch_topic(car_id) when is_number(car_id), do: "#{__MODULE__}/fetch/#{car_id}"
+ 
+   defp determince_interval(n) when is_nil(n) or n <= 0, do: 5
+-  defp determince_interval(n), do: round(250 / n) |> min(20) |> max(5)
++  defp determince_interval(n), do: round(250 / n) |> min(20) |> max(charging_interval())
+ 
+   defp fuse_name(:vehicle_not_found, car_id), do: :"#{__MODULE__}_#{car_id}_not_found"
+   defp fuse_name(:api_error, car_id), do: :"#{__MODULE__}_#{car_id}_api_error"
+@@ -1636,7 +1660,9 @@ defmodule TeslaMate.Vehicles.Vehicle do
+   defp parse_timestamp(ts), do: DateTime.from_unix!(ts, :millisecond)
+ 
+   defp schedule_fetch(%Data{} = data), do: schedule_fetch(10, :seconds, data)
+-  defp schedule_fetch(n, %Data{} = data), do: schedule_fetch(n, :seconds, data)
++
++  defp schedule_fetch(n, %Data{} = data),
++    do: schedule_fetch(n |> max(minimum_interval()), :seconds, data)
+ 
+   defp schedule_fetch(_n, _unit, %Data{import?: true}), do: {:state_timeout, 0, :fetch}
+   defp schedule_fetch(n, unit, _), do: {:state_timeout, fetch_timeout(n, unit), :fetch}
+diff --git a/website/docs/configuration/environment_variables.md b/website/docs/configuration/environment_variables.md
+index 7f2f6e84c1..82e83cd96a 100644
+--- a/website/docs/configuration/environment_variables.md
++++ b/website/docs/configuration/environment_variables.md
+@@ -7,7 +7,7 @@ sidebar_label: Environment Variables
+ TeslaMate accepts the following environment variables for runtime configuration:
+ 
+ | Variable Name                          | Description                                                                                                                                                                                                                                                                                                      | Default Value                                                                           |
+-| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
++|----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|
+ | **ENCRYPTION_KEY**                     | A key used to encrypt the Tesla API tokens (**required**)                                                                                                                                                                                                                                                        |                                                                                         |
+ | **DATABASE_USER**                      | Username (**required**)                                                                                                                                                                                                                                                                                          |                                                                                         |
+ | **DATABASE_PASS**                      | User password (**required**)                                                                                                                                                                                                                                                                                     |                                                                                         |
+@@ -37,11 +37,17 @@ TeslaMate accepts the following environment variables for runtime configuration:
+ | **IMPORT_DIR**                         | The path of the directory for the import of data (e.g. TeslaFi)                                                                                                                                                                                                                                                  | ./import                                                                                |
+ | **TZ**                                 | Used to establish the local time zone, e.g. to use the local time in logs. See [List of tz database time zones](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).                                                                                                                                   |                                                                                         |
+ | **DEFAULT_GEOFENCE**                   | The default GEOFENCE to send via GEOFENCE if car not in geofence. Overrides the default of "" which will delete any retained value.                                                                                                                                                                              | "" (no quotes)                                                                          |
+-| **TESLAFI_IMPORT_VEHICLE_ID**     | The default Vehicle ID used when importing from TeslaFi. If it is not defined and the import source does not contain the data, 1 is used.
++| **TESLAFI_IMPORT_VEHICLE_ID**          | The default Vehicle ID used when importing from TeslaFi. If it is not defined and the import source does not contain the data, 1 is used.                                                                                                                                                                        |                                                                                         |
+ | **TESLA_API_HOST**                     | Hostname of the Tesla API                                                                                                                                                                                                                                                                                        | https://owner-api.teslamotors.com (or for chinese: https://owner-api.vn.cloud.tesla.cn) |
+ | **TESLA_AUTH_HOST**                    | Hostname of the Tesla authentication API                                                                                                                                                                                                                                                                         | https://auth.tesla.com                                                                  |
+ | **TESLA_AUTH_PATH**                    | The Tesla authentication path                                                                                                                                                                                                                                                                                    | /oauth2/v3                                                                              |
+ | **TESLA_WSS_HOST**                     | Hostname of the Tesla streaming                                                                                                                                                                                                                                                                                  | wss://streaming.vn.teslamotors.com (or for chinese: wss://streaming.vn.cloud.tesla.cn)  |
+ | **TESLA_WSS_TLS_ACCEPT_INVALID_CERTS** | Accepts invalid certificates on TESLA_WSS_HOST if `true`                                                                                                                                                                                                                                                         |                                                                                         |
+ | **TESLA_WSS_USE_VIN**                  | Use the `vin` field instead of `vid` to connect stream if `true`                                                                                                                                                                                                                                                 |                                                                                         |
+-| **TOKEN**                              | Token given by a third party Tesla API provider. This `TOKEN` is added to each API request and the format must be `?token=xxxx-xxxx-xxxx`                                                                                                                                                                        |                                                                                         |
+\ No newline at end of file
++| **TOKEN**                              | Token given by a third party Tesla API provider. This `TOKEN` is added to each API request and the format must be `?token=xxxx-xxxx-xxxx`                                                                                                                                                                        |                                                                                         |
++| **POLLING_ASLEEP_INTERVAL**            | Interval between API fetch when the vehicle is asleep (in seconds). **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                         | 30                                                                                      |
++| **POLLING_CHARGING_INTERVAL**          | Minimum interval between API fetch when the vehicle is charging (in seconds). **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                               | 5                                                                                       |
++| **POLLING_DRIVING_INTERVAL**           | Interval between API fetch when the vehicle is driving (in seconds). **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                        | 2.5                                                                                     |
++| **POLLING_ONLINE_INTERVAL**            | Interval between API fetch when the vehicle is online (in seconds). **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                         | 60                                                                                      |
++| **POLLING_DEFAULT_INTERVAL**           | Default interval between API fetch (in seconds). **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                                            | 15                                                                                      |
++| **POLLING_MINIMUM_INTERVAL**           | Minimum interval between API fetch. No minimum by default. **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                                  | 0                                                                                       |

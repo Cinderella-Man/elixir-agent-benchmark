@@ -1,0 +1,370 @@
+From 6b7ab73f68fc069da2a97f98ddcf452ce7912373 Mon Sep 17 00:00:00 2001
+From: Kieran Eglin <kieran.eglin@gmail.com>
+Date: Tue, 26 Nov 2024 11:16:26 -0800
+Subject: [PATCH 1/4] Added logic to ignore downloads that aren't in the right
+ live state
+
+---
+ .../downloading/media_download_worker.ex      |  4 ++++
+ lib/pinchflat/downloading/media_downloader.ex | 15 +++++++++++-
+ lib/pinchflat/yt_dlp/media.ex                 | 24 +++++++++++++++++--
+ 3 files changed, 40 insertions(+), 3 deletions(-)
+
+diff --git a/lib/pinchflat/downloading/media_download_worker.ex b/lib/pinchflat/downloading/media_download_worker.ex
+index 989668ea0..6b9f94294 100644
+--- a/lib/pinchflat/downloading/media_download_worker.ex
++++ b/lib/pinchflat/downloading/media_download_worker.ex
+@@ -94,6 +94,10 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+       {:recovered, _} ->
+         {:error, :retry}
+ 
++      # TODO: test
++      {:error, :unsuitable_for_download} ->
++        {:ok, :non_retry}
++
+       {:error, message} ->
+         action_on_error(message)
+     end
+diff --git a/lib/pinchflat/downloading/media_downloader.ex b/lib/pinchflat/downloading/media_downloader.ex
+index df5ea4fa0..e94665d75 100644
+--- a/lib/pinchflat/downloading/media_downloader.ex
++++ b/lib/pinchflat/downloading/media_downloader.ex
+@@ -37,6 +37,14 @@ defmodule Pinchflat.Downloading.MediaDownloader do
+       {:ok, parsed_json} ->
+         update_media_item_from_parsed_json(media_with_preloads, parsed_json)
+ 
++      # TODO: test
++      {:error, :unsuitable_for_download} ->
++        Logger.warning(
++          "Media item ##{media_with_preloads.id} isn't suitable for download yet. May be an active or processing live stream"
++        )
++
++        {:error, :unsuitable_for_download}
++
+       {:error, message, _exit_code} ->
+         Logger.error("yt-dlp download error for media item ##{media_with_preloads.id}: #{inspect(message)}")
+ 
+@@ -108,7 +116,12 @@ defmodule Pinchflat.Downloading.MediaDownloader do
+     {:ok, options} = DownloadOptionBuilder.build(item_with_preloads, override_opts)
+     runner_opts = [output_filepath: output_filepath, use_cookies: item_with_preloads.source.use_cookies]
+ 
+-    YtDlpMedia.download(url, options, runner_opts)
++    # TODO: test
++    case YtDlpMedia.get_downloadable_status(url) do
++      {:ok, :downloadable} -> YtDlpMedia.download(url, options, runner_opts)
++      {:ok, :ignorable} -> {:error, :unsuitable_for_download}
++      err -> err
++    end
+   end
+ 
+   defp recoverable_errors do
+diff --git a/lib/pinchflat/yt_dlp/media.ex b/lib/pinchflat/yt_dlp/media.ex
+index cdd8dea24..253a378be 100644
+--- a/lib/pinchflat/yt_dlp/media.ex
++++ b/lib/pinchflat/yt_dlp/media.ex
+@@ -49,6 +49,19 @@ defmodule Pinchflat.YtDlp.Media do
+     end
+   end
+ 
++  # TODO: test
++  def get_downloadable_status(url) do
++    case backend_runner().run(url, [:simulate, :skip_download], "%(.{live_status})j") do
++      {:ok, output} ->
++        output
++        |> Phoenix.json_library().decode!()
++        |> parse_downloadable_status()
++
++      err ->
++        err
++    end
++  end
++
+   @doc """
+   Downloads a thumbnail for a single piece of media. Usually used for
+   downloading thumbnails for internal use
+@@ -71,11 +84,10 @@ defmodule Pinchflat.YtDlp.Media do
+   Returns {:ok, %Media{}} | {:error, any, ...}.
+   """
+   def get_media_attributes(url, command_opts \\ [], addl_opts \\ []) do
+-    runner = Application.get_env(:pinchflat, :yt_dlp_runner)
+     all_command_opts = [:simulate, :skip_download] ++ command_opts
+     output_template = indexing_output_template()
+ 
+-    case runner.run(url, all_command_opts, output_template, addl_opts) do
++    case backend_runner().run(url, all_command_opts, output_template, addl_opts) do
+       {:ok, output} ->
+         output
+         |> Phoenix.json_library().decode!()
+@@ -147,6 +159,14 @@ defmodule Pinchflat.YtDlp.Media do
+   defp parse_uploaded_at(%{"upload_date" => nil}), do: nil
+   defp parse_uploaded_at(response), do: MetadataFileHelpers.parse_upload_date(response["upload_date"])
+ 
++  defp parse_downloadable_status(response) do
++    case response["live_status"] do
++      status when status in ["is_live", "is_upcoming", "post_live"] -> {:ok, :ignorable}
++      status when status in ["was_live", "not_live"] -> {:ok, :downloadable}
++      _ -> {:error, "Unknown live status: #{response["live_status"]}"}
++    end
++  end
++
+   defp backend_runner do
+     # This approach lets us mock the command for testing
+     Application.get_env(:pinchflat, :yt_dlp_runner)
+
+From a8b47f2d49b53a492a3b0ba80491923f32bc1192 Mon Sep 17 00:00:00 2001
+From: Kieran Eglin <kieran.eglin@gmail.com>
+Date: Tue, 26 Nov 2024 11:29:22 -0800
+Subject: [PATCH 2/4] Added tests for get_downloadable_status method
+
+---
+ lib/pinchflat/yt_dlp/media.ex        |  9 ++++-
+ test/pinchflat/yt_dlp/media_test.exs | 58 ++++++++++++++++++++++++++++
+ 2 files changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/lib/pinchflat/yt_dlp/media.ex b/lib/pinchflat/yt_dlp/media.ex
+index 253a378be..5bd565475 100644
+--- a/lib/pinchflat/yt_dlp/media.ex
++++ b/lib/pinchflat/yt_dlp/media.ex
+@@ -49,7 +49,12 @@ defmodule Pinchflat.YtDlp.Media do
+     end
+   end
+ 
+-  # TODO: test
++  @doc """
++  Determines if the media at the given URL is ready to be downloaded.
++  Common examples of non-downloadable media are upcoming or in-progress live streams.
++
++  Returns {:ok, :downloadable | :ignorable} | {:error, any}
++  """
+   def get_downloadable_status(url) do
+     case backend_runner().run(url, [:simulate, :skip_download], "%(.{live_status})j") do
+       {:ok, output} ->
+@@ -163,6 +168,8 @@ defmodule Pinchflat.YtDlp.Media do
+     case response["live_status"] do
+       status when status in ["is_live", "is_upcoming", "post_live"] -> {:ok, :ignorable}
+       status when status in ["was_live", "not_live"] -> {:ok, :downloadable}
++      # This preserves my tenuous support for non-youtube sources.
++      nil -> {:ok, :downloadable}
+       _ -> {:error, "Unknown live status: #{response["live_status"]}"}
+     end
+   end
+diff --git a/test/pinchflat/yt_dlp/media_test.exs b/test/pinchflat/yt_dlp/media_test.exs
+index 8a3d9ae20..ef76e1e57 100644
+--- a/test/pinchflat/yt_dlp/media_test.exs
++++ b/test/pinchflat/yt_dlp/media_test.exs
+@@ -58,6 +58,64 @@ defmodule Pinchflat.YtDlp.MediaTest do
+     end
+   end
+ 
++  describe "get_downloadable_status/1" do
++    test "returns :downloadable if the media was never live" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, Phoenix.json_library().encode!(%{"live_status" => "not_live"})}
++      end)
++
++      assert {:ok, :downloadable} = Media.get_downloadable_status(@media_url)
++    end
++
++    test "returns :downloadable if the media was live and has been processed" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, Phoenix.json_library().encode!(%{"live_status" => "was_live"})}
++      end)
++
++      assert {:ok, :downloadable} = Media.get_downloadable_status(@media_url)
++    end
++
++    test "returns :downloadable if the media's live_status is nil" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, Phoenix.json_library().encode!(%{"live_status" => nil})}
++      end)
++
++      assert {:ok, :downloadable} = Media.get_downloadable_status(@media_url)
++    end
++
++    test "returns :ignorable if the media is currently live" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, Phoenix.json_library().encode!(%{"live_status" => "is_live"})}
++      end)
++
++      assert {:ok, :ignorable} = Media.get_downloadable_status(@media_url)
++    end
++
++    test "returns :ignorable if the media is scheduled to be live" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, Phoenix.json_library().encode!(%{"live_status" => "is_upcoming"})}
++      end)
++
++      assert {:ok, :ignorable} = Media.get_downloadable_status(@media_url)
++    end
++
++    test "returns :ignorable if the media was live but hasn't been processed" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, Phoenix.json_library().encode!(%{"live_status" => "post_live"})}
++      end)
++
++      assert {:ok, :ignorable} = Media.get_downloadable_status(@media_url)
++    end
++
++    test "returns an error if the downloadable status can't be determined" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, Phoenix.json_library().encode!(%{"live_status" => "what_tha"})}
++      end)
++
++      assert {:error, "Unknown live status: what_tha"} = Media.get_downloadable_status(@media_url)
++    end
++  end
++
+   describe "download_thumbnail/2" do
+     test "calls the backend runner with the expected arguments" do
+       expect(YtDlpRunnerMock, :run, fn @media_url, opts, ot, _addl ->
+
+From cfb241efb20c2c354097c56fd6894a034cc9772a Mon Sep 17 00:00:00 2001
+From: Kieran Eglin <kieran.eglin@gmail.com>
+Date: Tue, 26 Nov 2024 11:37:52 -0800
+Subject: [PATCH 3/4] Added tests for media downloader module
+
+---
+ lib/pinchflat/downloading/media_downloader.ex |  2 -
+ .../downloading/media_downloader_test.exs     | 39 +++++++++++++++++++
+ 2 files changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/lib/pinchflat/downloading/media_downloader.ex b/lib/pinchflat/downloading/media_downloader.ex
+index e94665d75..5425932ef 100644
+--- a/lib/pinchflat/downloading/media_downloader.ex
++++ b/lib/pinchflat/downloading/media_downloader.ex
+@@ -37,7 +37,6 @@ defmodule Pinchflat.Downloading.MediaDownloader do
+       {:ok, parsed_json} ->
+         update_media_item_from_parsed_json(media_with_preloads, parsed_json)
+ 
+-      # TODO: test
+       {:error, :unsuitable_for_download} ->
+         Logger.warning(
+           "Media item ##{media_with_preloads.id} isn't suitable for download yet. May be an active or processing live stream"
+@@ -116,7 +115,6 @@ defmodule Pinchflat.Downloading.MediaDownloader do
+     {:ok, options} = DownloadOptionBuilder.build(item_with_preloads, override_opts)
+     runner_opts = [output_filepath: output_filepath, use_cookies: item_with_preloads.source.use_cookies]
+ 
+-    # TODO: test
+     case YtDlpMedia.get_downloadable_status(url) do
+       {:ok, :downloadable} -> YtDlpMedia.download(url, options, runner_opts)
+       {:ok, :ignorable} -> {:error, :unsuitable_for_download}
+diff --git a/test/pinchflat/downloading/media_downloader_test.exs b/test/pinchflat/downloading/media_downloader_test.exs
+index 70ab6fe46..a09e0c5fa 100644
+--- a/test/pinchflat/downloading/media_downloader_test.exs
++++ b/test/pinchflat/downloading/media_downloader_test.exs
+@@ -16,6 +16,7 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+       )
+ 
+     stub(HTTPClientMock, :get, fn _url, _headers, _opts -> {:ok, ""} end)
++    stub(YtDlpRunnerMock, :run, fn _url, _opts, _ot -> {:ok, "{}"} end)
+     stub(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_args -> {:ok, ""} end)
+ 
+     {:ok, %{media_item: media_item}}
+@@ -49,6 +50,14 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+       assert updated_media_item.metadata.thumbnail_filepath =~ "media_items/#{media_item.id}/thumbnail.jpg"
+     end
+ 
++    test "errors for non-downloadable media are passed through", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, Phoenix.json_library().encode!(%{"live_status" => "is_live"})}
++      end)
++
++      assert {:error, :unsuitable_for_download} = MediaDownloader.download_for_media_item(media_item)
++    end
++
+     test "non-recoverable errors are passed through", %{media_item: media_item} do
+       expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl ->
+         {:error, :some_error, 1}
+@@ -67,6 +76,36 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+     end
+   end
+ 
++  describe "download_for_media_item/3 when testing non-downloadable media" do
++    test "calls the download runner if the media is currently downloadable", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, Phoenix.json_library().encode!(%{"live_status" => "was_live"})}
++      end)
++
++      expect(YtDlpRunnerMock, :run, 2, fn _url, _opts, _ot, _addl ->
++        {:ok, render_metadata(:media_metadata)}
++      end)
++
++      assert {:ok, _} = MediaDownloader.download_for_media_item(media_item)
++    end
++
++    test "does not call the download runner if the media is not downloadable", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, Phoenix.json_library().encode!(%{"live_status" => "is_live"})}
++      end)
++
++      expect(YtDlpRunnerMock, :run, 0, fn _url, _opts, _ot, _addl -> {:ok, ""} end)
++
++      assert {:error, :unsuitable_for_download} = MediaDownloader.download_for_media_item(media_item)
++    end
++
++    test "returns unexpected errors from the download status determination method", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot -> {:error, :what_tha} end)
++
++      assert {:error, "Unknown error: {:error, :what_tha}"} = MediaDownloader.download_for_media_item(media_item)
++    end
++  end
++
+   describe "download_for_media_item/3 when testing override options" do
+     test "includes override opts if specified", %{media_item: media_item} do
+       expect(YtDlpRunnerMock, :run, 1, fn _url, opts, _ot, _addl ->
+
+From 9745340bee106a0f07681878ec757bb032dcd9ac Mon Sep 17 00:00:00 2001
+From: Kieran Eglin <kieran.eglin@gmail.com>
+Date: Tue, 26 Nov 2024 11:44:06 -0800
+Subject: [PATCH 4/4] Added tests to download worker modeule
+
+---
+ .../downloading/media_download_worker.ex          |  1 -
+ .../downloading/media_download_worker_test.exs    | 15 +++++++++++++++
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/lib/pinchflat/downloading/media_download_worker.ex b/lib/pinchflat/downloading/media_download_worker.ex
+index 6b9f94294..ff1459b5d 100644
+--- a/lib/pinchflat/downloading/media_download_worker.ex
++++ b/lib/pinchflat/downloading/media_download_worker.ex
+@@ -94,7 +94,6 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+       {:recovered, _} ->
+         {:error, :retry}
+ 
+-      # TODO: test
+       {:error, :unsuitable_for_download} ->
+         {:ok, :non_retry}
+ 
+diff --git a/test/pinchflat/downloading/media_download_worker_test.exs b/test/pinchflat/downloading/media_download_worker_test.exs
+index a34adfb1f..76dc1a35a 100644
+--- a/test/pinchflat/downloading/media_download_worker_test.exs
++++ b/test/pinchflat/downloading/media_download_worker_test.exs
+@@ -9,6 +9,7 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+   alias Pinchflat.Downloading.MediaDownloadWorker
+ 
+   setup do
++    stub(YtDlpRunnerMock, :run, fn _url, _opts, _ot -> {:ok, "{}"} end)
+     stub(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl -> {:ok, ""} end)
+     stub(UserScriptRunnerMock, :run, fn _event_type, _data -> {:ok, "", 0} end)
+     stub(HTTPClientMock, :get, fn _url, _headers, _opts -> {:ok, ""} end)
+@@ -186,6 +187,20 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+     end
+   end
+ 
++  describe "perform/1 when testing non-downloadable media" do
++    test "does not retry the job if the media is currently not downloadable", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, Phoenix.json_library().encode!(%{"live_status" => "is_live"})}
++      end)
++
++      Oban.Testing.with_testing_mode(:inline, fn ->
++        {:ok, job} = Oban.insert(MediaDownloadWorker.new(%{id: media_item.id}))
++
++        assert job.state == "completed"
++      end)
++    end
++  end
++
+   describe "perform/1 when testing forced downloads" do
+     test "ignores 'prevent_download' if forced", %{media_item: media_item} do
+       expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl -> :ok end)

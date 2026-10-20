@@ -1,0 +1,262 @@
+diff --git a/lib/thousand_island/acceptor.ex b/lib/thousand_island/acceptor.ex
+index f7c476c..4a292b2 100644
+--- a/lib/thousand_island/acceptor.ex
++++ b/lib/thousand_island/acceptor.ex
+@@ -3,6 +3,12 @@ defmodule ThousandIsland.Acceptor do
+ 
+   use Task, restart: :transient
+ 
++  # How long to pause the accept loop when the system reports file descriptor
++  # exhaustion (:emfile / :enfile). We cannot accept while out of descriptors, so
++  # we back off briefly to let the situation resolve rather than spinning or
++  # crashing. This mirrors Ranch's behaviour (ranch_acceptor.erl).
++  @fd_exhaustion_wait 100
++
+   @spec start_link(
+           {server :: Supervisor.supervisor(), parent :: Supervisor.supervisor(), pos_integer(),
+            ThousandIsland.ServerConfig.t()}
+@@ -66,6 +72,24 @@ defmodule ThousandIsland.Acceptor do
+           count + 1
+         )
+ 
++      {:error, reason} when reason in [:emfile, :enfile] ->
++        # File descriptors are exhausted, so nothing can be accepted right now.
++        # Back off briefly to let the situation resolve rather than crashing the
++        # acceptor (whose crash loop would escalate through the supervision
++        # tree, killing in-flight connections along the way). This mirrors
++        # Ranch's handling of the same condition
++        ThousandIsland.Telemetry.span_event(span, :emfile, %{error: reason})
++        Process.sleep(@fd_exhaustion_wait)
++
++        accept(
++          listener_socket,
++          connection_sup_pid,
++          server_config,
++          handler_config,
++          span,
++          count + 1
++        )
++
+       {:error, :closed} ->
+         ThousandIsland.Telemetry.stop_span(span, %{connections: count})
+ 
+diff --git a/lib/thousand_island/logger.ex b/lib/thousand_island/logger.ex
+index 94894a3..c31fe09 100644
+--- a/lib/thousand_island/logger.ex
++++ b/lib/thousand_island/logger.ex
+@@ -23,7 +23,8 @@ defmodule ThousandIsland.Logger do
+   def attach_logger(:error) do
+     events = [
+       [:thousand_island, :acceptor, :spawn_error],
+-      [:thousand_island, :acceptor, :econnaborted]
++      [:thousand_island, :acceptor, :econnaborted],
++      [:thousand_island, :acceptor, :emfile]
+     ]
+ 
+     :telemetry.attach_many("#{__MODULE__}.error", events, &__MODULE__.log_error/4, nil)
+diff --git a/lib/thousand_island/telemetry.ex b/lib/thousand_island/telemetry.ex
+index 42329a0..42ff4e0 100644
+--- a/lib/thousand_island/telemetry.ex
++++ b/lib/thousand_island/telemetry.ex
+@@ -112,6 +112,23 @@ defmodule ThousandIsland.Telemetry do
+ 
+       * `telemetry_span_context`: A unique identifier for this span
+ 
++  * `[:thousand_island, :acceptor, :emfile]`
++
++      Thousand Island was unable to accept a connection because the system is out of file
++      descriptors (`:emfile` or `:enfile`). The acceptor backs off briefly and keeps running
++      rather than crashing. Persistent occurrences indicate that the OS file descriptor limit
++      (`ulimit -n`) is too low, or that file descriptors are being leaked elsewhere in the node.
++
++      This event contains the following measurements:
++
++      * `monotonic_time`: The time of this event, in `:native` units
++      * `error`: The specific error returned by accept: `:emfile` if the per-process
++        descriptor limit was reached, or `:enfile` if the system-wide limit was reached
++
++      This event contains the following metadata:
++
++      * `telemetry_span_context`: A unique identifier for this span
++
+   ## `[:thousand_island, :connection, *]`
+ 
+   Represents Thousand Island handling a specific client request
+@@ -306,6 +323,7 @@ defmodule ThousandIsland.Telemetry do
+           :ready
+           | :spawn_error
+           | :econnaborted
++          | :emfile
+           | :recv_error
+           | :send_error
+           | :sendfile_error
+diff --git a/test/support/telemetry_helpers.ex b/test/support/telemetry_helpers.ex
+index 8841cb4..19588bd 100644
+--- a/test/support/telemetry_helpers.ex
++++ b/test/support/telemetry_helpers.ex
+@@ -8,6 +8,7 @@ defmodule TelemetryHelpers do
+     [:thousand_island, :acceptor, :stop],
+     [:thousand_island, :acceptor, :spawn_error],
+     [:thousand_island, :acceptor, :econnaborted],
++    [:thousand_island, :acceptor, :emfile],
+     [:thousand_island, :connection, :start],
+     [:thousand_island, :connection, :stop],
+     [:thousand_island, :connection, :ready],
+diff --git a/test/thousand_island/acceptor_test.exs b/test/thousand_island/acceptor_test.exs
+new file mode 100644
+index 0000000..2ea8fa1
+--- /dev/null
++++ b/test/thousand_island/acceptor_test.exs
+@@ -0,0 +1,152 @@
++defmodule ThousandIsland.AcceptorTest do
++  use ExUnit.Case, async: false
++
++  use Machete
++
++  # A transport that delegates to gen_tcp but lets the test inject a queue of
++  # accept/1 results via :persistent_term, so we can simulate the OS reporting
++  # file descriptor exhaustion. Once the queue is drained, real accepts resume.
++  defmodule FlakyTransport do
++    @behaviour ThousandIsland.Transport
++
++    def set_accept_results(key, results), do: :persistent_term.put({__MODULE__, key}, results)
++
++    @impl true
++    def listen(port, _opts),
++      do: :gen_tcp.listen(port, [:binary, active: false, reuseaddr: true])
++
++    @impl true
++    def accept(listener_socket) do
++      key = :persistent_term.get({__MODULE__, :key})
++
++      case :persistent_term.get({__MODULE__, key}, []) do
++        [next | rest] ->
++          :persistent_term.put({__MODULE__, key}, rest)
++          # Inject a simulated error without consuming a real connection
++          {:error, next}
++
++        [] ->
++          :gen_tcp.accept(listener_socket)
++      end
++    end
++
++    @impl true
++    def handshake(socket), do: {:ok, socket}
++    @impl true
++    def upgrade(_socket, _opts), do: {:error, :unsupported_upgrade}
++    @impl true
++    def controlling_process(socket, pid), do: :gen_tcp.controlling_process(socket, pid)
++    @impl true
++    def recv(socket, length, timeout), do: :gen_tcp.recv(socket, length, timeout)
++    @impl true
++    def send(socket, data), do: :gen_tcp.send(socket, data)
++    @impl true
++    def sendfile(_s, _f, _o, _l), do: {:error, :not_supported}
++    @impl true
++    def getopts(socket, options), do: :inet.getopts(socket, options)
++    @impl true
++    def setopts(socket, options), do: :inet.setopts(socket, options)
++    @impl true
++    def shutdown(socket, way), do: :gen_tcp.shutdown(socket, way)
++    @impl true
++    def close(socket), do: :gen_tcp.close(socket)
++    @impl true
++    def sockname(socket), do: :inet.sockname(socket)
++    @impl true
++    def peername(socket), do: :inet.peername(socket)
++    @impl true
++    def peercert(_socket), do: {:error, :not_secure}
++    @impl true
++    def secure?, do: false
++    @impl true
++    def getstat(socket), do: :inet.getstat(socket)
++    @impl true
++    def negotiated_protocol(_socket), do: {:error, :protocol_not_negotiated}
++    @impl true
++    def connection_information(_socket), do: {:error, :not_secure}
++  end
++
++  defmodule Echo do
++    use ThousandIsland.Handler
++
++    @impl ThousandIsland.Handler
++    def handle_data(data, socket, state) do
++      ThousandIsland.Socket.send(socket, data)
++      {:continue, state}
++    end
++  end
++
++  defp acceptor_sup_pids(server_pid) do
++    server_pid
++    |> ThousandIsland.Server.acceptor_pool_supervisor_pid()
++    |> ThousandIsland.AcceptorPoolSupervisor.acceptor_supervisor_pids()
++  end
++
++  test "descriptor exhaustion does not take down the acceptor or its in-flight connections" do
++    key = make_ref()
++    :persistent_term.put({FlakyTransport, :key}, key)
++    FlakyTransport.set_accept_results(key, [])
++
++    {:ok, server_pid} =
++      start_supervised(
++        {ThousandIsland,
++         port: 0, handler_module: Echo, transport_module: FlakyTransport, num_acceptors: 1}
++      )
++
++    {:ok, {_ip, port}} = ThousandIsland.listener_info(server_pid)
++    [acceptor_sup] = acceptor_sup_pids(server_pid)
++
++    # Open a connection while descriptors are still available
++    {:ok, existing} = :gen_tcp.connect(:localhost, port, [:binary, active: false])
++    :ok = :gen_tcp.send(existing, "FIRST")
++    assert :gen_tcp.recv(existing, 0, 1000) == {:ok, "FIRST"}
++
++    # Now have accept report descriptor exhaustion five times in a row. Five
++    # failures is past the acceptor's restart budget (3 restarts in 5 seconds):
++    # if each error crashes the acceptor, the crash loop takes down the
++    # acceptor's supervisor, and with it every connection that acceptor is
++    # currently serving
++    FlakyTransport.set_accept_results(key, [:emfile, :enfile, :emfile, :enfile, :emfile])
++
++    # A new client unblocks the acceptor's pending accept; the acceptor then
++    # works through the injected errors (backing off briefly on each) before
++    # settling back into normal accepts
++    {:ok, fresh} = :gen_tcp.connect(:localhost, port, [:binary, active: false])
++    Process.sleep(800)
++
++    # The in-flight connections survived the exhaustion window
++    :ok = :gen_tcp.send(existing, "STILL HERE")
++    assert :gen_tcp.recv(existing, 0, 1000) == {:ok, "STILL HERE"}
++    :ok = :gen_tcp.send(fresh, "HELLO")
++    assert :gen_tcp.recv(fresh, 0, 1000) == {:ok, "HELLO"}
++
++    # Nothing under the server was restarted, and new connections are accepted
++    # now that descriptors have freed up
++    assert acceptor_sup_pids(server_pid) == [acceptor_sup]
++    {:ok, late} = :gen_tcp.connect(:localhost, port, [:binary, active: false])
++    :ok = :gen_tcp.send(late, "LATE")
++    assert :gen_tcp.recv(late, 0, 1000) == {:ok, "LATE"}
++
++    Enum.each([existing, fresh, late], &:gen_tcp.close/1)
++  end
++
++  test "an :emfile telemetry event is emitted on descriptor exhaustion" do
++    on_exit(TelemetryHelpers.attach_all_events(Echo))
++
++    key = make_ref()
++    :persistent_term.put({FlakyTransport, :key}, key)
++    FlakyTransport.set_accept_results(key, [:emfile])
++
++    {:ok, _server_pid} =
++      start_supervised(
++        {ThousandIsland,
++         port: 0, handler_module: Echo, transport_module: FlakyTransport, num_acceptors: 1}
++      )
++
++    assert_receive {:telemetry, [:thousand_island, :acceptor, :emfile], measurements, metadata},
++                   1000
++
++    assert measurements ~> %{monotonic_time: integer(), error: :emfile}
++    assert metadata ~> %{handler: Echo, telemetry_span_context: reference()}
++  end
++end

@@ -1,0 +1,189 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8eee4240cc..c20ce375f5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,8 @@
+ 
+ ## Unreleased
+ 
++- Bug Fix: [Validate type references for invalid wrapped types](https://github.com/absinthe-graphql/absinthe/pull/1195)
++- Feature: [Add `specifiedBy` type system directive](https://github.com/absinthe-graphql/absinthe/pull/1193)
+ - Bug Fix: [Object type extensions may be empty](https://github.com/absinthe-graphql/absinthe/pull/1228)
+ - Bug Fix: [Validate input object not being an Enum](https://github.com/absinthe-graphql/absinthe/pull/1231)
+ - Bug Fix: [Deduplicate directives when building schema](https://github.com/absinthe-graphql/absinthe/pull/1242)
+diff --git a/lib/absinthe/phase/document/validation/known_directives.ex b/lib/absinthe/phase/document/validation/known_directives.ex
+index e1d978ee7b..32c9a9a36c 100644
+--- a/lib/absinthe/phase/document/validation/known_directives.ex
++++ b/lib/absinthe/phase/document/validation/known_directives.ex
+@@ -63,7 +63,7 @@ defmodule Absinthe.Phase.Document.Validation.KnownDirectives do
+   defp error_unknown(node) do
+     %Phase.Error{
+       phase: __MODULE__,
+-      message: "Unknown directive `#{node.name}'.",
++      message: "Unknown directive `#{node.name}`.",
+       locations: [node.source_location]
+     }
+   end
+@@ -74,7 +74,7 @@ defmodule Absinthe.Phase.Document.Validation.KnownDirectives do
+ 
+     %Phase.Error{
+       phase: __MODULE__,
+-      message: "Directive `#{node.name}' may not be used on #{placement_name}.",
++      message: "Directive `#{node.name}` may not be used on #{placement_name}.",
+       locations: [node.source_location]
+     }
+   end
+diff --git a/lib/absinthe/schema/notation.ex b/lib/absinthe/schema/notation.ex
+index 6628bbaef4..3d5b2b08a7 100644
+--- a/lib/absinthe/schema/notation.ex
++++ b/lib/absinthe/schema/notation.ex
+@@ -1606,7 +1606,7 @@ defmodule Absinthe.Schema.Notation do
+     attrs =
+       attrs
+       |> Keyword.put(:identifier, identifier)
+-      |> Keyword.put_new(:name, to_string(identifier))
++      |> Keyword.put_new(:name, default_name(Schema.DirectiveDefinition, identifier))
+       |> Keyword.update(:description, nil, &wrap_in_unquote/1)
+ 
+     scoped_def(env, Schema.DirectiveDefinition, identifier, attrs, block)
+@@ -1985,6 +1985,11 @@ defmodule Absinthe.Schema.Notation do
+     |> Atom.to_string()
+   end
+ 
++  defp default_name(Schema.DirectiveDefinition, identifier) do
++    identifier
++    |> Atom.to_string()
++  end
++
+   defp default_name(_, identifier) do
+     identifier
+     |> Atom.to_string()
+diff --git a/lib/absinthe/schema/prototype/notation.ex b/lib/absinthe/schema/prototype/notation.ex
+index e06dd0ced6..68dce53c2e 100644
+--- a/lib/absinthe/schema/prototype/notation.ex
++++ b/lib/absinthe/schema/prototype/notation.ex
+@@ -34,6 +34,17 @@ defmodule Absinthe.Schema.Prototype.Notation do
+         expand &__MODULE__.expand_deprecate/2
+       end
+ 
++      directive :specified_by do
++        description "Exposes a URL that specifies the behavior of this scalar."
++
++        repeatable false
++
++        arg :url, non_null(:string),
++          description: "The URL that specifies the behavior of this scalar."
++
++        on [:scalar]
++      end
++
+       def pipeline(pipeline) do
+         pipeline
+         |> Absinthe.Pipeline.without(Absinthe.Phase.Schema.Validation.QueryTypeMustBeObject)
+diff --git a/lib/absinthe/type/built_ins/introspection.ex b/lib/absinthe/type/built_ins/introspection.ex
+index 4923acc230..5ffc20fe53 100644
+--- a/lib/absinthe/type/built_ins/introspection.ex
++++ b/lib/absinthe/type/built_ins/introspection.ex
+@@ -54,7 +54,11 @@ defmodule Absinthe.Type.BuiltIns.Introspection do
+   object :__directive do
+     description "Represents a directive"
+ 
+-    field :name, non_null(:string)
++    field :name,
++      type: non_null(:string),
++      resolve: fn _, %{adapter: adapter, source: source} ->
++        {:ok, adapter.to_external_name(source.name, :field)}
++      end
+ 
+     field :description, :string
+ 
+diff --git a/test/absinthe/integration/execution/introspection/directives_test.exs b/test/absinthe/integration/execution/introspection/directives_test.exs
+index bd779fad54..764afc0c1c 100644
+--- a/test/absinthe/integration/execution/introspection/directives_test.exs
++++ b/test/absinthe/integration/execution/introspection/directives_test.exs
+@@ -72,6 +72,23 @@ defmodule Elixir.Absinthe.Integration.Execution.Introspection.DirectivesTest do
+                       "onFragment" => true,
+                       "onOperation" => false,
+                       "isRepeatable" => false
++                    },
++                    %{
++                      "isRepeatable" => false,
++                      "locations" => ["SCALAR"],
++                      "name" => "specifiedBy",
++                      "onField" => false,
++                      "onFragment" => false,
++                      "onOperation" => false,
++                      "args" => [
++                        %{
++                          "name" => "url",
++                          "type" => %{
++                            "kind" => "NON_NULL",
++                            "ofType" => %{"kind" => "SCALAR", "name" => "String"}
++                          }
++                        }
++                      ]
+                     }
+                   ]
+                 }
+diff --git a/test/absinthe/introspection_test.exs b/test/absinthe/introspection_test.exs
+index 391eddfcf9..3575efb9d1 100644
+--- a/test/absinthe/introspection_test.exs
++++ b/test/absinthe/introspection_test.exs
+@@ -71,6 +71,16 @@ defmodule Absinthe.IntrospectionTest do
+                         "onField" => true,
+                         "onFragment" => true,
+                         "onOperation" => false
++                      },
++                      %{
++                        "description" =>
++                          "Exposes a URL that specifies the behavior of this scalar.",
++                        "isRepeatable" => false,
++                        "locations" => ["SCALAR"],
++                        "name" => "specifiedBy",
++                        "onField" => false,
++                        "onFragment" => false,
++                        "onOperation" => false
+                       }
+                     ]
+                   }
+diff --git a/test/absinthe/phase/document/validation/known_directives_test.exs b/test/absinthe/phase/document/validation/known_directives_test.exs
+index f20ce5782e..5d6da639f9 100644
+--- a/test/absinthe/phase/document/validation/known_directives_test.exs
++++ b/test/absinthe/phase/document/validation/known_directives_test.exs
+@@ -5,12 +5,12 @@ defmodule Absinthe.Phase.Document.Validation.KnownDirectivesTest do
+     phase: @phase,
+     async: true
+ 
+-  alias Absinthe.{Blueprint}
++  alias Absinthe.Blueprint
+ 
+   def unknown_directive(name, line) do
+     bad_value(
+       Blueprint.Directive,
+-      "Unknown directive `#{name}'.",
++      "Unknown directive `#{name}`.",
+       line,
+       name: name
+     )
+@@ -19,7 +19,7 @@ defmodule Absinthe.Phase.Document.Validation.KnownDirectivesTest do
+   def misplaced_directive(name, placement, line) do
+     bad_value(
+       Blueprint.Directive,
+-      "Directive `#{name}' may not be used on #{placement}.",
++      "Directive `#{name}` may not be used on #{placement}.",
+       line,
+       name: name
+     )
+diff --git a/test/absinthe/strict_schema_test.exs b/test/absinthe/strict_schema_test.exs
+index 03eda113c4..d62592a0bf 100644
+--- a/test/absinthe/strict_schema_test.exs
++++ b/test/absinthe/strict_schema_test.exs
+@@ -34,7 +34,7 @@ defmodule Absinthe.StrictSchemaTest do
+       variables = %{"input" => %{"naiveDatetime" => "2017-01-27T20:31:55"}}
+ 
+       assert_error_message(
+-        "Unknown directive `foo_bar_directive'.",
++        "Unknown directive `foo_bar_directive`.",
+         run(document, Absinthe.Fixtures.StrictSchema,
+           adapter: Absinthe.Adapter.StrictLanguageConventions,
+           variables: variables

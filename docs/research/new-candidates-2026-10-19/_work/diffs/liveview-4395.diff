@@ -1,0 +1,163 @@
+diff --git a/assets/js/phoenix_live_view/upload_entry.js b/assets/js/phoenix_live_view/upload_entry.js
+index b4ca2d784e..f6c537315d 100644
+--- a/assets/js/phoenix_live_view/upload_entry.js
++++ b/assets/js/phoenix_live_view/upload_entry.js
+@@ -44,6 +44,7 @@ export default class UploadEntry {
+     this._isDone = false;
+     this._progress = 0;
+     this._lastProgressSent = -1;
++    this._onCancel = function () {};
+     this._onDone = function () {};
+     this._onElUpdated = this.onElUpdated.bind(this);
+     this.fileEl.addEventListener(PHX_LIVE_FILE_UPDATED, this._onElUpdated);
+@@ -80,7 +81,11 @@ export default class UploadEntry {
+     this.file._preflightInProgress = false;
+     this._isCancelled = true;
+     this._isDone = true;
+-    this._onDone();
++    try {
++      this._onCancel();
++    } finally {
++      this._onDone();
++    }
+   }
+ 
+   isDone() {
+@@ -99,6 +104,14 @@ export default class UploadEntry {
+     return this.autoUpload;
+   }
+ 
++  onCancel(callback) {
++    if (this.isCancelled()) {
++      callback();
++    } else {
++      this._onCancel = callback;
++    }
++  }
++
+   //private
+ 
+   onDone(callback) {
+diff --git a/guides/client/external-uploads.md b/guides/client/external-uploads.md
+index 931fe02ec5..41e4a07d6b 100644
+--- a/guides/client/external-uploads.md
++++ b/guides/client/external-uploads.md
+@@ -84,6 +84,9 @@ Uploaders.UpChunk = function(entries, onViewError){
+     // stop uploading in the event of a view error
+     onViewError(() => upload.pause())
+ 
++    // abort the upload if the user cancels it
++    entry.onCancel(() => upload.abort())
++
+     // upload error triggers LiveView error
+     upload.on("error", (e) => entry.error(e.detail.message))
+ 
+@@ -206,6 +209,7 @@ Uploaders.S3 = function(entries, onViewError){
+     formData.append("file", entry.file)
+     let xhr = new XMLHttpRequest()
+     onViewError(() => xhr.abort())
++    entry.onCancel(() => xhr.abort())
+     xhr.onload = () => xhr.status === 204 ? entry.progress(100) : entry.error()
+     xhr.onerror = () => entry.error()
+     xhr.upload.addEventListener("progress", (event) => {
+@@ -284,6 +288,7 @@ Uploaders.S3 = function (entries, onViewError) {
+   entries.forEach(entry => {
+     let xhr = new XMLHttpRequest()
+     onViewError(() => xhr.abort())
++    entry.onCancel(() => xhr.abort())
+     xhr.onload = () => xhr.status === 200 ? entry.progress(100) : entry.error()
+     xhr.onerror = () => entry.error()
+ 
+diff --git a/test/e2e/support/upload_live.ex b/test/e2e/support/upload_live.ex
+index 4c67b3eb25..066b03a6c9 100644
+--- a/test/e2e/support/upload_live.ex
++++ b/test/e2e/support/upload_live.ex
+@@ -19,6 +19,19 @@ defmodule Phoenix.LiveViewTest.E2E.UploadLive do
+     |> then(&{:noreply, &1})
+   end
+ 
++  def handle_params(%{"external_upload" => _}, _uri, socket) do
++    socket
++    |> allow_upload(:avatar,
++      accept: ~w(.txt .md),
++      max_entries: 2,
++      auto_upload: true,
++      external: fn _entry, socket ->
++        {:ok, %{uploader: "TestExternal"}, socket}
++      end
++    )
++    |> then(&{:noreply, &1})
++  end
++
+   def handle_params(_params, _uri, socket) do
+     {:noreply, socket}
+   end
+diff --git a/test/e2e/test_helper.exs b/test/e2e/test_helper.exs
+index c37f7ba4fb..879070af8c 100644
+--- a/test/e2e/test_helper.exs
++++ b/test/e2e/test_helper.exs
+@@ -57,12 +57,27 @@ defmodule Phoenix.LiveViewTest.E2E.Layout do
+           this.pushEvent("ping", {}, () => (this.el.innerText += "pong"));
+         },
+       };
++      let Uploaders = {};
++      Uploaders.TestExternal = function (entries) {
++        entries.forEach((entry) => {
++          document.documentElement.dataset.externalUploadStarted = entry.ref;
++
++          let upload = {
++            abort() {
++              document.documentElement.dataset.externalUploadAborted = entry.ref;
++            },
++          };
++
++          entry.onCancel(() => upload.abort());
++        });
++      };
+       let csrfToken = document
+         .querySelector("meta[name='csrf-token']")
+         .getAttribute("content");
+       let liveSocket = new LiveSocket("/live", window.Phoenix.Socket, {
+         params: { _csrf_token: csrfToken },
+         hooks: { ...Hooks, ...window.hooks, ...colocatedHooks },
++        uploaders: Uploaders,
+       });
+       liveSocket.connect();
+       window.liveSocket = liveSocket;
+diff --git a/test/e2e/tests/uploads.spec.js b/test/e2e/tests/uploads.spec.js
+index 6e286629b7..32835c32a7 100644
+--- a/test/e2e/tests/uploads.spec.js
++++ b/test/e2e/tests/uploads.spec.js
+@@ -199,6 +199,32 @@ test("auto upload", async ({ page }) => {
+   await expect(page.locator("ul li")).toBeVisible();
+ });
+ 
++// https://github.com/phoenixframework/phoenix_live_view/issues/3287
++test("external uploader is notified when an upload is cancelled", async ({
++  page,
++}) => {
++  await page.goto("/upload?external_upload=1");
++  await syncLV(page);
++
++  await page.locator("#upload-form input").setInputFiles({
++    name: "file.txt",
++    mimeType: "text/plain",
++    buffer: Buffer.from("this upload remains in progress"),
++  });
++
++  await expect(page.locator("html")).toHaveAttribute(
++    "data-external-upload-started",
++    /.+/,
++  );
++
++  await page.getByLabel("cancel").click();
++
++  await expect(page.locator("html")).toHaveAttribute(
++    "data-external-upload-aborted",
++    /.+/,
++  );
++});
++
+ test("issue 3115 - cancelled upload is not re-added", async ({ page }) => {
+   await page.goto("/upload");
+   await syncLV(page);

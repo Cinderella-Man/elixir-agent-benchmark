@@ -1,0 +1,1941 @@
+diff --git a/.sobelow-conf b/.sobelow-conf
+index ed5bb1f47..0c4088d99 100644
+--- a/.sobelow-conf
++++ b/.sobelow-conf
+@@ -9,7 +9,15 @@
+   threshold: :low,
+   # All of these are ignorable because this app is intended to be single-user and self-hosted.
+   # There is an expectation that the user won't intentionally run a FS Traversal on themselves
+-  ignore: ["CI.System", "Traversal.FileModule", "Config.HTTPS", "Config.CSP"],
++  ignore:
++    [
++      "CI.System",
++      "Traversal.FileModule",
++      "Config.HTTPS",
++      "Config.CSP",
++      "XSS.ContentType",
++      "Traversal.SendFile"
++    ],
+   ignore_files: [],
+   version: false
+ ]
+diff --git a/README.md b/README.md
+index 46f0771bc..523ed6455 100644
+--- a/README.md
++++ b/README.md
+@@ -22,12 +22,12 @@
+ - [Installation](#installation)
+   - [Unraid](#unraid)
+   - [Docker](#docker)
+-- [Authentication](#authentication)
++- [Username and Password (authentication)](https://github.com/kieraneglin/pinchflat/wiki/Username-and-Password)
+ - [Frequently asked questions](https://github.com/kieraneglin/pinchflat/wiki/Frequently-Asked-Questions)
+ - [Documentation](https://github.com/kieraneglin/pinchflat/wiki)
+ - [EFF donations](#eff-donations)
+ - [Pre-release disclaimer](#pre-release-disclaimer)
+-- [Development](#development)
++- [Development and Contributing](https://github.com/kieraneglin/pinchflat/wiki/Development-and-Contributing)
+ 
+ ## What it does
+ 
+@@ -43,6 +43,7 @@ If it doesn't work for your use case, please make a feature request! You can als
+ - Powerful naming system so content is stored where and how you want it
+ - Easy-to-use web interface with presets to get you started right away
+ - First-class support for media center apps like Plex, Jellyfin, and Kodi
++- Supports serving RSS feeds to your favourite podcast app (beta - [docs](<https://github.com/kieraneglin/pinchflat/wiki/Podcast-RSS-Feeds-(beta)>))
+ - Automatically downloads new content from channels and playlists
+   - Uses a novel approach to download new content more quickly than other apps
+ - Supports downloading audio content
+@@ -103,10 +104,6 @@ You _must_ ensure the host directories you've mounted are writable by the user r
+ 
+ It's recommended to not run the container as root. Doing so can create permission issues if other apps need to work with the downloaded media. If you need to run any command as root, you can run `su` from the container's shell as there is no password set for the root user.
+ 
+-## Username and Password
+-
+-HTTP basic authentication is optionally supported. To use it, set the `BASIC_AUTH_USERNAME` and `BASIC_AUTH_PASSWORD` environment variables when starting the container. No authentication will be required unless you set _both_ of these.
+-
+ ## EFF donations
+ 
+ A portion of all donations to Pinchflat will be donated to the [Electronic Frontier Foundation](https://www.eff.org/). The EFF defends your online liberties and [backed](https://github.com/github/dmca/blob/9a85e0f021f7967af80e186b890776a50443f06c/2020/11/2020-11-16-RIAA-reversal-effletter.pdf) `youtube-dl` when Google took them down. [See here](https://github.com/kieraneglin/pinchflat/wiki/EFF-Donation-Receipts) for a list of donation receipts.
+@@ -115,30 +112,6 @@ A portion of all donations to Pinchflat will be donated to the [Electronic Front
+ 
+ This is pre-release software and anything can break at any time. I make not guarantees about the stability of this software, forward-compatibility of updates, or integrity (both related to and independent of Pinchflat). Essentially, use at your own risk and expect there will be rough edges for now.
+ 
+-## Development
+-
+-Pinchflat is written in Elixir - a functional programming language that runs on the Erlang VM. It uses the Phoenix web framework and SQLite for the database. The frontend is mostly normal server-rendered HTML with a little Alpine.js as-needed.
+-
+-Elixir is a personal favourite of mine and is ideal for building fault-tolerant systems. It's also a joy to work with and has a great community. If you're interested in contributing, I'd be happy to help you get started with Elixir - just open an issue with some questions and we can chat!
+-
+-### Local setup
+-
+-- `docker compose build --no-cache`
+-- `docker compose up -d && docker attach pinchflat-phx-1`
+-- After a few minutes the app should be accessible at `localhost:4008`
+-  - Please let me know if you run into any hiccups here - I haven't had to bootstrap the app from scratch in a long time and I might have forgotten something
+-- Media downloads and config will be stored in the `tmp` directory. Not the OS's `/tmp` directory, but the one in the root of the project
+-
+-### Running tests and linting
+-
+-- Open a shell with `docker compose exec phx bash`
+-- Run `mix test` to run the tests
+-- Run `mix check` to do a full testing, linting, and static analysis pass
+-
+-### Top tips
+-
+-- Look for any module that ends in `*_worker.ex` - these are where the interesting stuff happens and you can trace back from there to see how the app works. `lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex` is a good place to start
+-
+ ## License
+ 
+ See `LICENSE` file
+diff --git a/config/config.exs b/config/config.exs
+index 76f4b0127..4c26b3b9a 100644
+--- a/config/config.exs
++++ b/config/config.exs
+@@ -20,8 +20,9 @@ config :pinchflat,
+   tmpfile_directory: Path.join([System.tmp_dir!(), "pinchflat", "data"]),
+   # Setting BASIC_AUTH_USERNAME and BASIC_AUTH_PASSWORD implies you want to use basic auth.
+   # If either is unset, basic auth will not be used.
+-  basic_auth_username: System.get_env("BASIC_AUTH_USERNAME"),
+-  basic_auth_password: System.get_env("BASIC_AUTH_PASSWORD"),
++  basic_auth_username: "",
++  basic_auth_password: "",
++  expose_feed_endpoints: false,
+   file_watcher_poll_interval: 1000
+ 
+ # Configures the endpoint
+diff --git a/config/runtime.exs b/config/runtime.exs
+index 6c0d6cd04..c90ffb95f 100644
+--- a/config/runtime.exs
++++ b/config/runtime.exs
+@@ -47,6 +47,9 @@ if config_env() == :prod do
+   metadata_path = System.get_env("METADATA_PATH", Path.join([config_path, "metadata"]))
+   extras_path = System.get_env("EXTRAS_PATH", Path.join([config_path, "extras"]))
+ 
++  # For running PF as a podcast host on self-hosted environments
++  expose_feed_endpoints = String.length(System.get_env("EXPOSE_FEED_ENDPOINTS", "")) > 0
++
+   # We want to force _some_ level of useful logging in production
+   acceptable_log_levels = ~w(debug info)a
+   log_level = String.to_existing_atom(System.get_env("LOG_LEVEL", "info"))
+@@ -64,7 +67,8 @@ if config_env() == :prod do
+     metadata_directory: metadata_path,
+     extras_directory: extras_path,
+     tmpfile_directory: Path.join([System.tmp_dir!(), "pinchflat", "data"]),
+-    dns_cluster_query: System.get_env("DNS_CLUSTER_QUERY")
++    dns_cluster_query: System.get_env("DNS_CLUSTER_QUERY"),
++    expose_feed_endpoints: expose_feed_endpoints
+ 
+   config :pinchflat, Pinchflat.Repo,
+     database: db_path,
+@@ -121,54 +125,4 @@ if config_env() == :prod do
+        formatter: Logger.Formatter.new()
+      }}
+   ]
+-
+-  # ## SSL Support
+-  #
+-  # To get SSL working, you will need to add the `https` key
+-  # to your endpoint configuration:
+-  #
+-  #     config :pinchflat, PinchflatWeb.Endpoint,
+-  #       https: [
+-  #         ...,
+-  #         port: 443,
+-  #         cipher_suite: :strong,
+-  #         keyfile: System.get_env("SOME_APP_SSL_KEY_PATH"),
+-  #         certfile: System.get_env("SOME_APP_SSL_CERT_PATH")
+-  #       ]
+-  #
+-  # The `cipher_suite` is set to `:strong` to support only the
+-  # latest and more secure SSL ciphers. This means old browsers
+-  # and clients may not be supported. You can set it to
+-  # `:compatible` for wider support.
+-  #
+-  # `:keyfile` and `:certfile` expect an absolute path to the key
+-  # and cert in disk or a relative path inside priv, for example
+-  # "priv/ssl/server.key". For all supported SSL configuration
+-  # options, see https://hexdocs.pm/plug/Plug.SSL.html#configure/1
+-  #
+-  # We also recommend setting `force_ssl` in your endpoint, ensuring
+-  # no data is ever sent via http, always redirecting to https:
+-  #
+-  #     config :pinchflat, PinchflatWeb.Endpoint,
+-  #       force_ssl: [hsts: true]
+-  #
+-  # Check `Plug.SSL` for all available options in `force_ssl`.
+-
+-  # ## Configuring the mailer
+-  #
+-  # In production you need to configure the mailer to use a different adapter.
+-  # Also, you may need to configure the Swoosh API client of your choice if you
+-  # are not using SMTP. Here is an example of the configuration:
+-  #
+-  #     config :pinchflat, Pinchflat.Mailer,
+-  #       adapter: Swoosh.Adapters.Mailgun,
+-  #       api_key: System.get_env("MAILGUN_API_KEY"),
+-  #       domain: System.get_env("MAILGUN_DOMAIN")
+-  #
+-  # For this example you need include a HTTP client required by Swoosh API client.
+-  # Swoosh supports Hackney and Finch out of the box:
+-  #
+-  #     config :swoosh, :api_client, Swoosh.ApiClient.Hackney
+-  #
+-  # See https://hexdocs.pm/swoosh/Swoosh.html#module-installation for details.
+ end
+diff --git a/lib/pinchflat/media/media_item.ex b/lib/pinchflat/media/media_item.ex
+index a87e9191f..a11b5c099 100644
+--- a/lib/pinchflat/media/media_item.ex
++++ b/lib/pinchflat/media/media_item.ex
+@@ -5,6 +5,7 @@ defmodule Pinchflat.Media.MediaItem do
+ 
+   use Ecto.Schema
+   import Ecto.Changeset
++  import Pinchflat.Utils.ChangesetUtils
+ 
+   alias Pinchflat.Tasks.Task
+   alias Pinchflat.Sources.Source
+@@ -32,6 +33,7 @@ defmodule Pinchflat.Media.MediaItem do
+   ]
+   # Pretty much all the fields captured at index are required.
+   @required_fields ~w(
++    uuid
+     title
+     original_url
+     livestream
+@@ -42,6 +44,11 @@ defmodule Pinchflat.Media.MediaItem do
+     )a
+ 
+   schema "media_items" do
++    # This is _not_ used as the primary key or internally in the database
++    # relations. This is only used to prevent an enumeration attack on the streaming
++    # and RSS feed endpoints since those _must_ be public (ie: no basic auth)
++    field :uuid, Ecto.UUID
++
+     field :title, :string
+     field :media_id, :string
+     field :description, :string
+@@ -78,6 +85,7 @@ defmodule Pinchflat.Media.MediaItem do
+     media_item
+     |> cast(attrs, @allowed_fields)
+     |> cast_assoc(:metadata, with: &MediaMetadata.changeset/2, required: false)
++    |> dynamic_default(:uuid, fn _ -> Ecto.UUID.generate() end)
+     |> validate_required(@required_fields)
+     |> unique_constraint([:media_id, :source_id])
+   end
+diff --git a/lib/pinchflat/podcasts/podcast_helpers.ex b/lib/pinchflat/podcasts/podcast_helpers.ex
+new file mode 100644
+index 000000000..33e328e88
+--- /dev/null
++++ b/lib/pinchflat/podcasts/podcast_helpers.ex
+@@ -0,0 +1,75 @@
++defmodule Pinchflat.Podcasts.PodcastHelpers do
++  @moduledoc """
++  Methods for fetching postcast-related data from a source
++  or its media items
++  """
++
++  alias Pinchflat.Repo
++  alias Pinchflat.Media
++  alias Pinchflat.Metadata.MediaMetadata
++  alias Pinchflat.Metadata.SourceMetadata
++
++  @doc """
++  Returns a list of media items that have been downloaded to disk
++  and have been proven to still exist there.
++
++  Useful for podcasts since we don't want to serve media that
++  has been deleted or moved, but it's also fairly generally useful
++  so I could see this being moved in the future.
++
++  Options:
++    - limit: integer - the maximum number of media items to return
++
++  Returns: [%MediaItem{}]
++  """
++  def persisted_media_items_for(source, opts \\ []) do
++    limit = Keyword.get(opts, :limit, 500)
++
++    source
++    |> Media.list_downloaded_media_items_for(limit: limit)
++    |> Enum.filter(fn media_item -> File.exists?(media_item.media_filepath) end)
++  end
++
++  @doc """
++  Selects a cover image for a source based on the source's metadata
++  and the metadata of the media items associated with the source. Also
++  ensures images exist on disk.
++
++  Only one media item should need to be returned since this is using the
++  internal metadata which, so long as the media_item was _downloaded_, should
++  be guaranteed to exist.
++
++  Prefers the source's poster, then fanart, then the media item's thumbnail.
++
++  Returns: {:ok, filepath} | {:error, :no_suitable_image}
++  """
++  def select_cover_image(source, media_items) do
++    source_with_preloads = Repo.preload(source, :metadata)
++
++    source_with_preloads
++    |> get_images_by_preference(media_items)
++    |> Enum.reject(&is_nil(&1))
++    |> Enum.find(&File.exists?/1)
++    |> case do
++      nil -> {:error, :no_suitable_image}
++      filepath -> {:ok, filepath}
++    end
++  end
++
++  defp get_images_by_preference(source_with_preloads, []) do
++    source_metadata = source_with_preloads.metadata || %SourceMetadata{}
++
++    [
++      source_metadata.poster_filepath,
++      source_metadata.fanart_filepath
++    ]
++  end
++
++  defp get_images_by_preference(source_with_preloads, [media_item | _]) do
++    media_item_with_preloads = Repo.preload(media_item, :metadata)
++    media_item_metadata = media_item_with_preloads.metadata || %MediaMetadata{}
++    source_images = get_images_by_preference(source_with_preloads, [])
++
++    source_images ++ [media_item_metadata.thumbnail_filepath]
++  end
++end
+diff --git a/lib/pinchflat/podcasts/rss_feed_builder.ex b/lib/pinchflat/podcasts/rss_feed_builder.ex
+new file mode 100644
+index 000000000..54eb104ef
+--- /dev/null
++++ b/lib/pinchflat/podcasts/rss_feed_builder.ex
+@@ -0,0 +1,138 @@
++defmodule Pinchflat.Podcasts.RssFeedBuilder do
++  @moduledoc """
++  Methods for building an RSS feed for a source and its media items.
++  """
++
++  @datetime_format "%a, %d %b %Y %H:%M:%S %z"
++
++  alias Pinchflat.Utils.DatetimeUtils
++  alias Pinchflat.Podcasts.PodcastHelpers
++  alias PinchflatWeb.Router.Helpers, as: Routes
++
++  @doc """
++  Builds an RSS feed for a given source and its media items.
++  Only MediaItems that have been persisted will be included in the feed.
++
++  ## Options:
++    - `:limit` - The maximum number of media items to include in the feed. Defaults to 300.
++
++  Returns an XML document as a string.
++  """
++  def build(source, opts \\ []) do
++    limit = Keyword.get(opts, :limit, 300)
++    url_base = Keyword.get(opts, :url_base, PinchflatWeb.Endpoint.url())
++
++    media_items = PodcastHelpers.persisted_media_items_for(source, limit: limit)
++    build_source_xml(source, media_items, url_base)
++  end
++
++  defp build_source_xml(source, media_items, url_base) do
++    media_item_xml = Enum.map(media_items, &build_media_item_xml(source, &1, url_base))
++    # "caching" the image path since it requires some DB calls and is used twice
++    feed_image_path = feed_image_path(url_base, source, media_items)
++
++    # Useful: resources:
++    #   - https://validator.w3.org/feed/#validate_by_input
++    #   - https://github.com/Podcastindex-org/podcast-namespace/blob/main/docs/1.0.md
++    #   - https://podba.se/validate
++    """
++    <?xml version="1.0" encoding="UTF-8"?>
++    <rss version="2.0"
++      xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"
++      xmlns:podcast="https://podcastindex.org/namespace/1.0"
++      xmlns:atom="http://www.w3.org/2005/Atom">
++      <channel>
++        <title>#{safe(source.custom_name)}</title>
++        <link>#{source.original_url}</link>
++        <description>#{safe(source.description)}</description>
++        <category>TV &amp; Film</category>
++        <generator>Generated by Pinchflat</generator>
++        <language>en-us</language>
++        <lastBuildDate>#{Calendar.strftime(source.updated_at, @datetime_format)}</lastBuildDate>
++        <pubDate>#{Calendar.strftime(source.inserted_at, @datetime_format)}</pubDate>
++        <atom:link href="#{generate_self_link(url_base, source)}" rel="self" type="application/rss+xml" />
++        <podcast:locked>yes</podcast:locked>
++        <podcast:guid>#{source.uuid}</podcast:guid>
++        <image>
++          <url>#{feed_image_path}</url>
++          <title>#{safe(source.custom_name)}</title>
++          <link>#{source.original_url}</link>
++        </image>
++        <itunes:author>#{safe(source.custom_name)}</itunes:author>
++        <itunes:subtitle>#{safe(source.custom_name)}</itunes:subtitle>
++        <itunes:block>yes</itunes:block>
++        <itunes:image href="#{feed_image_path}"></itunes:image>
++        <itunes:explicit>false</itunes:explicit>
++        <itunes:category text="TV &amp; Film"></itunes:category>
++
++        #{Enum.join(media_item_xml, "\n")}
++
++      </channel>
++    </rss>
++    """
++  end
++
++  defp build_media_item_xml(source, media_item, url_base) do
++    """
++    <item>
++      <guid isPermaLink="false">#{media_item.uuid}</guid>
++      <title>#{safe(media_item.title)}</title>
++      <link>#{media_item.original_url}</link>
++      <description>#{safe(media_item.description)}</description>
++      <pubDate>#{generate_upload_date(media_item)}</pubDate>
++      <enclosure
++        url="#{media_stream_path(url_base, media_item)}"
++        length="#{media_item.media_size_bytes}"
++        type="#{MIME.from_path(media_item.media_filepath)}"
++      />
++      <itunes:author>#{safe(source.custom_name)}</itunes:author>
++      <itunes:subtitle>#{safe(media_item.title)}</itunes:subtitle>
++      <itunes:summary><![CDATA[#{media_item.description}]]></itunes:summary>
++      <itunes:explicit>false</itunes:explicit>
++    </item>
++    """
++  end
++
++  defp safe(nil), do: ""
++
++  defp safe(value) do
++    value
++    |> Phoenix.HTML.html_escape()
++    |> Phoenix.HTML.safe_to_string()
++  end
++
++  defp generate_self_link(url_base, source) do
++    Path.join(url_base, "#{podcast_route(:rss_feed, source.uuid)}.xml")
++  end
++
++  defp media_stream_path(url_base, media_item) do
++    extension = Path.extname(media_item.media_filepath)
++
++    Path.join(url_base, "#{media_route(:stream, media_item.uuid)}#{extension}")
++  end
++
++  defp feed_image_path(url_base, source, media_items) do
++    case PodcastHelpers.select_cover_image(source, media_items) do
++      {:error, _} ->
++        ""
++
++      {:ok, filepath} ->
++        extension = Path.extname(filepath)
++        Path.join(url_base, "#{podcast_route(:feed_image, source.uuid)}#{extension}")
++    end
++  end
++
++  defp generate_upload_date(media_item) do
++    media_item.upload_date
++    |> DatetimeUtils.date_to_datetime()
++    |> Calendar.strftime(@datetime_format)
++  end
++
++  defp podcast_route(action, params) do
++    Routes.podcast_path(PinchflatWeb.Endpoint, action, params)
++  end
++
++  defp media_route(action, params) do
++    Routes.media_item_path(PinchflatWeb.Endpoint, action, params)
++  end
++end
+diff --git a/lib/pinchflat/sources/source.ex b/lib/pinchflat/sources/source.ex
+index d2d10c8bc..4773dbce6 100644
+--- a/lib/pinchflat/sources/source.ex
++++ b/lib/pinchflat/sources/source.ex
+@@ -48,6 +48,7 @@ defmodule Pinchflat.Sources.Source do
+ 
+   @pre_insert_required_fields @initially_required_fields ++
+                                 ~w(
++                                  uuid
+                                   custom_name
+                                   collection_name
+                                   collection_id
+@@ -55,6 +56,11 @@ defmodule Pinchflat.Sources.Source do
+                                 )a
+ 
+   schema "sources" do
++    # This is _not_ used as the primary key or internally in the database
++    # relations. This is only used to prevent an enumeration attack on the streaming
++    # and RSS feed endpoints since those _must_ be public (ie: no basic auth)
++    field :uuid, Ecto.UUID
++
+     field :custom_name, :string
+     field :description, :string
+     field :collection_name, :string
+@@ -98,6 +104,7 @@ defmodule Pinchflat.Sources.Source do
+     source
+     |> cast(attrs, @allowed_fields)
+     |> dynamic_default(:custom_name, fn cs -> get_field(cs, :collection_name) end)
++    |> dynamic_default(:uuid, fn _ -> Ecto.UUID.generate() end)
+     |> validate_required(required_fields)
+     |> cast_assoc(:metadata, with: &SourceMetadata.changeset/2, required: false)
+   end
+diff --git a/lib/pinchflat/utils/datetime_utils.ex b/lib/pinchflat/utils/datetime_utils.ex
+new file mode 100644
+index 000000000..7fce7c66b
+--- /dev/null
++++ b/lib/pinchflat/utils/datetime_utils.ex
+@@ -0,0 +1,17 @@
++defmodule Pinchflat.Utils.DatetimeUtils do
++  @moduledoc """
++  Utility methods for working with dates and datetimes
++  """
++
++  @doc """
++  Converts a Date to a DateTime
++
++  Returns %DateTime{}
++  """
++  def date_to_datetime(date) do
++    date
++    |> Date.to_gregorian_days()
++    |> Kernel.*(86_400)
++    |> DateTime.from_gregorian_seconds()
++  end
++end
+diff --git a/lib/pinchflat_web.ex b/lib/pinchflat_web.ex
+index e7fbc324d..ef58d005b 100644
+--- a/lib/pinchflat_web.ex
++++ b/lib/pinchflat_web.ex
+@@ -21,7 +21,7 @@ defmodule PinchflatWeb do
+ 
+   def router do
+     quote do
+-      use Phoenix.Router, helpers: false
++      use Phoenix.Router, helpers: true
+ 
+       # Import common connection and controller functions to use in pipelines
+       import Plug.Conn
+diff --git a/lib/pinchflat_web/components/core_components.ex b/lib/pinchflat_web/components/core_components.ex
+index 52295d075..ee4c4dacd 100644
+--- a/lib/pinchflat_web/components/core_components.ex
++++ b/lib/pinchflat_web/components/core_components.ex
+@@ -14,7 +14,7 @@ defmodule PinchflatWeb.CoreComponents do
+ 
+   Icons are provided by [heroicons](https://heroicons.com). See `icon/1` for usage.
+   """
+-  use Phoenix.Component
++  use Phoenix.Component, global_prefixes: ~w(x-)
+ 
+   import PinchflatWeb.Gettext
+ 
+@@ -654,10 +654,11 @@ defmodule PinchflatWeb.CoreComponents do
+   """
+   attr :name, :string, required: true
+   attr :class, :string, default: nil
++  attr :rest, :global
+ 
+   def icon(%{name: "hero-" <> _} = assigns) do
+     ~H"""
+-    <span class={[@name, @class]} />
++    <span class={[@name, @class]} {@rest} />
+     """
+   end
+ 
+diff --git a/lib/pinchflat_web/components/custom_components/button_components.ex b/lib/pinchflat_web/components/custom_components/button_components.ex
+index c6f6e012f..a80bb754a 100644
+--- a/lib/pinchflat_web/components/custom_components/button_components.ex
++++ b/lib/pinchflat_web/components/custom_components/button_components.ex
+@@ -1,6 +1,8 @@
+ defmodule PinchflatWeb.CustomComponents.ButtonComponents do
+   @moduledoc false
+-  use Phoenix.Component
++  use Phoenix.Component, global_prefixes: ~w(x-)
++
++  alias PinchflatWeb.CoreComponents
+ 
+   @doc """
+   Render a button
+@@ -39,4 +41,52 @@ defmodule PinchflatWeb.CustomComponents.ButtonComponents do
+     </button>
+     """
+   end
++
++  @doc """
++  Render a dropdown based off a button
++
++  ## Examples
++
++      <.button_dropdown text="Actions">
++        <:option>TEST</:option>
++      </.button_dropdown>
++  """
++  attr :text, :string, required: true
++  attr :class, :string, default: ""
++
++  slot :option, required: true
++
++  def button_dropdown(assigns) do
++    ~H"""
++    <div x-data="{ dropdownOpen: false }" class={["relative flex", @class]}>
++      <span
++        x-on:click.prevent="dropdownOpen = !dropdownOpen"
++        class={[
++          "cursor-pointer inline-flex gap-2.5 rounded-md bg-primary px-5.5 py-3",
++          "font-medium text-white hover:bg-opacity-95"
++        ]}
++      >
++        <%= @text %>
++        <CoreComponents.icon
++          name="hero-chevron-down"
++          class="fill-current duration-200 ease-linear mt-1"
++          x-bind:class="dropdownOpen && 'rotate-180'"
++        />
++      </span>
++      <div
++        x-show="dropdownOpen"
++        x-on:click.outside="dropdownOpen = false"
++        class="absolute left-0 top-full z-40 mt-2 w-full rounded-md bg-black py-3 shadow-card"
++      >
++        <ul class="flex flex-col">
++          <li :for={option <- @option}>
++            <span class="flex px-5 py-2 font-medium text-bodydark2 hover:text-white cursor-pointer">
++              <%= render_slot(option) %>
++            </span>
++          </li>
++        </ul>
++      </div>
++    </div>
++    """
++  end
+ end
+diff --git a/lib/pinchflat_web/components/custom_components/tab_components.ex b/lib/pinchflat_web/components/custom_components/tab_components.ex
+index 1b0ae22c5..3e6876df6 100644
+--- a/lib/pinchflat_web/components/custom_components/tab_components.ex
++++ b/lib/pinchflat_web/components/custom_components/tab_components.ex
+@@ -9,24 +9,31 @@ defmodule PinchflatWeb.CustomComponents.TabComponents do
+     attr :title, :string, required: true
+   end
+ 
++  slot :tab_append, required: false
++
+   def tabbed_layout(assigns) do
+     ~H"""
+     <div
+       x-data="{ openTab: 0, activeClasses: 'text-meta-5 border-meta-5', inactiveClasses: 'border-transparent' }"
+       class="w-full"
+     >
+-      <div class="mb-6 flex flex-wrap gap-5 border-b border-strokedark sm:gap-10">
+-        <a
+-          :for={{tab, idx} <- Enum.with_index(@tab)}
+-          href="#"
+-          @click.prevent={"openTab = #{idx}"}
+-          x-bind:class={"openTab === #{idx} ? activeClasses : inactiveClasses"}
+-          class="border-b-2 py-4 text-sm font-medium hover:text-meta-5 md:text-base"
+-        >
+-          <span class="text-xl"><%= tab.title %></span>
+-        </a>
+-      </div>
+-      <div>
++      <header class="flex flex-col md:flex-row md:justify-between border-b border-strokedark">
++        <div class="flex flex-wrap gap-5 sm:gap-10">
++          <a
++            :for={{tab, idx} <- Enum.with_index(@tab)}
++            href="#"
++            @click.prevent={"openTab = #{idx}"}
++            x-bind:class={"openTab === #{idx} ? activeClasses : inactiveClasses"}
++            class="border-b-2 py-4 w-full sm:w-fit text-sm font-medium hover:text-meta-5 md:text-base"
++          >
++            <span class="text-xl"><%= tab.title %></span>
++          </a>
++        </div>
++        <div class="mx-4 my-4 lg:my-0 flex gap-5 sm:gap-10 items-center">
++          <%= render_slot(@tab_append) %>
++        </div>
++      </header>
++      <div class="mt-4">
+         <div :for={{tab, idx} <- Enum.with_index(@tab)} x-show={"openTab === #{idx}"} class="font-medium leading-relaxed">
+           <%= render_slot(tab) %>
+         </div>
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_controller.ex b/lib/pinchflat_web/controllers/media_items/media_item_controller.ex
+index 95847dd41..31a9ef402 100644
+--- a/lib/pinchflat_web/controllers/media_items/media_item_controller.ex
++++ b/lib/pinchflat_web/controllers/media_items/media_item_controller.ex
+@@ -1,8 +1,11 @@
+ defmodule PinchflatWeb.MediaItems.MediaItemController do
+   use PinchflatWeb, :controller
+ 
++  require Logger
++
+   alias Pinchflat.Repo
+   alias Pinchflat.Media
++  alias Pinchflat.Media.MediaItem
+ 
+   def show(conn, %{"id" => id}) do
+     media_item =
+@@ -29,4 +32,69 @@ defmodule PinchflatWeb.MediaItems.MediaItemController do
+     |> put_flash(:info, flash_message)
+     |> redirect(to: ~p"/sources/#{media_item.source_id}")
+   end
++
++  # See here for details on streaming files and range requests:
++  # https://www.zeng.dev/post/2023-http-range-and-play-mp4-in-browser/
++  #
++  # Uses the UUID instead of the ID to avoid enumeration attacks
++  # since streaming is a public endpoint (ie: no auth required)
++  def stream(conn, %{"uuid" => uuid}) do
++    media_item = Repo.get_by!(MediaItem, uuid: uuid)
++
++    if File.exists?(media_item.media_filepath) do
++      file_size = File.stat!(media_item.media_filepath).size
++      mime_type = MIME.from_path(media_item.media_filepath)
++
++      case parse_range(conn, file_size) do
++        {:ok, {start_pos, end_pos}} ->
++          Logger.debug("Streaming media item: #{media_item.uuid} from #{start_pos} to #{end_pos}")
++          length = end_pos - start_pos + 1
++
++          conn
++          |> put_resp_content_type(mime_type)
++          |> put_resp_header("accept-ranges", "bytes")
++          |> put_resp_header("content-range", "bytes #{start_pos}-#{end_pos}/#{file_size}")
++          |> put_resp_header("content-length", to_string(length))
++          |> send_file(206, media_item.media_filepath, start_pos, length)
++
++        {:error, :invalid_range} ->
++          Logger.debug("Invalid range request for media item: #{media_item.uuid} - serving full file")
++
++          conn
++          |> put_resp_content_type(mime_type)
++          |> put_resp_header("content-length", to_string(file_size))
++          |> put_resp_header("accept-ranges", "bytes")
++          |> send_file(200, media_item.media_filepath)
++      end
++    else
++      send_resp(conn, 404, "File not found")
++    end
++  end
++
++  defp parse_range(conn, file_size) do
++    with [range_header | _] <- get_req_header(conn, "range"),
++         ["bytes", range] <- String.split(range_header, "="),
++         [start_pos, end_pos] <- String.split(range, "-") do
++      validate_range(start_pos, end_pos, file_size)
++    else
++      _ -> {:error, :invalid_range}
++    end
++  end
++
++  defp validate_range(start_pos, end_pos, file_size) do
++    case {Integer.parse(start_pos), Integer.parse(end_pos)} do
++      {:error, :error} ->
++        {:error, :invalid_range}
++
++      {{start_pos, _}, :error} ->
++        {:ok, {start_pos, file_size - 1}}
++
++      # See RFC7233
++      {{start_pos, _}, {end_pos, _}} when end_pos >= file_size ->
++        {:ok, {start_pos, file_size - 1}}
++
++      {{start_pos, _}, {end_pos, _}} ->
++        {:ok, {start_pos, end_pos}}
++    end
++  end
+ end
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_html.ex b/lib/pinchflat_web/controllers/media_items/media_item_html.ex
+index ffae16ae4..12d7ffa36 100644
+--- a/lib/pinchflat_web/controllers/media_items/media_item_html.ex
++++ b/lib/pinchflat_web/controllers/media_items/media_item_html.ex
+@@ -2,4 +2,16 @@ defmodule PinchflatWeb.MediaItems.MediaItemHTML do
+   use PinchflatWeb, :html
+ 
+   embed_templates "media_item_html/*"
++
++  def media_file_exists?(media_item) do
++    !!media_item.media_filepath and File.exists?(media_item.media_filepath)
++  end
++
++  def media_type(media_item) do
++    case Path.extname(media_item.media_filepath) do
++      ext when ext in [".mp4", ".webm", ".mkv"] -> :video
++      ext when ext in [".mp3", ".m4a"] -> :audio
++      _ -> :unknown
++    end
++  end
+ end
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_html/media_preview.heex b/lib/pinchflat_web/controllers/media_items/media_item_html/media_preview.heex
+new file mode 100644
+index 000000000..2146a984b
+--- /dev/null
++++ b/lib/pinchflat_web/controllers/media_items/media_item_html/media_preview.heex
+@@ -0,0 +1,13 @@
++<%= if media_type(@media_item) == :video do %>
++  <video controls class="max-h-96 w-full lg:w-2/3 xl:w-1/2">
++    <source src={~p"/media/#{@media_item.uuid}/stream"} type="video/mp4" />
++    Your browser does not support the video element.
++  </video>
++<% end %>
++
++<%= if media_type(@media_item) == :audio do %>
++  <audio controls class="w-full lg:w-2/3 xl:w-1/2">
++    <source src={~p"/media/#{@media_item.uuid}/stream"} type="audio/mpeg" />
++    Your browser does not support the audio element.
++  </audio>
++<% end %>
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex b/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
+index 660c17965..fb81b1a85 100644
+--- a/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
+@@ -8,11 +8,30 @@
+     </h2>
+   </div>
+ </div>
+-<div class="rounded-sm border border-stroke bg-white py-5 pt-6 shadow-default dark:border-strokedark dark:bg-boxdark sm:px-7.5">
++<div class="rounded-sm border border-stroke bg-white py-5 pt-6 shadow-default dark:border-strokedark dark:bg-boxdark px-7.5">
+   <div class="max-w-full overflow-x-auto">
+     <.tabbed_layout>
++      <:tab_append>
++        <.button_dropdown text="Actions" class="justify-center w-full sm:w-50">
++          <:option>
++            <.link
++              href={~p"/sources/#{@media_item.source_id}/media/#{@media_item}?delete_files=true"}
++              method="delete"
++              data-confirm="Are you sure you want to delete this record and all associated files on disk? This cannot be undone."
++            >
++              Delete Files
++            </.link>
++          </:option>
++        </.button_dropdown>
++      </:tab_append>
++
+       <:tab title="Attributes">
+         <div class="flex flex-col gap-10 dark:text-white">
++          <%= if media_file_exists?(@media_item) do %>
++            <h3 class="font-bold text-xl">Preview</h3>
++            <.media_preview media_item={@media_item} />
++          <% end %>
++
+           <h3 class="font-bold text-xl">Attributes</h3>
+           <section>
+             <strong>Source:</strong>
+@@ -23,18 +42,6 @@
+ 
+           <.list_items_from_map map={Map.from_struct(@media_item)} />
+         </div>
+-
+-        <section class="flex justify-center my-10">
+-          <.link
+-            href={~p"/sources/#{@media_item.source_id}/media/#{@media_item}?delete_files=true"}
+-            method="delete"
+-            data-confirm="Are you sure you want to delete this record and all associated files on disk? This cannot be undone."
+-          >
+-            <.button color="bg-meta-1" rounding="rounded-lg">
+-              Delete Files
+-            </.button>
+-          </.link>
+-        </section>
+       </:tab>
+       <:tab title="Tasks">
+         <%= if match?([_|_], @media_item.tasks) do %>
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
+index 9d07eb654..66073ddfa 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
+@@ -38,7 +38,7 @@
+         presets: { 
+           default: 'Default',
+           media_center: 'TV Shows',
+-          audio: 'Audio',
++          audio: 'Music',
+           archiving: 'Archiving'
+         }
+     }">
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/show.html.heex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/show.html.heex
+index 0cff8411b..0160e86c2 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/show.html.heex
+@@ -19,33 +19,35 @@
+ <div class="rounded-sm border border-stroke bg-white px-5 pb-2.5 pt-6 shadow-default dark:border-strokedark dark:bg-boxdark sm:px-7.5 xl:pb-1">
+   <div class="max-w-full overflow-x-auto">
+     <.tabbed_layout>
++      <:tab_append>
++        <.button_dropdown text="Actions" class="justify-center w-full sm:w-50">
++          <:option>
++            <.link
++              href={~p"/media_profiles/#{@media_profile}"}
++              method="delete"
++              data-confirm="Are you sure you want to delete this profile and all its sources (leaving files in place)? This cannot be undone."
++            >
++              Delete Profile
++            </.link>
++          </:option>
++          <:option>
++            <.link
++              href={~p"/media_profiles/#{@media_profile}?delete_files=true"}
++              method="delete"
++              data-confirm="Are you sure you want to delete this profile, all its sources, and its files on disk? This cannot be undone."
++              class="mt-5 md:mt-0"
++            >
++              Delete Profile + Files
++            </.link>
++          </:option>
++        </.button_dropdown>
++      </:tab_append>
++
+       <:tab title="Attributes">
+         <div class="flex flex-col gap-10 text-white">
+           <h3 class="font-bold text-xl">Attributes for "<%= @media_profile.name %>"</h3>
+           <.list_items_from_map map={Map.from_struct(@media_profile)} />
+         </div>
+-
+-        <section class="flex flex-col md:flex-row items-center md:justify-around my-10">
+-          <.link
+-            href={~p"/media_profiles/#{@media_profile}"}
+-            method="delete"
+-            data-confirm="Are you sure you want to delete this profile and all its sources (leaving files in place)? This cannot be undone."
+-          >
+-            <.button color="bg-meta-1" rounding="rounded-lg">
+-              Delete Profile and its Sources
+-            </.button>
+-          </.link>
+-          <.link
+-            href={~p"/media_profiles/#{@media_profile}?delete_files=true"}
+-            method="delete"
+-            data-confirm="Are you sure you want to delete this profile, all its sources, and its files on disk? This cannot be undone."
+-            class="mt-5 md:mt-0"
+-          >
+-            <.button color="bg-meta-1" rounding="rounded-lg">
+-              Delete Profile, Sources, and Files
+-            </.button>
+-          </.link>
+-        </section>
+       </:tab>
+       <:tab title="Sources">
+         <.table rows={@media_profile.sources} table_class="text-black dark:text-white">
+diff --git a/lib/pinchflat_web/controllers/podcasts/podcast_controller.ex b/lib/pinchflat_web/controllers/podcasts/podcast_controller.ex
+new file mode 100644
+index 000000000..aa65c57a3
+--- /dev/null
++++ b/lib/pinchflat_web/controllers/podcasts/podcast_controller.ex
+@@ -0,0 +1,38 @@
++defmodule PinchflatWeb.Podcasts.PodcastController do
++  use PinchflatWeb, :controller
++
++  alias Pinchflat.Repo
++  alias Pinchflat.Media
++  alias Pinchflat.Sources.Source
++  alias Pinchflat.Podcasts.RssFeedBuilder
++  alias Pinchflat.Podcasts.PodcastHelpers
++
++  def rss_feed(conn, %{"uuid" => uuid}) do
++    source = Repo.get_by!(Source, uuid: uuid)
++    url_base = url(conn, ~p"/")
++    xml = RssFeedBuilder.build(source, limit: 300, url_base: url_base)
++
++    conn
++    |> put_resp_content_type("application/rss+xml")
++    |> put_resp_header("content-disposition", "inline")
++    |> send_resp(200, xml)
++  end
++
++  def feed_image(conn, %{"uuid" => uuid}) do
++    source = Repo.get_by!(Source, uuid: uuid)
++    # This provides a fallback image if the source has none.
++    # We only need one since we're using the internal metadata image which
++    # we know exists.
++    media_items = Media.list_downloaded_media_items_for(source, limit: 1)
++
++    case PodcastHelpers.select_cover_image(source, media_items) do
++      {:error, _} ->
++        send_resp(conn, 404, "Image not found")
++
++      {:ok, filepath} ->
++        conn
++        |> put_resp_content_type(MIME.from_path(filepath))
++        |> send_file(200, filepath)
++    end
++  end
++end
+diff --git a/lib/pinchflat_web/controllers/sources/source_html.ex b/lib/pinchflat_web/controllers/sources/source_html.ex
+index dcb6b0581..b93b75439 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html.ex
++++ b/lib/pinchflat_web/controllers/sources/source_html.ex
+@@ -24,4 +24,8 @@ defmodule PinchflatWeb.Sources.SourceHTML do
+       {"Monthly", 30 * 24 * 60}
+     ]
+   end
++
++  def rss_feed_url(conn, source) do
++    url(conn, ~p"/sources/#{source.uuid}/feed") <> ".xml"
++  end
+ end
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/show.html.heex b/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
+index 8474d640d..3c2934b52 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
+@@ -19,6 +19,45 @@
+ <div class="rounded-sm border border-stroke bg-white px-5 py-5 shadow-default dark:border-strokedark dark:bg-boxdark sm:px-7.5">
+   <div class="max-w-full overflow-x-auto">
+     <.tabbed_layout>
++      <:tab_append>
++        <.button_dropdown text="Actions" class="justify-center w-full sm:w-50">
++          <:option>
++            <span
++              x-data="{ copied: false }"
++              x-on:click={"
++                navigator.clipboard.writeText('#{rss_feed_url(@conn, @source)}');
++                copied = true;
++                setTimeout(() => copied = false, 4000);
++              "}
++            >
++              Copy RSS Feed <span x-show="copied"><.icon name="hero-check" class="ml-2 h-4 w-4" /></span>
++            </span>
++          </:option>
++          <:option>
++            <div class="h-px w-full bg-bodydark2"></div>
++          </:option>
++          <:option>
++            <.link
++              href={~p"/sources/#{@source}"}
++              method="delete"
++              data-confirm="Are you sure you want to delete this source (leaving files in place)? This cannot be undone."
++            >
++              Delete Source
++            </.link>
++          </:option>
++          <:option>
++            <.link
++              href={~p"/sources/#{@source}?delete_files=true"}
++              method="delete"
++              data-confirm="Are you sure you want to delete this source and it's files on disk? This cannot be undone."
++              class="mt-5 md:mt-0"
++            >
++              Delete Source + Files
++            </.link>
++          </:option>
++        </.button_dropdown>
++      </:tab_append>
++
+       <:tab title="Attributes">
+         <div class="flex flex-col gap-10 text-white">
+           <h3 class="font-bold text-lg">Attributes</h3>
+@@ -31,28 +70,6 @@
+ 
+           <.list_items_from_map map={Map.from_struct(@source)} />
+         </div>
+-
+-        <section class="flex flex-col md:flex-row items-center md:justify-around mt-10">
+-          <.link
+-            href={~p"/sources/#{@source}"}
+-            method="delete"
+-            data-confirm="Are you sure you want to delete this source (leaving files in place)? This cannot be undone."
+-          >
+-            <.button color="bg-meta-1" rounding="rounded-lg">
+-              Delete Source
+-            </.button>
+-          </.link>
+-          <.link
+-            href={~p"/sources/#{@source}?delete_files=true"}
+-            method="delete"
+-            data-confirm="Are you sure you want to delete this source and it's files on disk? This cannot be undone."
+-            class="mt-5 md:mt-0"
+-          >
+-            <.button color="bg-meta-1" rounding="rounded-lg">
+-              Delete Source and Files
+-            </.button>
+-          </.link>
+-        </section>
+       </:tab>
+       <:tab title="Pending Media">
+         <%= if match?([_|_], @pending_media) do %>
+diff --git a/lib/pinchflat_web/endpoint.ex b/lib/pinchflat_web/endpoint.ex
+index a3a2acb2a..b6ab01686 100644
+--- a/lib/pinchflat_web/endpoint.ex
++++ b/lib/pinchflat_web/endpoint.ex
+@@ -47,5 +47,54 @@ defmodule PinchflatWeb.Endpoint do
+   plug Plug.MethodOverride
+   plug Plug.Head
+   plug Plug.Session, @session_options
++
++  plug :override_base_url
++  plug :strip_trailing_extension
++
+   plug PinchflatWeb.Router
++
++  # URLs need to be generated using the host of the current page being accessed
++  # for things like Podcast RSS feeds to contain links to the right location.
++  #
++  # Normally you'd set the `url` option in the Endpoint configuration, but
++  # since this is self-hosted and often accessed at multiple different URLs,
++  # that would probably be more difficult for end-users to set up than just
++  # having the application figure it out.
++  defp override_base_url(conn, _opts) do
++    new_scheme =
++      case get_req_header(conn, "x-forwarded-proto") do
++        [scheme] -> scheme
++        _ -> to_string(conn.scheme)
++      end
++
++    new_port = if conn.port in [80, 443], do: "", else: ":#{conn.port}"
++    new_base_url = "#{new_scheme}://#{conn.host}#{new_port}"
++
++    Phoenix.Controller.put_router_url(conn, new_base_url)
++  end
++
++  defp strip_trailing_extension(%{path_info: []} = conn, _opts), do: conn
++
++  defp strip_trailing_extension(conn, _opts) do
++    path =
++      conn.path_info
++      |> List.last()
++      |> String.split(".")
++      |> Enum.reverse()
++
++    case path do
++      [_] ->
++        conn
++
++      [_format | fragments] ->
++        new_path =
++          fragments
++          |> Enum.reverse()
++          |> Enum.join(".")
++
++        path_fragments = List.replace_at(conn.path_info, -1, new_path)
++
++        %{conn | path_info: path_fragments}
++    end
++  end
+ end
+diff --git a/lib/pinchflat_web/router.ex b/lib/pinchflat_web/router.ex
+index e68e799ef..6b70d0310 100644
+--- a/lib/pinchflat_web/router.ex
++++ b/lib/pinchflat_web/router.ex
+@@ -1,6 +1,8 @@
+ defmodule PinchflatWeb.Router do
+   use PinchflatWeb, :router
+ 
++  # IMPORTANT: `strip_trailing_extension` in endpoint.ex removes
++  # the extension from the path
+   pipeline :browser do
+     plug :basic_auth
+     plug :accepts, ["html"]
+@@ -15,6 +17,10 @@ defmodule PinchflatWeb.Router do
+     plug :accepts, ["json"]
+   end
+ 
++  pipeline :feeds do
++    plug :maybe_basic_auth
++  end
++
+   scope "/", PinchflatWeb do
+     pipe_through :browser
+ 
+@@ -28,10 +34,16 @@ defmodule PinchflatWeb.Router do
+     end
+   end
+ 
+-  # Other scopes may use custom stacks.
+-  # scope "/api", PinchflatWeb do
+-  #   pipe_through :api
+-  # end
++  # Routes in here _may not be_ protected by basic auth. This is necessary for
++  # media streaming to work for RSS podcast feeds.
++  scope "/", PinchflatWeb do
++    pipe_through :feeds
++
++    get "/sources/:uuid/feed", Podcasts.PodcastController, :rss_feed
++    get "/sources/:uuid/feed_image", Podcasts.PodcastController, :feed_image
++
++    get "/media/:uuid/stream", MediaItems.MediaItemController, :stream
++  end
+ 
+   # Enable LiveDashboard and Swoosh mailbox preview in development
+   if Application.compile_env(:pinchflat, :dev_routes) do
+@@ -50,6 +62,14 @@ defmodule PinchflatWeb.Router do
+     end
+   end
+ 
++  defp maybe_basic_auth(conn, opts) do
++    if Application.get_env(:pinchflat, :expose_feed_endpoints) do
++      conn
++    else
++      basic_auth(conn, opts)
++    end
++  end
++
+   defp basic_auth(conn, _opts) do
+     username = Application.get_env(:pinchflat, :basic_auth_username)
+     password = Application.get_env(:pinchflat, :basic_auth_password)
+diff --git a/priv/repo/migrations/20240325222242_add_uuid_to_source_and_media.exs b/priv/repo/migrations/20240325222242_add_uuid_to_source_and_media.exs
+new file mode 100644
+index 000000000..40b69db15
+--- /dev/null
++++ b/priv/repo/migrations/20240325222242_add_uuid_to_source_and_media.exs
+@@ -0,0 +1,13 @@
++defmodule Pinchflat.Repo.Migrations.AddUuidToSourceAndMedia do
++  use Ecto.Migration
++
++  def change do
++    alter table(:sources) do
++      add :uuid, :uuid
++    end
++
++    alter table(:media_items) do
++      add :uuid, :uuid
++    end
++  end
++end
+diff --git a/priv/repo/migrations/20240325222243_backfill_content_uuids.exs b/priv/repo/migrations/20240325222243_backfill_content_uuids.exs
+new file mode 100644
+index 000000000..dc20e51ed
+--- /dev/null
++++ b/priv/repo/migrations/20240325222243_backfill_content_uuids.exs
+@@ -0,0 +1,13 @@
++defmodule Pinchflat.Repo.Migrations.BackfillContentUuids do
++  use Ecto.Migration
++
++  def up do
++    execute("UPDATE sources SET uuid = gen_random_uuid() WHERE uuid IS NULL")
++    execute("UPDATE media_items SET uuid = gen_random_uuid() WHERE uuid IS NULL")
++  end
++
++  def down do
++    execute("UPDATE sources SET uuid = NULL")
++    execute("UPDATE media_items SET uuid = NULL")
++  end
++end
+diff --git a/priv/repo/migrations/20240327165841_add_index_to_uuid_fields.exs b/priv/repo/migrations/20240327165841_add_index_to_uuid_fields.exs
+new file mode 100644
+index 000000000..0f0604fbf
+--- /dev/null
++++ b/priv/repo/migrations/20240327165841_add_index_to_uuid_fields.exs
+@@ -0,0 +1,8 @@
++defmodule Pinchflat.Repo.Migrations.AddIndexToUuidFields do
++  use Ecto.Migration
++
++  def change do
++    create unique_index(:sources, [:uuid])
++    create unique_index(:media_items, [:uuid])
++  end
++end
+diff --git a/test/pinchflat/media_test.exs b/test/pinchflat/media_test.exs
+index 21cdf2c7d..40e338cf4 100644
+--- a/test/pinchflat/media_test.exs
++++ b/test/pinchflat/media_test.exs
+@@ -398,6 +398,37 @@ defmodule Pinchflat.MediaTest do
+       assert media_item.media_filepath == valid_attrs.media_filepath
+     end
+ 
++    test "automatically sets the UUID" do
++      valid_attrs = %{
++        media_id: Faker.String.base64(12),
++        title: Faker.Commerce.product_name(),
++        media_filepath: "/video/#{Faker.File.file_name(:video)}",
++        source_id: source_fixture().id,
++        original_url: "https://www.youtube.com/channel/#{Faker.String.base64(12)}",
++        upload_date: Date.utc_today()
++      }
++
++      assert {:ok, %MediaItem{} = media_item} = Media.create_media_item(valid_attrs)
++
++      assert String.length(media_item.uuid) == 36
++    end
++
++    test "UUID is not writable by the user" do
++      valid_attrs = %{
++        media_id: Faker.String.base64(12),
++        title: Faker.Commerce.product_name(),
++        media_filepath: "/video/#{Faker.File.file_name(:video)}",
++        source_id: source_fixture().id,
++        original_url: "https://www.youtube.com/channel/#{Faker.String.base64(12)}",
++        upload_date: Date.utc_today(),
++        uuid: "some-uuid"
++      }
++
++      assert {:ok, %MediaItem{} = media_item} = Media.create_media_item(valid_attrs)
++
++      assert String.length(media_item.uuid) == 36
++    end
++
+     test "creating with invalid data returns error changeset" do
+       assert {:error, %Ecto.Changeset{}} = Media.create_media_item(@invalid_attrs)
+     end
+diff --git a/test/pinchflat/metadata/source_metadata_storage_worker_test.exs b/test/pinchflat/metadata/source_metadata_storage_worker_test.exs
+index 878f8fdb3..06e6959a3 100644
+--- a/test/pinchflat/metadata/source_metadata_storage_worker_test.exs
++++ b/test/pinchflat/metadata/source_metadata_storage_worker_test.exs
+@@ -57,7 +57,7 @@ defmodule Pinchflat.Metadata.SourceMetadataStorageWorkerTest do
+         _url, _opts, ot when ot == @metadata_ot -> {:ok, render_metadata(:channel_source_metadata)}
+       end)
+ 
+-      source = source_fixture()
++      source = source_fixture(%{description: nil})
+ 
+       refute source.description
+       perform_job(SourceMetadataStorageWorker, %{id: source.id})
+diff --git a/test/pinchflat/podcasts/podcast_helpers_test.exs b/test/pinchflat/podcasts/podcast_helpers_test.exs
+new file mode 100644
+index 000000000..1d21d054d
+--- /dev/null
++++ b/test/pinchflat/podcasts/podcast_helpers_test.exs
+@@ -0,0 +1,64 @@
++defmodule Pinchflat.Podcasts.PodcastHelpersTest do
++  use Pinchflat.DataCase
++
++  import Pinchflat.SourcesFixtures
++  import Pinchflat.MediaFixtures
++
++  alias Pinchflat.Podcasts.PodcastHelpers
++
++  describe "persisted_media_items_for/2" do
++    test "returns media items with files that exist on-disk" do
++      source = source_fixture()
++      good_media = media_item_with_attachments(%{source_id: source.id})
++      _bad_media = media_item_fixture(%{source_id: source.id, media_filepath: "/tmp/existing_file.mp3"})
++
++      assert [persisted_media] = PodcastHelpers.persisted_media_items_for(source)
++      assert persisted_media.id == good_media.id
++    end
++
++    test "lets you specify a limit" do
++      source = source_fixture()
++      _good_media = media_item_with_attachments(%{source_id: source.id})
++
++      assert [] = PodcastHelpers.persisted_media_items_for(source, limit: 0)
++    end
++  end
++
++  describe "select_cover_image/2" do
++    test "returns a source's poster, if present" do
++      source = source_with_metadata_attachments()
++
++      {:ok, res} = PodcastHelpers.select_cover_image(source, [])
++
++      assert res == source.metadata.poster_filepath
++    end
++
++    test "falls back to a source's fanart, if present" do
++      source = source_with_metadata_attachments()
++
++      File.rm(source.metadata.poster_filepath)
++
++      {:ok, res} = PodcastHelpers.select_cover_image(source, [])
++
++      assert res == source.metadata.fanart_filepath
++    end
++
++    test "falls back to a media item's thumbnail, if present" do
++      source = source_with_metadata_attachments()
++      media_item = media_item_with_metadata_attachments(%{source_id: source.id})
++
++      File.rm(source.metadata.poster_filepath)
++      File.rm(source.metadata.fanart_filepath)
++
++      {:ok, res} = PodcastHelpers.select_cover_image(source, [media_item])
++
++      assert res == media_item.metadata.thumbnail_filepath
++    end
++
++    test "returns error if no artwork can be found" do
++      source = source_fixture()
++
++      assert PodcastHelpers.select_cover_image(source, []) == {:error, :no_suitable_image}
++    end
++  end
++end
+diff --git a/test/pinchflat/podcasts/rss_feed_builder_test.exs b/test/pinchflat/podcasts/rss_feed_builder_test.exs
+new file mode 100644
+index 000000000..99bf32cfd
+--- /dev/null
++++ b/test/pinchflat/podcasts/rss_feed_builder_test.exs
+@@ -0,0 +1,145 @@
++defmodule Pinchflat.Podcasts.RssFeedBuilderTest do
++  use Pinchflat.DataCase
++
++  import Pinchflat.MediaFixtures
++  import Pinchflat.SourcesFixtures
++
++  alias Pinchflat.Podcasts.RssFeedBuilder
++
++  @datetime_format "%a, %d %b %Y %H:%M:%S %z"
++
++  setup do
++    source = source_fixture()
++
++    {:ok, source: source}
++  end
++
++  describe "build/2" do
++    test "returns an XML document", %{source: source} do
++      res = RssFeedBuilder.build(source)
++
++      assert String.contains?(res, ~s(<?xml version="1.0" encoding="UTF-8"?>))
++    end
++
++    test "escapes illegal characters" do
++      source = source_fixture(%{custom_name: "A & B"})
++      res = RssFeedBuilder.build(source)
++
++      assert String.contains?(res, ~s(<title>A &amp; B</title>))
++    end
++
++    test "can optionally apply a limit to media items", %{source: source} do
++      good_media = media_item_with_attachments(%{source_id: source.id})
++
++      res = RssFeedBuilder.build(source, limit: 0)
++
++      refute String.contains?(res, ~s(<title>#{good_media.title}</title>))
++    end
++
++    test "can optionally specify a URL base", %{source: source} do
++      res = RssFeedBuilder.build(source, url_base: "http://example.com")
++
++      assert String.contains?(res, ~s(http://example.com/sources/#{source.uuid}/feed.xml))
++    end
++  end
++
++  describe "build/2 when testing source XML" do
++    test "returns XML for static source attributes", %{source: source} do
++      res = RssFeedBuilder.build(source)
++
++      assert String.contains?(res, ~s(<title>#{source.custom_name}</title>))
++      assert String.contains?(res, ~s(<link>#{source.original_url}</link>))
++      assert String.contains?(res, ~s(<description>#{source.description}</description>))
++      assert String.contains?(res, ~s(<itunes:author>#{source.custom_name}</itunes:author>))
++      assert String.contains?(res, ~s(<itunes:subtitle>#{source.custom_name}</itunes:subtitle>))
++      assert String.contains?(res, ~s(<description>#{source.description}</description>))
++      assert String.contains?(res, ~s(<podcast:guid>#{source.uuid}</podcast:guid>))
++    end
++
++    test "returns the lastBuildDate and pubDate based off the source's timestamps", %{source: source} do
++      res = RssFeedBuilder.build(source)
++
++      assert String.contains?(res, ~s(<lastBuildDate>#{format_date(source.updated_at)}</lastBuildDate>))
++      assert String.contains?(res, ~s(<pubDate>#{format_date(source.inserted_at)}</pubDate>))
++    end
++
++    test "returns a self-link", %{source: source} do
++      res = RssFeedBuilder.build(source)
++
++      assert String.contains?(
++               res,
++               ~s(<atom:link href="http://localhost:8945/sources/#{source.uuid}/feed.xml" rel="self" type="application/rss+xml" />)
++             )
++    end
++
++    test "returns a link to the feed image" do
++      source = source_with_metadata_attachments()
++
++      res = RssFeedBuilder.build(source)
++      [_before, image_block, _after] = String.split(res, ~r(</?image>))
++
++      assert String.contains?(image_block, ~s(<url>http://localhost:8945/sources/#{source.uuid}/feed_image.jpg</url>))
++      assert String.contains?(image_block, ~s(<title>#{source.custom_name}</title>))
++      assert String.contains?(image_block, ~s(<link>#{source.original_url}</link>))
++
++      assert String.contains?(
++               res,
++               ~s(<itunes:image href="http://localhost:8945/sources/#{source.uuid}/feed_image.jpg"></itunes:image>)
++             )
++    end
++  end
++
++  describe "build/2 when testing media XML" do
++    test "only includes media persisted to disk", %{source: source} do
++      good_media = media_item_with_attachments(%{source_id: source.id})
++      bad_media = media_item_fixture(%{source_id: source.id, media_filepath: "/tmp/existing_file.mp3"})
++      pending_media = media_item_fixture(%{source_id: source.id, media_filepath: nil})
++
++      res = RssFeedBuilder.build(source)
++
++      assert String.contains?(res, ~s(<title>#{good_media.title}</title>))
++      refute String.contains?(res, ~s(<title>#{bad_media.title}</title>))
++      refute String.contains?(res, ~s(<title>#{pending_media.title}</title>))
++    end
++
++    test "returns XML for static media attributes", %{source: source} do
++      media_item = media_item_with_attachments(%{source_id: source.id})
++
++      res = RssFeedBuilder.build(source)
++      [_before, item_xml, _after] = String.split(res, ~r(</?item>))
++
++      assert String.contains?(item_xml, ~s(<guid isPermaLink="false">#{media_item.uuid}</guid>))
++      assert String.contains?(item_xml, ~s(<title>#{media_item.title}</title>))
++      assert String.contains?(item_xml, ~s(<link>#{media_item.original_url}</link>))
++      assert String.contains?(item_xml, ~s(<description>#{media_item.description}</description>))
++      assert String.contains?(item_xml, ~s(<itunes:author>#{source.custom_name}</itunes:author>))
++      assert String.contains?(item_xml, ~s(<itunes:subtitle>#{media_item.title}</itunes:subtitle>))
++      assert String.contains?(item_xml, ~s(<itunes:summary><![CDATA[#{media_item.description}]]></itunes:summary>))
++    end
++
++    test "returns pubDate based off the media's upload_date", %{source: source} do
++      media_item_with_attachments(%{source_id: source.id, upload_date: ~D[2020-01-01]})
++
++      res = RssFeedBuilder.build(source)
++      [_before, item_xml, _after] = String.split(res, ~r(</?item>))
++
++      assert String.contains?(item_xml, ~s(<pubDate>Wed, 01 Jan 2020 00:00:00 +0000</pubDate>))
++    end
++
++    test "returns an enclosure tag with the media's stream URL", %{source: source} do
++      media_item = media_item_with_attachments(%{source_id: source.id, media_size_bytes: 1234})
++
++      res = RssFeedBuilder.build(source)
++      [_before, item_xml, _after] = String.split(res, ~r(</?item>))
++
++      assert String.contains?(item_xml, ~s(<enclosure))
++      assert String.contains?(item_xml, ~s(url="http://localhost:8945/media/#{media_item.uuid}/stream.mp4"))
++      assert String.contains?(item_xml, ~s(length="1234"))
++      assert String.contains?(item_xml, ~s(type="video/mp4"))
++    end
++  end
++
++  defp format_date(date) do
++    Calendar.strftime(date, @datetime_format)
++  end
++end
+diff --git a/test/pinchflat/sources_test.exs b/test/pinchflat/sources_test.exs
+index ce247a279..392cc2f5e 100644
+--- a/test/pinchflat/sources_test.exs
++++ b/test/pinchflat/sources_test.exs
+@@ -59,6 +59,31 @@ defmodule Pinchflat.SourcesTest do
+   end
+ 
+   describe "create_source/2" do
++    test "automatically sets the UUID" do
++      expect(YtDlpRunnerMock, :run, &channel_mock/3)
++
++      valid_attrs = %{
++        media_profile_id: media_profile_fixture().id,
++        original_url: "https://www.youtube.com/channel/abc123"
++      }
++
++      assert {:ok, %Source{} = source} = Sources.create_source(valid_attrs)
++      assert String.length(source.uuid) == 36
++    end
++
++    test "UUID is not writable by the user" do
++      expect(YtDlpRunnerMock, :run, &channel_mock/3)
++
++      valid_attrs = %{
++        media_profile_id: media_profile_fixture().id,
++        original_url: "https://www.youtube.com/channel/abc123",
++        uuid: "some_uuid"
++      }
++
++      assert {:ok, %Source{} = source} = Sources.create_source(valid_attrs)
++      assert String.length(source.uuid) == 36
++    end
++
+     test "creates a source and adds name + ID from runner response for channels" do
+       expect(YtDlpRunnerMock, :run, &channel_mock/3)
+ 
+diff --git a/test/pinchflat/utils/datetime_utils_test.exs b/test/pinchflat/utils/datetime_utils_test.exs
+new file mode 100644
+index 000000000..166b9c04d
+--- /dev/null
++++ b/test/pinchflat/utils/datetime_utils_test.exs
+@@ -0,0 +1,14 @@
++defmodule Pinchflat.Utils.DatetimeUtilsTest do
++  use ExUnit.Case, async: true
++
++  alias Pinchflat.Utils.DatetimeUtils
++
++  describe "date_to_datetime/1" do
++    test "converts a Date to a DateTime" do
++      date = ~D[2022-01-01]
++      datetime = DatetimeUtils.date_to_datetime(date)
++
++      assert datetime == ~U[2022-01-01 00:00:00Z]
++    end
++  end
++end
+diff --git a/test/pinchflat_web/controllers/media_item_controller_test.exs b/test/pinchflat_web/controllers/media_item_controller_test.exs
+index 1f50462b4..428d337c5 100644
+--- a/test/pinchflat_web/controllers/media_item_controller_test.exs
++++ b/test/pinchflat_web/controllers/media_item_controller_test.exs
+@@ -66,6 +66,147 @@ defmodule PinchflatWeb.MediaItemControllerTest do
+     end
+   end
+ 
++  describe "streaming media" do
++    test "returns 404 if the media isn't found", %{conn: conn} do
++      media_item = media_item_fixture()
++      conn = get(conn, ~p"/media/#{media_item.uuid}/stream")
++
++      assert conn.status == 404
++    end
++
++    test "automatically sets the content type", %{conn: conn} do
++      media_item = media_item_with_attachments()
++      conn = get(conn, ~p"/media/#{media_item.uuid}/stream")
++
++      assert {"content-type", "video/mp4; charset=utf-8"} in conn.resp_headers
++    end
++
++    test "sets the content length", %{conn: conn} do
++      media_item = media_item_with_attachments()
++      filesize = File.stat!(media_item.media_filepath).size
++
++      conn = get(conn, ~p"/media/#{media_item.uuid}/stream")
++
++      assert {"content-length", to_string(filesize)} in conn.resp_headers
++    end
++  end
++
++  describe "streaming media when range is valid" do
++    setup do
++      media_item = media_item_with_attachments()
++
++      %{media_item: media_item}
++    end
++
++    test "sets the correct status and headers", %{conn: conn, media_item: media_item} do
++      filesize = File.stat!(media_item.media_filepath).size
++
++      conn =
++        conn
++        |> put_req_header("range", "bytes=0-100")
++        |> get(~p"/media/#{media_item.uuid}/stream")
++
++      assert conn.status == 206
++      assert {"content-range", "bytes 0-100/#{filesize}"} in conn.resp_headers
++      assert {"content-length", "101"} in conn.resp_headers
++    end
++
++    test "streams the specified range", %{conn: conn, media_item: media_item} do
++      conn =
++        conn
++        |> put_req_header("range", "bytes=0-100")
++        |> get(~p"/media/#{media_item.uuid}/stream")
++
++      assert byte_size(conn.resp_body) == 101
++    end
++
++    test "supports range offsets", %{conn: conn, media_item: media_item} do
++      contents = File.read!(media_item.media_filepath)
++      expected = String.slice(contents, 100..200)
++
++      conn =
++        conn
++        |> put_req_header("range", "bytes=100-200")
++        |> get(~p"/media/#{media_item.uuid}/stream")
++
++      assert conn.resp_body == expected
++    end
++
++    test "returns as expected if the requested range is larger than the file", %{conn: conn, media_item: media_item} do
++      contents = File.read!(media_item.media_filepath)
++      filesize = File.stat!(media_item.media_filepath).size
++
++      conn =
++        conn
++        |> put_req_header("range", "bytes=0-#{filesize * 10}")
++        |> get(~p"/media/#{media_item.uuid}/stream")
++
++      assert conn.resp_body == contents
++      assert {"content-range", "bytes 0-#{filesize - 1}/#{filesize}"} in conn.resp_headers
++      assert {"content-length", to_string(filesize)} in conn.resp_headers
++    end
++
++    test "supports endless ranges", %{conn: conn, media_item: media_item} do
++      contents = File.read!(media_item.media_filepath)
++
++      conn =
++        conn
++        |> put_req_header("range", "bytes=0-")
++        |> get(~p"/media/#{media_item.uuid}/stream")
++
++      assert conn.resp_body == contents
++    end
++
++    test "supports endless ranges with offsets", %{conn: conn, media_item: media_item} do
++      contents = File.read!(media_item.media_filepath)
++      {_, expected} = String.split_at(contents, 100)
++
++      conn =
++        conn
++        |> put_req_header("range", "bytes=100-")
++        |> get(~p"/media/#{media_item.uuid}/stream")
++
++      assert conn.resp_body == expected
++    end
++  end
++
++  describe "streaming media when range is invalid or not present" do
++    setup do
++      media_item = media_item_with_attachments()
++
++      %{media_item: media_item}
++    end
++
++    test "sets the correct status and headers", %{conn: conn, media_item: media_item} do
++      filesize = File.stat!(media_item.media_filepath).size
++
++      conn = get(conn, ~p"/media/#{media_item.uuid}/stream")
++
++      assert conn.status == 200
++      assert {"content-length", to_string(filesize)} in conn.resp_headers
++    end
++
++    test "streams the entire file", %{conn: conn, media_item: media_item} do
++      contents = File.read!(media_item.media_filepath)
++
++      conn = get(conn, ~p"/media/#{media_item.uuid}/stream")
++
++      assert conn.resp_body == contents
++    end
++
++    test "doesn't blow up if the range header is invalid", %{conn: conn, media_item: media_item} do
++      contents = File.read!(media_item.media_filepath)
++
++      conn =
++        conn
++        |> put_req_header("range", "bytes=-")
++        |> get(~p"/media/#{media_item.uuid}/stream")
++
++      assert conn.status == 200
++      assert conn.resp_body == contents
++    end
++  end
++
+   defp create_media_item(_) do
+     media_item = media_item_fixture()
+     %{media_item: media_item}
+diff --git a/test/pinchflat_web/controllers/podcast_controller_test.exs b/test/pinchflat_web/controllers/podcast_controller_test.exs
+new file mode 100644
+index 000000000..0e327ebcb
+--- /dev/null
++++ b/test/pinchflat_web/controllers/podcast_controller_test.exs
+@@ -0,0 +1,38 @@
++defmodule PinchflatWeb.PodcastControllerTest do
++  use PinchflatWeb.ConnCase
++
++  import Pinchflat.SourcesFixtures
++
++  describe "rss_feed" do
++    test "renders the XML document", %{conn: conn} do
++      source = source_fixture()
++
++      conn = get(conn, ~p"/sources/#{source.uuid}/feed" <> ".xml")
++
++      assert conn.status == 200
++      assert {"content-type", "application/rss+xml; charset=utf-8"} in conn.resp_headers
++      assert {"content-disposition", "inline"} in conn.resp_headers
++    end
++  end
++
++  describe "feed_image" do
++    test "returns a feed image if one can be found", %{conn: conn} do
++      source = source_with_metadata_attachments()
++
++      conn = get(conn, ~p"/sources/#{source.uuid}/feed_image" <> ".jpg")
++
++      assert conn.status == 200
++      assert {"content-type", "image/jpeg; charset=utf-8"} in conn.resp_headers
++      assert conn.resp_body == File.read!(source.metadata.poster_filepath)
++    end
++
++    test "returns 404 if an image cannot be found", %{conn: conn} do
++      source = source_fixture()
++
++      conn = get(conn, ~p"/sources/#{source.uuid}/feed_image" <> ".jpg")
++
++      assert conn.status == 404
++      assert conn.resp_body == "Image not found"
++    end
++  end
++end
+diff --git a/test/pinchflat_web/routing_test.exs b/test/pinchflat_web/routing_test.exs
+index 37c047dae..cbe4dd855 100644
+--- a/test/pinchflat_web/routing_test.exs
++++ b/test/pinchflat_web/routing_test.exs
+@@ -1,6 +1,8 @@
+ defmodule PinchflatWeb.RoutingTest do
+   use PinchflatWeb.ConnCase
+ 
++  import Pinchflat.SourcesFixtures
++
+   describe "basic_auth plug" do
+     setup do
+       old_username = Application.get_env(:pinchflat, :basic_auth_username)
+@@ -54,4 +56,53 @@ defmodule PinchflatWeb.RoutingTest do
+       assert conn.status == 200
+     end
+   end
++
++  describe "maybe_basic_auth plug" do
++    setup do
++      old_username = Application.get_env(:pinchflat, :basic_auth_username)
++      old_password = Application.get_env(:pinchflat, :basic_auth_password)
++      old_expose_feed_endpoints = Application.get_env(:pinchflat, :expose_feed_endpoints)
++
++      source = source_fixture()
++
++      on_exit(fn ->
++        Application.put_env(:pinchflat, :basic_auth_username, old_username)
++        Application.put_env(:pinchflat, :basic_auth_password, old_password)
++        Application.put_env(:pinchflat, :expose_feed_endpoints, old_expose_feed_endpoints)
++      end)
++
++      {:ok, source: source}
++    end
++
++    test "uses basic auth when expose_feed_endpoints is false", %{source: source} do
++      Application.put_env(:pinchflat, :basic_auth_username, "user")
++      Application.put_env(:pinchflat, :basic_auth_password, "pass")
++      Application.put_env(:pinchflat, :expose_feed_endpoints, false)
++
++      conn = get(build_conn(), "/sources/#{source.uuid}/feed")
++
++      assert conn.status == 401
++      assert {"www-authenticate", "Basic realm=\"Pinchflat\""} in conn.resp_headers
++    end
++
++    test "does not use basic auth when expose_feed_endpoints is true", %{source: source} do
++      Application.put_env(:pinchflat, :basic_auth_username, "user")
++      Application.put_env(:pinchflat, :basic_auth_password, "pass")
++      Application.put_env(:pinchflat, :expose_feed_endpoints, true)
++
++      conn = get(build_conn(), "/sources/#{source.uuid}/feed")
++
++      assert conn.status == 200
++    end
++
++    test "does not use basic auth when username/password aren't set", %{source: source} do
++      Application.put_env(:pinchflat, :basic_auth_username, nil)
++      Application.put_env(:pinchflat, :basic_auth_password, nil)
++      Application.put_env(:pinchflat, :expose_feed_endpoints, false)
++
++      conn = get(build_conn(), "/sources/#{source.uuid}/feed")
++
++      assert conn.status == 200
++    end
++  end
+ end
+diff --git a/test/support/fixtures/media_fixtures.ex b/test/support/fixtures/media_fixtures.ex
+index 153ccd895..f7240396e 100644
+--- a/test/support/fixtures/media_fixtures.ex
++++ b/test/support/fixtures/media_fixtures.ex
+@@ -5,6 +5,7 @@ defmodule Pinchflat.MediaFixtures do
+   """
+ 
+   alias Pinchflat.SourcesFixtures
++  alias Pinchflat.Filesystem.FilesystemHelpers
+ 
+   @doc """
+   Generate a media_item.
+@@ -44,18 +45,36 @@ defmodule Pinchflat.MediaFixtures do
+     media_item_fixture(merged_attrs)
+   end
+ 
++  def media_item_with_metadata_attachments(attrs \\ %{}) do
++    metadata_dir =
++      Path.join(Application.get_env(:pinchflat, :metadata_directory), "#{:rand.uniform(1_000_000)}")
++
++    json_gz_filepath = Path.join(metadata_dir, "metadata.json.gz")
++    thumbnail_filepath = Path.join(metadata_dir, "thumbnail.jpg")
++
++    FilesystemHelpers.cp_p!(media_metadata_filepath_fixture(), json_gz_filepath)
++    FilesystemHelpers.cp_p!(thumbnail_filepath_fixture(), thumbnail_filepath)
++
++    merged_attrs =
++      Map.merge(attrs, %{
++        metadata: %{
++          metadata_filepath: json_gz_filepath,
++          thumbnail_filepath: thumbnail_filepath
++        }
++      })
++
++    media_item_with_attachments(merged_attrs)
++  end
++
+   def media_item_with_attachments(attrs \\ %{}) do
+     stored_media_filepath =
+       Path.join([
+         Application.get_env(:pinchflat, :media_directory),
+         "#{:rand.uniform(1_000_000)}",
+-        "#{:rand.uniform(1_000_000)}_media.mkv"
++        "#{:rand.uniform(1_000_000)}_media.mp4"
+       ])
+ 
+-    fixture_media_filepath = media_filepath_fixture()
+-
+-    :ok = File.mkdir_p(Path.dirname(stored_media_filepath))
+-    :ok = File.cp(fixture_media_filepath, stored_media_filepath)
++    FilesystemHelpers.cp_p!(media_filepath_fixture(), stored_media_filepath)
+ 
+     merged_attrs = Map.merge(attrs, %{media_filepath: stored_media_filepath})
+     media_item_fixture(merged_attrs)
+@@ -105,4 +124,14 @@ defmodule Pinchflat.MediaFixtures do
+       "example.info.json"
+     ])
+   end
++
++  def media_metadata_filepath_fixture do
++    Path.join([
++      File.cwd!(),
++      "test",
++      "support",
++      "files",
++      "media_metadata.json"
++    ])
++  end
+ end
+diff --git a/test/support/fixtures/sources_fixtures.ex b/test/support/fixtures/sources_fixtures.ex
+index 0db2e78e6..55375e570 100644
+--- a/test/support/fixtures/sources_fixtures.ex
++++ b/test/support/fixtures/sources_fixtures.ex
+@@ -5,8 +5,10 @@ defmodule Pinchflat.SourcesFixtures do
+   """
+ 
+   alias Pinchflat.Repo
+-  alias Pinchflat.ProfilesFixtures
++  alias Pinchflat.MediaFixtures
+   alias Pinchflat.Sources.Source
++  alias Pinchflat.ProfilesFixtures
++  alias Pinchflat.Filesystem.FilesystemHelpers
+ 
+   @doc """
+   Generate a source.
+@@ -22,6 +24,7 @@ defmodule Pinchflat.SourcesFixtures do
+             collection_id: Base.encode16(:crypto.hash(:md5, "#{:rand.uniform(1_000_000)}")),
+             collection_type: "channel",
+             custom_name: "Cool and good internal name!",
++            description: "This is a description",
+             original_url: "https://www.youtube.com/channel/#{Faker.String.base64(12)}",
+             media_profile_id: ProfilesFixtures.media_profile_fixture().id,
+             index_frequency_minutes: 60
+@@ -48,6 +51,30 @@ defmodule Pinchflat.SourcesFixtures do
+     source_fixture(merged_attrs)
+   end
+ 
++  def source_with_metadata_attachments(attrs \\ %{}) do
++    metadata_dir =
++      Path.join(Application.get_env(:pinchflat, :metadata_directory), "#{:rand.uniform(1_000_000)}")
++
++    json_gz_filepath = Path.join(metadata_dir, "metadata.json.gz")
++    poster_filepath = Path.join(metadata_dir, "poster.jpg")
++    fanart_filepath = Path.join(metadata_dir, "fanart.jpg")
++
++    FilesystemHelpers.cp_p!(MediaFixtures.media_metadata_filepath_fixture(), json_gz_filepath)
++    FilesystemHelpers.cp_p!(MediaFixtures.thumbnail_filepath_fixture(), poster_filepath)
++    FilesystemHelpers.cp_p!(MediaFixtures.thumbnail_filepath_fixture(), fanart_filepath)
++
++    merged_attrs =
++      Map.merge(attrs, %{
++        metadata: %{
++          metadata_filepath: json_gz_filepath,
++          poster_filepath: poster_filepath,
++          fanart_filepath: fanart_filepath
++        }
++      })
++
++    source_fixture(merged_attrs)
++  end
++
+   def source_attributes_return_fixture do
+     source_attributes = [
+       %{
