@@ -12,11 +12,15 @@ The immutable fork candidate is `66b3546266deff378786cf94a92d5b2257978678ef948e3
 
 ## Current execution checkpoint
 
-All 13 original bundles remain parked under `cases_approved/`, with complete hashes in [original-inventory.json](original-inventory.json). The draft is `.local/ash-curation/draft`; the prepared fork clone is `.local/ash-curation/fork`. Controller inventory is empty and its normal observer is installed. No model run has started.
+All 13 original bundles remain parked under `cases_approved/`, with complete hashes in [original-inventory.json](original-inventory.json). They were rechecked unchanged before export. The admitted Ash bundle is now the only directory under `cases/` containing `case.json`; its eight reviewed input hashes match exactly, and `admission.json` binds the fork candidate.
 
-The first fork qualification is active via `/tmp/ash-qualify-fork.exs`. The repeat script is queued on its candidate lock and will retain round 1, then execute rounds 2 and 3 after archiving the preceding cache receipt out of lookup. Logs are `.local/ash-curation/qualification-fork-1.log` and `qualification-fork-repeat.log`. The prior buffered-upstream round completed before this work started; its queued repeat was cancelled before acquiring the lock or launching work.
+**Three fresh qualification rounds passed with identical complete named outcomes.** Reference: 13 acceptance, 117 preservation and 170 submitted tests passed. Unchanged source: ten acceptance failures; incomplete repair: one acceptance failure; early exit: no completed tests and rejected. The comparison includes both pristine probes and failure phases/types. Sanitized receipts are `qualification-round-1.json`, `qualification-round-2.json`, and `qualification-round-3.json`; original receipts/cache archives remain under `/data/curation/ash-pr-3031/66b3546266deff378786cf94a92d5b2257978678ef948e38c8eb2952e8093a5b/`.
 
-Next: require all three fresh fork rounds to match complete named outcomes, export with admission, rebuild the singleton controller, install the disabled timing observer, and run the ordinary Pi benchmark twice with fresh Astra contexts. Review both sealed results and patches, then restore all 14 unchanged bundles and the normal controller before committing/pushing the completed branch. Do not import the old `/tmp/ash-draft`: it contains the superseded upstream candidate.
+The controller was rebuilt with singleton inventory `ash-pr-3031`. Admission, three receipts, source/runtime identities, controller idleness and the disabled observer passed preflight. The temporary observer is installed only inside this validation controller; repository harness source is unchanged.
+
+Fresh ordinary Astra run **`20261020-145143-810635d8`** has started using `gpt-6-astra`, high reasoning and the 262144 generated-token response-boundary soft threshold. It is the first model attempt for this case; there were no model attempts on prior candidate versions. The run ID is also retained under the candidate's `astra-runs.json`. No second run has started.
+
+Next: wait for first-run grading and cleanup, start the second ordinary fresh run with the same inputs/settings, review both sealed results and patches, then restore all 14 unchanged bundles and the normal controller. Freeze the restored full release without starting a model run, commit/push the completed Ash checkpoint, and proceed with the authorized fork audit below.
 
 ## Authorized follow-on work
 
