@@ -78,12 +78,13 @@ defmodule Eab.GraderTest do
   end
 
   test "all retained PR reference patches satisfy edit rules and have partial controls" do
-    assert length(Eab.Inventory.all()) == 9
-    refute "plausible-pr-6300" in Eab.Inventory.all()
-    refute "plausible-pr-6763" in Eab.Inventory.all()
-    refute "plausible-pr-6441" in Eab.Inventory.all()
+    ids = Eab.Inventory.all()
+    assert ids != []
+    refute "plausible-pr-6300" in ids
+    refute "plausible-pr-6763" in ids
+    refute "plausible-pr-6441" in ids
 
-    for id <- Eab.Inventory.all() do
+    for id <- ids do
       spec = Eab.Inventory.spec(id)
       assert spec["source_inspiration"]["url"] =~ "/pull/"
       assert {:ok, _} = Grader.validate_patch(Eab.Inventory.file(id, "reference.patch"), spec)

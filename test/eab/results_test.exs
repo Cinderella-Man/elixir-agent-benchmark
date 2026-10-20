@@ -47,7 +47,7 @@ defmodule Eab.ResultsTest do
   end
 
   defp current do
-    inventory = Results.read!("config/benchmark.json")
+    inventory = Eab.Inventory.definition()
 
     Map.merge(run(), %{
       "cases" => inventory["cases"],
@@ -255,9 +255,10 @@ defmodule Eab.ResultsTest do
       end)
 
     result = Results.export!(source, inventory: inventory)
-    assert length(result["cases"]) == 9 and Enum.all?(result["cases"], & &1["passed"])
+    assert Enum.map(result["cases"], & &1["id"]) == inventory["cases"]
+    assert Enum.all?(result["cases"], & &1["passed"])
     refute Jason.encode!(result) =~ "retired-"
-    assert length(source["cases"]) == 11
+    assert source["cases"] == inventory["cases"] ++ ~w(retired-a retired-b)
 
     bad =
       put_in(
@@ -300,7 +301,8 @@ defmodule Eab.ResultsTest do
 
   test "build validates duplicates and fixtures, escapes script data, and supports an empty page",
        %{dir: dir} do
-    record = Results.export!(current(), model_label: "<img src=x onerror=alert(1)>")
+    source = current()
+    record = Results.export!(source, model_label: "<img src=x onerror=alert(1)>")
     Results.write!(Path.join(dir, "first.json"), record)
     Results.write!(Path.join(dir, "second.json"), record)
     assert_raise ArgumentError, ~r/Duplicate/, fn -> Results.load!(dir) end
@@ -308,7 +310,9 @@ defmodule Eab.ResultsTest do
     output = Path.join(dir, "dist")
     Results.build!(Results.load!(dir), output)
     [built] = Results.read!(Path.join(output, "results.json"))["results"]
-    assert built["passed"] == 9 and built["total"] == 9
+    assert built["passed"] == length(source["cases"])
+    assert built["total"] == length(source["cases"])
+    assert Enum.map(built["cases"], & &1["id"]) == source["cases"]
     refute File.read!(Path.join(output, "results.js")) =~ "<img"
 
     assert Enum.sort(File.ls!(output)) ==
@@ -341,7 +345,9 @@ defmodule Eab.ResultsTest do
     assert Results.publish!(source, opts) == :already_added
     [built] = Results.read!(Path.join(page, "dist/results.json"))["results"]
     assert built["note"] == "Reviewed note"
-    assert built["passed"] == 9 and built["total"] == 9
+    assert built["passed"] == length(source["cases"])
+    assert built["total"] == length(source["cases"])
+    assert Enum.map(built["cases"], & &1["id"]) == source["cases"]
     refute Jason.encode!(built) =~ "private-host"
     refute Jason.encode!(built) =~ "private-account"
     refute Jason.encode!(built) =~ "private-trace"

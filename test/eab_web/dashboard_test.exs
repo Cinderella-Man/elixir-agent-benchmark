@@ -52,7 +52,7 @@ defmodule EabWeb.DashboardTest do
     assert has_element?(view, "#case-panel-#{case_id} #case-log", "Tests finished")
   end
 
-  test "local setup page shows nine PR cases and waits for a model connection" do
+  test "local setup page shows current PR cases and waits for a model connection" do
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "Benchmark dashboard"
     assert html =~ "Model and tool calls are unlimited."
@@ -62,7 +62,10 @@ defmodule EabWeb.DashboardTest do
     refute html =~ "plausible-pr-6300"
     refute html =~ "plausible-pr-6763"
     refute html =~ "plausible-pr-6441"
-    assert length(Eab.Inventory.all()) == 9
+    ids = Eab.Inventory.all()
+    assert has_element?(view, ".inventory-summary strong", "#{length(ids)} cases")
+
+    for id <- ids, do: assert(has_element?(view, ".case-inventory article .eyebrow", id))
   end
 
   test "completed runs can be added from the dashboard and viewed without exporting a file" do
@@ -79,7 +82,10 @@ defmodule EabWeb.DashboardTest do
     [public] = Eab.Results.load!(Path.join(page, "results"))
     assert public == Eab.Results.export!(run, inventory: run["protocol"]["inventory"])
     [built] = Eab.Results.read!(Path.join(page, "dist/results.json"))["results"]
-    assert built["passed"] == 9 and built["model"]["quantization"] == "Q4_K_M"
+    assert built["passed"] == length(run["cases"])
+    assert built["total"] == length(run["cases"])
+    assert Enum.map(built["cases"], & &1["id"]) == run["cases"]
+    assert built["model"]["quantization"] == "Q4_K_M"
     refute Jason.encode!(built) =~ "private-host"
 
     # A repeated event and a reloaded tab cannot add another copy.
@@ -389,7 +395,7 @@ defmodule EabWeb.DashboardTest do
   end
 
   defp publication_run do
-    inventory = Eab.Results.read!("config/benchmark.json")
+    inventory = Eab.Inventory.definition()
 
     %{
       "id" => "publish-button-test",
