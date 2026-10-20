@@ -1,0 +1,74 @@
+diff --git a/lib/operately_web/api/queries/get_project.ex b/lib/operately_web/api/queries/get_project.ex
+index 791b602..e602445 100644
+--- a/lib/operately_web/api/queries/get_project.ex
++++ b/lib/operately_web/api/queries/get_project.ex
+@@ -48,7 +48,7 @@ defmodule OperatelyWeb.Api.Queries.GetProject do
+     OperatelyWeb.Api.Helpers.Inputs.parse_includes(inputs, [
+       include_contributors: [contributors: [:person]],
+       include_key_resources: [key_resources: :project],
+-      include_milestones: [milestones: :project],
++      include_milestones: [milestones: {from(m in Operately.Projects.Milestone, where: is_nil(m.deleted_at)), :project}],
+       include_goal: [:goal],
+       include_space: [:group],
+       include_champion: [:champion],
+diff --git a/test/operately_web/api/queries/get_project_test.exs b/test/operately_web/api/queries/get_project_test.exs
+index 81bc84a..ce7118b 100644
+--- a/test/operately_web/api/queries/get_project_test.exs
++++ b/test/operately_web/api/queries/get_project_test.exs
+@@ -113,6 +113,37 @@ defmodule OperatelyWeb.Api.Queries.GetProjectTest do
+       assert query(ctx.conn, :get_project, %{}) == {400, %{error: "Bad request", message: "id is required"}}
+     end
+ 
++    test "include_milestones excludes archived milestones", ctx do
++      project = create_project(ctx)
++      active = milestone_fixture(ctx.person, project_id: project.id, title: "Active milestone")
++      completed = milestone_fixture(ctx.person, project_id: project.id, title: "Completed milestone", status: :done)
++      archived = milestone_fixture(ctx.person, project_id: project.id, title: "Archived milestone")
++      {:ok, _} = Operately.Projects.delete_milestone(ctx.person, archived)
++
++      assert {200, res} = query(ctx.conn, :get_project, %{id: Paths.project_id(project), include_milestones: true})
++      expected = Repo.preload([active, completed], :project) |> serialize(level: :essential)
++      assert Enum.sort_by(res.project.milestones, & &1.id) == Enum.sort_by(expected, & &1.id)
++
++      assert {200, res} = query(ctx.conn, :get_project, %{id: Paths.project_id(project)})
++      assert res.project.milestones == nil
++
++      assert {200, res} = query(ctx.conn, :get_project, %{id: Paths.project_id(project), include_milestones: false})
++      assert res.project.milestones == nil
++    end
++
++    test "include_milestones returns an empty list when no visible milestones exist", ctx do
++      project = create_project(ctx)
++
++      assert {200, res} = query(ctx.conn, :get_project, %{id: Paths.project_id(project), include_milestones: true})
++      assert res.project.milestones == []
++
++      archived = milestone_fixture(ctx.person, project_id: project.id)
++      {:ok, _} = Operately.Projects.delete_milestone(ctx.person, archived)
++
++      assert {200, res} = query(ctx.conn, :get_project, %{id: Paths.project_id(project), include_milestones: true})
++      assert res.project.milestones == []
++    end
++
+     test "include_space", ctx do
+       space = group_fixture(ctx.person, company_id: ctx.company.id)
+       project = create_project(ctx, group_id: space.id)
+@@ -195,10 +226,18 @@ defmodule OperatelyWeb.Api.Queries.GetProjectTest do
+ 
+     test "include_archived", ctx do
+       project = create_project(ctx)
++      active = milestone_fixture(ctx.person, project_id: project.id, title: "Active milestone")
++      archived = milestone_fixture(ctx.person, project_id: project.id, title: "Archived milestone")
++      {:ok, _} = Operately.Projects.delete_milestone(ctx.person, archived)
+       {:ok, project} = Operately.Projects.archive_project(ctx.person, project)
+ 
+       assert {200, res} = query(ctx.conn, :get_project, %{id: Paths.project_id(project)})
+       assert res.project.is_archived == true
++      assert res.project.milestones == nil
++
++      assert {200, res} = query(ctx.conn, :get_project, %{id: Paths.project_id(project), include_milestones: true})
++      assert res.project.is_archived == true
++      assert res.project.milestones == [serialize(%{active | project: project}, level: :essential)]
+     end
+ 
+     test "include_permissions", ctx do
