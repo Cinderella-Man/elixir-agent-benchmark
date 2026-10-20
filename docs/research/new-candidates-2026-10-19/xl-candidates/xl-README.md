@@ -99,3 +99,5 @@ Guidance: [pr-selection-guidelines.md](../../pr-selection-guidelines.md) — lar
 - Full text of linked issues (#280, #2090) beyond PR summaries.
 
 HTML/diff/API retrieval date: **2026-10-19**. Diff files and PR JSON snapshots under [`_work/`](_work/).
+
+**Curation policy, 2026-10-20:** before implementing a researched candidate, follow [prepared fork sources](../../../prepared-fork-sources.md) and inspect existing fork branches. Runnable cases must pin prepared fork baselines; a research shortlist is not an admitted inventory. The [source audit](../../../../verification/prepared-forks-2026-10-20/README.md) records branch reuse and migration evidence.

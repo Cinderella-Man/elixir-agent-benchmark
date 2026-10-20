@@ -42,3 +42,5 @@ Recommended clarification: **“Keep the CSV columns unchanged; leave unavailabl
 [Results and all eleven case histories](results.json) · [Execution release](release.json) · [Artifact checksums](checksums.json)
 
 The `patches/` directory contains the two failed submissions as evidence; neither was applied to benchmark fixtures. The public export omits account identifiers, credentials, raw provider responses and model reasoning. Saved benchmark runs and their private copies were cleared on 2026-10-18; the one-off exporter was retired. Public evidence remains unchanged. Historical checksums describe the original package, including retired tooling available in Git history.
+
+**Prepared-source policy, 2026-10-20:** runnable additions and source migrations must follow [prepared fork sources](../../docs/prepared-fork-sources.md). This record retains its original source versions and outcomes; [the later fork audit](../prepared-forks-2026-10-20/README.md) records branch reuse and any new migration evidence separately.

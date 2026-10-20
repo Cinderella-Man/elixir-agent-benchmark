@@ -143,3 +143,5 @@ Skip list honored for this sub-batch: teslamate 5781/5782/5820/5823/5827/5847; p
 - REST API metadata for bandit/oban/broadway (rate-limited/422); those library leads are not filed.
 
 HTML/diff/commit retrieval date: **2026-10-19**.
+
+**Curation policy, 2026-10-20:** before implementing a researched candidate, follow [prepared fork sources](../../../prepared-fork-sources.md) and inspect existing fork branches. Runnable cases must pin prepared fork baselines; a research shortlist is not an admitted inventory. The [source audit](../../../../verification/prepared-forks-2026-10-20/README.md) records branch reuse and migration evidence.

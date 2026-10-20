@@ -1,6 +1,6 @@
 # Sequential case curation
 
-Use this workflow when asked to add cases or finish a candidate. Work on one candidate at a time, validate it, park it, then continue only within the requested scope. Finish a batch with all approved cases restored so the merge contains the additions and their evidence.
+Use this workflow when asked to add cases, finish a candidate, or change an existing case's source or preparation. Work on one candidate at a time, validate it, park it, then continue only within the requested scope. Finish a batch with all approved cases restored so the merge contains the changes and their evidence.
 
 **“Run against Astra” means run the actual benchmark with `gpt-6-astra` as the LLM solver through the ordinary Pi runner.** Fixture qualification without a model, a curator-written solution, and an Astra subagent are not those solver runs.
 
@@ -21,7 +21,7 @@ Read the worktree status, current case folders and any candidate's verification 
 
 For an unfinished case from an older branch, inspect its diff first. Import only that candidate's bundle, contract review and case-specific evidence onto the new branch. Main may have moved substantially: keep current harness/configuration code and existing cases. Verify imported admission and qualification evidence against current source, artifact hashes, grader and runtime identities.
 
-Record the original approved case IDs and file hashes before moving them. These establish that restoration preserves every original bundle.
+Record the original approved case IDs and file hashes before moving them. These establish that restoration preserves every original bundle except explicitly authorized migrations. For a migration, retain the old bundle and record the approved replacement's complete hashes separately.
 
 **Ready:** the branch/base and candidate are identified, existing work is preserved, and any reused evidence has been checked rather than assumed valid.
 
@@ -37,15 +37,19 @@ Docker copies case files into the controller image; host moves alone do not chan
 
 ## 3. Prepare and qualify the fixture
 
+Every runnable case must pin a prepared baseline branch in the user's fork. Follow [prepared fork sources](prepared-fork-sources.md) before creating refs or editing a source manifest: inspect every existing branch, reuse exact compatible preparation, preserve unrelated/excluded branches, and verify the prepared reference pair. Durable source preparation belongs in that branch; ordinary clones should not need an environment patch. Record and verify the exact prepared image's source tree after setup.
+
 Follow the [selection guidelines](pr-selection-guidelines.md) and [admission APIs](case-admission.md) for source provenance, the minimal solver contract, independent requirements-first review, acceptance/preservation checks, and plausible incomplete/integrity controls.
 
-Develop drafts outside `cases/`. Import and review the immutable version through `Eab.Candidates`, then complete **three fresh qualification rounds with matching named outcomes**, including completion and failure phases/types. Each round executes reference, unchanged, incomplete and integrity controls in fresh workspaces/service state. A cached qualification lookup is not another fresh round; preserve the previous receipt outside the cache lookup before repeating controls. Prepared images may be reused.
+Develop drafts outside `cases/`. For new cases and existing schema-v2 cases, import and review the immutable version through `Eab.Candidates`. For an existing legacy case's source migration, preserve its schema and grading semantics, hash the complete draft, retain genuine independent review against those hashes, and use the existing source/fixture/grader APIs under `Inventory.with_case/3`. Save checksummed source/runtime/grader receipts for that immutable version alongside its review; do not fabricate an admission receipt for a legacy bundle.
+
+Complete **three fresh qualification rounds with matching named outcomes**, including completion and failure phases/types, through the applicable path. Each round executes reference, unchanged, incomplete and integrity controls in fresh workspaces/service state. A cached qualification lookup is not another fresh round; preserve the previous receipt outside the cache lookup before repeating controls. Prepared images may be reused.
 
 For an unchanged resumed candidate, existing three-round evidence can remain valid after verifying the exact artifacts, receipts, grader, runtime and qualification identity. Record that verification as evidence reuse, not three new executions. Changed inputs require the applicable renewed review and fresh qualification.
 
-Export the qualified bundle with `Eab.Candidates.export/2` to `cases/<case-id>/`, including `admission.json`, then rebuild the controller and verify isolation. Preserve the qualified upstream reference throughout model validation.
+Export schema-v2 bundles with `Eab.Candidates.export/2` to `cases/<case-id>/`, including `admission.json`. For a qualified legacy source migration, copy the exact reviewed bundle and retain its equivalent source/review/three-round evidence separately. Rebuild the controller and verify isolation. Both paths use the same manual solver, sealed-submission review and restoration gates. Preserve the qualified upstream reference throughout model validation.
 
-**Ready:** independent review is recorded, all three rounds match, source reconstruction verifies, and `Eab.Candidates.verify_admission!(candidate_id)` succeeds on the active bundle.
+**Ready:** independent review is recorded, all three rounds match the current ensured runtime and qualification identity, source reconstruction and prepared image tree verify, and `Eab.Candidates.verify_admission!(candidate_id)` succeeds on schema-v2 bundles. A source migration preserves an existing legacy contract's format and semantics; it still needs the same manual evidence gates.
 
 ## 4. Run the benchmark with Astra twice
 
@@ -73,21 +77,21 @@ For that implementation, install the disabled source and its compiled module onl
 
 For each pass, verify the sealed submission/completion receipts, final cleanup, patch hashes, usage ledger, completed named acceptance/preservation/submitted results and applicable model-test policy. For bug fixes/features, confirm submitted tests fail in test bodies on pristine source and pass on the repair.
 
-Compare the two releases/experiments, model/settings, agent and runtime identities, frozen prompts/instructions/configuration/qualification, and initial requests excluding distinct session keys. Record unavailable provider revision/seed information honestly.
+Compare the two releases/experiments, model/settings, agent and runtime identities, frozen prompts/instructions/configuration/qualification, and initial requests excluding distinct session keys. Bind each run's saved qualification identity and complete normalized outcomes to all three reviewed receipts, and its runtime to their image/services/baseline and verified source tree. Agreement between the two model runs alone does not establish that the earlier qualification still applies. Record unavailable provider revision/seed information honestly.
 
 Read both submitted patches for correctness, weakened tests and grader shortcuts. A valid implementation may differ from the reference or touch fewer files. Preserve both patches, reviews and sanitized result summaries in the case's verification directory, including all earlier unsuccessful attempts and amendments.
 
-Once those gates pass, move the **unchanged complete bundle** from `cases/<case-id>/` to `cases_approved/<case-id>/` while the controller is idle. Record bundle hashes and approved status. For a multi-case batch, commit/push the checkpoint on its curation branch, rebuild the controller before the next run, and continue with the next requested candidate. Stop at the requested scope; finishing one candidate does not authorize an open-ended queue.
+Once those gates pass, move the **unchanged complete bundle** from `cases/<case-id>/` to `cases_approved/<case-id>/` while the controller is idle. For a migration, preserve the old held bundle outside both active/approved folders before parking its reviewed replacement; do not merge directories. Record bundle hashes and approved status. For a multi-case batch, commit/push the checkpoint on its curation branch, rebuild the controller before the next run, and continue with the next requested candidate. Stop at the requested scope; finishing one candidate does not authorize an open-ended queue.
 
 ## 6. Restore the inventory and finish the branch
 
 At batch completion, move every approved case directory from `cases_approved/` back to `cases/`, including newly accepted cases. Check for destination collisions before moving and remove the holding folder only if empty. Unqualified/deferred drafts stay outside the validated inventory.
 
-Verify the original case IDs and complete file hashes against the pre-move record. Rebuild/recreate the idle controller from repository source, verify the restored `Eab.Inventory.all()`, check schema-v2 admissions and freeze the restored release without starting another model run.
+Verify the original case IDs and complete file hashes against the pre-move record, using each authorized migration's reviewed replacement hashes for that case. Recheck all prepared fork branches against their pinned commits and preserve the recorded excluded bundles/refs. Rebuild/recreate the idle controller from repository source, verify the restored `Eab.Inventory.all()`, check schema-v2 admissions and freeze the restored release without starting another model run.
 
-Review the diff against the branch's main base. A case-only batch should contain new case bundles and their relevant review/verification evidence; temporary moves, deletions of existing cases, observer changes and unrelated old-branch harness changes must be absent. Commit and push the completed curation branch. Report its name/commit, which cases passed twice, and that the full inventory has been restored. Single-case validations are not a full-inventory model score.
+Review the diff against the branch's main base. A case-only batch should contain the requested bundles, relevant documentation and review/verification evidence; temporary moves, unrequested case deletions, observer changes and unrelated old-branch harness changes must be absent. Commit and push the completed curation branch. Report its name/commit, which cases passed twice, and that the full inventory has been restored. Single-case validations are not a full-inventory model score.
 
-**Done:** the requested candidates are accounted for, accepted bundles are in `cases/`, original bundles are unchanged, controller inventory matches the checkout, and the branch is ready to merge.
+**Done:** the requested candidates and migrations are accounted for, accepted bundles are in `cases/`, other original bundles are unchanged, controller inventory matches the checkout, and the branch is ready to merge.
 
 ## Handoff before an interruption
 

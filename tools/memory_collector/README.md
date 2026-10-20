@@ -22,3 +22,5 @@ Implementation lives in `lib/eab/memory_collector/` so the runner's ExUnit suite
 ```sh
 mix test test/eab/memory_collector_test.exs test/eab/memory_monitor_test.exs --max-cases 2
 ```
+
+For case preparation and validation, follow [prepared fork sources](../../docs/prepared-fork-sources.md) and the [source audit](../../verification/prepared-forks-2026-10-20/README.md). Runnable cases pin prepared branches in the user’s forks; their source preparation is separate from model-host memory collection.

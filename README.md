@@ -4,6 +4,8 @@ The standalone **Elixir SWE Bench** [results page](results-page/README.md) displ
 
 A local Elixir website that evaluates coding models against historical PR tasks. During the [sequential curation loop](docs/case-curation-loop.md), approved cases are temporarily parked in `cases_approved/`. Only case folders inside `cases/` are run. Moving folders back into `cases/` restores them automatically, with no inventory or configuration edits.
 
+Every runnable case must pin a prepared baseline branch in the user’s fork. Inspect and reuse existing branches before creating any; commit durable preparation there so ordinary clones need no source patch. Follow [prepared fork sources](docs/prepared-fork-sources.md); the [case-by-case fork audit](verification/prepared-forks-2026-10-20/README.md) records existing branch matches and migration evidence.
+
 The application prepares Docker images, checks the fixtures, runs the [Pi coding agent](https://github.com/earendil-works/pi) in isolated Docker workspaces, and grades its repairs with executable tests. There is no AI judge or speed score.
 
 ## Start

@@ -16,3 +16,5 @@ case is unsolvable; every case in that review was solved at least once.
 The earlier eleven-case freeze remains a historical record. Its strict verifier
 targets that original inventory and implementation, rather than the current
 active set.
+
+**Prepared forks, 2026-10-20:** [the source audit](../verification/prepared-forks-2026-10-20/README.md) checks the existing branches for these rejected cases and retired Plausible 6300. Their historical bundles and excluded status remain unchanged. Any reconsidered runnable version must follow [prepared fork sources](../docs/prepared-fork-sources.md) and its renewed admission gates.

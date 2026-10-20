@@ -62,3 +62,5 @@ Same gate as always, and **none of it was done in this pass**:
 ## Later pass — more library candidates
 
 Additional library candidates mined the same day live in [`more-candidates/more-candidates-README.md`](more-candidates/more-candidates-README.md) (ecto_sql #758 / #741, absinthe `@oneOf` lineage #1386+#1438+#1439, broadway #369, bandit #705). That index owns the rows; this README does not duplicate them.
+
+**Curation policy, 2026-10-20:** before implementing a researched candidate, follow [prepared fork sources](../../prepared-fork-sources.md) and inspect existing fork branches. Runnable cases must pin prepared fork baselines; a research shortlist is not an admitted inventory. The [source audit](../../../verification/prepared-forks-2026-10-20/README.md) records branch reuse and migration evidence.

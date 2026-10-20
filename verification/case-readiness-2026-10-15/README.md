@@ -20,3 +20,5 @@ The recorded run uses one preparation worker and one case at a time. Existing sa
 The one-off exporter was retired on 2026-10-18. Its checked-in portable evidence remains unchanged and identifies the original inputs: the audit's case-file hashes, verified source archive receipts, sanitized controller metadata and account-status counts. A later re-audit should record its own date and input snapshot; do not fabricate missing historical inputs to reproduce an old attestation. Historical exporter source remains in Git history.
 
 Raw qualification records remain under the isolated data directory's `controls/` and `jobs/`; full challenge results are under `readiness/`. A completed functional run does not establish two blind model successes or independent human review.
+
+**Prepared-source policy, 2026-10-20:** runnable additions and source migrations must follow [prepared fork sources](../../docs/prepared-fork-sources.md). This record retains its original source versions and outcomes; [the later fork audit](../prepared-forks-2026-10-20/README.md) records branch reuse and any new migration evidence separately.

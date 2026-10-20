@@ -155,3 +155,5 @@ Limit-testing **feature** candidates from Elixir libraries/frameworks: **5–10 
 - Integration DB behavior for ecto_sql #703 (unit SQL only).
 
 HTML/diff/raw retrieval date: **2026-10-19**.
+
+**Curation policy, 2026-10-20:** before implementing a researched candidate, follow [prepared fork sources](../../../prepared-fork-sources.md) and inspect existing fork branches. Runnable cases must pin prepared fork baselines; a research shortlist is not an admitted inventory. The [source audit](../../../../verification/prepared-forks-2026-10-20/README.md) records branch reuse and migration evidence.

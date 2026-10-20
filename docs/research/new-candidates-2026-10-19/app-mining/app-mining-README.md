@@ -223,3 +223,5 @@ Method: GitHub HTML PR lists (embedded JSON), `pull/N.diff`, `pull/N.patch`, raw
 - Any `mix` compile/test run; offline Hex availability; exact OTP image fit for 2020 changelog.com PRs (#339).
 - Dual-DB migration behavior for mydia (#1083/#1168) on both SQLite and PostgreSQL.
 - Parent SHAs are parent-of-first-commit from commit HTML, not confirmed merge-bases.
+
+**Curation policy, 2026-10-20:** before implementing a researched candidate, follow [prepared fork sources](../../../prepared-fork-sources.md) and inspect existing fork branches. Runnable cases must pin prepared fork baselines; a research shortlist is not an admitted inventory. The [source audit](../../../../verification/prepared-forks-2026-10-20/README.md) records branch reuse and migration evidence.

@@ -4,6 +4,8 @@ Start with the [case-selection and validation guidelines](pr-selection-guideline
 
 Draft cases live outside the scored inventory. `Eab.Candidates.import(directory)` validates a flat bundle of fixture files and stores an immutable version under `/data/candidates/<id>/<hash>/`. Importing does not alter `config/benchmark.json`, start a model, or claim that a case is qualified. These are curator/developer APIs; the model-run website remains the execution interface. Automated GitHub discovery and a curation website are separate work.
 
+Before importing a new or migrated bundle, follow [prepared fork sources](prepared-fork-sources.md). Pin the user's prepared baseline commit and tree, record its baseline/reference branches and actual fork source-pair PR, and retain upstream provenance separately. Reuse matching existing branches. Durable environment changes belong in the fork; remove their bundle overlay after verifying the prepared pair and runtime source tree. A source migration preserves legacy contract semantics but produces evidence for the new source version.
+
 Every new case uses `schema_version: 2` and `task_kind: bug_fix | feature | refactor`. Keep the existing repository, runtime, edit-prefix and acceptance-patch fields. The `grading` object declares:
 
 ```json

@@ -16,3 +16,5 @@ complete qualification.
 The original scores and recorded audit evidence are not reinterpreted under the
 new grader. The audit scripts select these archived inputs explicitly. Current
 qualification and promotion replay scripts use the active eleven-case inventory.
+
+**Prepared-source policy, 2026-10-20:** runnable additions and source migrations must follow [prepared fork sources](../../../docs/prepared-fork-sources.md). This record retains its original source versions and outcomes; [the later fork audit](../../prepared-forks-2026-10-20/README.md) records branch reuse and any new migration evidence separately.

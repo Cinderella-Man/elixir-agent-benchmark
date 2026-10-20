@@ -77,6 +77,8 @@ Feature reconstruction and original requests are eligible for small pilots, not 
 
 Apply the same contract, preservation, repeatability and blind-solvability gates to every source. Record source type and related task families. The current importer expects source reconstruction evidence; verify that a new source type fits that contract before preparing a bundle. Runtime or provenance support that is missing remains separate implementation work.
 
+Every runnable case uses a prepared branch in the user's fork. Follow [prepared fork sources](prepared-fork-sources.md): inspect existing branches before creating refs, commit neutral preparation once, preserve the exact upstream repair/reference pair, and verify the built workspace matches the pinned baseline tree. A researched upstream PR is source evidence, not the execution repository.
+
 ## Reject or defer these PRs
 
 | Disposition | Examples and reason |
