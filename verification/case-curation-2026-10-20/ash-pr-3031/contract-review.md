@@ -132,3 +132,41 @@ I recomputed each SHA-256 value and confirmed an exact match with `final-draft-h
 | `incomplete.patch` | `552acbfe4db0123df75888198526500028f77caa99694b1c54af491d750bbb1b` |
 | `integrity.patch` | `3b954ff88ed1cfc58d47171917e5c338e8f613c7f046671bad164c0499718f42` |
 | `provenance.json` | `58117a715899847d92340a05af5dc0e2f79b2a3bd1b500e429f83eb9d97c2257` |
+
+## Output-environment amendment review
+
+Reviewer `/root/contract_review` independently reviewed the further amendment supplied by author `/root` on 2026-10-20. **APPROVE the contract and environmental-neutrality review for candidate `bf2535232342395525e8e45651fbdf3a45f846d7a0b23eca537322e98d90a691`, bound to the hashes below.** This is not approval of its still-separate runtime qualification or model-run gates.
+
+I inspected the new `environment.patch`, its retained adapter source and diagnostic test sources, the amended manifest, both hash inventories, and `reporter-interleaving.json`. I recomputed all nine final file hashes. Only `case.json` changed and `environment.patch` was added relative to `unbuffered-draft-hashes.json`. Removing the two newly appended output/concurrency sentences from the manifest reproduces the exact previously reviewed manifest hash. The ticket, acceptance assertions, reference implementation, upstream tests, incomplete control, integrity control, and provenance are byte-identical to the preceding reviewed draft.
+
+### Reason for the amendment
+
+The two retained unbuffered receipts identify candidate `8a1b0882a61f1a172d54bedac4854c316ac1f37784eaf2776bf7e543aa922d38`. Their recorded raw lines differ by a CLI progress dot before one `EAB_FAILURE_PHASE` record. Independent comparison of the named outcomes finds that the second receipt loses the corresponding phase in the reference regression probes and changes the derived detected-test list. Their other control outcomes agree, but this is scoring-relevant evidence loss. The record marks the repeatability gate failed, preserves both receipts, and records no model attempts. These receipts do not qualify the corrected candidate.
+
+### Environmental neutrality and scope
+
+The environment patch installs a group-leader IO proxy before `ExUnit.start/1`, and sets the default `max_cases` to two. It does not alter Ash implementation files, the reporters, calculation fixtures, test selection, assertions, or grading expectations. Two-case concurrency is consistent with the user's bounded-concurrency instruction and the existing suite commands; the added default also covers probes without command-specific overrides.
+
+The adapter groups buffered characters by requesting process and emits each writer's complete lines. Its only content boundary is a newline. It contains no test-name, reporter-name, marker-prefix, pass/fail, exception-phase, or expected-outcome recognition. Non-write IO requests are delegated. Remaining partial output is flushed through the global exit callback, not when individual writers exit; it is not selectively discarded or rewritten into result records. A failed final flush raises rather than pretending the output completed. The retained `line-buffered-io.exs` is byte-identical to the module introduced by the patch, with SHA-256 `b633f083b402c4c79e44783eff3d5b2333d8f23895745c1bb3bf90f40482ca96`.
+
+This deliberately changes when partial output appears and the interleaving of different writers; the solver-visible environment clarification discloses that buffering. Per-writer order and character content are retained on successful writes. Independent writer fragments can remain pending until finalization, so this is not a general preservation claim about cross-writer chronology or every possible interactive IO session. Processes already using another group leader and writes to other devices remain outside this adapter's interception scope. None of those boundaries adds an unstated calculation requirement or favors the reference implementation.
+
+The five diagnostic test sources exercise departed partial writers, supported write forms and Unicode, delegated non-write requests, write/flush failures, and proxy death. The retained actual-reporter diagnostic requires 40 completed test records, 20 assertion failures, and all failure phases/types. These are appropriate functional checks for the amendment. I reviewed their source but did not independently rerun them or treat their author's reported success as completion of the corrected candidate's qualification.
+
+The original requirements-first findings and all 13 assertion mappings remain applicable without revision. No new unfair solver obligation or contract mismatch was found. Three fresh, fully compared qualification rounds for this exact candidate remain required; previous successful control outcomes cannot be carried over as those rounds. I ran no qualifications, models, tests, builds, speed measurements, or folder moves during this amendment review.
+
+### Reviewed output-environment package hashes
+
+These recomputed values match the updated `final-draft-hashes.json`:
+
+| File | SHA-256 |
+| --- | --- |
+| `case.json` | `cb76a4a93c40c7f9d29936d425e56a323fbcec1513a589410b4c7c07fddeba25` |
+| `environment.patch` | `35a2076b4206bb61ca094cedd2dc3a91243a36c659838940a0aedbcca3da4bd9` |
+| `ticket.md` | `892d6f1633f36b6a85ec158da2ce1b77401b8ac072b6bc054ba892e9e6192de8` |
+| `acceptance.patch` | `9537f29ab5b06ef1b5364efd6eaa1695b386d4fe540047c0f94a24228fb39281` |
+| `reference.patch` | `06e3d0584c23c9b69a8e473afb55b880339084d4e8a368102eaf40bf34f36430` |
+| `reference-tests.patch` | `ef3d7c8a3392ec08cdf888c0dcd0ec44e564a4bad67b90395bdfecbd48e18e69` |
+| `incomplete.patch` | `552acbfe4db0123df75888198526500028f77caa99694b1c54af491d750bbb1b` |
+| `integrity.patch` | `3b954ff88ed1cfc58d47171917e5c338e8f613c7f046671bad164c0499718f42` |
+| `provenance.json` | `58117a715899847d92340a05af5dc0e2f79b2a3bd1b500e429f83eb9d97c2257` |
