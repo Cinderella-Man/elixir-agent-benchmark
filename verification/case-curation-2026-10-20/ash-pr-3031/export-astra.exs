@@ -14,12 +14,28 @@ records = for {run_id, n} <- Enum.with_index(run_ids, 1) do
   unless run["cases"] == [id] and is_nil(run["selection"]) and (run["resume_count"] || 0) == 0,
     do: raise("Expected a fresh ordinary run of only the new case")
   release = Release.read!(run["release_id"])
+  unless Store.read("releases/#{release["id"]}/cases/#{id}/admission.json")["candidate"] == ref,
+    do: raise("Frozen run admission differs from current candidate")
   Checkpoints.validate_cases!(run, release)
   attempt = Checkpoints.completed(run, id) || raise("No verified completion receipt")
   unless attempt["grade"]["passed"], do: raise("Astra attempt failed")
   unless attempt["measurement"] == %{"disabled" => "functional_validation_machine_policy"},
     do: raise("Unexpected timing data")
   base = "runs/#{run_id}/#{id}"
+  for file <- ~w(attempt.json agent-progress.json) do
+    saved = Store.read("#{base}/#{file}")
+    unless saved["measurement"] == %{"disabled" => "functional_validation_machine_policy"} and
+        not String.contains?(Jason.encode!(saved), "\"attempt_ms\""),
+      do: raise("Attempt/progress record contains unexpected timing data")
+  end
+  pi_config = Store.read("#{base}/pi-config.json")
+  unless get_in(pi_config, ["settings", "compaction", "enabled"]) == false and
+      get_in(pi_config, ["settings", "retry", "enabled"]) == false and
+      get_in(pi_config, ["settings", "retry", "provider", "maxRetries"]) == 0,
+    do: raise("Unexpected compaction/retry policy")
+  unless run["settings"]["max_tokens"] == 262144 and
+      run["settings"]["budget_policy"] == "response_boundary_soft_limit",
+    do: raise("Unexpected generated-token budget policy")
   grade = Store.read("#{base}/grade.json")
   usages = Path.wildcard(Store.path("#{base}/usage-*.json")) |> Enum.map(&Inventory.read_json/1)
   output = Enum.sum(Enum.map(usages, & &1["output_tokens"]))
@@ -28,6 +44,8 @@ records = for {run_id, n} <- Enum.with_index(run_ids, 1) do
   initial = Store.read("#{base}/request-0000.json") |> Map.delete("prompt_cache_key")
   unless initial["model"] == "gpt-6-astra" and initial["reasoning"]["effort"] == "high",
     do: raise("Unexpected model/settings")
+  unless Enum.map(initial["input"], & &1["role"]) == ["developer", "user"],
+    do: raise("Initial request contains prior context")
   unless grade["regression_coverage"]["passed"], do: raise("No behavioral regression coverage")
   File.cp!(Store.path("#{base}/model.patch"), Path.join(out, "astra-#{n}.patch"))
   %{
@@ -38,6 +56,8 @@ records = for {run_id, n} <- Enum.with_index(run_ids, 1) do
     "calls" => attempt["calls"], "generated_tokens" => output,
     "completion_receipt_verified" => true, "usage_ledger_verified" => true,
     "measurement" => attempt["measurement"],
+    "compaction_enabled" => false, "automatic_retries" => 0,
+    "initial_request_roles" => Enum.map(initial["input"], & &1["role"]),
     "grade" => Evidence.summarize(grade),
     "named_results" => Map.new(~w(hidden regression submission),
       &{&1, Map.take(grade[&1], ~w(passed completed test_results failure_phases failure_types))}),

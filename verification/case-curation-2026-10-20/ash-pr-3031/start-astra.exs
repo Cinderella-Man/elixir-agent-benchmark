@@ -5,6 +5,9 @@ prefix = "curation/#{id}/#{ref["version"]}"
 unless Store.read("#{prefix}/preflight.json"), do: raise("Preflight missing")
 unless Inventory.all() == [id], do: raise("Expected singleton candidate inventory")
 Candidates.verify_admission!(id)
+unless Inventory.read_json(Inventory.case_path(id, "admission.json"))["candidate"] == ref and
+    Store.read("#{prefix}/preflight.json")["candidate"] == ref,
+  do: raise("Candidate pointer, admission and preflight differ")
 unless Eab.Measurement.start() == :disabled, do: raise("Elapsed-time observer must be disabled")
 snapshot = Runs.snapshot()
 unless is_nil(snapshot.active) and not snapshot.cleaning and is_nil(snapshot.cleanup_error), do: raise("Controller busy")

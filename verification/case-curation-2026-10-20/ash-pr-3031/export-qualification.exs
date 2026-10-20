@@ -4,16 +4,8 @@ prefix = "curation/#{ref["id"]}/#{ref["version"]}"
 out = "/tmp/ash-curation-evidence"
 File.mkdir_p!(out)
 matching = Store.read("#{prefix}/matching-controls.json")
-normalize = fn proof ->
-  Map.new(~w(empty_patch reference_patch early_exit partial_repair), fn name ->
-    grade = proof["controls"][name]
-    results = Map.new(~w(hidden regression submission regression_coverage), fn phase ->
-      result = grade[phase]
-      {phase, if(is_map(result), do: Map.take(result, ~w(passed completed test_results failure_phases failure_types)), else: result)}
-    end)
-    {name, Map.merge(Map.take(grade, ~w(passed reason submitted_test_files)), results)}
-  end)
-end
+Code.require_file("qualification-outcomes.exs", __DIR__)
+normalize = &AshCuration.Outcomes.normalize/1
 for round <- 1..3 do
   path = "#{prefix}/qualification-round-#{round}.json"
   proof = Store.read(path)

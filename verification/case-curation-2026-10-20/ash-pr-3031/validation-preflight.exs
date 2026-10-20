@@ -4,6 +4,8 @@ ref = Store.read("curation/#{id}-current.json")
 prefix = "curation/#{id}/#{ref["version"]}"
 unless Inventory.all() == [id], do: raise("Expected singleton candidate inventory")
 Candidates.verify_admission!(id)
+unless Inventory.read_json(Inventory.case_path(id, "admission.json"))["candidate"] == ref,
+  do: raise("Active admission differs from current candidate pointer")
 s = Eab.Runs.snapshot()
 unless is_nil(s.active) and not s.cleaning and is_nil(s.cleanup_error), do: raise("Controller busy")
 unless Eab.Measurement.start() == :disabled and
@@ -15,6 +17,10 @@ unless Enum.all?(proofs, &(&1["candidate"] == ref and &1["controls"]["valid"] an
   &1["checksum"] == Cache.key(Map.delete(&1, "checksum")))), do: raise("Invalid qualification receipts")
 unless Enum.uniq(Enum.map(proofs, & &1["controls"]["identity"])) |> length() == 1,
   do: raise("Qualification inputs differ")
+Code.require_file("qualification-outcomes.exs", __DIR__)
+matching = Store.read("#{prefix}/matching-controls.json")
+unless Enum.all?(proofs, &(AshCuration.Outcomes.normalize(&1) == matching)),
+  do: raise("Named qualification outcomes differ")
 record = %{
   "case" => id, "candidate" => ref,
   "main_commit" => "d9684ec85319e3c86be384f534ddd19af4b10562",

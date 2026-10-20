@@ -5,16 +5,8 @@ proof_path = "candidates/#{ref["id"]}/#{ref["version"]}/qualification.json"
 first = Store.read(proof_path) || raise("Initial qualification has not passed")
 unless first["controls"]["valid"], do: raise("Initial controls invalid")
 
-normalize = fn proof ->
-  Map.new(~w(empty_patch reference_patch early_exit partial_repair), fn name ->
-    grade = proof["controls"][name]
-    results = Map.new(~w(hidden regression submission regression_coverage), fn phase ->
-      result = grade[phase]
-      {phase, if(is_map(result), do: Map.take(result, ~w(passed completed test_results failure_phases failure_types)), else: result)}
-    end)
-    {name, Map.merge(Map.take(grade, ~w(passed reason submitted_test_files)), results)}
-  end)
-end
+Code.require_file("qualification-outcomes.exs", __DIR__)
+normalize = &AshCuration.Outcomes.normalize/1
 
 for round <- 1..3 do
   destination = "#{prefix}/qualification-round-#{round}.json"
