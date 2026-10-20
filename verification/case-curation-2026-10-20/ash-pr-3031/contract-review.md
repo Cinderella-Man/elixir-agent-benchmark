@@ -1,5 +1,7 @@
 # Independent contract review: ash-pr-3031
 
+The later preservation-check amendment is independently reviewed in [preservation-amendment-review.md](preservation-amendment-review.md). Earlier approvals and hashes below remain tied to their named immutable versions.
+
 - Reviewer: `/root/contract_review`
 - Package author: `/root`
 - Review date: 2026-10-20
