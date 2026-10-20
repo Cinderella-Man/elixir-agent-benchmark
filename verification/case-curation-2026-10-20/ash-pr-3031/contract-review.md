@@ -170,3 +170,41 @@ These recomputed values match the updated `final-draft-hashes.json`:
 | `incomplete.patch` | `552acbfe4db0123df75888198526500028f77caa99694b1c54af491d750bbb1b` |
 | `integrity.patch` | `3b954ff88ed1cfc58d47171917e5c338e8f613c7f046671bad164c0499718f42` |
 | `provenance.json` | `58117a715899847d92340a05af5dc0e2f79b2a3bd1b500e429f83eb9d97c2257` |
+
+## User-requested fork source amendment review
+
+Reviewer `/root/contract_review` independently reviewed the fork-source amendment supplied by author `/root` on 2026-10-20. **APPROVE the contract and source-neutrality review for candidate `66b3546266deff378786cf94a92d5b2257978678ef948e38c8eb2952e8093a5b`, bound to the eight hashes below.** This follows the user's explicit preference to use `Cinderella-Man/ash` with a prepared branch and minimal benchmark adaptation.
+
+I inspected the pinned Git objects, their complete changed-path inventories, the baseline preparation diff, the reference diff, the manifest/provenance changes, and the final package hashes. The source pair is:
+
+| Role | Revision | Tree |
+| --- | --- | --- |
+| Fork baseline, `codex/ash-pr-3031-benchmark` | `91d0b01085167e31193e93541623ef48c9f762b8` | `9b0b0a5718f7fd79e433d5352d168d4bd418ea38` |
+| Fork reference, `codex/ash-pr-3031-reference` | `ef09550410abc5444c3efc41b4c4b0f7c5a7c12a` | `95448ccaa26708ff6906f9126be34628fd1e5c60` |
+
+The baseline's sole parent is the original solver revision `abc634f5a725fadad850dacefc4284dd1d803fad`. Its complete diff changes only `.tool-versions`, `test/test_helper.exs`, and the new `test/support/line_buffered_io.exs`. There are no calculation implementation changes or new calculation regression assertions in this baseline. The upstream added calculation test file is absent.
+
+The adapter body is byte-identical to the independently reviewed adapter; only an SPDX copyright/license header is added. The helper installs it before ExUnit starts and sets `max_cases: 2, seed: 0`. The tool-version declarations now match the existing pinned runtime: Elixir `1.20.2-otp-29` and Erlang `29.0.5`; the `pipx` declaration is unchanged. This moves already-reviewed preparation into visible source without repairing the calculation bug. The previous adapter neutrality assessment and its IO boundaries continue to apply.
+
+The reference commit's sole parent is the prepared baseline. Its entire diff contains the same five implementation files and one added upstream calculation-test file reviewed originally. I independently compared the generated implementation diff byte-for-byte with `reference.patch` and the generated test-file diff byte-for-byte with `reference-tests.patch`; both match. Its author identity, author date, and subject match the accepted upstream commit `190987ec134a6a01b72d3eb8d9dcb26577b15873`. Thus the runtime preparation is common to both sides of the fork comparison, and the repair remains unchanged.
+
+The manifest now pins `https://github.com/Cinderella-Man/ash.git` at the prepared baseline. Provenance names [fork PR #1](https://github.com/Cinderella-Man/ash/pull/1) and the fork reference revision, while retaining [upstream PR #3031](https://github.com/ash-project/ash/pull/3031) and its revisions as inspiration. These links identify the recorded provenance; this review's identity checks use the immutable local Git objects.
+
+The only grading-command changes remove the explicit seed/concurrency flags from the two focused `mix test` commands. The test paths are unchanged, and the visible baseline now supplies those same defaults. Required tests, starting-failure inventory, requirement mappings, protected paths, timeout, pinned runtime image, and environment restrictions remain unchanged. No `environment.patch` exists in the final draft.
+
+The ticket, acceptance patch, reference patch, upstream test patch, incomplete control, and integrity control retain their previously reviewed hashes. All eight recomputed hashes match `final-draft-hashes.json`. The original requirements-first assessment and all 13 hidden assertion mappings therefore remain valid. No new unfair obligation or repair-scope change was found.
+
+This approval does not transfer qualification from any prior source pair. The fork candidate requires its own source/runtime qualification, three-round evidence comparison, and subsequent model-run gates. Any old candidate round allowed to finish remains evidence for its own version. I ran no qualifications, models, tests, builds, measurements, or folder moves during this review.
+
+### Reviewed fork package hashes
+
+| File | SHA-256 |
+| --- | --- |
+| `case.json` | `940f2d3bdc5ee837fe4db4504ff44a46aa9ef2682afb795605dbb9e1ddaa9736` |
+| `ticket.md` | `892d6f1633f36b6a85ec158da2ce1b77401b8ac072b6bc054ba892e9e6192de8` |
+| `acceptance.patch` | `9537f29ab5b06ef1b5364efd6eaa1695b386d4fe540047c0f94a24228fb39281` |
+| `reference.patch` | `06e3d0584c23c9b69a8e473afb55b880339084d4e8a368102eaf40bf34f36430` |
+| `reference-tests.patch` | `ef3d7c8a3392ec08cdf888c0dcd0ec44e564a4bad67b90395bdfecbd48e18e69` |
+| `incomplete.patch` | `552acbfe4db0123df75888198526500028f77caa99694b1c54af491d750bbb1b` |
+| `integrity.patch` | `3b954ff88ed1cfc58d47171917e5c338e8f613c7f046671bad164c0499718f42` |
+| `provenance.json` | `a01bca47e239f862139ec78d4ae3488ba65ef6bb6656153092cb5a07925e5bb9` |
