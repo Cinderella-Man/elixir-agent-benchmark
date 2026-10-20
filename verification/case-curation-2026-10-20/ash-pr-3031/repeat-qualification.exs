@@ -2,7 +2,11 @@ alias Eab.{Cache, Candidates, Store}
 ref = Store.read("curation/ash-pr-3031-current.json")
 prefix = "curation/#{ref["id"]}/#{ref["version"]}"
 proof_path = "candidates/#{ref["id"]}/#{ref["version"]}/qualification.json"
-first = Store.read(proof_path) || raise("Initial qualification has not passed")
+# Synchronize with a first round already running under the candidate lock.
+first =
+  Cache.locked({:candidate, ref["id"]}, fn ->
+    Store.read(proof_path) || raise("Initial qualification has not passed")
+  end)
 unless first["controls"]["valid"], do: raise("Initial controls invalid")
 
 Code.require_file("qualification-outcomes.exs", __DIR__)

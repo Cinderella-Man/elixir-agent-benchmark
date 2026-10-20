@@ -89,3 +89,46 @@ SHA-256 values identify the exact draft reviewed:
 | `reference-tests.patch` | `ef3d7c8a3392ec08cdf888c0dcd0ec44e564a4bad67b90395bdfecbd48e18e69` |
 | `incomplete.patch` | `552acbfe4db0123df75888198526500028f77caa99694b1c54af491d750bbb1b` |
 | `integrity.patch` | `3b954ff88ed1cfc58d47171917e5c338e8f613c7f046671bad164c0499718f42` |
+
+## Final draft amendment review
+
+Reviewer `/root/contract_review` independently reviewed the amendment supplied by author `/root` on 2026-10-20. **APPROVE the amended package identified by the final hashes below for the contract-review gate.** This approval applies to an immutable candidate containing these exact files; the preceding hash table and patch line references describe the initial draft.
+
+The amendment does not change the requirements-first assessment or assertion mapping:
+
+- `ticket.md` remains byte-identical to the contract read before hidden material.
+- The saved pre-format acceptance body reconstructs the exact previously reviewed patch hash, `7553bb9c30e0359d7e8d0d3aefd7c69edbc9fa4e8cfcfd728d193d24a45a8328`. The formatted body is byte-identical to the body of the final acceptance patch. I independently parsed both bodies with `Code.string_to_quoted!/1` and compared them after recursively removing AST metadata; they are equal. No fixtures, assertions, or test semantics changed.
+- All 13 required test identifiers still match the final acceptance tests, and the requirement links still cover exactly those identifiers.
+- `starting_failures` now contains all ten names reported as failed by the pristine `empty_patch.hidden.test_results` in `exploratory-controls.json`. I compared these sets directly and confirmed that each reported failure phase is `test`. The earlier four-name placeholder was incomplete; retaining the initial invalid qualification evidence and creating a new immutable candidate is the appropriate correction.
+- The environment clarification adds the user's existing functional-only machine constraint, including the prohibition on speed/throughput/latency benchmarks, performance comparisons, and timing commands. It adds no behavioral obligation to the code repair.
+- The reference implementation, upstream supplemental tests, incomplete implementation, and integrity fixture retain their previously reviewed hashes. The provenance record identifies the same source pair.
+
+The final acceptance groups begin at patch lines 182, 204, 232, 244, 265, 277, 284, 293, 321, 352, 451, 464, and 483, respectively, in the same order as the assertion-mapping table above.
+
+### Exploratory evidence inspected
+
+I inspected the named outcomes in `exploratory-controls.json`, which identify the **initial** candidate `a25d3e7fabd6772a0d2ce2de5d5e512a1cd1651d352a5236359f82a86c17c13d`:
+
+| Control | Recorded named outcome |
+| --- | --- |
+| Pristine/empty patch | Hidden suite completed: ten failures and three passes; all ten failures are test-body failures. Preservation completed with 117 passes. |
+| Reference patch | Hidden suite completed with 13 passes; preservation with 117 passes; submitted suite with 170 passes. |
+| Partial repair | Hidden suite completed with only the malformed-sort group failing; preservation and submitted suites each completed with 117 passes. This supplies execution evidence that the partial compiled and reached the intended behavior check. |
+| Early exit | Rejected; no completed suites or named test results were credited. |
+
+These observations support the manifest correction and the intended positive/negative controls. They do **not** make the initial four-name qualification valid, and they do **not** substitute for the three fresh qualification rounds on the amended candidate. Those final rounds were still a separate pending gate at this addendum. I ran only source parsing and read-only comparisons during this amendment review, not tests, builds, or measurements.
+
+### Final reviewed hashes
+
+I recomputed each SHA-256 value and confirmed an exact match with `final-draft-hashes.json`.
+
+| File | SHA-256 |
+| --- | --- |
+| `case.json` | `a62afa198835702983c6e0a6c2646875583ba9445aab1cf164cd0c3aeee0d2d6` |
+| `ticket.md` | `892d6f1633f36b6a85ec158da2ce1b77401b8ac072b6bc054ba892e9e6192de8` |
+| `acceptance.patch` | `9537f29ab5b06ef1b5364efd6eaa1695b386d4fe540047c0f94a24228fb39281` |
+| `reference.patch` | `06e3d0584c23c9b69a8e473afb55b880339084d4e8a368102eaf40bf34f36430` |
+| `reference-tests.patch` | `ef3d7c8a3392ec08cdf888c0dcd0ec44e564a4bad67b90395bdfecbd48e18e69` |
+| `incomplete.patch` | `552acbfe4db0123df75888198526500028f77caa99694b1c54af491d750bbb1b` |
+| `integrity.patch` | `3b954ff88ed1cfc58d47171917e5c338e8f613c7f046671bad164c0499718f42` |
+| `provenance.json` | `58117a715899847d92340a05af5dc0e2f79b2a3bd1b500e429f83eb9d97c2257` |
