@@ -1,0 +1,25 @@
+# Source and fixture review
+
+The candidate was selected from the [existing research](../../../docs/research/new-candidates-2026-10-19/ash-3031-calculation-arguments.md) and [deep dive](../../../docs/research/new-candidates-2026-10-19/deep-dive-ash-3031.md). No prior `ash-pr-3031` bundle existed in active or rejected inventory. GitHub's live PR API confirms [PR 3031](https://github.com/ash-project/ash/pull/3031) was accepted as squash commit `190987ec134a6a01b72d3eb8d9dcb26577b15873` on 2026-10-15; a search cache still showed the earlier open state. The immutable Git object establishes the source identity.
+
+The research's branch base `bc4f2bbd99ca4a2077908a49f036a65dc42b5828` is not the accepted commit's parent. Using it would import unrelated signal, tenant and action changes. The actual parent is `abc634f5a725fadad850dacefc4284dd1d803fad`, tree `79fd67fae33f72492146b09d4f3ab30d7e3c6bb6`. The fixed tree is `bd766f9d5d7af701358373166ae9ed047b3cc57f`. The reference and exact upstream test patches reconstruct this fixed tree.
+
+Five substantive implementation files coordinate one argument-validation contract:
+
+| File | Responsibility |
+| --- | --- |
+| `lib/ash/query/calculation.ex` | Calculation construction and permitted argument options |
+| `lib/ash/query/query.ex` | Literal/expression validation and normalized values |
+| `lib/ash/filter/filter.ex` | Filter call forms and the user-input expression boundary |
+| `lib/ash/query/function/type.ex` | Evaluation of already validated literals |
+| `lib/ash/sort/sort.ex` | Calculation sort input normalization and errors |
+
+The sixth changed file is the upstream calculation-argument test suite. Tests are counted separately. Model submissions may legitimately touch fewer files.
+
+Upstream author: `barnabasJ`; accepted in `ash-project/ash`. The snapshot retains the upstream SPDX copyright headers and `LICENSES/MIT.txt`. `reference-tests.patch` is the exact upstream addition. The curator `/root` derived independent grouped acceptance assertions from those fixtures, preserving their SPDX headers. The ticket expresses outcomes without naming the PR, affected paths, private AST fields or the reference's repair strategy. The independent review is recorded separately.
+
+The later commits flagged in discovery were inspected: `da464b83` adds calculation authorization, `5b7d8ec2` changes aggregate/sort type determination, and `8922691a` adjusts return type specifications. They concern different contracts; they are absent from this pinned pair and are not silently folded into the reference. This bounded review does not claim an exhaustive search of all later upstream defects.
+
+Acceptance uses private ETS resources, fixed timestamps and UUID fixture values, and seed 0. It exercises real Ash query construction and execution. Preservation uses the existing calculation directory and sort suite. No database, cloud account, browser, network data or sleeps are needed. Elixir 1.20.2 / OTP 29.0.5 is pinned by image digest, with locked upstream dependencies; the source's `.tool-versions` specifies the 1.20/29 family. Erlang schedulers and ExUnit concurrency are bounded at two; native make uses `-j2`.
+
+The incomplete control is the complete reference minus the sort implementation change. It is intended to leave valid filter/load behavior fixed while malformed sort containers still fail. The integrity control adds a compile-time early exit after the reference, which must be rejected as an incomplete suite. Neither control's success is assumed before executable qualification.
