@@ -1,0 +1,277 @@
+diff --git a/lib/thousand_island/handler.ex b/lib/thousand_island/handler.ex
+index 7800f58..12b522d 100644
+--- a/lib/thousand_island/handler.ex
++++ b/lib/thousand_island/handler.ex
+@@ -404,7 +404,9 @@ defmodule ThousandIsland.Handler do
+           when msg in [:tcp, :ssl] do
+         ThousandIsland.Telemetry.untimed_span_event(socket.span, :async_recv, %{data: data})
+ 
+-        __MODULE__.handle_data(data, socket, state)
++        ThousandIsland.Handler.invoke_callback(socket, fn ->
++          __MODULE__.handle_data(data, socket, state)
++        end)
+         |> ThousandIsland.Handler.handle_continuation(socket)
+       end
+ 
+@@ -439,7 +441,9 @@ defmodule ThousandIsland.Handler do
+       # close down the process
+       @impl true
+       def handle_continue(:handle_connection, {%ThousandIsland.Socket{} = socket, state}) do
+-        __MODULE__.handle_connection(socket, state)
++        ThousandIsland.Handler.invoke_callback(socket, fn ->
++          __MODULE__.handle_connection(socket, state)
++        end)
+         |> ThousandIsland.Handler.handle_continuation(socket)
+       end
+ 
+@@ -620,6 +624,17 @@ defmodule ThousandIsland.Handler do
+     end
+   end
+ 
++  @doc false
++  @spec invoke_callback(ThousandIsland.Socket.t(), (-> result)) :: result when result: term()
++  def invoke_callback(socket, callback) do
++    callback.()
++  catch
++    kind, reason ->
++      stacktrace = __STACKTRACE__
++      ThousandIsland.Telemetry.exception_span(socket.span, kind, reason, stacktrace)
++      :erlang.raise(kind, reason, stacktrace)
++  end
++
+   @doc false
+   def handle_continuation(continuation, socket) do
+     case continuation do
+diff --git a/lib/thousand_island/telemetry.ex b/lib/thousand_island/telemetry.ex
+index ce86cd1..46e05af 100644
+--- a/lib/thousand_island/telemetry.ex
++++ b/lib/thousand_island/telemetry.ex
+@@ -171,7 +171,7 @@ defmodule ThousandIsland.Telemetry do
+       * `remote_address`: The IP address of the connected client
+       * `remote_port`: The port of the connected client
+ 
+-  This span is ended by the following event:
++  This span is normally ended by the following event:
+ 
+   * `[:thousand_island, :connection, :stop]`
+ 
+@@ -195,6 +195,29 @@ defmodule ThousandIsland.Telemetry do
+       * `remote_port`: The port of the connected client
+       * `error`: The error that caused the span to end, if it ended in error
+ 
++  If `handle_connection/2` or `handle_data/3` raises, throws, or exits, the span is instead
++  ended by:
++
++  * `[:thousand_island, :connection, :exception]`
++
++      Represents an exception which ended the span
++
++      This event contains the following measurements:
++
++      * `monotonic_time`: The time of this event, in `:native` units
++      * `duration`: The span duration, in `:native` units
++
++      This event contains the following metadata:
++
++      * `telemetry_span_context`: A unique identifier for this span
++      * `parent_telemetry_span_context`: The span context of the `:acceptor` span which accepted
++        this connection
++      * `remote_address`: The IP address of the connected client
++      * `remote_port`: The port of the connected client
++      * `kind`: The exception class (`:error`, `:throw`, or `:exit`)
++      * `reason`: The exception reason
++      * `stacktrace`: The exception stacktrace
++
+   The following events may be emitted within this span:
+ 
+   * `[:thousand_island, :connection, :ready]`
+@@ -353,6 +376,7 @@ defmodule ThousandIsland.Telemetry do
+   @typedoc false
+   @type untimed_event_name ::
+           :async_recv
++          | :exception
+           | :stop
+           | :recv
+           | :send
+@@ -401,17 +425,49 @@ defmodule ThousandIsland.Telemetry do
+   @doc false
+   @spec stop_span(t(), measurements(), metadata()) :: :ok
+   def stop_span(span, measurements \\ %{}, metadata \\ %{}) do
+-    monotonic_time = measurements[:monotonic_time] || monotonic_time()
++    case Process.delete(exception_marker(span)) do
++      true ->
++        :ok
+ 
+-    measurements =
+-      Map.merge(measurements, %{
+-        monotonic_time: monotonic_time,
+-        duration: monotonic_time - span.start_time
+-      })
++      _ ->
++        monotonic_time = measurements[:monotonic_time] || monotonic_time()
++
++        measurements =
++          Map.merge(measurements, %{
++            monotonic_time: monotonic_time,
++            duration: monotonic_time - span.start_time
++          })
+ 
+-    metadata = Map.merge(span.start_metadata, metadata)
++        metadata = Map.merge(span.start_metadata, metadata)
+ 
+-    untimed_span_event(span, :stop, measurements, metadata)
++        untimed_span_event(span, :stop, measurements, metadata)
++    end
++  end
++
++  @doc false
++  @spec exception_span(t(), :error | :throw | :exit, term(), Exception.stacktrace()) :: :ok
++  def exception_span(span, kind, reason, stacktrace) do
++    case Process.put(exception_marker(span), true) do
++      true ->
++        :ok
++
++      _ ->
++        monotonic_time = monotonic_time()
++
++        measurements = %{
++          monotonic_time: monotonic_time,
++          duration: monotonic_time - span.start_time
++        }
++
++        metadata =
++          Map.merge(span.start_metadata, %{
++            kind: kind,
++            reason: reason,
++            stacktrace: stacktrace
++          })
++
++        untimed_span_event(span, :exception, measurements, metadata)
++    end
+   end
+ 
+   @doc false
+@@ -436,4 +492,7 @@ defmodule ThousandIsland.Telemetry do
+   defp event(suffix, measurements, metadata) do
+     :telemetry.execute([@app_name | suffix], measurements, metadata)
+   end
++
++  defp exception_marker(span),
++    do: {__MODULE__, :exception_emitted, span.telemetry_span_context}
+ end
+diff --git a/test/support/telemetry_helpers.ex b/test/support/telemetry_helpers.ex
+index a59c560..d2996ed 100644
+--- a/test/support/telemetry_helpers.ex
++++ b/test/support/telemetry_helpers.ex
+@@ -12,6 +12,7 @@ defmodule TelemetryHelpers do
+     [:thousand_island, :acceptor, :emfile],
+     [:thousand_island, :connection, :start],
+     [:thousand_island, :connection, :stop],
++    [:thousand_island, :connection, :exception],
+     [:thousand_island, :connection, :ready],
+     [:thousand_island, :connection, :async_recv],
+     [:thousand_island, :connection, :recv],
+diff --git a/test/thousand_island/handler_test.exs b/test/thousand_island/handler_test.exs
+index 1b00c34..bec36ca 100644
+--- a/test/thousand_island/handler_test.exs
++++ b/test/thousand_island/handler_test.exs
+@@ -1337,6 +1337,26 @@ defmodule ThousandIsland.HandlerTest do
+       end
+     end
+ 
++    defmodule Telemetry.Exception do
++      use ThousandIsland.Handler
++
++      @impl ThousandIsland.Handler
++      def handle_connection(_socket, {kind, reason}) do
++        case kind do
++          :error -> raise reason
++          :throw -> throw(reason)
++          :exit -> exit(reason)
++        end
++      end
++    end
++
++    defmodule Telemetry.DataException do
++      use ThousandIsland.Handler
++
++      @impl ThousandIsland.Handler
++      def handle_data(_data, _socket, _state), do: raise("data nope")
++    end
++
+     @tag capture_log: true
+     test "it should send `stop` telemetry event with payload on error" do
+       TelemetryHelpers.attach_all_events(Telemetry.Error)
+@@ -1368,9 +1388,72 @@ defmodule ThousandIsland.HandlerTest do
+                remote_port: port,
+                telemetry_span_context: reference()
+              }
++
++      refute_receive {:telemetry, [:thousand_island, :connection, :exception], _, _}, 100
++    end
++
++    for kind <- [:error, :throw, :exit] do
++      @tag capture_log: true
++      test "it should end the span with an exception event when a callback #{kind}s" do
++        kind = unquote(kind)
++        TelemetryHelpers.attach_all_events(Telemetry.Exception)
++
++        {:ok, port} = start_handler(Telemetry.Exception, handler_options: {kind, "nope"})
++        {:ok, client} = :gen_tcp.connect(:localhost, port, active: false)
++        {:ok, {ip, port}} = :inet.sockname(client)
++
++        assert_receive {:telemetry, [:thousand_island, :connection, :exception], measurements,
++                        metadata},
++                       500
++
++        assert measurements ~> %{monotonic_time: integer(), duration: integer()}
++
++        assert metadata
++               ~> %{
++                 handler: Telemetry.Exception,
++                 kind: kind,
++                 parent_telemetry_span_context: reference(),
++                 reason: term(),
++                 remote_address: ip,
++                 remote_port: port,
++                 stacktrace: list(),
++                 telemetry_span_context: reference()
++               }
++
++        assert_exception_reason(kind, metadata.reason)
++
++        refute_receive {:telemetry, [:thousand_island, :connection, :stop], _, _}, 100
++      end
++    end
++
++    @tag capture_log: true
++    test "it should end the span with an exception when handle_data raises" do
++      TelemetryHelpers.attach_all_events(Telemetry.DataException)
++
++      {:ok, port} = start_handler(Telemetry.DataException)
++      {:ok, client} = :gen_tcp.connect(:localhost, port, active: false)
++      :ok = :gen_tcp.send(client, "boom")
++
++      assert_receive {:telemetry, [:thousand_island, :connection, :exception], measurements,
++                      metadata},
++                     500
++
++      assert measurements ~> %{monotonic_time: integer(), duration: integer()}
++
++      assert Map.take(metadata, [:handler, :kind, :reason])
++             ~> %{handler: Telemetry.DataException, kind: :error, reason: term()}
++
++      assert %RuntimeError{message: "data nope"} = metadata.reason
++      refute_receive {:telemetry, [:thousand_island, :connection, :stop], _, _}, 100
+     end
+   end
+ 
++  defp assert_exception_reason(:error, reason),
++    do: assert(%RuntimeError{message: "nope"} = reason)
++
++  defp assert_exception_reason(kind, reason) when kind in [:throw, :exit],
++    do: assert(reason == "nope")
++
+   defp start_handler(handler, server_args \\ []) do
+     resolved_args = [port: 0, handler_module: handler, num_acceptors: 1] ++ server_args
+     {:ok, server_pid} = start_supervised({ThousandIsland, resolved_args})

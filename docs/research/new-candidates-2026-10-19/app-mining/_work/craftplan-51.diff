@@ -1,0 +1,273 @@
+diff --git a/docs/src/pages/docs/production-batching.md b/docs/src/pages/docs/production-batching.md
+index a732b2f0..f9bad666 100644
+--- a/docs/src/pages/docs/production-batching.md
++++ b/docs/src/pages/docs/production-batching.md
+@@ -36,6 +36,7 @@ From the kanban board or the batch detail modal:
+ 
+ - **Start** — Sets status to `in_progress` and records `started_at`. Can be triggered by clicking the Start button or dragging the card from Open to In Progress.
+ - **Mark Done** — Opens an inline form to enter the produced quantity and optional duration in minutes. Submitting triggers the `complete` action.
++- **Cancel Batch** — Open the batch detail page and confirm **Cancel Batch** to abandon an open or in-progress batch. Its order-item allocations are released so those quantities can be planned again. No inventory is deducted. Completed batches and batches with recorded material consumption cannot be canceled; their traceability records remain intact.
+ 
+ Drag-and-drop on the kanban enforces valid transitions and opens the completion form automatically when dragging from In Progress to Done.
+ 
+diff --git a/lib/craftplan/orders.ex b/lib/craftplan/orders.ex
+index 680652a5..fe81225e 100644
+--- a/lib/craftplan/orders.ex
++++ b/lib/craftplan/orders.ex
+@@ -35,6 +35,7 @@ defmodule Craftplan.Orders do
+       define :list_production_batches_for_plan, action: :plan
+       define :open_batch_with_allocations, action: :open_with_allocations
+       define :start_batch, action: :start
++      define :cancel_batch, action: :cancel
+       define :complete_batch, action: :complete
+       define :list_open_batches_for_product, action: :open_for_product
+     end
+diff --git a/lib/craftplan/orders/changes/batch_cancel.ex b/lib/craftplan/orders/changes/batch_cancel.ex
+new file mode 100644
+index 00000000..a69dc4c8
+--- /dev/null
++++ b/lib/craftplan/orders/changes/batch_cancel.ex
+@@ -0,0 +1,25 @@
++defmodule Craftplan.Orders.Changes.BatchCancel do
++  @moduledoc false
++  use Ash.Resource.Change
++
++  alias Ash.Changeset
++  alias Craftplan.Production.Batching
++
++  @impl true
++  def change(changeset, _opts, context) do
++    changeset
++    |> Changeset.before_action(fn changeset ->
++      actor = context.actor
++
++      if Batching.batch_consumed?(changeset.data, actor) do
++        Changeset.add_error(changeset,
++          field: :status,
++          message: "A batch with recorded material consumption cannot be canceled."
++        )
++      else
++        changeset
++      end
++    end)
++    |> Changeset.manage_relationship(:allocations, [], type: :direct_control)
++  end
++end
+diff --git a/lib/craftplan/orders/production_batch.ex b/lib/craftplan/orders/production_batch.ex
+index 7bf8a46d..dcd075ae 100644
+--- a/lib/craftplan/orders/production_batch.ex
++++ b/lib/craftplan/orders/production_batch.ex
+@@ -10,6 +10,7 @@ defmodule Craftplan.Orders.ProductionBatch do
+   import Ash.Expr
+ 
+   alias Craftplan.Orders.Changes.BatchOpenInit
++  alias Craftplan.Orders.OrderItemBatchAllocation
+ 
+   require Ash.Query
+ 
+@@ -58,13 +59,27 @@ defmodule Craftplan.Orders.ProductionBatch do
+ 
+     update :start do
+       accept []
++      validate attribute_in(:status, [:open])
++      change filter(expr(status == :open))
+       change set_attribute(:status, :in_progress)
+       change set_attribute(:started_at, &DateTime.utc_now/0)
+     end
+ 
++    update :cancel do
++      accept []
++      require_atomic? false
++      touches_resources [OrderItemBatchAllocation]
++      validate attribute_in(:status, [:open, :in_progress])
++      change filter(expr(status in [:open, :in_progress]))
++      change {Craftplan.Orders.Changes.BatchCancel, []}
++      change set_attribute(:status, :canceled)
++    end
++
+     update :consume do
+       argument :lot_plan, :map, allow_nil?: false
+       require_atomic? false
++      validate attribute_in(:status, [:open, :in_progress])
++      change filter(expr(status in [:open, :in_progress]))
+       change {Craftplan.Orders.Changes.BatchConsume, []}
+     end
+ 
+@@ -245,7 +260,7 @@ defmodule Craftplan.Orders.ProductionBatch do
+ 
+     has_many :order_items, Craftplan.Orders.OrderItem
+ 
+-    has_many :allocations, Craftplan.Orders.OrderItemBatchAllocation
++    has_many :allocations, OrderItemBatchAllocation
+     has_many :batch_lots, Craftplan.Orders.ProductionBatchLot
+   end
+ end
+diff --git a/lib/craftplan/production/batching.ex b/lib/craftplan/production/batching.ex
+index 600e7544..c09f9d5b 100644
+--- a/lib/craftplan/production/batching.ex
++++ b/lib/craftplan/production/batching.ex
+@@ -197,10 +197,6 @@ defmodule Craftplan.Production.Batching do
+     |> Ash.Query.filter(production_batch_id == ^batch.id)
+     |> Ash.Query.limit(1)
+     |> Ash.exists?(actor: actor)
+-    |> case do
+-      {:ok, exists?} -> exists?
+-      _ -> false
+-    end
+   end
+ 
+   def validate_recorded_consumption(%ProductionBatch{} = batch, output_qty, actor) do
+diff --git a/lib/craftplan_web/live/manage/production_batch_live/show.ex b/lib/craftplan_web/live/manage/production_batch_live/show.ex
+index 03b82bdc..95568a5d 100644
+--- a/lib/craftplan_web/live/manage/production_batch_live/show.ex
++++ b/lib/craftplan_web/live/manage/production_batch_live/show.ex
+@@ -150,6 +150,15 @@ defmodule CraftplanWeb.ProductionBatchLive.Show do
+               >
+                 Start Batch
+               </.button>
++              <.button
++                :if={@production_batch && @production_batch.status in [:open, :in_progress]}
++                id="cancel-batch"
++                variant={:outline}
++                phx-click="cancel_batch"
++                data-confirm="Cancel this batch? Its order quantities will be available to plan again."
++              >
++                Cancel Batch
++              </.button>
+             </div>
+           </Page.surface>
+         </Page.section>
+@@ -420,6 +429,22 @@ defmodule CraftplanWeb.ProductionBatchLive.Show do
+     end
+   end
+ 
++  @impl true
++  def handle_event("cancel_batch", _params, socket) do
++    case Orders.cancel_batch(socket.assigns.production_batch, %{}, actor: socket.assigns[:current_user]) do
++      {:ok, _} ->
++        refresh_and_flash(socket, "Batch canceled")
++
++      {:error, _} ->
++        {:noreply,
++         put_flash(
++           socket,
++           :error,
++           "Could not cancel batch. Only open or in-progress batches without recorded material consumption can be canceled."
++         )}
++    end
++  end
++
+   @impl true
+   def handle_event("toggle_advanced_lots", _params, socket) do
+     {:noreply, assign(socket, show_advanced_lots: !socket.assigns.show_advanced_lots)}
+diff --git a/test/craftplan/production_batching_test.exs b/test/craftplan/production_batching_test.exs
+index 1fa23119..ac4984f7 100644
+--- a/test/craftplan/production_batching_test.exs
++++ b/test/craftplan/production_batching_test.exs
+@@ -124,6 +124,65 @@ defmodule Craftplan.ProductionBatchingTest do
+     assert item2.status in [:in_progress, :done]
+   end
+ 
++  test "cancel releases allocations without consuming stock and permits replanning" do
++    actor = Craftplan.DataCase.staff_actor()
++    {product, flour} = setup_product_with_material(actor)
++    lot = create_lot_with_stock(flour.id, "FLOT-CANCEL", "10000", actor)
++    {:ok, batch} = Batching.open_batch(product.id, D.new("15"), actor: actor)
++    {item1, item2} = setup_orders_and_allocations(product, batch, actor)
++
++    assert {:ok, canceled} = Orders.cancel_batch(batch, %{}, actor: actor)
++    assert canceled.status == :canceled
++
++    assert Orders.list_allocations_for_batch!(%{production_batch_id: batch.id}, actor: actor) ==
++             []
++
++    assert D.equal?(Ash.reload!(lot, load: [:current_stock], actor: actor).current_stock, "10000")
++    refute Batching.batch_consumed?(canceled, actor)
++    assert Ash.reload!(item1, actor: actor).status == :todo
++    assert {:error, _} = Orders.start_batch(canceled, %{}, actor: actor)
++    assert {:error, _} = Orders.start_batch(batch, %{}, actor: actor)
++
++    assert {:error, _} =
++             Orders.complete_batch(canceled, %{produced_qty: D.new("15")}, actor: actor)
++
++    assert {:error, _} = Orders.cancel_batch(canceled, %{}, actor: actor)
++
++    {:ok, replacement} = Batching.open_batch(product.id, D.new("15"), actor: actor)
++
++    for {item, quantity} <- [{item1, "10"}, {item2, "5"}] do
++      assert {:ok, _} =
++               Orders.create_order_item_batch_allocation(
++                 %{
++                   production_batch_id: replacement.id,
++                   order_item_id: item.id,
++                   planned_qty: D.new(quantity)
++                 },
++                 actor: actor
++               )
++    end
++  end
++
++  test "in-progress batches can be canceled until consumption is recorded" do
++    actor = Craftplan.DataCase.staff_actor()
++    {product, flour} = setup_product_with_material(actor)
++    lot = create_lot_with_stock(flour.id, "FLOT-CANCEL-STARTED", "10000", actor)
++    {:ok, batch} = Batching.open_batch(product.id, D.new("1"), actor: actor)
++    {:ok, started} = Orders.start_batch(batch, %{}, actor: actor)
++    assert {:ok, canceled} = Orders.cancel_batch(started, %{}, actor: actor)
++    assert canceled.status == :canceled
++
++    {:ok, batch} = Batching.open_batch(product.id, D.new("1"), actor: actor)
++    {:ok, started} = Orders.start_batch(batch, %{}, actor: actor)
++    plan = %{flour.id => [%{lot_id: lot.id, quantity: D.new("500")}]}
++    assert {:ok, _} = Batching.consume_batch(started, plan, actor: actor)
++    assert Batching.batch_consumed?(started, actor)
++    assert {:error, _} = Orders.cancel_batch(started, %{}, actor: actor)
++    assert Ash.reload!(started, actor: actor).status == :in_progress
++    assert D.equal?(Ash.reload!(lot, load: [:current_stock], actor: actor).current_stock, "9500")
++    assert {:error, _} = Ash.update(canceled, %{lot_plan: plan}, action: :consume, actor: actor)
++  end
++
+   test "open, consume manually, and complete batch allocates costs and updates items" do
+     actor = Craftplan.DataCase.staff_actor()
+ 
+diff --git a/test/craftplan_web/production_batch_live_actions_test.exs b/test/craftplan_web/production_batch_live_actions_test.exs
+index 87b9f730..7e9480d4 100644
+--- a/test/craftplan_web/production_batch_live_actions_test.exs
++++ b/test/craftplan_web/production_batch_live_actions_test.exs
+@@ -132,6 +132,36 @@ defmodule CraftplanWeb.ProductionBatchLiveActionsTest do
+   # ── Batch lifecycle ─────────────────────────────────────────────
+ 
+   describe "batch lifecycle" do
++    @tag role: :staff
++    test "cancel button cancels an open batch and removes lifecycle controls", %{conn: conn} do
++      product = product_with_bom!()
++      {batch, _order, item} = open_batch(product)
++      create_allocation!(batch, item)
++      {:ok, view, _} = live(conn, ~p"/manage/production/batches/#{batch.batch_code}")
++
++      view |> element("#cancel-batch") |> render_click()
++
++      assert has_element?(view, "#batch-summary", "canceled")
++      refute has_element?(view, "#cancel-batch")
++      refute has_element?(view, "button[phx-click=start_batch]")
++      refute has_element?(view, "#complete-batch-section")
++
++      assert Orders.list_allocations_for_batch!(%{production_batch_id: batch.id}, actor: staff()) ==
++               []
++    end
++
++    @tag role: :staff
++    test "cancel button cancels an in-progress batch", %{conn: conn} do
++      product = product_with_bom!()
++      {batch, _order, _item} = open_batch(product)
++      {:ok, view, _} = live(conn, ~p"/manage/production/batches/#{batch.batch_code}")
++      view |> element("button[phx-click=start_batch]") |> render_click()
++      assert has_element?(view, "#complete-batch-section")
++      view |> element("#cancel-batch") |> render_click()
++      assert has_element?(view, "#batch-summary", "canceled")
++      refute has_element?(view, "#complete-batch-section")
++    end
++
+     @tag role: :staff
+     test "start action transitions batch to in_progress", %{conn: conn} do
+       prod = product_with_bom!()

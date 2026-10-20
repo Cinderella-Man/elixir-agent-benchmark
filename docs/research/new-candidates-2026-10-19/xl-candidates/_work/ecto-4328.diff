@@ -1,0 +1,225 @@
+diff --git a/Earthfile b/Earthfile
+index d626dc680c..dbd903ba7c 100644
+--- a/Earthfile
++++ b/Earthfile
+@@ -2,12 +2,13 @@ VERSION 0.6
+ 
+ all:
+     BUILD \
+-        --build-arg ELIXIR_BASE=1.15.6-erlang-25.3.2.6-alpine-3.16.7 \
+-        --build-arg ELIXIR_BASE=1.15.6-erlang-24.3.4.14-alpine-3.16.7 \
++        --build-arg ELIXIR_BASE=1.15.6-erlang-25.3.2.6-alpine-3.18.4 \
++        --build-arg ELIXIR_BASE=1.15.6-erlang-24.3.4.14-alpine-3.18.4 \
+         +integration-test
+ 
+ integration-test-base:
+-    ARG ELIXIR_BASE=1.15.6-erlang-25.3.2.6-alpine-3.16.7
++    ARG ELIXIR_BASE=1.15.6-erlang-25.3.2.6-alpine-3.18.4
++    ARG TARGETARCH 
+     FROM hexpm/elixir:$ELIXIR_BASE
+     RUN apk add --no-progress --update git build-base
+     RUN mix local.rebar --force
+@@ -17,11 +18,11 @@ integration-test-base:
+     RUN apk add --no-progress --update docker docker-compose git postgresql-client mysql-client
+ 
+     RUN apk add --no-cache curl gnupg --virtual .build-dependencies -- && \
+-        curl -O https://download.microsoft.com/download/e/4/e/e4e67866-dffd-428c-aac7-8d28ddafb39b/msodbcsql17_17.5.2.1-1_amd64.apk && \
+-        curl -O https://download.microsoft.com/download/e/4/e/e4e67866-dffd-428c-aac7-8d28ddafb39b/mssql-tools_17.5.2.1-1_amd64.apk && \
+-        echo y | apk add --allow-untrusted msodbcsql17_17.5.2.1-1_amd64.apk mssql-tools_17.5.2.1-1_amd64.apk && \
++        curl -O https://download.microsoft.com/download/3/5/5/355d7943-a338-41a7-858d-53b259ea33f5/msodbcsql18_18.3.2.1-1_${TARGETARCH}.apk && \
++        curl -O https://download.microsoft.com/download/3/5/5/355d7943-a338-41a7-858d-53b259ea33f5/mssql-tools18_18.3.1.1-1_${TARGETARCH}.apk && \
++        echo y | apk add --allow-untrusted msodbcsql18_18.3.2.1-1_${TARGETARCH}.apk mssql-tools18_18.3.1.1-1_${TARGETARCH}.apk && \
+         apk del .build-dependencies && rm -f msodbcsql*.sig mssql-tools*.apk
+-    ENV PATH="/opt/mssql-tools/bin:${PATH}"
++    ENV PATH="/opt/mssql-tools18/bin:${PATH}"
+ 
+     GIT CLONE https://github.com/elixir-ecto/ecto_sql.git /src/ecto_sql
+     WORKDIR /src/ecto_sql
+@@ -44,7 +45,7 @@ integration-test:
+     ARG MYSQL_IMG="mysql:5.7"
+ 
+     # then run the tests
+-    WITH DOCKER --pull "$PG_IMG" --pull "$MCR_IMG" --pull "$MYSQL_IMG"
++    WITH DOCKER --pull "$PG_IMG" --pull "$MCR_IMG" --pull "$MYSQL_IMG" --platform linux/amd64
+         RUN set -e; \
+             timeout=$(expr $(date +%s) + 60); \
+ 
+@@ -54,7 +55,7 @@ integration-test:
+             docker run --name mysql --network=host -d -e MYSQL_ROOT_PASSWORD=root "$MYSQL_IMG"; \
+ 
+             # wait for mssql to start
+-            while ! sqlcmd -S tcp:127.0.0.1,1433 -U sa -P 'some!Password' -Q "SELECT 1" >/dev/null 2>&1; do \
++            while ! sqlcmd -C -S tcp:127.0.0.1,1433 -U sa -P 'some!Password' -Q "SELECT 1" >/dev/null 2>&1; do \
+                 test "$(date +%s)" -le "$timeout" || (echo "timed out waiting for mysql"; exit 1); \
+                 echo "waiting for mssql"; \
+                 sleep 1; \
+diff --git a/integration_test/cases/type.exs b/integration_test/cases/type.exs
+index 057bfb3d96..691ceaf6ec 100644
+--- a/integration_test/cases/type.exs
++++ b/integration_test/cases/type.exs
+@@ -1,7 +1,7 @@
+ defmodule Ecto.Integration.TypeTest do
+   use Ecto.Integration.Case, async: Application.compile_env(:ecto, :async_integration_tests, true)
+ 
+-  alias Ecto.Integration.{Comment, Custom, Item, ItemColor, Order, Post, User, Tag, Usec}
++  alias Ecto.Integration.{Bitstring, Comment, Custom, Item, ItemColor, Order, Post, User, Tag, Usec}
+   alias Ecto.Integration.TestRepo
+   import Ecto.Query
+ 
+@@ -67,6 +67,19 @@ defmodule Ecto.Integration.TypeTest do
+     assert [^datetime] = TestRepo.all(from u in Usec, where: u.utc_datetime_usec == ^datetime, select: u.utc_datetime_usec)
+   end
+ 
++  @tag :bitstring_type
++  test "bitstring type" do
++    bitstring = <<2::3>>
++
++    TestRepo.insert!(%Bitstring{bs: bitstring, bs_with_size: <<5::10>>})
++
++    # Bitstrings
++    assert [^bitstring] = TestRepo.all(from p in Bitstring, where: p.bs == ^bitstring, select: p.bs)
++    assert [^bitstring] = TestRepo.all(from p in Bitstring, where: p.bs == <<2::3>>, select: p.bs)
++
++    assert [<<42::6>>] = TestRepo.all(from p in Bitstring, limit: 1, select: p.bs_with_default)
++  end
++
+   @tag :select_not
+   test "primitive types boolean negate" do
+     TestRepo.insert!(%Post{public: true})
+diff --git a/integration_test/support/schemas.exs b/integration_test/support/schemas.exs
+index 7b9464aa5f..01c50e7a7e 100644
+--- a/integration_test/support/schemas.exs
++++ b/integration_test/support/schemas.exs
+@@ -388,3 +388,19 @@ defmodule Ecto.Integration.ArrayLogging do
+     timestamps()
+   end
+ end
++
++defmodule Ecto.Integration.Bitstring do
++  @moduledoc """
++  This module is used to test:
++
++    * Bitstring type
++
++  """
++  use Ecto.Integration.Schema
++
++  schema "bitstrings" do
++    field :bs,  :bitstring
++    field :bs_with_default, :bitstring
++    field :bs_with_size, :bitstring
++  end
++end
+diff --git a/lib/ecto/query/builder.ex b/lib/ecto/query/builder.ex
+index e40b11ff2c..3ae1f52337 100644
+--- a/lib/ecto/query/builder.ex
++++ b/lib/ecto/query/builder.ex
+@@ -777,7 +777,7 @@ defmodule Ecto.Query.Builder do
+     do: do_literal(value, expected, quoted_type(value, vars))
+ 
+   defp do_literal(value, _, current) when current in @always_tagged,
+-    do: {:%, [], [Ecto.Query.Tagged, {:%{}, [], [value: value, type: current]}]}
++    do: {:%, [], [Ecto.Query.Tagged, {:%{}, [], [value: value, type: normalize_type(value, current)]}]}
+   defp do_literal(value, :any, _current),
+     do: value
+   defp do_literal(value, expected, expected),
+@@ -1228,6 +1228,9 @@ defmodule Ecto.Query.Builder do
+   defp get_env({env, _}), do: env
+   defp get_env(env), do: env
+ 
++  defp normalize_type(value, :binary),
++    do: quote(do: is_binary(unquote(value)) && :binary || :bitstring)
++
+   @doc """
+   Raises a query building error.
+   """
+diff --git a/lib/ecto/schema.ex b/lib/ecto/schema.ex
+index 50be5a13b6..151bbb3dd7 100644
+--- a/lib/ecto/schema.ex
++++ b/lib/ecto/schema.ex
+@@ -256,6 +256,7 @@ defmodule Ecto.Schema do
+   `:boolean`              | `boolean`               | true, false
+   `:string`               | UTF-8 encoded `string`  | "hello"
+   `:binary`               | `binary`                | `<<int, int, int, ...>>`
++  `:bitstring`            | `bitstring`             | `<<_::size>>
+   `{:array, inner_type}`  | `list`                  | `[value, value, value, ...]`
+   `:map`                  | `map` |
+   `{:map, inner_type}`    | `map` |
+diff --git a/lib/ecto/type.ex b/lib/ecto/type.ex
+index bbceed432d..393bb7badc 100644
+--- a/lib/ecto/type.ex
++++ b/lib/ecto/type.ex
+@@ -208,6 +208,7 @@ defmodule Ecto.Type do
+           | :float
+           | :boolean
+           | :string
++          | :bitstring
+           | :map
+           | :binary
+           | :decimal
+@@ -227,7 +228,7 @@ defmodule Ecto.Type do
+   @typep private_composite :: {:maybe, t} | {:in, t} | {:param, :any_datetime}
+ 
+   @base ~w(
+-    integer float decimal boolean string map binary id binary_id any
++    integer float decimal boolean string bitstring map binary id binary_id any
+     utc_datetime naive_datetime date time
+     utc_datetime_usec naive_datetime_usec time_usec
+   )a
+@@ -550,6 +551,7 @@ defmodule Ecto.Type do
+   def dump(:map, value, _dumper), do: same_map(value)
+   def dump(:string, value, _dumper), do: same_binary(value)
+   def dump(:binary, value, _dumper), do: same_binary(value)
++  def dump(:bitstring, value, _dumper), do: same_bitstring(value)
+   def dump(:id, value, _dumper), do: same_integer(value)
+   def dump(:binary_id, value, _dumper), do: same_binary(value)
+   def dump(:decimal, value, _dumper), do: same_decimal(value)
+@@ -644,6 +646,7 @@ defmodule Ecto.Type do
+   def load(:map, value, _loader), do: same_map(value)
+   def load(:string, value, _loader), do: same_binary(value)
+   def load(:binary, value, _loader), do: same_binary(value)
++  def load(:bitstring, value, _loader), do: same_bitstring(value)
+   def load(:id, value, _loader), do: same_integer(value)
+   def load(:binary_id, value, _loader), do: same_binary(value)
+   def load(:decimal, value, _loader), do: same_decimal(value)
+@@ -814,6 +817,7 @@ defmodule Ecto.Type do
+   defp cast_fun(:map), do: &cast_map/1
+   defp cast_fun(:string), do: &cast_binary/1
+   defp cast_fun(:binary), do: &cast_binary/1
++  defp cast_fun(:bitstring), do: &cast_bitstring/1
+   defp cast_fun(:id), do: &cast_integer/1
+   defp cast_fun(:binary_id), do: &cast_binary/1
+   defp cast_fun(:any), do: &{:ok, &1}
+@@ -897,6 +901,9 @@ defmodule Ecto.Type do
+   defp cast_binary(term) when is_binary(term), do: {:ok, term}
+   defp cast_binary(_), do: :error
+ 
++  defp cast_bitstring(term) when is_bitstring(term), do: {:ok, term}
++  defp cast_bitstring(_), do: :error
++
+   defp cast_map(term) when is_map(term), do: {:ok, term}
+   defp cast_map(_), do: :error
+ 
+@@ -912,6 +919,9 @@ defmodule Ecto.Type do
+   defp same_binary(term) when is_binary(term), do: {:ok, term}
+   defp same_binary(_), do: :error
+ 
++  defp same_bitstring(term) when is_bitstring(term), do: {:ok, term}
++  defp same_bitstring(_), do: :error
++
+   defp same_map(term) when is_map(term), do: {:ok, term}
+   defp same_map(_), do: :error
+ 
+diff --git a/test/ecto/query/builder_test.exs b/test/ecto/query/builder_test.exs
+index 1f7aec9957..b4b3f4cb97 100644
+--- a/test/ecto/query/builder_test.exs
++++ b/test/ecto/query/builder_test.exs
+@@ -32,7 +32,7 @@ defmodule Ecto.Query.BuilderTest do
+     assert {quote(do: ~s"123"), []} ==
+            escape(quote do ~s"123" end, [], __ENV__)
+ 
+-    assert {{:%, [], [Ecto.Query.Tagged, {:%{}, [], [value: {:<<>>, [], [0, 1, 2]}, type: :binary]}]}, []} ==
++    assert {{:%, [], [Ecto.Query.Tagged, {:%{}, [], [value: {:<<>>, [], [0, 1, 2]}, type: {:||, _, [{:&&, _, [{:is_binary, _, [{:<<>>, [], [0, 1, 2]}]}, :binary]}, :bitstring]}]}]}, []} =
+            escape(quote do <<0, 1, 2>> end, [], __ENV__)
+ 
+     assert {:some_atom, []} ==

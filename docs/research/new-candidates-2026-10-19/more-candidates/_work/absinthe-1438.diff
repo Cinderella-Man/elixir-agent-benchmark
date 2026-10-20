@@ -1,0 +1,70 @@
+diff --git a/lib/absinthe/type/built_ins/introspection.ex b/lib/absinthe/type/built_ins/introspection.ex
+index b709801446..7081e0299a 100644
+--- a/lib/absinthe/type/built_ins/introspection.ex
++++ b/lib/absinthe/type/built_ins/introspection.ex
+@@ -214,6 +214,16 @@ defmodule Absinthe.Type.BuiltIns.Introspection do
+         _, _ ->
+           {:ok, nil}
+       end
++
++    field :is_one_of,
++      type: :boolean,
++      resolve: fn
++        _, %{source: %Absinthe.Type.InputObject{__private__: private}} ->
++          {:ok, Keyword.get(private, :one_of, false)}
++
++        _, _ ->
++          {:ok, nil}
++      end
+   end
+ 
+   object :__field do
+diff --git a/priv/graphql/introspection.graphql b/priv/graphql/introspection.graphql
+index 3f8b0fd5e9..c7cb7c69ce 100644
+--- a/priv/graphql/introspection.graphql
++++ b/priv/graphql/introspection.graphql
+@@ -29,6 +29,7 @@ fragment FullType on __Type {
+   kind
+   name
+   description
++  isOneOf
+   fields(includeDeprecated: true) {
+     name
+     description
+diff --git a/test/absinthe/introspection_test.exs b/test/absinthe/introspection_test.exs
+index 43806b18f5..a08f0be19d 100644
+--- a/test/absinthe/introspection_test.exs
++++ b/test/absinthe/introspection_test.exs
+@@ -383,6 +383,7 @@ defmodule Absinthe.IntrospectionTest do
+             kind
+             name
+             description
++            isOneOf
+             inputFields {
+               name
+               description
+@@ -407,6 +408,7 @@ defmodule Absinthe.IntrospectionTest do
+            data: %{
+              "__type" => %{
+                "description" => "The basic details for a person",
++               "isOneOf" => false,
+                "inputFields" => [
+                  %{
+                    "defaultValue" => "43",
+diff --git a/test/absinthe/phase/document/validation/one_of_directive_test.exs b/test/absinthe/phase/document/validation/one_of_directive_test.exs
+index c299759ca0..c5c9f5a876 100644
+--- a/test/absinthe/phase/document/validation/one_of_directive_test.exs
++++ b/test/absinthe/phase/document/validation/one_of_directive_test.exs
+@@ -70,5 +70,12 @@ defmodule Absinthe.Phase.Document.Validation.OneOfDirectiveTest do
+       assert %{locations: [%{column: 47, line: 1}], message: @message} = error
+       refute result[:data]
+     end
++
++    test "introspection exposes isOneOf on the input type" do
++      query = ~s[{ __type(name: "ValidInput") { kind isOneOf } }]
++
++      assert {:ok, %{data: %{"__type" => %{"kind" => "INPUT_OBJECT", "isOneOf" => true}}}} =
++               Absinthe.run(query, Schema)
++    end
+   end
+ end

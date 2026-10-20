@@ -1,0 +1,190 @@
+diff --git a/lib/thousand_island/acceptor.ex b/lib/thousand_island/acceptor.ex
+index 4a292b2..7354689 100644
+--- a/lib/thousand_island/acceptor.ex
++++ b/lib/thousand_island/acceptor.ex
+@@ -60,6 +60,23 @@ defmodule ThousandIsland.Acceptor do
+           count + 1
+         )
+ 
++      {:error, {:spawn_error, reason}} ->
++        # The socket was accepted fine but a handler process could not be
++        # started for it (the socket has already been closed by
++        # ThousandIsland.Connection). This is a failure of one connection, so
++        # emit a spawn error and keep accepting rather than crashing the
++        # acceptor
++        ThousandIsland.Telemetry.span_event(span, :spawn_error, %{error: reason})
++
++        accept(
++          listener_socket,
++          connection_sup_pid,
++          server_config,
++          handler_config,
++          span,
++          count + 1
++        )
++
+       {:error, reason} when reason in [:econnaborted, :einval] ->
+         ThousandIsland.Telemetry.span_event(span, reason)
+ 
+diff --git a/lib/thousand_island/connection.ex b/lib/thousand_island/connection.ex
+index 81f0482..598f124 100644
+--- a/lib/thousand_island/connection.ex
++++ b/lib/thousand_island/connection.ex
+@@ -8,10 +8,8 @@ defmodule ThousandIsland.Connection do
+           ThousandIsland.HandlerConfig.t(),
+           ThousandIsland.Telemetry.t()
+         ) ::
+-          :ignore
+-          | :ok
+-          | {:ok, pid, info :: term}
+-          | {:error, :too_many_connections | {:already_started, pid} | term}
++          :ok
++          | {:error, :too_many_connections | {:spawn_error, term}}
+   def start(
+         sup_pid,
+         raw_socket,
+@@ -95,8 +93,20 @@ defmodule ThousandIsland.Connection do
+         handler_config.transport_module.close(raw_socket)
+         {:error, :too_many_connections}
+ 
++      {:error, reason} ->
++        # The handler process could not be started, for example because its
++        # init returned `{:stop, reason}`. We still own the raw socket at this
++        # point, so close it (rather than leaving it open until this acceptor
++        # exits), and report a spawn error so the acceptor can carry on rather
++        # than crashing on an otherwise-successful accept
++        _ = handler_config.transport_module.close(raw_socket)
++        {:error, {:spawn_error, reason}}
++
+       other ->
+-        other
++        # `:ignore`, or a nonstandard return from the handler's start_link.
++        # Handled exactly as above
++        _ = handler_config.transport_module.close(raw_socket)
++        {:error, {:spawn_error, other}}
+     end
+   end
+ end
+diff --git a/lib/thousand_island/telemetry.ex b/lib/thousand_island/telemetry.ex
+index 42ff4e0..ddad1a0 100644
+--- a/lib/thousand_island/telemetry.ex
++++ b/lib/thousand_island/telemetry.ex
+@@ -86,12 +86,15 @@ defmodule ThousandIsland.Telemetry do
+   * `[:thousand_island, :acceptor, :spawn_error]`
+ 
+       Thousand Island was unable to spawn a process to handle a connection. This occurs when too
+-      many connections are in progress; you may want to look at increasing the `num_connections`
+-      configuration parameter
++      many connections are in progress (in which case you may want to look at increasing the
++      `num_connections` configuration parameter), or when the configured handler failed to start
++      (for example if its `init/1` returned `{:stop, reason}` or `:ignore`)
+ 
+       This event contains the following measurements:
+ 
+       * `monotonic_time`: The time of this event, in `:native` units
++      * `error`: Present when a handler process failed to start; the reason the start failed.
++        Not present when the connection limit was reached
+ 
+       This event contains the following metadata:
+ 
+diff --git a/test/thousand_island/acceptor_test.exs b/test/thousand_island/acceptor_test.exs
+index 2ea8fa1..6622934 100644
+--- a/test/thousand_island/acceptor_test.exs
++++ b/test/thousand_island/acceptor_test.exs
+@@ -76,12 +76,36 @@ defmodule ThousandIsland.AcceptorTest do
+     end
+   end
+ 
++  # A handler_module (with a real child_spec via `use GenServer`) whose init
++  # fails, modelling a handler that cannot start (a failed resource acquisition
++  # or registry registration at connection setup time, say). The failure mode
++  # is selected via handler_options.
++  defmodule FailInitHandler do
++    use GenServer, restart: :temporary
++
++    def start_link({handler_options, genserver_options}),
++      do: GenServer.start_link(__MODULE__, handler_options, genserver_options)
++
++    @impl true
++    def init(:stop), do: {:stop, :intentional_init_failure}
++    def init(:ignore), do: :ignore
++  end
++
+   defp acceptor_sup_pids(server_pid) do
+     server_pid
+     |> ThousandIsland.Server.acceptor_pool_supervisor_pid()
+     |> ThousandIsland.AcceptorPoolSupervisor.acceptor_supervisor_pids()
+   end
+ 
++  defp acceptor_pids(server_pid) do
++    server_pid
++    |> ThousandIsland.Server.acceptor_pool_supervisor_pid()
++    |> ThousandIsland.AcceptorPoolSupervisor.acceptor_supervisor_pids()
++    |> Enum.flat_map(fn sup ->
++      for {:acceptor, pid, _, _} <- Supervisor.which_children(sup), is_pid(pid), do: pid
++    end)
++  end
++
+   test "descriptor exhaustion does not take down the acceptor or its in-flight connections" do
+     key = make_ref()
+     :persistent_term.put({FlakyTransport, :key}, key)
+@@ -149,4 +173,59 @@ defmodule ThousandIsland.AcceptorTest do
+     assert measurements ~> %{monotonic_time: integer(), error: :emfile}
+     assert metadata ~> %{handler: Echo, telemetry_span_context: reference()}
+   end
++
++  for mode <- [:stop, :ignore] do
++    test "a handler whose init returns #{inspect(mode)} does not crash the acceptor, and the socket is closed" do
++      {:ok, server_pid} =
++        start_supervised(
++          {ThousandIsland,
++           port: 0,
++           handler_module: FailInitHandler,
++           handler_options: unquote(mode),
++           num_acceptors: 1}
++        )
++
++      {:ok, {_ip, port}} = ThousandIsland.listener_info(server_pid)
++      acceptors_before = acceptor_pids(server_pid)
++
++      # Six connections in a row; each accept succeeds but no handler can be
++      # started. Six is past the acceptor's restart budget (3 restarts in 5
++      # seconds), so if each failure crashed the acceptor this would take down
++      # its supervisor as well
++      for _ <- 1..6 do
++        {:ok, client} = :gen_tcp.connect(:localhost, port, [:binary, active: false], 1000)
++
++        # The server must actively close the accepted socket rather than leave
++        # it dangling
++        assert {:error, :closed} = :gen_tcp.recv(client, 0, 1000)
++        :gen_tcp.close(client)
++      end
++
++      # The very same acceptor process is still in place: it never crashed,
++      # let alone escalated into its supervision tree
++      assert acceptor_pids(server_pid) == acceptors_before
++      assert Process.alive?(server_pid)
++      assert {:ok, []} = ThousandIsland.connection_pids(server_pid)
++    end
++  end
++
++  test "a spawn failure emits a spawn_error telemetry event carrying the reason" do
++    on_exit(TelemetryHelpers.attach_all_events(FailInitHandler))
++
++    {:ok, server_pid} =
++      start_supervised(
++        {ThousandIsland,
++         port: 0, handler_module: FailInitHandler, handler_options: :stop, num_acceptors: 1}
++      )
++
++    {:ok, {_ip, port}} = ThousandIsland.listener_info(server_pid)
++    {:ok, _client} = :gen_tcp.connect(:localhost, port, [:binary, active: false], 1000)
++
++    assert_receive {:telemetry, [:thousand_island, :acceptor, :spawn_error], measurements,
++                    metadata},
++                   1000
++
++    assert measurements ~> %{monotonic_time: integer(), error: :intentional_init_failure}
++    assert metadata ~> %{handler: FailInitHandler, telemetry_span_context: reference()}
++  end
+ end

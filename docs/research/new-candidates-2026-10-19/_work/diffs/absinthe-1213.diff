@@ -1,0 +1,124 @@
+diff --git a/lib/absinthe/subscription/local.ex b/lib/absinthe/subscription/local.ex
+index 041896885c..b128bc4cf1 100644
+--- a/lib/absinthe/subscription/local.ex
++++ b/lib/absinthe/subscription/local.ex
+@@ -53,7 +53,7 @@ defmodule Absinthe.Subscription.Local do
+         pipeline = [
+           pipeline,
+           [
+-            Absinthe.Phase.Document.Result,
++            result_phase(doc),
+             {Absinthe.Phase.Telemetry, event: [:subscription, :publish, :stop]}
+           ]
+         ]
+@@ -90,4 +90,22 @@ defmodule Absinthe.Subscription.Local do
+     |> Enum.map(&to_string/1)
+     |> Enum.flat_map(&Absinthe.Subscription.get(pubsub, {field, &1}))
+   end
++
++  defp result_phase(doc) do
++    # use the configured result phase from the initial pipeline
++    # this will allow the result of the subscription data to match
++    # the output of query/mutation. An example of result phase is
++    # Absinthe.Phoenix.Controller.Result where the output will have
++    # atom keys and allow struct to be returned
++
++    doc.initial_phases
++    |> Pipeline.from(Phase.Blueprint)
++    |> case do
++      [{Phase.Blueprint, opts} | _] ->
++        Keyword.get(opts, :result_phase, Phase.Document.Result)
++
++      _ ->
++        Phase.Document.Result
++    end
++  end
+ end
+diff --git a/test/absinthe/execution/subscription_test.exs b/test/absinthe/execution/subscription_test.exs
+index 28233c0d4b..d7e2bdb00e 100644
+--- a/test/absinthe/execution/subscription_test.exs
++++ b/test/absinthe/execution/subscription_test.exs
+@@ -3,6 +3,48 @@ defmodule Absinthe.Execution.SubscriptionTest do
+ 
+   import ExUnit.CaptureLog
+ 
++  defmodule ResultPase do
++    @moduledoc false
++
++    alias Absinthe.Blueprint
++    use Absinthe.Phase
++
++    def run(%Blueprint{} = bp, _options \\ []) do
++      result = Map.merge(bp.result, process(bp))
++      {:ok, %{bp | result: result}}
++    end
++
++    defp process(blueprint) do
++      data = data(blueprint.execution.result)
++      %{data: data}
++    end
++
++    defp data(%{value: value}), do: value
++
++    defp data(%{fields: []} = result) do
++      result.root_value
++    end
++
++    defp data(%{fields: fields, emitter: emitter, root_value: root_value}) do
++      with %{put: _} <- emitter.flags,
++           true <- is_map(root_value) do
++        data = field_data(fields)
++        Map.merge(root_value, data)
++      else
++        _ ->
++          field_data(fields)
++      end
++    end
++
++    defp field_data(fields, acc \\ [])
++    defp field_data([], acc), do: Map.new(acc)
++
++    defp field_data([field | fields], acc) do
++      value = data(field)
++      field_data(fields, [{String.to_existing_atom(field.emitter.name), value} | acc])
++    end
++  end
++
+   defmodule PubSub do
+     @behaviour Absinthe.Subscription.Pubsub
+ 
+@@ -150,6 +192,34 @@ defmodule Absinthe.Execution.SubscriptionTest do
+     :ok
+   end
+ 
++  @query """
++  subscription ($clientId: ID!) {
++    thing(clientId: $clientId)
++  }
++  """
++  test "should use result_phase from main pipeline" do
++    client_id = "abc"
++
++    assert {:ok, %{"subscribed" => topic}} =
++             run_subscription(
++               @query,
++               Schema,
++               variables: %{"clientId" => client_id},
++               context: %{pubsub: PubSub},
++               result_phase: ResultPase
++             )
++
++    Absinthe.Subscription.publish(PubSub, %{foo: "bar"}, thing: client_id)
++
++    assert_receive({:broadcast, msg})
++
++    assert %{
++             event: "subscription:data",
++             result: %{data: %{thing: %{foo: "bar"}}},
++             topic: topic
++           } == msg
++  end
++
+   @query """
+   subscription ($clientId: ID!) {
+     thing(clientId: $clientId)

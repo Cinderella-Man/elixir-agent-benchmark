@@ -1,0 +1,724 @@
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 23cde7067..31e897e10 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -12,3 +12,5 @@ services:
+       - ./docker-run.dev.sh
+     stdin_open: true
+     tty: true
++    env_file:
++      - .env
+diff --git a/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex b/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex
+index 684ef49ca..02fc00f9c 100644
+--- a/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex
++++ b/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex
+@@ -13,12 +13,13 @@ defmodule Pinchflat.FastIndexing.FastIndexingHelpers do
+   alias Pinchflat.Media
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.FastIndexing.YoutubeRss
++  alias Pinchflat.FastIndexing.YoutubeApi
+   alias Pinchflat.Downloading.DownloadingHelpers
+ 
+   alias Pinchflat.YtDlp.Media, as: YtDlpMedia
+ 
+   @doc """
+-  Fetches new media IDs from a source's YouTube RSS feed, indexes them, and kicks off downloading
++  Fetches new media IDs for a source from YT's API or RSS, indexes them, and kicks off downloading
+   tasks for any pending media items. See comments in `FastIndexingWorker` for more info on the
+   order of operations and how this fits into the indexing process.
+ 
+@@ -26,7 +27,7 @@ defmodule Pinchflat.FastIndexing.FastIndexingHelpers do
+   downloaded_.
+   """
+   def kickoff_download_tasks_from_youtube_rss_feed(%Source{} = source) do
+-    {:ok, media_ids} = YoutubeRss.get_recent_media_ids_from_rss(source)
++    {:ok, media_ids} = get_recent_media_ids(source)
+     existing_media_items = list_media_items_by_media_id_for(source, media_ids)
+     new_media_ids = media_ids -- Enum.map(existing_media_items, & &1.media_id)
+ 
+@@ -47,6 +48,17 @@ defmodule Pinchflat.FastIndexing.FastIndexingHelpers do
+     Enum.filter(maybe_new_media_items, & &1)
+   end
+ 
++  # If possible, use the YouTube API to fetch media IDs. If that fails, fall back to the RSS feed.
++  # If the YouTube API isn't set up, just use the RSS feed.
++  defp get_recent_media_ids(source) do
++    with true <- YoutubeApi.enabled?(),
++         {:ok, media_ids} <- YoutubeApi.get_recent_media_ids(source) do
++      {:ok, media_ids}
++    else
++      _ -> YoutubeRss.get_recent_media_ids(source)
++    end
++  end
++
+   defp list_media_items_by_media_id_for(source, media_ids) do
+     MediaQuery.new()
+     |> where(^dynamic([mi], ^MediaQuery.for_source(source) and mi.media_id in ^media_ids))
+diff --git a/lib/pinchflat/fast_indexing/youtube_api.ex b/lib/pinchflat/fast_indexing/youtube_api.ex
+new file mode 100644
+index 000000000..95e6b39a4
+--- /dev/null
++++ b/lib/pinchflat/fast_indexing/youtube_api.ex
+@@ -0,0 +1,92 @@
++defmodule Pinchflat.FastIndexing.YoutubeApi do
++  @moduledoc """
++  Methods for interacting with the YouTube API for fast indexing
++  """
++
++  require Logger
++
++  alias Pinchflat.Settings
++  alias Pinchflat.Sources.Source
++  alias Pinchflat.Utils.FunctionUtils
++  alias Pinchflat.FastIndexing.YoutubeBehaviour
++
++  @behaviour YoutubeBehaviour
++
++  @doc """
++  Determines if the YouTube API is enabled for fast indexing by checking
++  if the user has an API key set
++
++  Returns boolean()
++  """
++  @impl YoutubeBehaviour
++  def enabled?(), do: is_binary(api_key())
++
++  @doc """
++  Fetches the recent media IDs from the YouTube API for a given source.
++
++  Returns {:ok, [binary()]} | {:error, binary()}
++  """
++  @impl YoutubeBehaviour
++  def get_recent_media_ids(%Source{} = source) do
++    api_response =
++      source
++      |> determine_playlist_id()
++      |> do_api_request()
++
++    case api_response do
++      {:ok, parsed_json} -> get_media_ids_from_response(parsed_json)
++      {:error, reason} -> {:error, reason}
++    end
++  end
++
++  # The UC prefix is for channels which won't work with this API endpoint. Swapping
++  # the prefix to UU will get us the playlist that represents the channel's uploads
++  defp determine_playlist_id(%{collection_id: c_id}) do
++    String.replace_prefix(c_id, "UC", "UU")
++  end
++
++  defp do_api_request(playlist_id) do
++    Logger.debug("Fetching recent media IDs from YouTube API for playlist: #{playlist_id}")
++
++    playlist_id
++    |> construct_api_endpoint()
++    |> http_client().get(accept: "application/json")
++    |> case do
++      {:ok, response} ->
++        Phoenix.json_library().decode(response)
++
++      {:error, reason} ->
++        Logger.error("Failed to fetch YouTube API: #{inspect(reason)}")
++        {:error, reason}
++    end
++  end
++
++  defp get_media_ids_from_response(parsed_json) do
++    parsed_json
++    |> Map.get("items", [])
++    |> Enum.map(fn item ->
++      item
++      |> Map.get("contentDetails", %{})
++      |> Map.get("videoId", nil)
++    end)
++    |> Enum.reject(&is_nil/1)
++    |> Enum.uniq()
++    |> FunctionUtils.wrap_ok()
++  end
++
++  defp api_key do
++    Settings.get!(:youtube_api_key)
++  end
++
++  defp construct_api_endpoint(playlist_id) do
++    api_base = "https://youtube.googleapis.com/youtube/v3/playlistItems"
++    property_type = "contentDetails"
++    max_results = 50
++
++    "#{api_base}?part=#{property_type}&maxResults=#{max_results}&playlistId=#{playlist_id}&key=#{api_key()}"
++  end
++
++  defp http_client do
++    Application.get_env(:pinchflat, :http_client, Pinchflat.HTTP.HTTPClient)
++  end
++end
+diff --git a/lib/pinchflat/fast_indexing/youtube_behaviour.ex b/lib/pinchflat/fast_indexing/youtube_behaviour.ex
+new file mode 100644
+index 000000000..8a6c39040
+--- /dev/null
++++ b/lib/pinchflat/fast_indexing/youtube_behaviour.ex
+@@ -0,0 +1,11 @@
++defmodule Pinchflat.FastIndexing.YoutubeBehaviour do
++  @moduledoc """
++  This module defines the behaviour for clients that interface with YouTube
++  for the purpose of fast indexing.
++  """
++
++  alias Pinchflat.Sources.Source
++
++  @callback enabled?() :: boolean()
++  @callback get_recent_media_ids(%Source{}) :: {:ok, [String.t()]} | {:error, String.t()}
++end
+diff --git a/lib/pinchflat/fast_indexing/youtube_rss.ex b/lib/pinchflat/fast_indexing/youtube_rss.ex
+index 5caaab8c7..cb83fa909 100644
+--- a/lib/pinchflat/fast_indexing/youtube_rss.ex
++++ b/lib/pinchflat/fast_indexing/youtube_rss.ex
+@@ -1,18 +1,31 @@
+ defmodule Pinchflat.FastIndexing.YoutubeRss do
+   @moduledoc """
+-  Methods for interacting with YouTube RSS feeds
++  Methods for interacting with YouTube RSS feeds for fast indexing
+   """
+ 
+   require Logger
+ 
+   alias Pinchflat.Sources.Source
++  alias Pinchflat.FastIndexing.YoutubeBehaviour
++
++  @behaviour YoutubeBehaviour
++
++  @doc """
++  Determines if the YouTube RSS feed is enabled for fast indexing. Used to satisfy
++  the `YoutubeBehaviour` behaviour.
++
++  Returns true
++  """
++  @impl YoutubeBehaviour
++  def enabled?(), do: true
+ 
+   @doc """
+   Fetches the recent media IDs from a YouTube RSS feed for a given source.
+ 
+   Returns {:ok, [binary()]} | {:error, binary()}
+   """
+-  def get_recent_media_ids_from_rss(%Source{} = source) do
++  @impl YoutubeBehaviour
++  def get_recent_media_ids(%Source{} = source) do
+     Logger.debug("Fetching recent media IDs from YouTube RSS feed for source: #{source.collection_id}")
+ 
+     case http_client().get(rss_url_for_source(source)) do
+diff --git a/lib/pinchflat/http/http_client.ex b/lib/pinchflat/http/http_client.ex
+index 45abda4b1..c7d455071 100644
+--- a/lib/pinchflat/http/http_client.ex
++++ b/lib/pinchflat/http/http_client.ex
+@@ -21,9 +21,11 @@ defmodule Pinchflat.HTTP.HTTPClient do
+   """
+   @impl HTTPBehaviour
+   def get(url, headers \\ [], opts \\ []) do
++    headers = parse_headers(headers)
++
+     case :httpc.request(:get, {url, headers}, [], opts) do
+       {:ok, {{_version, 200, _reason_phrase}, _headers, body}} ->
+-        {:ok, body}
++        {:ok, to_string(body)}
+ 
+       {:ok, {{_version, status_code, reason_phrase}, _headers, _body}} ->
+         {:error, "HTTP request failed with status code #{status_code}: #{reason_phrase}"}
+@@ -32,4 +34,8 @@ defmodule Pinchflat.HTTP.HTTPClient do
+         {:error, "HTTP request failed: #{reason}"}
+     end
+   end
++
++  defp parse_headers(headers) do
++    Enum.map(headers, fn {k, v} -> {to_charlist(k), to_charlist(v)} end)
++  end
+ end
+diff --git a/lib/pinchflat/settings/setting.ex b/lib/pinchflat/settings/setting.ex
+index d8d056020..d449ca006 100644
+--- a/lib/pinchflat/settings/setting.ex
++++ b/lib/pinchflat/settings/setting.ex
+@@ -13,7 +13,8 @@ defmodule Pinchflat.Settings.Setting do
+     :apprise_version,
+     :apprise_server,
+     :video_codec_preference,
+-    :audio_codec_preference
++    :audio_codec_preference,
++    :youtube_api_key
+   ]
+ 
+   @required_fields ~w(
+@@ -29,6 +30,7 @@ defmodule Pinchflat.Settings.Setting do
+     field :yt_dlp_version, :string
+     field :apprise_version, :string
+     field :apprise_server, :string
++    field :youtube_api_key, :string
+ 
+     field :video_codec_preference, :string
+     field :audio_codec_preference, :string
+diff --git a/lib/pinchflat/sources/source.ex b/lib/pinchflat/sources/source.ex
+index e40972524..1cdebee59 100644
+--- a/lib/pinchflat/sources/source.ex
++++ b/lib/pinchflat/sources/source.ex
+@@ -129,7 +129,7 @@ defmodule Pinchflat.Sources.Source do
+   @doc false
+   def fast_index_frequency do
+     # minutes
+-    15
++    10
+   end
+ 
+   @doc false
+diff --git a/lib/pinchflat_web/controllers/settings/setting_html.ex b/lib/pinchflat_web/controllers/settings/setting_html.ex
+index dcb549ac6..340068b1d 100644
+--- a/lib/pinchflat_web/controllers/settings/setting_html.ex
++++ b/lib/pinchflat_web/controllers/settings/setting_html.ex
+@@ -14,9 +14,14 @@ defmodule PinchflatWeb.Settings.SettingHTML do
+ 
+   def apprise_server_help do
+     url = "https://github.com/caronc/apprise/wiki/URLBasics"
+-    classes = "underline decoration-bodydark decoration-1 hover:decoration-white"
+ 
+-    ~s(Server endpoint for Apprise notifications when new media is found. See <a href="#{url}" class="#{classes}" target="_blank">Apprise docs</a> for more information)
++    ~s(Server endpoint for Apprise notifications when new media is found. See <a href="#{url}" class="#{help_link_classes()}" target="_blank">Apprise docs</a> for more information)
++  end
++
++  def youtube_api_help do
++    url = "https://github.com/kieraneglin/pinchflat/wiki/Generating-a-YouTube-API-key"
++
++    ~s(API key for YouTube Data API v3. Greatly improves the accuracy of Fast Indexing. See <a href="#{url}" class="#{help_link_classes()}" target="_blank">here</a> for details on generating an API key)
+   end
+ 
+   def diagnostic_info_string do
+@@ -28,4 +33,8 @@ defmodule PinchflatWeb.Settings.SettingHTML do
+     - Timezone: #{Application.get_env(:pinchflat, :timezone)}
+     """
+   end
++
++  defp help_link_classes do
++    "underline decoration-bodydark decoration-1 hover:decoration-white"
++  end
+ end
+diff --git a/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex b/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
+index 0f017ab77..2cf170168 100644
+--- a/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
++++ b/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
+@@ -15,7 +15,7 @@
+         Notification Settings
+       </h3>
+       <span class="cursor-pointer hover:underline" x-on:click="advancedMode = !advancedMode">
+-        Editing Mode: <span x-text="advancedMode ? 'Advanced' : 'Basic'"></span>
++        Editing Mode: <span x-text="advancedMode ? 'Advanced' : 'Standard'"></span>
+       </span>
+     </section>
+ 
+@@ -26,7 +26,25 @@
+     ) %>
+   </section>
+ 
+-  <section class="mt-10" x-show="advancedMode">
++  <section class="mt-8">
++    <section>
++      <h3 class="text-2xl text-black dark:text-white">
++        Indexing Settings
++      </h3>
++
++      <.input
++        field={f[:youtube_api_key]}
++        placeholder="ABC123"
++        type="text"
++        label="YouTube API Key"
++        help={youtube_api_help()}
++        html_help={true}
++        inputclass="font-mono text-sm mr-4"
++      />
++    </section>
++  </section>
++
++  <section class="mt-8" x-show="advancedMode">
+     <section>
+       <h3 class="text-2xl text-black dark:text-white">
+         Codec Options
+diff --git a/lib/pinchflat_web/controllers/sources/source_html.ex b/lib/pinchflat_web/controllers/sources/source_html.ex
+index ab1ef07bf..bf6172089 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html.ex
++++ b/lib/pinchflat_web/controllers/sources/source_html.ex
+@@ -15,6 +15,7 @@ defmodule PinchflatWeb.Sources.SourceHTML do
+   def friendly_index_frequencies do
+     [
+       {"Only once when first created", -1},
++      {"30 minutes", 30},
+       {"1 Hour", 60},
+       {"3 Hours", 3 * 60},
+       {"6 Hours", 6 * 60},
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/fast_indexing_help.html.heex b/lib/pinchflat_web/controllers/sources/source_html/fast_indexing_help.html.heex
+index 710b2ed7b..9d20706d0 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/fast_indexing_help.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/fast_indexing_help.html.heex
+@@ -1,21 +1,63 @@
+ <aside>
+-  <h2 class="text-xl font-bold mb-2">What is fast indexing (experimental)?</h2>
++  <h2 class="text-2xl font-bold mb-2">What is fast indexing?</h2>
+   <section class="ml-2 md:ml-4 mb-4 max-w-prose">
+     <p>
+       Indexing is the act of scanning a channel or playlist (aka: source) for new media.
+     </p>
+     <p class="mt-2">
+       Normal indexing uses <code class="text-sm">yt-dlp</code>
+-      to scan the entire source on your specified frequency, but it's very slow for large sources. This is the most accurate way to find uploaded media with the tradeoff being that pairing a large source with a low index frequency will result in you spending most of your time indexing. Only so many indexing operations can be running at the same time, so this can impact your other source's ability to index.
++      to scan the entire source on your specified frequency, but it's very slow for large sources. This is the most accurate way to find uploaded media with the tradeoff being that pairing a large source that's indexed frequently will result in you spending most of your time indexing. Only so many indexing operations can be running at the same time so this can impact your other source's ability to index.
+     </p>
+     <p class="mt-2">
+-      Fast indexing takes a different approach. It still does an initial scan the slow way but after that it uses an RSS feed to frequently check for new videos. This has the potential to be hundreds of times faster, but it can miss videos if the uploader un-privates an old video or uploads dozens of videos in the space of a few minutes. It works well for most channels or playlists but it's not perfect.
++      Fast indexing takes a different approach. It still does an initial scan the slow way but after that it uses a secondary mechanism (either RSS or YouTube's API) to frequently check for new videos. This has the potential to be hundreds of times faster, but it can miss videos if the uploader un-privates an old video or uploads dozens of videos in the space of a few minutes.
+     </p>
+     <p class="mt-2">
+-      To make up for this limitation, a normal index is still run monthly to catch any videos that were missed by fast indexing. Fast indexing overrides the normal index frequency.
++      RSS is used by default but you should enable the YouTube API if you want the best version of fast indexing. This isn't needed for most users but it provides the fastest and most reliable media updates.
++      <.inline_link href="https://github.com/kieraneglin/pinchflat/wiki/Generating-a-YouTube-API-key">
++        Here is some documentation
++      </.inline_link>
++      on how to get your API key which you can add in the
++      <.inline_link href={~p"/settings"}>
++        settings
++      </.inline_link>
++      page.
+     </p>
+     <p class="mt-2">
+-      Fast indexing is experimental so please report any issues on GitHub. It's only recommended for sources with over 200-ish videos and that upload frequently. Not recommended for small or inactive sources.
++      To make up for this limitation, a normal index is still run monthly to catch any videos that were missed by fast indexing. Fast indexing overrides the normal index frequency.
++    </p>
++    <p class="mt-4">
++      <h4 class="font-bold text-xl">TL;DR</h4>
++
++      <strong class="mt-2 inline-block">In general:</strong>
++      <ul class="list-disc list-inside ml-2 md:ml-5">
++        <li>
++          Uses RSS by default which is fine for most users
++        </li>
++        <li>
++          <.inline_link href="https://github.com/kieraneglin/pinchflat/wiki/Generating-a-YouTube-API-key">
++            Create a YouTube API key
++          </.inline_link>
++          and add it in your
++          <.inline_link href={~p"/settings"}>
++            settings
++          </.inline_link>
++          for the fastest possible media updates
++        </li>
++      </ul>
++
++      <strong class="mt-2 inline-block">Fast indexing is great if any of these apply:</strong>
++      <ul class="list-disc list-inside ml-2 md:ml-5">
++        <li>The source is large channel and uploads frequently</li>
++        <li>You want to download a source's new content as soon as possible</li>
++      </ul>
++
++      <strong class="mt-2 inline-block">Consider <em>not</em> using fast indexing if any of these apply:</strong>
++      <ul class="list-disc list-inside ml-2 md:ml-5">
++        <li>The source is a playlist</li>
++        <li>The source has under 200 videos</li>
++        <li>The source rarely uploads</li>
++        <li>You don't mind if it takes longer for new content to be picked up</li>
++      </ul>
+     </p>
+   </section>
+ </aside>
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex b/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
+index 88b584d14..6705f9927 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
+@@ -15,7 +15,7 @@
+         General Options
+       </h3>
+       <span class="cursor-pointer hover:underline" x-on:click="advancedMode = !advancedMode">
+-        Editing Mode: <span x-text="advancedMode ? 'Advanced' : 'Basic'"></span>
++        Editing Mode: <span x-text="advancedMode ? 'Advanced' : 'Standard'"></span>
+       </span>
+     </section>
+ 
+@@ -49,7 +49,7 @@
+         label="Index Frequency"
+         x-bind:disabled="fastIndexingEnabled == true"
+         x-init="$watch('fastIndexingEnabled', v => v && ($el.value = 30 * 24 * 60))"
+-        help="Indexing is the process of checking for media to download. Sets the time between one index of this source finishing and the next one starting"
++        help="Indexing is the process of checking for media to download. For best results, set this to the longest delay you can tolerate for this source"
+       />
+ 
+       <div phx-click={show_modal("upgrade-modal")}>
+@@ -58,7 +58,7 @@
+           type="toggle"
+           label="Use Fast Indexing"
+           label_suffix="(pro)"
+-          help="Experimental. Overrides 'Index Frequency'. Recommended for large channels that upload frequently. Does not work with private playlists. See below for more info"
++          help="Not recommended for playlists. Overrides 'Index Frequency'. See below for more details (seriously, there's a TL;DR that's worth reading)"
+           x-init="
+           // `enabled` is the data attribute that the toggle uses internally
+           fastIndexingEnabled = enabled
+diff --git a/priv/repo/migrations/20240604221531_add_youtube_api_key_setting.exs b/priv/repo/migrations/20240604221531_add_youtube_api_key_setting.exs
+new file mode 100644
+index 000000000..cbb81c709
+--- /dev/null
++++ b/priv/repo/migrations/20240604221531_add_youtube_api_key_setting.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddYoutubeApiKeySetting do
++  use Ecto.Migration
++
++  def change do
++    alter table(:settings) do
++      add :youtube_api_key, :string
++    end
++  end
++end
+diff --git a/test/pinchflat/fast_indexing/fast_indexing_helpers_test.exs b/test/pinchflat/fast_indexing/fast_indexing_helpers_test.exs
+index 94d12aa6a..46f422654 100644
+--- a/test/pinchflat/fast_indexing/fast_indexing_helpers_test.exs
++++ b/test/pinchflat/fast_indexing/fast_indexing_helpers_test.exs
+@@ -6,19 +6,20 @@ defmodule Pinchflat.FastIndexing.FastIndexingHelpersTest do
+   import Pinchflat.ProfilesFixtures
+ 
+   alias Pinchflat.Tasks
++  alias Pinchflat.Settings
+   alias Pinchflat.Media.MediaItem
+   alias Pinchflat.Downloading.MediaDownloadWorker
+   alias Pinchflat.FastIndexing.FastIndexingHelpers
+ 
+-  describe "kickoff_download_tasks_from_youtube_rss_feed/1" do
+-    setup do
+-      stub(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
+-        {:ok, media_attributes_return_fixture()}
+-      end)
++  setup do
++    stub(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++      {:ok, media_attributes_return_fixture()}
++    end)
+ 
+-      {:ok, [source: source_fixture()]}
+-    end
++    {:ok, [source: source_fixture()]}
++  end
+ 
++  describe "kickoff_download_tasks_from_youtube_rss_feed/1" do
+     test "enqueues a new worker for each new media_id in the source's RSS feed", %{source: source} do
+       expect(HTTPClientMock, :get, fn _url -> {:ok, "<yt:videoId>test_1</yt:videoId>"} end)
+ 
+@@ -107,4 +108,49 @@ defmodule Pinchflat.FastIndexing.FastIndexingHelpersTest do
+       assert [] = FastIndexingHelpers.kickoff_download_tasks_from_youtube_rss_feed(source)
+     end
+   end
++
++  describe "kickoff_download_tasks_from_youtube_rss_feed/1 when testing backends" do
++    test "uses the YouTube API if it is enabled", %{source: source} do
++      expect(HTTPClientMock, :get, fn url, _headers ->
++        assert url =~ "https://youtube.googleapis.com/youtube/v3/playlistItems"
++
++        {:ok, "{}"}
++      end)
++
++      Settings.set(youtube_api_key: "test_key")
++
++      assert [] = FastIndexingHelpers.kickoff_download_tasks_from_youtube_rss_feed(source)
++    end
++
++    test "the YouTube API creates records as expected", %{source: source} do
++      expect(HTTPClientMock, :get, fn _url, _headers ->
++        {:ok, ~s({ "items": [ {"contentDetails": {"videoId": "test_1"}} ] })}
++      end)
++
++      Settings.set(youtube_api_key: "test_key")
++
++      assert [%MediaItem{}] = FastIndexingHelpers.kickoff_download_tasks_from_youtube_rss_feed(source)
++    end
++
++    test "RSS is used as a backup if the API fails", %{source: source} do
++      expect(HTTPClientMock, :get, fn _url, _headers -> {:error, ""} end)
++      expect(HTTPClientMock, :get, fn _url -> {:ok, "<yt:videoId>test_1</yt:videoId>"} end)
++
++      Settings.set(youtube_api_key: "test_key")
++
++      assert [%MediaItem{}] = FastIndexingHelpers.kickoff_download_tasks_from_youtube_rss_feed(source)
++    end
++
++    test "RSS is used if the API is not enabled", %{source: source} do
++      expect(HTTPClientMock, :get, fn url ->
++        assert url =~ "https://www.youtube.com/feeds/videos.xml"
++
++        {:ok, "<yt:videoId>test_1</yt:videoId>"}
++      end)
++
++      Settings.set(youtube_api_key: nil)
++
++      assert [%MediaItem{}] = FastIndexingHelpers.kickoff_download_tasks_from_youtube_rss_feed(source)
++    end
++  end
+ end
+diff --git a/test/pinchflat/fast_indexing/youtube_api_test.exs b/test/pinchflat/fast_indexing/youtube_api_test.exs
+new file mode 100644
+index 000000000..cc310d6ca
+--- /dev/null
++++ b/test/pinchflat/fast_indexing/youtube_api_test.exs
+@@ -0,0 +1,85 @@
++defmodule Pinchflat.FastIndexing.YoutubeApiTest do
++  use Pinchflat.DataCase
++
++  import Pinchflat.SourcesFixtures
++
++  alias Pinchflat.Settings
++  alias Pinchflat.FastIndexing.YoutubeApi
++
++  describe "enabled?/0" do
++    test "returns true if the user has set a YouTube API key" do
++      Settings.set(youtube_api_key: "test_key")
++
++      assert YoutubeApi.enabled?()
++    end
++
++    test "returns false if the user has not set an API key" do
++      Settings.set(youtube_api_key: nil)
++
++      refute YoutubeApi.enabled?()
++    end
++  end
++
++  describe "get_recent_media_ids/1" do
++    setup do
++      source = source_fixture()
++      Settings.set(youtube_api_key: "test_key")
++
++      {:ok, source: source}
++    end
++
++    test "calls the expected URL", %{source: source} do
++      expect(HTTPClientMock, :get, fn url, headers ->
++        api_base = "https://youtube.googleapis.com/youtube/v3/playlistItems"
++        request_url = "#{api_base}?part=contentDetails&maxResults=50&playlistId=#{source.collection_id}&key=test_key"
++
++        assert url == request_url
++        assert headers == [accept: "application/json"]
++
++        {:ok, "{}"}
++      end)
++
++      assert {:ok, _} = YoutubeApi.get_recent_media_ids(source)
++    end
++
++    test "replaces channel IDs with playlist IDs if needed" do
++      source = source_fixture(collection_id: "UC_ABC123")
++
++      expect(HTTPClientMock, :get, fn url, _headers ->
++        assert url =~ "playlistId=UU_ABC123&"
++
++        {:ok, "{}"}
++      end)
++
++      assert {:ok, _} = YoutubeApi.get_recent_media_ids(source)
++    end
++
++    test "returns an empty list if no media is returned", %{source: source} do
++      expect(HTTPClientMock, :get, fn _url, _headers -> {:ok, "{}"} end)
++
++      assert {:ok, []} = YoutubeApi.get_recent_media_ids(source)
++    end
++
++    test "returns media IDs if present", %{source: source} do
++      expect(HTTPClientMock, :get, fn _url, _headers ->
++        {:ok,
++         """
++           {
++             "items": [
++               {"contentDetails": {"videoId": "test_1"}},
++               {"contentDetails": {"videoId": "test_2"}}
++             ]
++           }
++         """}
++      end)
++
++      assert {:ok, ["test_1", "test_2"]} = YoutubeApi.get_recent_media_ids(source)
++    end
++
++    test "returns an error if the HTTP request fails", %{source: source} do
++      expect(HTTPClientMock, :get, fn _url, _headers -> {:error, "error"} end)
++
++      assert {:error, "error"} = YoutubeApi.get_recent_media_ids(source)
++    end
++  end
++end
+diff --git a/test/pinchflat/fast_indexing/youtube_rss_test.exs b/test/pinchflat/fast_indexing/youtube_rss_test.exs
+index a76949886..20f9a4d52 100644
+--- a/test/pinchflat/fast_indexing/youtube_rss_test.exs
++++ b/test/pinchflat/fast_indexing/youtube_rss_test.exs
+@@ -11,7 +11,13 @@ defmodule Pinchflat.FastIndexing.YoutubeRssTest do
+     {:ok, source: source}
+   end
+ 
+-  describe "get_recent_media_ids_from_rss/1" do
++  describe "enabled?/0" do
++    test "returns true" do
++      assert YoutubeRss.enabled?()
++    end
++  end
++
++  describe "get_recent_media_ids/1" do
+     test "calls the expected URL for channel sources" do
+       source = source_fixture(collection_type: :channel, collection_id: "channel_id")
+ 
+@@ -21,7 +27,7 @@ defmodule Pinchflat.FastIndexing.YoutubeRssTest do
+         {:ok, ""}
+       end)
+ 
+-      assert {:ok, _} = YoutubeRss.get_recent_media_ids_from_rss(source)
++      assert {:ok, _} = YoutubeRss.get_recent_media_ids(source)
+     end
+ 
+     test "calls the expected URL for playlist sources" do
+@@ -33,13 +39,13 @@ defmodule Pinchflat.FastIndexing.YoutubeRssTest do
+         {:ok, ""}
+       end)
+ 
+-      assert {:ok, _} = YoutubeRss.get_recent_media_ids_from_rss(source)
++      assert {:ok, _} = YoutubeRss.get_recent_media_ids(source)
+     end
+ 
+     test "returns an error if the HTTP request fails", %{source: source} do
+       expect(HTTPClientMock, :get, fn _url -> {:error, ""} end)
+ 
+-      assert {:error, "Failed to fetch RSS feed"} = YoutubeRss.get_recent_media_ids_from_rss(source)
++      assert {:error, "Failed to fetch RSS feed"} = YoutubeRss.get_recent_media_ids(source)
+     end
+ 
+     test "returns the media IDs from the RSS feed", %{source: source} do
+@@ -47,7 +53,7 @@ defmodule Pinchflat.FastIndexing.YoutubeRssTest do
+         {:ok, "<yt:videoId>test_1</yt:videoId><yt:videoId>test_2</yt:videoId>"}
+       end)
+ 
+-      assert {:ok, ["test_1", "test_2"]} = YoutubeRss.get_recent_media_ids_from_rss(source)
++      assert {:ok, ["test_1", "test_2"]} = YoutubeRss.get_recent_media_ids(source)
+     end
+ 
+     test "strips whitespace from media IDs", %{source: source} do
+@@ -55,7 +61,7 @@ defmodule Pinchflat.FastIndexing.YoutubeRssTest do
+         {:ok, "<yt:videoId> test_1 </yt:videoId><yt:videoId> test_2 </yt:videoId>"}
+       end)
+ 
+-      assert {:ok, ["test_1", "test_2"]} = YoutubeRss.get_recent_media_ids_from_rss(source)
++      assert {:ok, ["test_1", "test_2"]} = YoutubeRss.get_recent_media_ids(source)
+     end
+ 
+     test "removes empty media IDs", %{source: source} do
+@@ -63,7 +69,7 @@ defmodule Pinchflat.FastIndexing.YoutubeRssTest do
+         {:ok, "<yt:videoId>test_1</yt:videoId><yt:videoId></yt:videoId>"}
+       end)
+ 
+-      assert {:ok, ["test_1"]} = YoutubeRss.get_recent_media_ids_from_rss(source)
++      assert {:ok, ["test_1"]} = YoutubeRss.get_recent_media_ids(source)
+     end
+ 
+     test "removes duplicate media IDs", %{source: source} do
+@@ -71,7 +77,7 @@ defmodule Pinchflat.FastIndexing.YoutubeRssTest do
+         {:ok, "<yt:videoId>test_1</yt:videoId><yt:videoId>test_1</yt:videoId>"}
+       end)
+ 
+-      assert {:ok, ["test_1"]} = YoutubeRss.get_recent_media_ids_from_rss(source)
++      assert {:ok, ["test_1"]} = YoutubeRss.get_recent_media_ids(source)
+     end
+   end
+ end

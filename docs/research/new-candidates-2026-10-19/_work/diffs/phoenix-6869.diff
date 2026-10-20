@@ -1,0 +1,350 @@
+diff --git a/installer/templates/phx_umbrella/apps/app_name/mix.exs.eex b/installer/templates/phx_umbrella/apps/app_name/mix.exs.eex
+index 53be35f595..0c15bee7e2 100644
+--- a/installer/templates/phx_umbrella/apps/app_name/mix.exs.eex
++++ b/installer/templates/phx_umbrella/apps/app_name/mix.exs.eex
+@@ -37,7 +37,7 @@ defmodule <%= @app_module %>.MixProject do
+   defp deps do
+     [
+       {:dns_cluster, "~> 0.2.0"},
+-      {:phoenix_pubsub, "~> 2.1"}<%= if @ecto do %>,
++      {:phoenix_pubsub, "~> 2.4"}<%= if @ecto do %>,
+       {:ecto_sql, "~> 3.13"},
+       {:<%= @adapter_app %>, ">= 0.0.0"},
+       {:jason, "~> 1.2"}<% end %><%= if @mailer do %>,
+diff --git a/installer/test/phx_new_umbrella_test.exs b/installer/test/phx_new_umbrella_test.exs
+index cc7ee1fedb..a901daa833 100644
+--- a/installer/test/phx_new_umbrella_test.exs
++++ b/installer/test/phx_new_umbrella_test.exs
+@@ -122,7 +122,7 @@ defmodule Mix.Tasks.Phx.New.UmbrellaTest do
+ 
+       assert_file(app_path(@app, "mix.exs"), fn file ->
+         assert file =~ "mod: {PhxUmb.Application, []}"
+-        assert file =~ "{:phoenix_pubsub, \"~> 2.1\"}"
++        assert file =~ "{:phoenix_pubsub, \"~> 2.4\"}"
+       end)
+ 
+       assert_file(app_path(@app, "test/test_helper.exs"))
+diff --git a/lib/phoenix/channel/server.ex b/lib/phoenix/channel/server.ex
+index 3d6c57e7a5..fb2c252170 100644
+--- a/lib/phoenix/channel/server.ex
++++ b/lib/phoenix/channel/server.ex
+@@ -2,6 +2,8 @@ defmodule Phoenix.Channel.Server do
+   @moduledoc false
+   use GenServer, restart: :temporary
+ 
++  @behaviour Phoenix.PubSub.Sender
++
+   require Logger
+ 
+   alias Phoenix.PubSub
+@@ -89,52 +91,44 @@ defmodule Phoenix.Channel.Server do
+   ## Channel API
+ 
+   @doc """
+-  Hook invoked by Phoenix.PubSub dispatch.
++  Hook invoked by Phoenix.PubSub to deliver a message to a channel subscription.
++
++  Broadcasts not intercepted by the channel are encoded once per
++  serializer and sent directly to the transport process.
+   """
+-  def dispatch(subscribers, from, %Broadcast{event: event} = msg) do
+-    Enum.reduce(subscribers, %{}, fn
+-      {pid, _}, cache when pid == from ->
+-        cache
+-
+-      {pid, {:fastlane, fastlane_pid, serializer, event_intercepts}}, cache ->
+-        if event in event_intercepts do
+-          send(pid, msg)
++  def send(pid, {transport_pid, serializer, intercepts}, %Broadcast{event: event} = msg, cache) do
++    if event in intercepts do
++      send(pid, msg)
++      cache
++    else
++      case cache do
++        %{^serializer => encoded_msg} ->
++          send(transport_pid, encoded_msg)
+           cache
+-        else
+-          case cache do
+-            %{^serializer => encoded_msg} ->
+-              send(fastlane_pid, encoded_msg)
+-              cache
+-
+-            %{} ->
+-              encoded_msg = serializer.fastlane!(msg)
+-              send(fastlane_pid, encoded_msg)
+-              Map.put(cache, serializer, encoded_msg)
+-          end
+-        end
+-
+-      {pid, _}, cache ->
+-        send(pid, msg)
+-        cache
+-    end)
+-
+-    :ok
+-  end
+ 
+-  def dispatch(entries, :none, message) do
+-    for {pid, _} <- entries do
+-      send(pid, message)
++        _ ->
++          encoded_msg = serializer.fastlane!(msg)
++          send(transport_pid, encoded_msg)
++          Map.put(cache || %{}, serializer, encoded_msg)
++      end
+     end
++  end
+ 
+-    :ok
++  def send(pid, _meta, msg, cache) do
++    send(pid, msg)
++    cache
+   end
+ 
++  # TODO: Remove in Phoenix 1.10
++  #
++  # Nodes running Phoenix < 1.8.16 expect cluster-wide channel broadcasts to use
++  # this module as dispatcher, otherwise their channels receive broadcasts
++  # they cannot handle. Therefore we still broadcast with it, and it is also
++  # invoked for broadcasts coming from older nodes. Subscriptions carry their
++  # own sender, so we delegate to the default dispatching.
++  @doc false
+   def dispatch(entries, from, message) do
+-    for {pid, _} <- entries, pid != from do
+-      send(pid, message)
+-    end
+-
+-    :ok
++    PubSub.dispatch(entries, from, message)
+   end
+ 
+   @doc """
+@@ -440,8 +434,8 @@ defmodule Phoenix.Channel.Server do
+     end
+ 
+     Process.monitor(transport_pid)
+-    fastlane = {:fastlane, transport_pid, serializer, channel.__intercepts__()}
+-    PubSub.subscribe(pubsub_server, topic, metadata: fastlane)
++    sender = {__MODULE__, {transport_pid, serializer, channel.__intercepts__()}}
++    PubSub.subscribe(pubsub_server, topic, sender: sender)
+ 
+     {:noreply, %{socket | joined: true}}
+   end
+diff --git a/mix.exs b/mix.exs
+index 3660937d9e..23d1d57435 100644
+--- a/mix.exs
++++ b/mix.exs
+@@ -82,7 +82,7 @@ defmodule Phoenix.MixProject do
+       {:plug, "~> 1.14"},
+       {:plug_crypto, "~> 2.2"},
+       {:telemetry, "~> 0.4 or ~> 1.0"},
+-      {:phoenix_pubsub, "~> 2.1"},
++      {:phoenix_pubsub, "~> 2.4"},
+       {:phoenix_template, "~> 1.0"},
+       {:websock_adapter, "~> 0.5"},
+ 
+diff --git a/mix.lock b/mix.lock
+index 6c79af67b6..4ff7164f02 100644
+--- a/mix.lock
++++ b/mix.lock
+@@ -25,7 +25,7 @@
+   "mint_web_socket": {:hex, :mint_web_socket, "1.0.6", "5ffcf350df5b90f2d7a04adf877165228804993714592512374218d4679e325a", [:mix], [{:mint, ">= 1.4.1 and < 2.0.0-0", [hex: :mint, repo: "hexpm", optional: false]}], "hexpm", "0c360e9012413f1c115a63532601eb5d63731aab7010949178769760686c1698"},
+   "nimble_parsec": {:hex, :nimble_parsec, "1.4.2", "8efba0122db06df95bfaa78f791344a89352ba04baedd3849593bfce4d0dc1c6", [:mix], [], "hexpm", "4b21398942dda052b403bbe1da991ccd03a053668d147d53fb8c4e0efe09c973"},
+   "phoenix_html": {:hex, :phoenix_html, "4.3.0", "d3577a5df4b6954cd7890c84d955c470b5310bb49647f0a114a6eeecc850f7ad", [:mix], [], "hexpm", "3eaa290a78bab0f075f791a46a981bbe769d94bc776869f4f3063a14f30497ad"},
+-  "phoenix_pubsub": {:hex, :phoenix_pubsub, "2.2.0", "ff3a5616e1bed6804de7773b92cbccfc0b0f473faf1f63d7daf1206c7aeaaa6f", [:mix], [], "hexpm", "adc313a5bf7136039f63cfd9668fde73bba0765e0614cba80c06ac9460ff3e96"},
++  "phoenix_pubsub": {:hex, :phoenix_pubsub, "2.4.0", "be29b070ec9298df8c3c90a2ae0712d4c9e37c214f6a6ca81341bd19f1bde00b", [:mix], [], "hexpm", "80776f727460ed104c95ecddcacc5098d3cd31f40e5f05741e1219abfb20f4a8"},
+   "phoenix_template": {:hex, :phoenix_template, "1.0.4", "e2092c132f3b5e5b2d49c96695342eb36d0ed514c5b252a77048d5969330d639", [:mix], [{:phoenix_html, "~> 2.14.2 or ~> 3.0 or ~> 4.0", [hex: :phoenix_html, repo: "hexpm", optional: true]}], "hexpm", "2c0c81f0e5c6753faf5cca2f229c9709919aba34fab866d3bc05060c9c444206"},
+   "phoenix_view": {:hex, :phoenix_view, "2.0.4", "b45c9d9cf15b3a1af5fb555c674b525391b6a1fe975f040fb4d913397b31abf4", [:mix], [{:phoenix_html, "~> 2.14.2 or ~> 3.0 or ~> 4.0", [hex: :phoenix_html, repo: "hexpm", optional: true]}, {:phoenix_template, "~> 1.0", [hex: :phoenix_template, repo: "hexpm", optional: false]}], "hexpm", "4e992022ce14f31fe57335db27a28154afcc94e9983266835bb3040243eb620b"},
+   "plug": {:hex, :plug, "1.20.3", "56c480c633ec2ce10140e236e15233bf576e1d323887d7c96711bd02ab5160db", [:mix], [{:mime, "~> 1.0 or ~> 2.0", [hex: :mime, repo: "hexpm", optional: false]}, {:plug_crypto, "~> 1.1.1 or ~> 1.2 or ~> 2.0", [hex: :plug_crypto, repo: "hexpm", optional: false]}, {:telemetry, "~> 0.4.3 or ~> 1.0", [hex: :telemetry, repo: "hexpm", optional: false]}], "hexpm", "be266aee1b8536ef6409d58cf39a3121319f0ec47cfa1b24024485aa0e76ad76"},
+diff --git a/test/phoenix/channel_test.exs b/test/phoenix/channel_test.exs
+index 7b1805ba1a..641d2fb1d5 100644
+--- a/test/phoenix/channel_test.exs
++++ b/test/phoenix/channel_test.exs
+@@ -4,6 +4,28 @@ defmodule Phoenix.Channel.ChannelTest do
+   @pubsub __MODULE__.PubSub
+   import Phoenix.Channel
+ 
++  defmodule ClusterAdapter do
++    # Sends what would be broadcast to other nodes to the test process
++    @behaviour Phoenix.PubSub.Adapter
++
++    def node_name(_adapter_name), do: node()
++
++    def child_spec(opts) do
++      test_pid = Keyword.fetch!(opts, :test_pid)
++      agent_opts = [name: opts[:adapter_name]]
++      %{id: __MODULE__, start: {Agent, :start_link, [fn -> test_pid end, agent_opts]}}
++    end
++
++    def broadcast(adapter_name, topic, message, dispatcher) do
++      send(Agent.get(adapter_name, & &1), {:cluster_broadcast, topic, message, dispatcher})
++      :ok
++    end
++
++    def direct_broadcast(adapter_name, _node_name, topic, message, dispatcher) do
++      broadcast(adapter_name, topic, message, dispatcher)
++    end
++  end
++
+   setup_all do
+     start_supervised! {Phoenix.PubSub, name: @pubsub, pool_size: 1}
+     :ok
+@@ -95,6 +117,39 @@ defmodule Phoenix.Channel.ChannelTest do
+     }
+   end
+ 
++  # TODO: Remove in Phoenix 1.10
++  test "broadcasts to other nodes with Phoenix.Channel.Server as dispatcher" do
++    pubsub = __MODULE__.ClusterPubSub
++    start_supervised!({Phoenix.PubSub, name: pubsub, adapter: ClusterAdapter, test_pid: self()})
++
++    socket = %Phoenix.Socket{
++      pubsub_server: pubsub,
++      topic: "sometopic",
++      channel_pid: spawn_link(fn -> :ok end),
++      joined: true
++    }
++
++    broadcast(socket, "event1", %{key: :val})
++
++    assert_receive {:cluster_broadcast, "sometopic", %Phoenix.Socket.Broadcast{event: "event1"},
++                    Phoenix.Channel.Server}
++
++    broadcast!(socket, "event2", %{key: :val})
++
++    assert_receive {:cluster_broadcast, "sometopic", %Phoenix.Socket.Broadcast{event: "event2"},
++                    Phoenix.Channel.Server}
++
++    broadcast_from(socket, "event3", %{key: :val})
++
++    assert_receive {:cluster_broadcast, "sometopic", %Phoenix.Socket.Broadcast{event: "event3"},
++                    Phoenix.Channel.Server}
++
++    broadcast_from!(socket, "event4", %{key: :val})
++
++    assert_receive {:cluster_broadcast, "sometopic", %Phoenix.Socket.Broadcast{event: "event4"},
++                    Phoenix.Channel.Server}
++  end
++
+   test "pushing to transport" do
+     socket = %Phoenix.Socket{
+       serializer: Phoenix.ChannelTest.NoopSerializer,
+diff --git a/test/phoenix/endpoint/endpoint_test.exs b/test/phoenix/endpoint/endpoint_test.exs
+index 4340151af4..41dc026650 100644
+--- a/test/phoenix/endpoint/endpoint_test.exs
++++ b/test/phoenix/endpoint/endpoint_test.exs
+@@ -42,6 +42,15 @@ defmodule Phoenix.Endpoint.EndpointTest do
+     use Phoenix.Endpoint, otp_app: :phoenix
+   end
+ 
++  defmodule TaggingSender do
++    @behaviour Phoenix.PubSub.Sender
++
++    def send(pid, tag, message, state) do
++      Kernel.send(pid, {tag, message})
++      state
++    end
++  end
++
+   setup_all do
+     ExUnit.CaptureLog.capture_log(fn -> start_supervised!(Endpoint) end)
+     start_supervised!({Phoenix.PubSub, name: :endpoint_pub})
+@@ -307,6 +316,22 @@ defmodule Phoenix.Endpoint.EndpointTest do
+     }
+   end
+ 
++  test "pubsub broadcasts are delivered through the subscription sender" do
++    Endpoint.subscribe("sendertopic", sender: {TaggingSender, :tagged})
++    some = spawn(fn -> :ok end)
++
++    Endpoint.broadcast("sendertopic", "event1", %{key: :val})
++    assert_receive {:tagged, %Phoenix.Socket.Broadcast{event: "event1", topic: "sendertopic"}}
++
++    Endpoint.broadcast_from!(some, "sendertopic", "event2", %{key: :val})
++    assert_receive {:tagged, %Phoenix.Socket.Broadcast{event: "event2", topic: "sendertopic"}}
++
++    Endpoint.local_broadcast("sendertopic", "event3", %{key: :val})
++    assert_receive {:tagged, %Phoenix.Socket.Broadcast{event: "event3", topic: "sendertopic"}}
++
++    refute_received %Phoenix.Socket.Broadcast{}
++  end
++
+   test "loads cache manifest from specified application" do
+     config =
+       put_in(
+diff --git a/test/phoenix/presence_test.exs b/test/phoenix/presence_test.exs
+index ec52d47ead..1137819470 100644
+--- a/test/phoenix/presence_test.exs
++++ b/test/phoenix/presence_test.exs
+@@ -52,6 +52,15 @@ defmodule Phoenix.PresenceTest do
+     end
+   end
+ 
++  defmodule TaggingSender do
++    @behaviour Phoenix.PubSub.Sender
++
++    def send(pid, tag, message, state) do
++      Kernel.send(pid, {tag, message})
++      state
++    end
++  end
++
+   defmodule CustomDispatcherPresence do
+     use Phoenix.Presence, otp_app: :phoenix, dispatcher: CustomDispatcher
+   end
+@@ -189,6 +198,21 @@ defmodule Phoenix.PresenceTest do
+     assert MyPresence.list(topic) == %{}
+   end
+ 
++  test "handle_diff broadcasts through the subscription sender", %{topic: topic} = config do
++    pid = spawn(fn -> :timer.sleep(:infinity) end)
++    Phoenix.PubSub.subscribe(config.pubsub, topic, sender: {TaggingSender, :tagged})
++    MyPresence.track(pid, topic, "u1", %{name: "u1"})
++
++    assert_receive {:tagged,
++                    %Broadcast{
++                      topic: ^topic,
++                      event: "presence_diff",
++                      payload: %{joins: %{"u1" => _}, leaves: %{}}
++                    }}
++
++    refute_received %Broadcast{}
++  end
++
+   test "handle_diff with custom dispatcher", %{topic: topic} = config do
+     pid = spawn(fn -> :timer.sleep(:infinity) end)
+     Phoenix.PubSub.subscribe(config.pubsub, topic)
+diff --git a/test/phoenix/test/channel_test.exs b/test/phoenix/test/channel_test.exs
+index 30f7b53901..6096067dee 100644
+--- a/test/phoenix/test/channel_test.exs
++++ b/test/phoenix/test/channel_test.exs
+@@ -454,6 +454,28 @@ defmodule Phoenix.Test.ChannelTest do
+     assert_graceful_exit(pid)
+   end
+ 
++  test "push broadcasts sent directly through pubsub" do
++    subscribe_and_join!(socket(UserSocket), Channel, "foo:ok")
++    broadcast = %Broadcast{topic: "foo:ok", event: "default", payload: %{"foo" => "bar"}}
++    Phoenix.PubSub.broadcast!(Phoenix.Test.ChannelTest.PubSub, "foo:ok", broadcast)
++    assert_push "default", %{"foo" => "bar"}
++  end
++
++  test "handles broadcasts dispatched by Phoenix.Channel.Server from older nodes" do
++    Process.flag(:trap_exit, true)
++    {:ok, _, socket} = subscribe_and_join(socket(UserSocket), Channel, "foo:ok")
++    pubsub = Phoenix.Test.ChannelTest.PubSub
++
++    broadcast = %Broadcast{topic: "foo:ok", event: "default", payload: %{"foo" => "bar"}}
++    Phoenix.PubSub.local_broadcast(pubsub, "foo:ok", broadcast, Phoenix.Channel.Server)
++    assert_push "default", %{"foo" => "bar"}
++
++    broadcast = %Broadcast{topic: "foo:ok", event: "stop", payload: %{"foo" => "bar"}}
++    Phoenix.PubSub.local_broadcast(pubsub, "foo:ok", broadcast, Phoenix.Channel.Server)
++    assert_receive {:terminate, :shutdown}
++    assert_graceful_exit(socket.channel_pid)
++  end
++
+   ## handle_info
+ 
+   test "handles messages and stops" do

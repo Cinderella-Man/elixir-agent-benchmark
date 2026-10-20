@@ -1,0 +1,178 @@
+diff --git a/lib/pinchflat/media/media_item.ex b/lib/pinchflat/media/media_item.ex
+index a11b5c099..40353db24 100644
+--- a/lib/pinchflat/media/media_item.ex
++++ b/lib/pinchflat/media/media_item.ex
+@@ -22,6 +22,7 @@ defmodule Pinchflat.Media.MediaItem do
+     :source_id,
+     :short_form_content,
+     :upload_date,
++    :duration_seconds,
+     # these fields are captured only on download
+     :media_downloaded_at,
+     :media_filepath,
+@@ -57,6 +58,7 @@ defmodule Pinchflat.Media.MediaItem do
+     field :short_form_content, :boolean, default: false
+     field :media_downloaded_at, :utc_datetime
+     field :upload_date, :date
++    field :duration_seconds, :integer
+ 
+     field :media_filepath, :string
+     field :media_size_bytes, :integer
+diff --git a/lib/pinchflat/metadata/metadata_parser.ex b/lib/pinchflat/metadata/metadata_parser.ex
+index 53ca0669b..117300102 100644
+--- a/lib/pinchflat/metadata/metadata_parser.ex
++++ b/lib/pinchflat/metadata/metadata_parser.ex
+@@ -30,7 +30,8 @@ defmodule Pinchflat.Metadata.MetadataParser do
+       original_url: metadata["original_url"],
+       description: metadata["description"],
+       media_filepath: metadata["filepath"],
+-      livestream: metadata["was_live"]
++      livestream: metadata["was_live"],
++      duration_seconds: metadata["duration"] && round(metadata["duration"])
+     }
+   end
+ 
+diff --git a/lib/pinchflat/podcasts/rss_feed_builder.ex b/lib/pinchflat/podcasts/rss_feed_builder.ex
+index 54eb104ef..f429a73b4 100644
+--- a/lib/pinchflat/podcasts/rss_feed_builder.ex
++++ b/lib/pinchflat/podcasts/rss_feed_builder.ex
+@@ -80,6 +80,7 @@ defmodule Pinchflat.Podcasts.RssFeedBuilder do
+       <link>#{media_item.original_url}</link>
+       <description>#{safe(media_item.description)}</description>
+       <pubDate>#{generate_upload_date(media_item)}</pubDate>
++      <itunes:duration>#{media_item.duration_seconds}</itunes:duration>
+       <enclosure
+         url="#{media_stream_path(url_base, media_item)}"
+         length="#{media_item.media_size_bytes}"
+diff --git a/lib/pinchflat/yt_dlp/media.ex b/lib/pinchflat/yt_dlp/media.ex
+index 6b2a363a3..4ca2bc620 100644
+--- a/lib/pinchflat/yt_dlp/media.ex
++++ b/lib/pinchflat/yt_dlp/media.ex
+@@ -10,7 +10,8 @@ defmodule Pinchflat.YtDlp.Media do
+     :original_url,
+     :livestream,
+     :short_form_content,
+-    :upload_date
++    :upload_date,
++    :duration_seconds
+   ]
+ 
+   defstruct [
+@@ -20,7 +21,8 @@ defmodule Pinchflat.YtDlp.Media do
+     :original_url,
+     :livestream,
+     :short_form_content,
+-    :upload_date
++    :upload_date,
++    :duration_seconds
+   ]
+ 
+   alias __MODULE__
+@@ -86,6 +88,7 @@ defmodule Pinchflat.YtDlp.Media do
+       description: response["description"],
+       original_url: response["webpage_url"],
+       livestream: response["was_live"],
++      duration_seconds: response["duration"] && round(response["duration"]),
+       short_form_content: response["webpage_url"] && short_form_content?(response),
+       upload_date: response["upload_date"] && MetadataFileHelpers.parse_upload_date(response["upload_date"])
+     }
+diff --git a/priv/repo/migrations/20240328221845_add_duration_to_media_items.exs b/priv/repo/migrations/20240328221845_add_duration_to_media_items.exs
+new file mode 100644
+index 000000000..28a13e03a
+--- /dev/null
++++ b/priv/repo/migrations/20240328221845_add_duration_to_media_items.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddDurationToMediaItems do
++  use Ecto.Migration
++
++  def change do
++    alter table(:media_items) do
++      add :duration_seconds, :integer
++    end
++  end
++end
+diff --git a/test/pinchflat/downloading/media_downloader_test.exs b/test/pinchflat/downloading/media_downloader_test.exs
+index e30350140..efc59fd65 100644
+--- a/test/pinchflat/downloading/media_downloader_test.exs
++++ b/test/pinchflat/downloading/media_downloader_test.exs
+@@ -35,7 +35,7 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+       assert {:ok, _} = MediaDownloader.download_for_media_item(media_item)
+     end
+ 
+-    test "it saves the metadata filepatha to the database", %{media_item: media_item} do
++    test "it saves the metadata filepath to the database", %{media_item: media_item} do
+       expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
+         {:ok, render_metadata(:media_metadata)}
+       end)
+@@ -93,6 +93,12 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+       assert [["de", _], ["en", _] | _rest] = updated_media_item.subtitle_filepaths
+     end
+ 
++    test "it extracts the duration_seconds", %{media_item: media_item} do
++      assert media_item.duration_seconds == nil
++      assert {:ok, updated_media_item} = MediaDownloader.download_for_media_item(media_item)
++      assert is_integer(updated_media_item.duration_seconds)
++    end
++
+     test "it extracts the thumbnail_filepath", %{media_item: media_item} do
+       expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
+         metadata = render_parsed_metadata(:media_metadata)
+diff --git a/test/pinchflat/metadata/metadata_parser_test.exs b/test/pinchflat/metadata/metadata_parser_test.exs
+index 2d4e8d4ce..dd55a19e4 100644
+--- a/test/pinchflat/metadata/metadata_parser_test.exs
++++ b/test/pinchflat/metadata/metadata_parser_test.exs
+@@ -45,6 +45,12 @@ defmodule Pinchflat.Metadata.MetadataParserTest do
+ 
+       assert result.livestream == metadata["was_live"]
+     end
++
++    test "it extracts the duration in seconds", %{metadata: metadata} do
++      result = Parser.parse_for_media_item(metadata)
++
++      assert result.duration_seconds == round(metadata["duration"])
++    end
+   end
+ 
+   describe "parse_for_media_item/1 when testing subtitle metadata" do
+diff --git a/test/pinchflat/yt_dlp/media_test.exs b/test/pinchflat/yt_dlp/media_test.exs
+index 3d617c183..0b12621b6 100644
+--- a/test/pinchflat/yt_dlp/media_test.exs
++++ b/test/pinchflat/yt_dlp/media_test.exs
+@@ -104,7 +104,8 @@ defmodule Pinchflat.YtDlp.MediaTest do
+                original_url: "https://www.youtube.com/watch?v=TiZPUDkDYbk",
+                livestream: false,
+                short_form_content: false,
+-               upload_date: Date.from_iso8601!("2021-01-01")
++               upload_date: Date.from_iso8601!("2021-01-01"),
++               duration_seconds: 60
+              } == Media.response_to_struct(response)
+     end
+ 
+@@ -174,5 +175,27 @@ defmodule Pinchflat.YtDlp.MediaTest do
+ 
+       assert %Media{upload_date: nil} = Media.response_to_struct(response)
+     end
++
++    test "parses the duration" do
++      response = %{
++        "webpage_url" => "https://www.youtube.com/watch?v=TiZPUDkDYbk",
++        "aspect_ratio" => 1.0,
++        "duration" => 60.4,
++        "upload_date" => "20210101"
++      }
++
++      assert %Media{duration_seconds: 60} = Media.response_to_struct(response)
++    end
++
++    test "doesn't blow up if duration is missing" do
++      response = %{
++        "webpage_url" => "https://www.youtube.com/watch?v=TiZPUDkDYbk",
++        "aspect_ratio" => 1.0,
++        "duration" => nil,
++        "upload_date" => "20210101"
++      }
++
++      assert %Media{duration_seconds: nil} = Media.response_to_struct(response)
++    end
+   end
+ end

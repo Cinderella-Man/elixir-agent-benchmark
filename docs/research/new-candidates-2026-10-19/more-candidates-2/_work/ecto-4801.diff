@@ -1,0 +1,81 @@
+diff --git a/lib/ecto/query/builder/filter.ex b/lib/ecto/query/builder/filter.ex
+index 12a374a763..5d49b67cc4 100644
+--- a/lib/ecto/query/builder/filter.ex
++++ b/lib/ecto/query/builder/filter.ex
+@@ -83,19 +83,26 @@ defmodule Ecto.Query.Builder.Filter do
+   The callback applied by `build/4` to build the query.
+   """
+   @spec apply(Ecto.Queryable.t, :where | :having, term) :: Ecto.Query.t
+-  def apply(query, _, %{expr: true}) do
+-    query
+-  end
+   def apply(%Ecto.Query{wheres: wheres} = query, :where, expr) do
+-    %{query | wheres: wheres ++ [expr]}
++    %{query | wheres: add_filter(wheres, expr)}
+   end
+   def apply(%Ecto.Query{havings: havings} = query, :having, expr) do
+-    %{query | havings: havings ++ [expr]}
++    %{query | havings: add_filter(havings, expr)}
+   end
+   def apply(query, kind, expr) do
+     apply(Ecto.Queryable.to_query(query), kind, expr)
+   end
+ 
++  # A runtime `true` can only be skipped when it is ANDed onto existing
++  # filters. On its own it must be kept, as a later `or_where`/`or_having`
++  # is combined with it, but a filter ANDed onto it can replace it.
++  defp add_filter([_ | _] = exprs, %{expr: true, op: :and}),
++    do: exprs
++  defp add_filter([%Ecto.Query.BooleanExpr{expr: true, params: [], subqueries: []}], %{op: :and} = expr),
++    do: [expr]
++  defp add_filter(exprs, expr),
++    do: exprs ++ [expr]
++
+   @doc """
+   Builds a filter based on the given arguments.
+ 
+diff --git a/test/ecto/query/builder/filter_test.exs b/test/ecto/query/builder/filter_test.exs
+index 9be7bfd603..1ca6533b68 100644
+--- a/test/ecto/query/builder/filter_test.exs
++++ b/test/ecto/query/builder/filter_test.exs
+@@ -61,7 +61,39 @@ defmodule Ecto.Query.Builder.FilterTest do
+   describe "at runtime" do
+     test "accepts empty keyword lists" do
+       query = where(from(p in "posts"), [p], ^[])
+-      assert query.wheres == []
++      assert [%{expr: true, op: :and}] = query.wheres
++
++      query = where(from(p in "posts", where: p.id == 1), [p], ^[])
++      assert [%{expr: {:==, _, _}}] = query.wheres
++    end
++
++    test "keeps interpolated booleans combined with or" do
++      a = false
++      b = true
++      query = from(p in "posts", where: ^a, or_where: ^b)
++      assert [%{expr: false, op: :and}, %{expr: true, op: :or}] = query.wheres
++
++      query = from(p in "posts", where: ^b, or_where: ^a)
++      assert [%{expr: true, op: :and}, %{expr: false, op: :or}] = query.wheres
++
++      query = from(p in "posts", having: ^a, or_having: ^b)
++      assert [%{expr: false, op: :and}, %{expr: true, op: :or}] = query.havings
++
++      query = from(p in "posts", having: ^b, or_having: ^a)
++      assert [%{expr: true, op: :and}, %{expr: false, op: :or}] = query.havings
++    end
++
++    test "drops interpolated true when it is and-ed with other filters" do
++      bool = true
++
++      query = from(p in "posts", where: p.id == 1, where: ^bool)
++      assert [%{expr: {:==, _, _}}] = query.wheres
++
++      query = from(p in "posts", where: ^bool, where: p.id == 1)
++      assert [%{expr: {:==, _, _}, op: :and}] = query.wheres
++
++      query = from(p in "posts", having: ^bool, having: p.id == 1, having: ^bool)
++      assert [%{expr: {:==, _, _}, op: :and}] = query.havings
+     end
+ 
+     test "accepts keyword lists" do

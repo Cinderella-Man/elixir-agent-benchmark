@@ -1,0 +1,351 @@
+diff --git a/lib/ash/resource/transformers/add_period_attribute.ex b/lib/ash/resource/transformers/add_period_attribute.ex
+index 74ae6eb5b..8e2ec180a 100644
+--- a/lib/ash/resource/transformers/add_period_attribute.ex
++++ b/lib/ash/resource/transformers/add_period_attribute.ex
+@@ -112,11 +112,23 @@ defmodule Ash.Resource.Transformers.AddPeriodAttribute do
+           read at any point in time.
+           """
+ 
++      limited?(attribute.constraints) ->
++        raise Spark.Error.DslError,
++          module: module,
++          path: [:attributes, attribute.name],
++          message: """
++          Expected the attribute #{attribute.name} not to declare a `limit:` on its bounds, since \
++          it is this resource's period.
++          """
++
+       true ->
+         :ok
+     end
+   end
+ 
++  defp limited?(constraints),
++    do: not is_nil(constraints[:lower][:limit]) or not is_nil(constraints[:upper][:limit])
++
+   @datetime_types [Ash.Type.DateTime, Ash.Type.UtcDatetime, Ash.Type.UtcDatetimeUsec]
+ 
+   defp datetime_inner_type?(constraints) do
+diff --git a/lib/ash/type/range.ex b/lib/ash/type/range.ex
+index 7ebe92ee3..ae60e3e4d 100644
+--- a/lib/ash/type/range.ex
++++ b/lib/ash/type/range.ex
+@@ -30,6 +30,10 @@ defmodule Ash.Type.Range do
+         inclusive?: [
+           type: :boolean,
+           doc: "The lower bound, where there is one, must include its own value."
++        ],
++        limit: [
++          type: :any,
++          doc: "The least value the range may start at."
+         ]
+       ],
+       doc: "Constraints on the range's lower bound."
+@@ -46,6 +50,10 @@ defmodule Ash.Type.Range do
+         inclusive?: [
+           type: :boolean,
+           doc: "The upper bound, where there is one, must include its own value."
++        ],
++        limit: [
++          type: :any,
++          doc: "The greatest value the range may end at."
+         ]
+       ],
+       doc: "Constraints on the range's upper bound."
+@@ -66,6 +74,9 @@ defmodule Ash.Type.Range do
+ 
+       attribute :valid_at, Ash.Type.Range, constraints: [inner_type: :datetime]
+ 
++  A lower bound written `:start` is the range's lower limit, and an upper bound written
++  `:end` its upper limit, each unbounded where the range has none.
++
+   Casts to/from an `Ash.Range` struct. The data layer maps it to a native range
+   type — `ash_postgres` renders `:datetime` as `tstzrange`, `:date` as
+   `daterange`, `:naive_datetime` as `tsrange`, `:integer` as `int8range`.
+@@ -128,18 +139,40 @@ defmodule Ash.Type.Range do
+   def init(constraints) do
+     type = Ash.Type.get_type(constraints[:inner_type])
+ 
+-    case Ash.Type.init(type, constraints[:inner_constraints] || []) do
+-      {:ok, inner_constraints} ->
+-        {:ok,
+-         constraints
+-         |> Keyword.put(:inner_type, type)
+-         |> Keyword.put(:inner_constraints, inner_constraints)}
++    with {:ok, inner_constraints} <- Ash.Type.init(type, constraints[:inner_constraints] || []),
++         {:ok, lower} <- init_limit(:lower, constraints[:lower], type, inner_constraints),
++         {:ok, upper} <- init_limit(:upper, constraints[:upper], type, inner_constraints) do
++      {:ok,
++       constraints
++       |> Keyword.put(:inner_type, type)
++       |> Keyword.put(:inner_constraints, inner_constraints)
++       |> put_present(:lower, lower)
++       |> put_present(:upper, upper)}
++    end
++  end
++
++  # A limit is cast by the inner type once, so it compares with bounds in their own form.
++  defp init_limit(_end_name, nil, _type, _inner_constraints), do: {:ok, nil}
++
++  defp init_limit(end_name, bound_constraints, type, inner_constraints) do
++    case Keyword.fetch(bound_constraints, :limit) do
++      {:ok, limit} when not is_nil(limit) ->
++        case Ash.Type.cast_input(type, limit, inner_constraints) do
++          {:ok, cast} when not is_nil(cast) ->
++            {:ok, Keyword.put(bound_constraints, :limit, cast)}
+ 
+-      {:error, error} ->
+-        {:error, error}
++          _ ->
++            {:error, "the #{end_name} limit #{inspect(limit)} is not a value of the inner type"}
++        end
++
++      _ ->
++        {:ok, bound_constraints}
+     end
+   end
+ 
++  defp put_present(constraints, _key, nil), do: constraints
++  defp put_present(constraints, key, value), do: Keyword.put(constraints, key, value)
++
+   @impl true
+   # Logical storage type. The concrete native range type (e.g. Postgres
+   # `tstzrange`/`daterange`) is chosen by the data layer (see
+@@ -186,6 +219,8 @@ defmodule Ash.Type.Range do
+ 
+   def cast_input(value, constraints) do
+     with {:ok, lower, upper, bounds, empty?} <- extract(value),
++         {:ok, lower} <- resolve_limit(:lower, lower, constraints),
++         {:ok, upper} <- resolve_limit(:upper, upper, constraints),
+          {:ok, lower} <- cast_bound(lower, :cast_input, constraints),
+          {:ok, upper} <- cast_bound(upper, :cast_input, constraints) do
+       {:ok,
+@@ -265,29 +300,41 @@ defmodule Ash.Type.Range do
+     end
+   end
+ 
+-  # Each end on its own terms: there if required, and of the asked-for inclusivity if
+-  # there. An absent end includes nothing, so only its presence can be constrained.
++  # Each end on its own terms: there if required or limited, of the asked-for inclusivity
++  # if there, and within its limit. An unbounded end runs past any limit.
+   defp check_bound(end_name, range, bound_constraints) do
+     value = Map.fetch!(range, end_name)
+     inclusive? = inclusive?(end_name, range.bounds)
++    limit = bound_constraints[:limit]
+ 
+     cond do
+-      is_nil(value) and Keyword.get(bound_constraints, :required?, false) ->
++      is_nil(value) and (Keyword.get(bound_constraints, :required?, false) or not is_nil(limit)) ->
+         {:error, message: "range must have a %{bound} bound", vars: [bound: end_name]}
+ 
+       is_nil(value) ->
+         :ok
+ 
+-      matches_inclusivity?(inclusive?, bound_constraints[:inclusive?]) ->
+-        :ok
+-
+-      true ->
++      not matches_inclusivity?(inclusive?, bound_constraints[:inclusive?]) ->
+         {:error,
+          message: "range %{bound} bound must be %{required}",
+          vars: [bound: end_name, required: inclusivity_name(bound_constraints[:inclusive?])]}
++
++      not within_limit?(end_name, value, inclusive?, limit) ->
++        {:error,
++         message: "range %{bound} bound must be within its limit %{limit}",
++         vars: [bound: end_name, limit: limit]}
++
++      true ->
++        :ok
+     end
+   end
+ 
++  # The limits bound a `[)` window: from the lower limit, up to the upper limit excluded.
++  defp within_limit?(_end_name, _value, _inclusive?, nil), do: true
++  defp within_limit?(:lower, value, _inclusive?, limit), do: Comp.compare(value, limit) != :lt
++  defp within_limit?(:upper, value, false, limit), do: Comp.compare(value, limit) != :gt
++  defp within_limit?(:upper, value, true, limit), do: Comp.compare(value, limit) == :lt
++
+   defp inclusive?(:lower, bounds), do: Range.lower_inclusive?(bounds)
+   defp inclusive?(:upper, bounds), do: Range.upper_inclusive?(bounds)
+ 
+@@ -421,6 +468,15 @@ defmodule Ash.Type.Range do
+ 
+   defp bounds_error, do: {:error, "bounds is not a valid bounds specifier"}
+ 
++  # `:start` and `:end` name the range's limits, and are unbounded where it has none.
++  defp resolve_limit(:lower, :start, constraints), do: {:ok, constraints[:lower][:limit]}
++  defp resolve_limit(:upper, :end, constraints), do: {:ok, constraints[:upper][:limit]}
++
++  defp resolve_limit(end_name, limit, _constraints) when limit in [:start, :end],
++    do: {:error, "#{inspect(limit)} cannot be the #{end_name} bound"}
++
++  defp resolve_limit(_end_name, value, _constraints), do: {:ok, value}
++
+   defp cast_bound(nil, _fun, _constraints), do: {:ok, nil}
+ 
+   defp cast_bound(value, fun, constraints) do
+diff --git a/test/resource/temporal_test.exs b/test/resource/temporal_test.exs
+index a7a34a96d..d34a2b467 100644
+--- a/test/resource/temporal_test.exs
++++ b/test/resource/temporal_test.exs
+@@ -224,6 +224,36 @@ defmodule Ash.Test.Resource.TemporalTest do
+       end
+     end
+ 
++    for end_name <- [:lower, :upper] do
++      test "must not limit its #{end_name} bound" do
++        assert_raise Spark.Error.DslError, ~r/bounds, since it is this resource/, fn ->
++          defmodule Module.concat(__MODULE__, "PeriodLimited#{unquote(end_name)}") do
++            @moduledoc false
++            use Ash.Resource,
++              domain: Ash.Test.Domain,
++              data_layer: Ash.Test.Temporal.StubDataLayer
++
++            temporal do
++              attribute :valid_at
++            end
++
++            attributes do
++              attribute :id, :integer, primary_key?: true, allow_nil?: false
++
++              attribute :valid_at, Ash.Type.Range,
++                allow_nil?: false,
++                constraints:
++                  [inner_type: :datetime, lower: [inclusive?: true], upper: [inclusive?: false]]
++                  |> Keyword.update!(
++                    unquote(end_name),
++                    &Keyword.put(&1, :limit, ~U[2025-07-01 00:00:00Z])
++                  )
++            end
++          end
++        end
++      end
++    end
++
+     test "must constrain its bounds to inclusive-exclusive" do
+       assert_raise Spark.Error.DslError, ~r/It constrains neither bound/, fn ->
+         defmodule PeriodWithoutBounds do
+diff --git a/test/type/range_test.exs b/test/type/range_test.exs
+index 4a0360274..fa5a2a5f3 100644
+--- a/test/type/range_test.exs
++++ b/test/type/range_test.exs
+@@ -228,6 +228,118 @@ defmodule Ash.Type.RangeTest do
+       assert {:ok, _} = apply!(range, constraints)
+     end
+ 
++    test "a lower bound must be at or above its limit, whatever its inclusivity" do
++      constraints = init!(inner_type: :datetime, lower: [limit: @lower])
++
++      assert {:ok, _} = apply!(%Range{lower: @lower, upper: @upper, bounds: :"[)"}, constraints)
++      assert {:ok, _} = apply!(%Range{lower: @lower, upper: @upper, bounds: :"()"}, constraints)
++
++      assert {:error, _} =
++               apply!(
++                 %Range{lower: ~U[2025-12-31 23:59:59.999999Z], upper: @upper, bounds: :"(]"},
++                 constraints
++               )
++    end
++
++    test "an upper limit is excluded: an exclusive bound may meet it, an inclusive one may not" do
++      constraints = init!(inner_type: :datetime, upper: [limit: @upper])
++
++      assert {:ok, _} = apply!(%Range{lower: @lower, upper: @upper, bounds: :"[)"}, constraints)
++
++      assert {:error, _} =
++               apply!(%Range{lower: @lower, upper: @upper, bounds: :"[]"}, constraints)
++
++      assert {:ok, _} =
++               apply!(
++                 %Range{lower: @lower, upper: ~U[2026-01-31 23:59:59.999999Z], bounds: :"[]"},
++                 constraints
++               )
++
++      assert {:error, _} =
++               apply!(
++                 %Range{lower: @lower, upper: ~U[2026-02-01 00:00:00.000001Z], bounds: :"[)"},
++                 constraints
++               )
++    end
++
++    test "a limited end must be there, since an unbounded end runs past any limit" do
++      lower = init!(inner_type: :integer, lower: [limit: 1])
++      upper = init!(inner_type: :integer, upper: [limit: 10])
++
++      assert {:error, _} = apply!(%Range{lower: nil, upper: 5, bounds: :"()"}, lower)
++      assert {:error, _} = apply!(%Range{lower: 1, upper: nil, bounds: :"[)"}, upper)
++    end
++
++    test "a discrete inclusive upper at the limit canonicalizes past it" do
++      constraints = init!(inner_type: :integer, upper: [limit: 10])
++
++      {:ok, at_limit} =
++        Ash.Type.cast_input(
++          Ash.Type.Range,
++          %Range{lower: 1, upper: 10, bounds: :"[]"},
++          constraints
++        )
++
++      {:ok, below} =
++        Ash.Type.cast_input(
++          Ash.Type.Range,
++          %Range{lower: 1, upper: 9, bounds: :"[]"},
++          constraints
++        )
++
++      assert {:error, _} = apply!(at_limit, constraints)
++      assert {:ok, %Range{upper: 10, bounds: :"[)"}} = apply!(below, constraints)
++    end
++
++    test "a limit is cast by the inner type" do
++      constraints = init!(inner_type: :date, lower: [limit: "2025-01-01"])
++
++      assert constraints[:lower][:limit] == ~D[2025-01-01]
++
++      assert {:error, _} =
++               apply!(%Range{lower: ~D[2024-12-31], upper: ~D[2025-02-01]}, constraints)
++    end
++
++    test "a limit the inner type cannot cast is refused" do
++      assert {:error, _} =
++               Ash.Type.init(Ash.Type.Range, inner_type: :date, lower: [limit: "never"])
++    end
++
++    test ":start and :end are the limits" do
++      constraints = init!(inner_type: :integer, lower: [limit: 1], upper: [limit: 10])
++
++      assert {:ok, %Range{lower: 1, upper: 10, bounds: :"[)"}} =
++               Ash.Type.cast_input(
++                 Ash.Type.Range,
++                 %Range{lower: :start, upper: :end},
++                 constraints
++               )
++    end
++
++    test ":start and :end are unbounded where there is no limit" do
++      lower_only = init!(inner_type: :integer, lower: [limit: 1])
++
++      assert {:ok, %Range{lower: 1, upper: nil}} =
++               Ash.Type.cast_input(Ash.Type.Range, %Range{lower: :start, upper: :end}, lower_only)
++
++      assert {:ok, %Range{lower: nil, upper: nil}} =
++               Ash.Type.cast_input(
++                 Ash.Type.Range,
++                 %Range{lower: :start, upper: :end},
++                 init!(inner_type: :integer)
++               )
++    end
++
++    test ":start and :end name one end each" do
++      constraints = init!(inner_type: :integer, lower: [limit: 1], upper: [limit: 10])
++
++      assert {:error, _} =
++               Ash.Type.cast_input(Ash.Type.Range, %Range{lower: :end, upper: 5}, constraints)
++
++      assert {:error, _} =
++               Ash.Type.cast_input(Ash.Type.Range, %Range{lower: 2, upper: :start}, constraints)
++    end
++
+     test "unconstrained by default" do
+       constraints = init!(inner_type: :integer)
+ 

@@ -1,0 +1,85 @@
+diff --git a/lib/ecto/adapters/myxql/connection.ex b/lib/ecto/adapters/myxql/connection.ex
+index 833c6d35..e6feb8dc 100644
+--- a/lib/ecto/adapters/myxql/connection.ex
++++ b/lib/ecto/adapters/myxql/connection.ex
+@@ -941,6 +941,9 @@ if Code.ensure_loaded?(MyXQL) do
+     defp op_to_binary({:is_nil, _, [_]} = expr, sources, query),
+       do: paren_expr(expr, sources, query)
+ 
++    defp op_to_binary({:not, _, [_]} = expr, sources, query),
++      do: paren_expr(expr, sources, query)
++
+     defp op_to_binary(expr, sources, query),
+       do: expr(expr, sources, query)
+ 
+diff --git a/lib/ecto/adapters/postgres/connection.ex b/lib/ecto/adapters/postgres/connection.ex
+index b6398531..64cb4081 100644
+--- a/lib/ecto/adapters/postgres/connection.ex
++++ b/lib/ecto/adapters/postgres/connection.ex
+@@ -1192,6 +1192,9 @@ if Code.ensure_loaded?(Postgrex) do
+     defp maybe_paren({:is_nil, _, [_]} = expr, sources, query),
+       do: paren_expr(expr, sources, query)
+ 
++    defp maybe_paren({:not, _, [_]} = expr, sources, query),
++      do: paren_expr(expr, sources, query)
++
+     defp maybe_paren(expr, sources, query),
+       do: expr(expr, sources, query)
+ 
+diff --git a/lib/ecto/adapters/tds/connection.ex b/lib/ecto/adapters/tds/connection.ex
+index be1cf229..27405d4b 100644
+--- a/lib/ecto/adapters/tds/connection.ex
++++ b/lib/ecto/adapters/tds/connection.ex
+@@ -1009,6 +1009,10 @@ if Code.ensure_loaded?(Tds) do
+       paren_expr(expr, sources, query)
+     end
+ 
++    defp op_to_binary({:not, _, [_]} = expr, sources, query) do
++      paren_expr(expr, sources, query)
++    end
++
+     defp op_to_binary(expr, sources, query) do
+       expr(expr, sources, query)
+     end
+diff --git a/test/ecto/adapters/myxql_test.exs b/test/ecto/adapters/myxql_test.exs
+index b062d7bb..8e8485b8 100644
+--- a/test/ecto/adapters/myxql_test.exs
++++ b/test/ecto/adapters/myxql_test.exs
+@@ -619,6 +619,9 @@ defmodule Ecto.Adapters.MyXQLTest do
+ 
+     query = Schema |> select([r], r.x + 2) |> plan()
+     assert all(query) == ~s{SELECT s0.`x` + 2 FROM `schema` AS s0}
++
++    query = Schema |> select([r], (not r.x) < r.y) |> plan()
++    assert all(query) == ~s{SELECT (NOT (s0.`x`)) < s0.`y` FROM `schema` AS s0}
+   end
+ 
+   test "is_nil" do
+diff --git a/test/ecto/adapters/postgres_test.exs b/test/ecto/adapters/postgres_test.exs
+index e877e7be..27d8e2c5 100644
+--- a/test/ecto/adapters/postgres_test.exs
++++ b/test/ecto/adapters/postgres_test.exs
+@@ -812,6 +812,9 @@ defmodule Ecto.Adapters.PostgresTest do
+ 
+     query = Schema |> select([r], r.x + 2) |> plan()
+     assert all(query) == ~s{SELECT s0."x" + 2 FROM "schema" AS s0}
++
++    query = Schema |> select([r], (not r.x) < r.y) |> plan()
++    assert all(query) == ~s{SELECT (NOT (s0."x")) < s0."y" FROM "schema" AS s0}
+   end
+ 
+   test "is_nil" do
+diff --git a/test/ecto/adapters/tds_test.exs b/test/ecto/adapters/tds_test.exs
+index 93413141..1f3f3b04 100644
+--- a/test/ecto/adapters/tds_test.exs
++++ b/test/ecto/adapters/tds_test.exs
+@@ -674,6 +674,9 @@ defmodule Ecto.Adapters.TdsTest do
+ 
+     query = Schema |> select([r], r.x > 2) |> plan()
+     assert all(query) == ~s{SELECT s0.[x] > 2 FROM [schema] AS s0}
++
++    query = Schema |> select([r], (not r.x) < r.y) |> plan()
++    assert all(query) == ~s{SELECT (NOT (s0.[x])) < s0.[y] FROM [schema] AS s0}
+   end
+ 
+   test "is_nil" do

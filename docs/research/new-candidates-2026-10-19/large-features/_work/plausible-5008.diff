@@ -1,0 +1,4832 @@
+diff --git a/config/runtime.exs b/config/runtime.exs
+index e5faab8a0134..47b702e5ad1a 100644
+--- a/config/runtime.exs
++++ b/config/runtime.exs
+@@ -802,6 +802,11 @@ if config_env() in [:dev, :staging, :prod, :test] do
+           api_key: [schema: Plausible.Auth.ApiKey, admin: Plausible.Auth.ApiKeyAdmin]
+         ]
+       ],
++      teams: [
++        resources: [
++          team: [schema: Plausible.Teams.Team, admin: Plausible.Teams.TeamAdmin]
++        ]
++      ],
+       sites: [
+         resources: [
+           site: [schema: Plausible.Site, admin: Plausible.SiteAdmin]
+diff --git a/extra/lib/plausible/help_scout.ex b/extra/lib/plausible/help_scout.ex
+index 11e4d9adb2c0..02952cc14d68 100644
+--- a/extra/lib/plausible/help_scout.ex
++++ b/extra/lib/plausible/help_scout.ex
+@@ -90,24 +90,45 @@ defmodule Plausible.HelpScout do
+             plan = Billing.Plans.get_subscription_plan(team.subscription)
+             {team, team.subscription, plan}
+ 
++          {:error, :multiple_teams} ->
++            # NOTE: We might consider exposing the other teams later on
++            [team | _] = Plausible.Teams.Users.owned_teams(user)
++            team = Plausible.Teams.with_subscription(team)
++            plan = Billing.Plans.get_subscription_plan(team.subscription)
++            {team, team.subscription, plan}
++
+           {:error, :no_team} ->
+             {nil, nil, nil}
+         end
+ 
++      status_link =
++        if team do
++          Routes.kaffy_resource_url(PlausibleWeb.Endpoint, :show, :teams, :team, team.id)
++        else
++          Routes.kaffy_resource_url(PlausibleWeb.Endpoint, :show, :auth, :user, user.id)
++        end
++
++      sites_link =
++        if team do
++          Routes.kaffy_resource_url(PlausibleWeb.Endpoint, :index, :sites, :site,
++            custom_search: team.identifier
++          )
++        else
++          Routes.kaffy_resource_url(PlausibleWeb.Endpoint, :index, :sites, :site,
++            custom_search: user.email
++          )
++        end
++
+       {:ok,
+        %{
+          email: user.email,
+          notes: user.notes,
+          status_label: status_label(team, subscription),
+-         status_link:
+-           Routes.kaffy_resource_url(PlausibleWeb.Endpoint, :show, :auth, :user, user.id),
++         status_link: status_link,
+          plan_label: plan_label(subscription, plan),
+          plan_link: plan_link(subscription),
+          sites_count: Plausible.Teams.owned_sites_count(team),
+-         sites_link:
+-           Routes.kaffy_resource_url(PlausibleWeb.Endpoint, :index, :sites, :site,
+-             custom_search: user.email
+-           )
++         sites_link: sites_link
+        }}
+     end
+   end
+diff --git a/extra/lib/plausible_web/controllers/api/external_sites_controller.ex b/extra/lib/plausible_web/controllers/api/external_sites_controller.ex
+index b6d8aa1c81da..0a311f49e372 100644
+--- a/extra/lib/plausible_web/controllers/api/external_sites_controller.ex
++++ b/extra/lib/plausible_web/controllers/api/external_sites_controller.ex
+@@ -8,16 +8,18 @@ defmodule PlausibleWeb.Api.ExternalSitesController do
+   alias Plausible.Sites
+   alias Plausible.Goal
+   alias Plausible.Goals
++  alias Plausible.Teams
+   alias PlausibleWeb.Api.Helpers, as: H
+ 
+   @pagination_opts [cursor_fields: [{:id, :desc}], limit: 100, maximum_limit: 1000]
+ 
+   def index(conn, params) do
++    team = Teams.get(params["team_id"])
+     user = conn.assigns.current_user
+ 
+     page =
+       user
+-      |> Sites.for_user_query()
++      |> Sites.for_user_query(team)
+       |> paginate(params, @pagination_opts)
+ 
+     json(conn, %{
+@@ -30,7 +32,7 @@ defmodule PlausibleWeb.Api.ExternalSitesController do
+     user = conn.assigns.current_user
+ 
+     with {:ok, site_id} <- expect_param_key(params, "site_id"),
+-         {:ok, site} <- get_site(user, site_id, [:owner, :admin, :viewer]) do
++         {:ok, site} <- get_site(user, site_id, [:owner, :admin, :editor, :viewer]) do
+       page =
+         site
+         |> Plausible.Goals.for_site_query()
+@@ -60,8 +62,9 @@ defmodule PlausibleWeb.Api.ExternalSitesController do
+ 
+   def create_site(conn, params) do
+     user = conn.assigns.current_user
++    team = Plausible.Teams.get(params["team_id"])
+ 
+-    case Sites.create(user, params) do
++    case Sites.create(user, params, team) do
+       {:ok, %{site: site}} ->
+         json(conn, site)
+ 
+@@ -73,6 +76,20 @@ defmodule PlausibleWeb.Api.ExternalSitesController do
+             "Your account has reached the limit of #{limit} sites. To unlock more sites, please upgrade your subscription."
+         })
+ 
++      {:error, _, :permission_denied, _} ->
++        conn
++        |> put_status(403)
++        |> json(%{
++          error: "You can't add sites to the selected team."
++        })
++
++      {:error, _, :multiple_teams, _} ->
++        conn
++        |> put_status(400)
++        |> json(%{
++          error: "You must select a team with 'team_id' parameter."
++        })
++
+       {:error, _, changeset, _} ->
+         conn
+         |> put_status(400)
+@@ -81,7 +98,7 @@ defmodule PlausibleWeb.Api.ExternalSitesController do
+   end
+ 
+   def get_site(conn, %{"site_id" => site_id}) do
+-    case get_site(conn.assigns.current_user, site_id, [:owner, :admin, :viewer]) do
++    case get_site(conn.assigns.current_user, site_id, [:owner, :admin, :editor, :viewer]) do
+       {:ok, site} ->
+         json(conn, %{
+           domain: site.domain,
+@@ -107,7 +124,7 @@ defmodule PlausibleWeb.Api.ExternalSitesController do
+ 
+   def update_site(conn, %{"site_id" => site_id} = params) do
+     # for now this only allows to change the domain
+-    with {:ok, site} <- get_site(conn.assigns.current_user, site_id, [:owner, :admin]),
++    with {:ok, site} <- get_site(conn.assigns.current_user, site_id, [:owner, :admin, :editor]),
+          {:ok, site} <- Plausible.Site.Domain.change(site, params["domain"]) do
+       json(conn, site)
+     else
+@@ -124,7 +141,7 @@ defmodule PlausibleWeb.Api.ExternalSitesController do
+   def find_or_create_shared_link(conn, params) do
+     with {:ok, site_id} <- expect_param_key(params, "site_id"),
+          {:ok, link_name} <- expect_param_key(params, "name"),
+-         {:ok, site} <- get_site(conn.assigns.current_user, site_id, [:owner, :admin]) do
++         {:ok, site} <- get_site(conn.assigns.current_user, site_id, [:owner, :admin, :editor]) do
+       shared_link = Repo.get_by(Plausible.Site.SharedLink, site_id: site.id, name: link_name)
+ 
+       shared_link =
+@@ -158,7 +175,7 @@ defmodule PlausibleWeb.Api.ExternalSitesController do
+   def find_or_create_goal(conn, params) do
+     with {:ok, site_id} <- expect_param_key(params, "site_id"),
+          {:ok, _} <- expect_param_key(params, "goal_type"),
+-         {:ok, site} <- get_site(conn.assigns.current_user, site_id, [:owner, :admin]),
++         {:ok, site} <- get_site(conn.assigns.current_user, site_id, [:owner, :admin, :editor]),
+          {:ok, goal} <- Goals.find_or_create(site, params) do
+       json(conn, goal)
+     else
+@@ -176,7 +193,7 @@ defmodule PlausibleWeb.Api.ExternalSitesController do
+   def delete_goal(conn, params) do
+     with {:ok, site_id} <- expect_param_key(params, "site_id"),
+          {:ok, goal_id} <- expect_param_key(params, "goal_id"),
+-         {:ok, site} <- get_site(conn.assigns.current_user, site_id, [:owner, :admin]),
++         {:ok, site} <- get_site(conn.assigns.current_user, site_id, [:owner, :admin, :editor]),
+          :ok <- Goals.delete(goal_id, site) do
+       json(conn, %{"deleted" => true})
+     else
+diff --git a/extra/lib/plausible_web/live/funnel_settings.ex b/extra/lib/plausible_web/live/funnel_settings.ex
+index f45b905fd7ea..ae0f852e4a62 100644
+--- a/extra/lib/plausible_web/live/funnel_settings.ex
++++ b/extra/lib/plausible_web/live/funnel_settings.ex
+@@ -19,6 +19,7 @@ defmodule PlausibleWeb.Live.FunnelSettings do
+         Plausible.Sites.get_for_user!(current_user, domain, [
+           :owner,
+           :admin,
++          :editor,
+           :super_admin
+         ])
+       end)
+@@ -110,7 +111,7 @@ defmodule PlausibleWeb.Live.FunnelSettings do
+       Plausible.Sites.get_for_user!(
+         socket.assigns.current_user,
+         socket.assigns.domain,
+-        [:owner, :admin]
++        [:owner, :admin, :editor]
+       )
+ 
+     id = String.to_integer(id)
+diff --git a/extra/lib/plausible_web/live/funnel_settings/form.ex b/extra/lib/plausible_web/live/funnel_settings/form.ex
+index 05bcdc90ace8..a9b0dabdec8f 100644
+--- a/extra/lib/plausible_web/live/funnel_settings/form.ex
++++ b/extra/lib/plausible_web/live/funnel_settings/form.ex
+@@ -16,6 +16,7 @@ defmodule PlausibleWeb.Live.FunnelSettings.Form do
+       Plausible.Sites.get_for_user!(socket.assigns.current_user, domain, [
+         :owner,
+         :admin,
++        :editor,
+         :super_admin
+       ])
+ 
+diff --git a/lib/plausible/auth/auth.ex b/lib/plausible/auth/auth.ex
+index 2ad4ebb295a7..45423cd369b4 100644
+--- a/lib/plausible/auth/auth.ex
++++ b/lib/plausible/auth/auth.ex
+@@ -7,6 +7,7 @@ defmodule Plausible.Auth do
+   use Plausible.Repo
+   alias Plausible.Auth
+   alias Plausible.RateLimit
++  alias Plausible.Teams
+ 
+   @rate_limits %{
+     login_ip: %{
+@@ -71,9 +72,9 @@ defmodule Plausible.Auth do
+ 
+   def delete_user(user) do
+     Repo.transaction(fn ->
+-      case Plausible.Teams.get_by_owner(user) do
+-        {:ok, team} ->
+-          for site <- Plausible.Teams.owned_sites(team) do
++      case Teams.get_by_owner(user) do
++        {:ok, %{setup_complete: false} = team} ->
++          for site <- Teams.owned_sites(team) do
+             Plausible.Site.Removal.run(site)
+           end
+ 
+@@ -84,15 +85,39 @@ defmodule Plausible.Auth do
+           )
+ 
+           Repo.delete!(team)
++          Repo.delete!(user)
++
++        {:ok, team} ->
++          check_can_leave_team!(team)
++          Repo.delete!(user)
+ 
+-        _ ->
+-          :skip
++        {:error, :multiple_teams} ->
++          check_can_leave_teams!(user)
++          Repo.delete!(user)
++
++        {:error, :no_team} ->
++          Repo.delete!(user)
+       end
+ 
+-      Repo.delete!(user)
++      :deleted
+     end)
+   end
+ 
++  defp check_can_leave_teams!(user) do
++    user
++    |> Teams.Users.owned_teams()
++    |> Enum.reject(&(&1.setup_complete == false))
++    |> Enum.map(fn team ->
++      check_can_leave_team!(team)
++    end)
++  end
++
++  defp check_can_leave_team!(team) do
++    if Teams.Memberships.owners_count(team) <= 1 do
++      Repo.rollback(:is_only_team_owner)
++    end
++  end
++
+   on_ee do
+     def is_super_admin?(nil), do: false
+     def is_super_admin?(%Plausible.Auth.User{id: id}), do: is_super_admin?(id)
+@@ -107,17 +132,12 @@ defmodule Plausible.Auth do
+   @spec create_api_key(Auth.User.t(), String.t(), String.t()) ::
+           {:ok, Auth.ApiKey.t()} | {:error, Ecto.Changeset.t() | :upgrade_required}
+   def create_api_key(user, name, key) do
+-    team =
+-      case Plausible.Teams.get_by_owner(user) do
+-        {:ok, team} -> team
+-        _ -> nil
+-      end
+-
+     params = %{name: name, user_id: user.id, key: key}
+     changeset = Auth.ApiKey.changeset(%Auth.ApiKey{}, params)
+ 
+-    with :ok <- Plausible.Billing.Feature.StatsAPI.check_availability(team),
+-         do: Repo.insert(changeset)
++    with :ok <- check_stats_api_available(user) do
++      Repo.insert(changeset)
++    end
+   end
+ 
+   @spec delete_api_key(Auth.User.t(), integer()) :: :ok | {:error, :not_found}
+@@ -148,6 +168,21 @@ defmodule Plausible.Auth do
+     end
+   end
+ 
++  defp check_stats_api_available(user) do
++    case Plausible.Teams.get_by_owner(user) do
++      {:ok, team} ->
++        Plausible.Billing.Feature.StatsAPI.check_availability(team)
++
++      {:error, :no_team} ->
++        Plausible.Billing.Feature.StatsAPI.check_availability(nil)
++
++      {:error, :multiple_teams} ->
++        # NOTE: Loophole to allow creating API keys when user is a member
++        # on multiple teams.
++        :ok
++    end
++  end
++
+   defp rate_limit_key(%Auth.User{id: id}), do: id
+   defp rate_limit_key(%Plug.Conn{} = conn), do: PlausibleWeb.RemoteIP.get(conn)
+ end
+diff --git a/lib/plausible/auth/user.ex b/lib/plausible/auth/user.ex
+index e210798f6fe9..ef4e0e373b17 100644
+--- a/lib/plausible/auth/user.ex
++++ b/lib/plausible/auth/user.ex
+@@ -34,11 +34,6 @@ defmodule Plausible.Auth.User do
+     # Field for purely informational purposes in CRM context
+     field :notes, :string
+ 
+-    # Fields used only by CRM for mapping to the ones in the owned team
+-    field :trial_expiry_date, :date, virtual: true
+-    field :allow_next_upgrade_override, :boolean, virtual: true
+-    field :accept_traffic_until, :date, virtual: true
+-
+     # Fields for TOTP authentication. See `Plausible.Auth.TOTP`.
+     field :totp_enabled, :boolean, default: false
+     field :totp_secret, Plausible.Auth.TOTP.EncryptedBinary
+@@ -49,8 +44,8 @@ defmodule Plausible.Auth.User do
+     has_many :team_memberships, Plausible.Teams.Membership
+     has_many :api_keys, Plausible.Auth.ApiKey
+     has_one :google_auth, Plausible.Site.GoogleAuth
+-    has_one :owner_membership, Plausible.Teams.Membership, where: [role: :owner]
+-    has_one :my_team, through: [:owner_membership, :team]
++    has_many :owner_memberships, Plausible.Teams.Membership, where: [role: :owner]
++    has_many :owned_teams, through: [:owner_memberships, :team]
+ 
+     timestamps()
+   end
+@@ -113,16 +108,7 @@ defmodule Plausible.Auth.User do
+ 
+   def changeset(user, attrs \\ %{}) do
+     user
+-    |> cast(attrs, [
+-      :email,
+-      :name,
+-      :email_verified,
+-      :theme,
+-      :notes,
+-      :trial_expiry_date,
+-      :allow_next_upgrade_override,
+-      :accept_traffic_until
+-    ])
++    |> cast(attrs, [:email, :name, :email_verified, :theme, :notes])
+     |> validate_required([:email, :name, :email_verified])
+     |> unique_constraint(:email)
+   end
+diff --git a/lib/plausible/auth/user_admin.ex b/lib/plausible/auth/user_admin.ex
+index 4e24f343ebf2..aeeab66f48fc 100644
+--- a/lib/plausible/auth/user_admin.ex
++++ b/lib/plausible/auth/user_admin.ex
+@@ -1,24 +1,13 @@
+ defmodule Plausible.Auth.UserAdmin do
+   use Plausible.Repo
+   use Plausible
+-  require Plausible.Billing.Subscription.Status
+-  alias Plausible.Billing.Subscription
+ 
+   def custom_index_query(_conn, _schema, query) do
+-    subscripton_q = from(s in Plausible.Billing.Subscription, order_by: [desc: s.inserted_at])
+-    from(r in query, preload: [my_team: [subscription: ^subscripton_q]])
++    from(r in query, preload: [:owned_teams])
+   end
+ 
+   def custom_show_query(_conn, _schema, query) do
+-    from(u in query,
+-      left_join: t in assoc(u, :my_team),
+-      select: %{
+-        u
+-        | trial_expiry_date: t.trial_expiry_date,
+-          allow_next_upgrade_override: t.allow_next_upgrade_override,
+-          accept_traffic_until: t.accept_traffic_until
+-      }
+-    )
++    from(u in query, preload: [:owned_teams])
+   end
+ 
+   def form_fields(_) do
+@@ -26,78 +15,31 @@ defmodule Plausible.Auth.UserAdmin do
+       name: nil,
+       email: nil,
+       previous_email: nil,
+-      trial_expiry_date: %{
+-        help_text: "Change will also update Accept Traffic Until date"
+-      },
+-      allow_next_upgrade_override: nil,
+-      accept_traffic_until: %{
+-        help_text: "Change will take up to 15 minutes to propagate"
+-      },
+       notes: %{type: :textarea, rows: 6}
+     ]
+   end
+ 
+-  def update(_conn, changeset) do
+-    my_team = Repo.preload(changeset.data, :my_team).my_team
+-
+-    team_changed_params =
+-      [:trial_expiry_date, :allow_next_upgrade_override, :accept_traffic_until]
+-      |> Enum.map(&{&1, Ecto.Changeset.get_change(changeset, &1, :no_change)})
+-      |> Enum.reject(fn {_, val} -> val == :no_change end)
+-      |> Map.new()
+-
+-    with {:ok, user} <- Repo.update(changeset) do
+-      cond do
+-        my_team && map_size(team_changed_params) > 0 ->
+-          my_team
+-          |> Plausible.Teams.Team.crm_sync_changeset(team_changed_params)
+-          |> Repo.update!()
+-
+-        team_changed_params[:trial_expiry_date] ->
+-          {:ok, team} = Plausible.Teams.get_or_create(user)
+-
+-          team
+-          |> Plausible.Teams.Team.crm_sync_changeset(team_changed_params)
+-          |> Repo.update!()
+-
+-        true ->
+-          :ignore
+-      end
++  def delete(_conn, %{data: user}) do
++    case Plausible.Auth.delete_user(user) do
++      {:ok, :deleted} ->
++        :ok
+ 
+-      {:ok, user}
++      {:error, :is_only_team_owner} ->
++        "The user is the only public team owner on one or more teams."
+     end
+   end
+ 
+-  def delete(_conn, %{data: user}) do
+-    Plausible.Auth.delete_user(user)
+-  end
+-
+   def index(_) do
+     [
+       name: nil,
+       email: nil,
+-      inserted_at: %{name: "Created at", value: &format_date(&1.inserted_at)},
+-      trial_expiry_date: %{name: "Trial expiry", value: &format_date(&1.trial_expiry_date)},
+-      subscription_plan: %{value: &subscription_plan/1},
+-      subscription_status: %{value: &subscription_status/1},
+-      grace_period: %{value: &grace_period_status/1},
+-      accept_traffic_until: %{
+-        name: "Accept traffic until",
+-        value: &format_date(&1.accept_traffic_until)
+-      }
++      owned_teams: %{value: &Phoenix.HTML.raw(teams(&1.owned_teams))},
++      inserted_at: %{name: "Created at", value: &format_date(&1.inserted_at)}
+     ]
+   end
+ 
+   def resource_actions(_) do
+     [
+-      unlock: %{
+-        name: "Unlock",
+-        action: fn _, user -> unlock(user) end
+-      },
+-      lock: %{
+-        name: "Lock",
+-        action: fn _, user -> lock(user) end
+-      },
+       reset_2fa: %{
+         name: "Reset 2FA",
+         action: fn _, user -> disable_2fa(user) end
+@@ -105,94 +47,21 @@ defmodule Plausible.Auth.UserAdmin do
+     ]
+   end
+ 
+-  defp lock(user) do
+-    user = Repo.preload(user, :my_team)
+-
+-    if user.my_team && user.my_team.grace_period do
+-      Plausible.Billing.SiteLocker.set_lock_status_for(user.my_team, true)
+-      Plausible.Teams.end_grace_period(user.my_team)
+-      {:ok, user}
+-    else
+-      {:error, user, "No active grace period on this user"}
+-    end
+-  end
+-
+-  defp unlock(user) do
+-    user = Repo.preload(user, :my_team)
+-
+-    if user.my_team && user.my_team.grace_period do
+-      Plausible.Teams.remove_grace_period(user.my_team)
+-      Plausible.Billing.SiteLocker.set_lock_status_for(user.my_team, false)
+-      {:ok, user}
+-    else
+-      {:error, user, "No active grace period on this user"}
+-    end
+-  end
+-
+   def disable_2fa(user) do
+     Plausible.Auth.TOTP.force_disable(user)
+   end
+ 
+-  defp grace_period_status(user) do
+-    grace_period = user.my_team && user.my_team.grace_period
+-
+-    case grace_period do
+-      nil ->
+-        "--"
+-
+-      %{manual_lock: true, is_over: true} ->
+-        "Manually locked"
+-
+-      %{manual_lock: true, is_over: false} ->
+-        "Waiting for manual lock"
+-
+-      %{is_over: true} ->
+-        "ended"
+-
+-      %{end_date: %Date{} = end_date} ->
+-        days_left = Date.diff(end_date, Date.utc_today())
+-        "#{days_left} days left"
+-    end
+-  end
+-
+-  defp subscription_plan(user) do
+-    subscription = user.my_team && user.my_team.subscription
+-
+-    if Subscription.Status.active?(subscription) && subscription.paddle_subscription_id do
+-      quota = PlausibleWeb.AuthView.subscription_quota(subscription)
+-      interval = PlausibleWeb.AuthView.subscription_interval(subscription)
+-
+-      {:safe, ~s(<a href="#{manage_url(subscription)}">#{quota} \(#{interval}\)</a>)}
+-    else
+-      "--"
+-    end
+-  end
+-
+-  defp subscription_status(user) do
+-    team = user.my_team
+-
+-    cond do
+-      team && team.subscription ->
+-        status_str =
+-          PlausibleWeb.SettingsView.present_subscription_status(team.subscription.status)
+-
+-        if team.subscription.paddle_subscription_id do
+-          {:safe, ~s(<a href="#{manage_url(team.subscription)}">#{status_str}</a>)}
+-        else
+-          status_str
+-        end
+-
+-      Plausible.Teams.on_trial?(team) ->
+-        "On trial"
+-
+-      true ->
+-        "Trial expired"
+-    end
++  def teams([]) do
++    "(none)"
+   end
+ 
+-  defp manage_url(%{paddle_subscription_id: paddle_id} = _subscription) do
+-    Plausible.Billing.PaddleApi.vendors_domain() <>
+-      "/subscriptions/customers/manage/" <> paddle_id
++  def teams(teams) do
++    teams
++    |> Enum.map_join("<br>\n", fn team ->
++      """
++      <a href="/crm/teams/team/#{team.id}">#{team.name}</a>
++      """
++    end)
+   end
+ 
+   defp format_date(nil), do: "--"
+diff --git a/lib/plausible/billing/billing.ex b/lib/plausible/billing/billing.ex
+index 245d78f53f7d..9314df1fc0c2 100644
+--- a/lib/plausible/billing/billing.ex
++++ b/lib/plausible/billing/billing.ex
+@@ -89,7 +89,7 @@ defmodule Plausible.Billing do
+     subscription =
+       Subscription
+       |> Repo.get_by(paddle_subscription_id: params["subscription_id"])
+-      |> Repo.preload(team: :owner)
++      |> Repo.preload(team: :owners)
+ 
+     if subscription do
+       changeset =
+@@ -99,9 +99,11 @@ defmodule Plausible.Billing do
+ 
+       updated = Repo.update!(changeset)
+ 
+-      subscription.team.owner
+-      |> PlausibleWeb.Email.cancellation_email()
+-      |> Plausible.Mailer.send()
++      for owner <- subscription.team.owners do
++        owner
++        |> PlausibleWeb.Email.cancellation_email()
++        |> Plausible.Mailer.send()
++      end
+ 
+       updated
+     end
+@@ -138,9 +140,16 @@ defmodule Plausible.Billing do
+         Teams.get!(team_id)
+ 
+       {:user_id, user_id} ->
+-        user = Repo.get!(Auth.User, user_id)
+-        {:ok, team} = Teams.get_or_create(user)
+-        team
++        # Given a guest or non-owner member user initiates the new subscription payment
++        # and becomes an owner of an existing team already with a subscription in between,
++        # this could result in assigning this new subscription to the newly owned team,
++        # effectively "shadowing" any old one.
++        #
++        # That's why we are always defaulting to creating a new "My Team" team regardless
++        # if they were owner of one before or not.
++        Auth.User
++        |> Repo.get!(user_id)
++        |> Teams.force_create_my_team()
+     end
+   end
+ 
+@@ -212,7 +221,7 @@ defmodule Plausible.Billing do
+       Teams.Team
+       |> Repo.get!(subscription.team_id)
+       |> Teams.with_subscription()
+-      |> Repo.preload(:owner)
++      |> Repo.preload(:owners)
+ 
+     if subscription.id != team.subscription.id do
+       Sentry.capture_message("Susbscription ID mismatch",
+@@ -236,7 +245,8 @@ defmodule Plausible.Billing do
+       )
+ 
+     if plan do
+-      api_keys = from(key in Plausible.Auth.ApiKey, where: key.user_id == ^team.owner.id)
++      owner_ids = Enum.map(team.owners, & &1.id)
++      api_keys = from(key in Plausible.Auth.ApiKey, where: key.user_id in ^owner_ids)
+       Repo.update_all(api_keys, set: [hourly_request_limit: plan.hourly_api_request_limit])
+     end
+ 
+diff --git a/lib/plausible/billing/enterprise_plan.ex b/lib/plausible/billing/enterprise_plan.ex
+index 36ccd0a1d6a9..54cd4efa118e 100644
+--- a/lib/plausible/billing/enterprise_plan.ex
++++ b/lib/plausible/billing/enterprise_plan.ex
+@@ -24,9 +24,6 @@ defmodule Plausible.Billing.EnterprisePlan do
+     field :features, Plausible.Billing.Ecto.FeatureList, default: []
+     field :hourly_api_request_limit, :integer
+ 
+-    # Field used only by CRM for mapping to the ones in the owned team
+-    field :user_id, :integer, virtual: true
+-
+     belongs_to :team, Plausible.Teams.Team
+ 
+     timestamps()
+diff --git a/lib/plausible/billing/enterprise_plan_admin.ex b/lib/plausible/billing/enterprise_plan_admin.ex
+index e0b56ef5a802..b8ed3fbe3d65 100644
+--- a/lib/plausible/billing/enterprise_plan_admin.ex
++++ b/lib/plausible/billing/enterprise_plan_admin.ex
+@@ -2,7 +2,7 @@ defmodule Plausible.Billing.EnterprisePlanAdmin do
+   use Plausible.Repo
+ 
+   @numeric_fields [
+-    "user_id",
++    "team_id",
+     "paddle_plan_id",
+     "monthly_pageview_limit",
+     "site_limit",
+@@ -18,7 +18,7 @@ defmodule Plausible.Billing.EnterprisePlanAdmin do
+ 
+   def form_fields(_schema) do
+     [
+-      user_id: nil,
++      team_id: nil,
+       paddle_plan_id: nil,
+       billing_interval: %{choices: [{"Yearly", "yearly"}, {"Monthly", "monthly"}]},
+       monthly_pageview_limit: nil,
+@@ -40,25 +40,19 @@ defmodule Plausible.Billing.EnterprisePlanAdmin do
+ 
+     from(r in query,
+       inner_join: t in assoc(r, :team),
+-      inner_join: o in assoc(t, :owner),
++      inner_join: o in assoc(t, :owners),
+       or_where: ilike(r.paddle_plan_id, ^search_term),
+-      or_where: ilike(o.email, ^search_term) or ilike(o.name, ^search_term),
+-      preload: [team: {t, owner: o}]
+-    )
+-  end
+-
+-  def custom_show_query(_conn, _schema, query) do
+-    from(ep in query,
+-      inner_join: t in assoc(ep, :team),
+-      inner_join: o in assoc(t, :owner),
+-      select: %{ep | user_id: o.id}
++      or_where: ilike(o.email, ^search_term),
++      or_where: ilike(o.name, ^search_term),
++      or_where: ilike(t.name, ^search_term),
++      preload: [team: {t, owners: o}]
+     )
+   end
+ 
+   def index(_) do
+     [
+       id: nil,
+-      user_email: %{value: &get_user_email/1},
++      user_email: %{value: &owner_emails(&1.team)},
+       paddle_plan_id: nil,
+       billing_interval: nil,
+       monthly_pageview_limit: nil,
+@@ -68,20 +62,15 @@ defmodule Plausible.Billing.EnterprisePlanAdmin do
+     ]
+   end
+ 
+-  defp get_user_email(plan), do: plan.team.owner.email
++  defp owner_emails(team) do
++    team.owners
++    |> Enum.map_join("<br>", & &1.email)
++    |> Phoenix.HTML.raw()
++  end
+ 
+   def create_changeset(schema, attrs) do
+     attrs = sanitize_attrs(attrs)
+ 
+-    team_id =
+-      if user_id = attrs["user_id"] do
+-        user = Repo.get!(Plausible.Auth.User, user_id)
+-        {:ok, team} = Plausible.Teams.get_or_create(user)
+-        team.id
+-      end
+-
+-    attrs = Map.put(attrs, "team_id", team_id)
+-
+     Plausible.Billing.EnterprisePlan.changeset(struct(schema, %{}), attrs)
+   end
+ 
+diff --git a/lib/plausible/billing/site_locker.ex b/lib/plausible/billing/site_locker.ex
+index 666bb0e04849..df871331e2e4 100644
+--- a/lib/plausible/billing/site_locker.ex
++++ b/lib/plausible/billing/site_locker.ex
+@@ -26,7 +26,7 @@ defmodule Plausible.Billing.SiteLocker do
+           Plausible.Teams.end_grace_period(team)
+ 
+           if send_email? do
+-            team = Repo.preload(team, :owner)
++            team = Repo.preload(team, :owners)
+             send_grace_period_end_email(team)
+           end
+ 
+@@ -64,8 +64,10 @@ defmodule Plausible.Billing.SiteLocker do
+     usage = Teams.Billing.monthly_pageview_usage(team)
+     suggested_plan = Plausible.Billing.Plans.suggest(team, usage.last_cycle.total)
+ 
+-    team.owner
+-    |> PlausibleWeb.Email.dashboard_locked(usage, suggested_plan)
+-    |> Plausible.Mailer.send()
++    for owner <- team.owners do
++      owner
++      |> PlausibleWeb.Email.dashboard_locked(usage, suggested_plan)
++      |> Plausible.Mailer.send()
++    end
+   end
+ end
+diff --git a/lib/plausible/crm_extensions.ex b/lib/plausible/crm_extensions.ex
+index 054b6106f003..c0aa28760e77 100644
+--- a/lib/plausible/crm_extensions.ex
++++ b/lib/plausible/crm_extensions.ex
+@@ -9,12 +9,31 @@ defmodule Plausible.CrmExtensions do
+     # Kaffy uses String.to_existing_atom when listing params
+     @custom_search :custom_search
+ 
++    def javascripts(%{assigns: %{context: "teams", resource: "team", entry: %{} = team}}) do
++      [
++        Phoenix.HTML.raw("""
++        <script type="text/javascript">
++          (async () => {
++            const response = await fetch("/crm/teams/team/#{team.id}/usage?embed=true")
++            const usageHTML = await response.text()
++            const cardBody = document.querySelector(".card-body")
++            if (cardBody) {
++              const usageDOM = document.createElement("div")
++              usageDOM.innerHTML = usageHTML
++              cardBody.prepend(usageDOM)
++            }
++          })()
++        </script>
++        """)
++      ]
++    end
++
+     def javascripts(%{assigns: %{context: "auth", resource: "user", entry: %{} = user}}) do
+       [
+         Phoenix.HTML.raw("""
+         <script type="text/javascript">
+           (async () => {
+-            const response = await fetch("/crm/auth/user/#{user.id}/usage?embed=true")
++            const response = await fetch("/crm/auth/user/#{user.id}/info")
+             const usageHTML = await response.text()
+             const cardBody = document.querySelector(".card-body")
+             if (cardBody) {
+@@ -54,15 +73,22 @@ defmodule Plausible.CrmExtensions do
+         <script type="text/javascript">
+           (async () => {
+             const CHECK_INTERVAL = 300
+-            const userIdField = document.querySelector("#enterprise_plan_user_id")
+-            const userIdLabel = document.querySelector("label[for=enterprise_plan_user_id]")
++
++            const teamPicker = document.querySelector("#pick-raw-resource")
++            if (teamPicker) {
++              teamPicker.style.display = "none";
++            }
++            const teamIdField = document.querySelector("#enterprise_plan_team_id") || 
++                            document.querySelector("#team_id")
++            const teamIdLabel = document.querySelector("label[for=enterprise_plan_team_id]")
+             const dataList = document.createElement("datalist")
+-            dataList.id = "user-choices"
+-            userIdField.after(dataList)
+-            userIdField.setAttribute("list", "user-choices")
+-            userIdField.setAttribute("type", "text")
++            dataList.id = "team-choices"
++            teamIdField.after(dataList)
++            teamIdField.setAttribute("list", "team-choices")
++            teamIdField.setAttribute("type", "text")
++            teamIdField.setAttribute("autocomplete", "off")
+             const labelSpan = document.createElement("span")
+-            userIdLabel.appendChild(labelSpan)
++            teamIdLabel.appendChild(labelSpan)
+ 
+             let updateAction;
+ 
+@@ -70,17 +96,17 @@ defmodule Plausible.CrmExtensions do
+               id = Number(id)
+ 
+               if (!isNaN(id) && id > 0) {
+-                const response = await fetch(`/crm/billing/search/user-by-id/${id}`)
++                const response = await fetch(`/crm/billing/search/team-by-id/${id}`)
+                 labelSpan.innerHTML = ` <i>(${await response.text()})</i>`
+               }
+             }
+ 
+             const updateSearch = async () => {
+-              const search = userIdField.value
++              const search = teamIdField.value
+ 
+               updateLabel(search)
+ 
+-              const response = await fetch("/crm/billing/search/user", {
++              const response = await fetch("/crm/billing/search/team", {
+                 headers: { "Content-Type": "application/json" },
+                 method: "POST",
+                 body: JSON.stringify({ search: search })
+@@ -100,9 +126,9 @@ defmodule Plausible.CrmExtensions do
+               dataList.replaceChildren(...options)
+             }
+ 
+-            updateLabel(userIdField.value)
++            updateLabel(teamIdField.value)
+ 
+-            userIdField.addEventListener("input", async (e) => {
++            teamIdField.addEventListener("input", async (e) => {
+               if (updateAction) {
+                 clearTimeout(updateAction)
+                 updateAction = null
+@@ -136,20 +162,20 @@ defmodule Plausible.CrmExtensions do
+         <script type="text/javascript">
+           (async () => {
+             const CHECK_INTERVAL = 300
+-            const userIdField = document.getElementById("enterprise_plan_user_id") || document.getElementById("user_id")
++            const teamIdField = document.getElementById("enterprise_plan_team_id") || document.getElementById("team_id")
+             let planRequest
+-            let lastValue = Number(userIdField.value)
++            let lastValue = Number(teamIdField.value)
+             let currentValue = lastValue
+ 
+             setTimeout(prefillCallback, CHECK_INTERVAL)
+ 
+             async function prefillCallback() {
+-              currentValue = Number(userIdField.value)
++              currentValue = Number(teamIdField.value)
+               if (Number.isInteger(currentValue)
+                     && currentValue > 0
+                     && currentValue != lastValue
+                     && !planRequest) {
+-                planRequest = await fetch("/crm/billing/user/" + currentValue + "/current_plan")
++                planRequest = await fetch("/crm/billing/team/" + currentValue + "/current_plan")
+                 const result = await planRequest.json()
+ 
+                 fillForm(result)
+@@ -178,7 +204,10 @@ defmodule Plausible.CrmExtensions do
+ 
+               ['stats_api', 'props', 'funnels', 'revenue_goals'].forEach(feature => {
+                 const checked = result.features.includes(feature)
+-                document.getElementById('enterprise_plan_features_' + feature).checked = checked
++                const field = document.querySelector(`input[type=checkbox][value=${feature}]`)
++                if (field) {
++                  field.checked = checked
++                }
+               });
+             }
+           })()
+@@ -188,7 +217,7 @@ defmodule Plausible.CrmExtensions do
+     end
+ 
+     def javascripts(%{assigns: %{context: context}})
+-        when context in ["sites", "billing"] do
++        when context in ["teams", "sites", "billing"] do
+       [
+         Phoenix.HTML.raw("""
+         <script type="text/javascript">
+diff --git a/lib/plausible/site.ex b/lib/plausible/site.ex
+index 11d89f4401fa..5e6cdd0281a0 100644
+--- a/lib/plausible/site.ex
++++ b/lib/plausible/site.ex
+@@ -47,8 +47,8 @@ defmodule Plausible.Site do
+     has_one :google_auth, GoogleAuth
+     has_one :weekly_report, Plausible.Site.WeeklyReport
+     has_one :monthly_report, Plausible.Site.MonthlyReport
+-    has_one :ownership, through: [:team, :ownership]
+-    has_one :owner, through: [:team, :owner]
++    has_many :ownerships, through: [:team, :ownerships], preload_order: [asc: :id]
++    has_many :owners, through: [:team, :owners]
+ 
+     # If `from_cache?` is set, the struct might be incomplete - see `Plausible.Site.Cache`.
+     # Use `Plausible.Repo.reload!(cached_site)` to pre-fill missing fields if
+diff --git a/lib/plausible/site/admin.ex b/lib/plausible/site/admin.ex
+index d20e3228f060..1881b14c4e56 100644
+--- a/lib/plausible/site/admin.ex
++++ b/lib/plausible/site/admin.ex
+@@ -33,9 +33,11 @@ defmodule Plausible.SiteAdmin do
+ 
+     from(r in query,
+       as: :site,
+-      inner_join: o in assoc(r, :owner),
++      inner_join: o in assoc(r, :owners),
+       inner_join: t in assoc(r, :team),
+-      preload: [owner: o, team: t, guest_memberships: [team_membership: :user]],
++      preload: [owners: o, team: t, guest_memberships: [team_membership: :user]],
++      or_where: type(t.identifier, :string) == ^search,
++      or_where: ilike(t.name, ^search_term),
+       or_where: ilike(r.domain, ^search_term),
+       or_where: ilike(o.email, ^search_term),
+       or_where: ilike(o.name, ^search_term),
+@@ -78,7 +80,8 @@ defmodule Plausible.SiteAdmin do
+       inserted_at: %{name: "Created at", value: &format_date(&1.inserted_at)},
+       timezone: nil,
+       public: nil,
+-      owner: %{value: &get_owner/1},
++      team: %{value: &get_team/1},
++      owners: %{value: &get_owners/1},
+       other_members: %{value: &get_other_members/1},
+       limits: %{
+         value: fn site ->
+@@ -113,7 +116,8 @@ defmodule Plausible.SiteAdmin do
+       transfer_ownership_direct: %{
+         name: "Transfer ownership without invite",
+         inputs: [
+-          %{name: "email", title: "New Owner Email", default: nil}
++          %{name: "email", title: "New Owner Email", default: nil},
++          %{name: "team_id", title: "Team Identifier", default: nil}
+         ],
+         action: fn conn, sites, params -> transfer_ownership_direct(conn, sites, params) end
+       }
+@@ -150,12 +154,14 @@ defmodule Plausible.SiteAdmin do
+     {:error, "Please select at least one site from the list"}
+   end
+ 
+-  defp transfer_ownership_direct(_conn, sites, %{"email" => email}) do
++  defp transfer_ownership_direct(_conn, sites, %{"email" => email} = params) do
+     with {:ok, new_owner} <- Plausible.Auth.get_user_by(email: email),
++         {:ok, team} <- get_team_by_id(params["team_id"]),
+          {:ok, _} <-
+            Plausible.Site.Memberships.bulk_transfer_ownership_direct(
+              sites,
+-             new_owner
++             new_owner,
++             team
+            ) do
+       :ok
+     else
+@@ -168,35 +174,87 @@ defmodule Plausible.SiteAdmin do
+       {:error, :no_plan} ->
+         {:error, "The new owner does not have a subscription"}
+ 
++      {:error, :multiple_teams} ->
++        {:error, "The new owner owns more than one team"}
++
++      {:error, :permission_denied} ->
++        {:error, "The new owner can't add sites in the selected team"}
++
++      {:error, :invalid_team_id} ->
++        {:error, "The provided team identifier is invalid"}
++
+       {:error, {:over_plan_limits, limits}} ->
+         {:error, "Plan limits exceeded for one of the sites: #{Enum.join(limits, ", ")}"}
+     end
+   end
+ 
++  defp get_team_by_id(id) when is_binary(id) and byte_size(id) > 0 do
++    case Ecto.UUID.cast(id) do
++      {:ok, team_id} ->
++        {:ok, Plausible.Teams.get(team_id)}
++
++      :error ->
++        {:error, :invalid_team_id}
++    end
++  end
++
++  defp get_team_by_id(_) do
++    {:ok, nil}
++  end
++
+   defp format_date(date) do
+     Calendar.strftime(date, "%b %-d, %Y")
+   end
+ 
+-  defp get_owner(site) do
+-    owner = site.owner
++  defp get_team(site) do
++    team_name =
++      case site.owners do
++        [owner] ->
++          if site.team.name == "My Team" do
++            owner.name
++          else
++            site.team.name
++          end
+ 
+-    if owner do
+-      escaped_name = Phoenix.HTML.html_escape(owner.name) |> Phoenix.HTML.safe_to_string()
+-      escaped_email = Phoenix.HTML.html_escape(owner.email) |> Phoenix.HTML.safe_to_string()
++        [_ | _] ->
++          site.team.name
++      end
++      |> html_escape()
+ 
+-      {:safe,
+-       """
+-        <a href="/crm/auth/user/#{owner.id}">#{escaped_name}</a>
+-        <br/><br/>
+-        #{escaped_email}
+-       """}
+-    end
++    """
++    <a href="/crm/teams/team/#{site.team.id}">#{team_name}</a>
++    """
++    |> Phoenix.HTML.raw()
++  end
++
++  defp get_owners(site) do
++    owners_html =
++      Enum.map(site.owners, fn owner ->
++        escaped_name = html_escape(owner.name)
++        escaped_email = html_escape(owner.email)
++
++        """
++         <a href="/crm/auth/user/#{owner.id}">#{escaped_name}</a>
++         <br/>
++         #{escaped_email}
++        """
++      end)
++
++    {:safe, Enum.join(owners_html, "<br/><br/>")}
+   end
+ 
+   defp get_other_members(site) do
+     site.guest_memberships
+-    |> Enum.map(fn m -> m.team_membership.user.email <> "(#{member_role(m.role)})" end)
+-    |> Enum.join(", ")
++    |> Enum.map_join(", ", fn m ->
++      id = m.team_membership.user.id
++      email = html_escape(m.team_membership.user.email)
++      role = html_escape(m.role)
++
++      """
++      <a href="/auth/user/#{id}">#{email} (#{role})</a>
++      """
++    end)
++    |> Phoenix.HTML.raw()
+   end
+ 
+   def get_struct_fields(module) do
+@@ -210,6 +268,9 @@ defmodule Plausible.SiteAdmin do
+   def create_changeset(schema, attrs), do: Plausible.Site.crm_changeset(schema, attrs)
+   def update_changeset(schema, attrs), do: Plausible.Site.crm_changeset(schema, attrs)
+ 
+-  defp member_role(:editor), do: :admin
+-  defp member_role(other), do: other
++  def html_escape(string) do
++    string
++    |> Phoenix.HTML.html_escape()
++    |> Phoenix.HTML.safe_to_string()
++  end
+ end
+diff --git a/lib/plausible/site/memberships.ex b/lib/plausible/site/memberships.ex
+index ea9797ee7f52..96981acbef18 100644
+--- a/lib/plausible/site/memberships.ex
++++ b/lib/plausible/site/memberships.ex
+@@ -5,7 +5,9 @@ defmodule Plausible.Site.Memberships do
+ 
+   alias Plausible.Site.Memberships
+ 
+-  defdelegate accept_invitation(invitation_id, user), to: Memberships.AcceptInvitation
++  defdelegate accept_invitation(invitation_id, user, team \\ nil),
++    to: Memberships.AcceptInvitation
++
+   defdelegate reject_invitation(invitation_id, user), to: Memberships.RejectInvitation
+   defdelegate remove_invitation(invitation_id, site), to: Memberships.RemoveInvitation
+ 
+@@ -15,6 +17,6 @@ defmodule Plausible.Site.Memberships do
+   defdelegate bulk_create_invitation(sites, inviter, invitee_email, role, opts),
+     to: Memberships.CreateInvitation
+ 
+-  defdelegate bulk_transfer_ownership_direct(sites, new_owner),
++  defdelegate bulk_transfer_ownership_direct(sites, new_owner, team \\ nil),
+     to: Memberships.AcceptInvitation
+ end
+diff --git a/lib/plausible/site/memberships/accept_invitation.ex b/lib/plausible/site/memberships/accept_invitation.ex
+index dec687387edd..6d64aaf9064a 100644
+--- a/lib/plausible/site/memberships/accept_invitation.ex
++++ b/lib/plausible/site/memberships/accept_invitation.ex
+@@ -25,22 +25,25 @@ defmodule Plausible.Site.Memberships.AcceptInvitation do
+           | Ecto.Changeset.t()
+           | :transfer_to_self
+           | :no_plan
++          | :multiple_teams
++          | :permission_denied
+ 
+   @type accept_error() ::
+           :invitation_not_found
+-          | :already_other_team_member
+           | Billing.Quota.Limits.over_limits_error()
+           | Ecto.Changeset.t()
+           | :no_plan
++          | :multiple_teams
++          | :permission_denied
+ 
+-  @type membership :: %Plausible.Teams.Membership{}
++  @type membership :: %Teams.Membership{}
+ 
+-  @spec bulk_transfer_ownership_direct([Site.t()], Auth.User.t()) ::
++  @spec bulk_transfer_ownership_direct([Site.t()], Auth.User.t(), Teams.Team.t() | nil) ::
+           {:ok, [membership]} | {:error, transfer_error()}
+-  def bulk_transfer_ownership_direct(sites, new_owner) do
++  def bulk_transfer_ownership_direct(sites, new_owner, team \\ nil) do
+     Repo.transaction(fn ->
+       for site <- sites do
+-        case transfer_ownership(site, new_owner) do
++        case transfer_ownership(site, new_owner, team) do
+           {:ok, membership} ->
+             membership
+ 
+@@ -51,14 +54,14 @@ defmodule Plausible.Site.Memberships.AcceptInvitation do
+     end)
+   end
+ 
+-  @spec accept_invitation(String.t(), Auth.User.t()) ::
++  @spec accept_invitation(String.t(), Auth.User.t(), Teams.Team.t() | nil) ::
+           {:ok, map()} | {:error, accept_error()}
+-  def accept_invitation(invitation_or_transfer_id, user) do
++  def accept_invitation(invitation_or_transfer_id, user, team \\ nil) do
+     with {:ok, invitation_or_transfer} <-
+            Teams.Invitations.find_for_user(invitation_or_transfer_id, user) do
+       case invitation_or_transfer do
+         %Teams.SiteTransfer{} = site_transfer ->
+-          do_accept_ownership_transfer(site_transfer, user)
++          do_accept_ownership_transfer(site_transfer, user, team)
+ 
+         %Teams.Invitation{} = team_invitation ->
+           do_accept_team_invitation(team_invitation, user)
+@@ -69,59 +72,57 @@ defmodule Plausible.Site.Memberships.AcceptInvitation do
+     end
+   end
+ 
+-  defp transfer_ownership(site, new_owner) do
++  defp transfer_ownership(site, new_owner, team) do
+     site = Repo.preload(site, :team)
+ 
+-    with :ok <-
+-           Plausible.Teams.Invitations.ensure_transfer_valid(
+-             site.team,
+-             new_owner,
+-             :owner
+-           ),
+-         {:ok, new_team} = Plausible.Teams.get_or_create(new_owner),
+-         :ok <- Plausible.Teams.Invitations.ensure_can_take_ownership(site, new_team),
+-         :ok <- Plausible.Teams.Invitations.transfer_site(site, new_owner) do
+-      site = site |> Repo.reload!() |> Repo.preload(ownership: :user)
+-
+-      {:ok, site.ownership}
++    with :ok <- Teams.Invitations.ensure_transfer_valid(site.team, new_owner, :owner),
++         {:ok, new_team} <- maybe_get_team(new_owner, team),
++         :ok <- check_can_transfer_site(new_team, new_owner),
++         :ok <- Teams.Invitations.ensure_can_take_ownership(site, new_team),
++         :ok <- Teams.Invitations.transfer_site(site, new_team) do
++      site = site |> Repo.reload!() |> Repo.preload(ownerships: :user)
++
++      {:ok, site.ownerships}
+     end
+   end
+ 
+-  defp do_accept_ownership_transfer(site_transfer, user) do
++  defp do_accept_ownership_transfer(site_transfer, new_owner, team) do
+     site = Repo.preload(site_transfer.site, :team)
+ 
+-    with :ok <-
+-           Plausible.Teams.Invitations.ensure_transfer_valid(
+-             site.team,
+-             user,
+-             :owner
+-           ),
+-         {:ok, team} = Plausible.Teams.get_or_create(user),
+-         :ok <- Plausible.Teams.Invitations.ensure_can_take_ownership(site, team),
+-         :ok <- Teams.Invitations.accept_site_transfer(site_transfer, user) do
++    with :ok <- Teams.Invitations.ensure_transfer_valid(site.team, new_owner, :owner),
++         {:ok, new_team} <- maybe_get_team(new_owner, team),
++         :ok <- check_can_transfer_site(new_team, new_owner),
++         :ok <- Teams.Invitations.ensure_can_take_ownership(site, new_team),
++         :ok <- Teams.Invitations.accept_site_transfer(site_transfer, new_team) do
+       Teams.Invitations.send_transfer_accepted_email(site_transfer)
+ 
+-      site = site |> Repo.reload!() |> Repo.preload(ownership: :user)
++      site = site |> Repo.reload!() |> Repo.preload(ownerships: :user)
+ 
+-      {:ok, %{team: team, team_membership: site.ownership, site: site}}
++      {:ok, %{team: new_team, team_memberships: site.ownerships, site: site}}
+     end
+   end
+ 
+-  defp do_accept_guest_invitation(guest_invitation, user) do
+-    Teams.Invitations.accept_guest_invitation(guest_invitation, user)
++  defp maybe_get_team(_user, %Teams.Team{} = team) do
++    {:ok, team}
+   end
+ 
+-  defp do_accept_team_invitation(team_invitation, user) do
+-    with :ok <- ensure_no_other_team_membership(team_invitation.team, user) do
+-      Teams.Invitations.accept_team_invitation(team_invitation, user)
+-    end
++  defp maybe_get_team(user, nil) do
++    Teams.get_or_create(user)
+   end
+ 
+-  defp ensure_no_other_team_membership(team, user) do
+-    if Teams.Users.team_member?(user, except: [team.id]) do
+-      {:error, :already_other_team_member}
+-    else
++  defp check_can_transfer_site(team, user) do
++    if Teams.Memberships.can_transfer_site?(team, user) do
+       :ok
++    else
++      {:error, :permission_denied}
+     end
+   end
++
++  defp do_accept_guest_invitation(guest_invitation, user) do
++    Teams.Invitations.accept_guest_invitation(guest_invitation, user)
++  end
++
++  defp do_accept_team_invitation(team_invitation, user) do
++    Teams.Invitations.accept_team_invitation(team_invitation, user)
++  end
+ end
+diff --git a/lib/plausible/site/memberships/create_invitation.ex b/lib/plausible/site/memberships/create_invitation.ex
+index 418085ba69f8..4d31af79de6b 100644
+--- a/lib/plausible/site/memberships/create_invitation.ex
++++ b/lib/plausible/site/memberships/create_invitation.ex
+@@ -50,7 +50,7 @@ defmodule Plausible.Site.Memberships.CreateInvitation do
+   end
+ 
+   defp do_invite(site, inviter, invitee_email, role, opts \\ []) do
+-    with site <- Repo.preload(site, [:owner, :team]),
++    with site <- Repo.preload(site, [:owners, :team]),
+          :ok <-
+            Teams.Invitations.check_invitation_permissions(
+              site,
+diff --git a/lib/plausible/site/removal.ex b/lib/plausible/site/removal.ex
+index 8fe878ab13de..2e4e0cf18907 100644
+--- a/lib/plausible/site/removal.ex
++++ b/lib/plausible/site/removal.ex
+@@ -9,7 +9,7 @@ defmodule Plausible.Site.Removal do
+   @spec run(Plausible.Site.t()) :: {:ok, map()}
+   def run(site) do
+     Repo.transaction(fn ->
+-      site = Plausible.Teams.load_for_site(site)
++      site = Repo.preload(site, :team)
+ 
+       result = Repo.delete_all(from(s in Plausible.Site, where: s.domain == ^site.domain))
+ 
+diff --git a/lib/plausible/sites.ex b/lib/plausible/sites.ex
+index 6dc806f7e827..1663999dc930 100644
+--- a/lib/plausible/sites.ex
++++ b/lib/plausible/sites.ex
+@@ -75,7 +75,7 @@ defmodule Plausible.Sites do
+     to: Plausible.Teams.Sites
+ 
+   def list_people(site) do
+-    owner_membership =
++    owner_memberships =
+       from(
+         tm in Teams.Membership,
+         inner_join: u in assoc(tm, :user),
+@@ -86,7 +86,7 @@ defmodule Plausible.Sites do
+           role: tm.role
+         }
+       )
+-      |> Repo.one!()
++      |> Repo.all()
+ 
+     memberships =
+       from(
+@@ -111,7 +111,7 @@ defmodule Plausible.Sites do
+       )
+       |> Repo.all()
+ 
+-    memberships = [owner_membership | memberships]
++    memberships = owner_memberships ++ memberships
+ 
+     invitations =
+       from(
+@@ -151,28 +151,55 @@ defmodule Plausible.Sites do
+     %{memberships: memberships, invitations: site_transfers ++ invitations}
+   end
+ 
+-  @spec for_user_query(Auth.User.t()) :: Ecto.Query.t()
+-  def for_user_query(user) do
+-    from(s in Site,
+-      inner_join: t in assoc(s, :team),
+-      inner_join: tm in assoc(t, :team_memberships),
+-      left_join: gm in assoc(tm, :guest_memberships),
+-      where: tm.user_id == ^user.id,
+-      where: tm.role != :guest or gm.site_id == s.id,
+-      order_by: [desc: s.id]
+-    )
++  @spec for_user_query(Auth.User.t(), Teams.Team.t() | nil) :: Ecto.Query.t()
++  def for_user_query(user, team \\ nil) do
++    query =
++      from(s in Site,
++        as: :site,
++        inner_join: t in assoc(s, :team),
++        as: :team,
++        inner_join: tm in assoc(t, :team_memberships),
++        as: :team_memberships,
++        left_join: gm in assoc(tm, :guest_memberships),
++        as: :guest_memberships,
++        where: tm.user_id == ^user.id,
++        order_by: [desc: s.id]
++      )
++
++    if team do
++      where(
++        query,
++        [team_memberships: tm, guest_memberships: gm, site: s],
++        (tm.role != :guest and tm.team_id == ^team.id) or gm.site_id == s.id
++      )
++    else
++      where(
++        query,
++        [team_memberships: tm, guest_memberships: gm, site: s],
++        tm.role != :guest or gm.site_id == s.id
++      )
++    end
+   end
+ 
+-  def create(user, params) do
++  def create(user, params, team \\ nil) do
+     Ecto.Multi.new()
+     |> Ecto.Multi.put(:site_changeset, Site.new(params))
+     |> Ecto.Multi.run(:create_team, fn _repo, _context ->
+-      {:ok, team} = Plausible.Teams.get_or_create(user)
++      cond do
++        team && Teams.Memberships.can_add_site?(team, user) ->
++          {:ok, Teams.with_subscription(team)}
++
++        is_nil(team) ->
++          with {:ok, team} <- Teams.get_or_create(user) do
++            {:ok, Teams.with_subscription(team)}
++          end
+ 
+-      {:ok, Plausible.Teams.with_subscription(team)}
++        true ->
++          {:error, :permission_denied}
++      end
+     end)
+     |> Ecto.Multi.run(:ensure_can_add_new_site, fn _repo, %{create_team: team} ->
+-      case Plausible.Teams.Billing.ensure_can_add_new_site(team) do
++      case Teams.Billing.ensure_can_add_new_site(team) do
+         :ok -> {:ok, :proceed}
+         error -> error
+       end
+@@ -304,9 +331,7 @@ defmodule Plausible.Sites do
+     locked
+   end
+ 
+-  def get_for_user!(user, domain, roles \\ [:owner, :admin, :viewer]) do
+-    roles = translate_roles(roles)
+-
++  def get_for_user!(user, domain, roles \\ [:owner, :admin, :editor, :viewer]) do
+     site =
+       if :super_admin in roles and Plausible.Auth.is_super_admin?(user.id) do
+         get_by_domain!(domain)
+@@ -319,9 +344,7 @@ defmodule Plausible.Sites do
+     Repo.preload(site, :team)
+   end
+ 
+-  def get_for_user(user, domain, roles \\ [:owner, :admin, :viewer]) do
+-    roles = translate_roles(roles)
+-
++  def get_for_user(user, domain, roles \\ [:owner, :admin, :editor, :viewer]) do
+     if :super_admin in roles and Plausible.Auth.is_super_admin?(user.id) do
+       get_by_domain(domain)
+     else
+@@ -331,13 +354,6 @@ defmodule Plausible.Sites do
+     end
+   end
+ 
+-  defp translate_roles(roles) do
+-    Enum.map(roles, fn
+-      :admin -> :editor
+-      role -> role
+-    end)
+-  end
+-
+   defp get_for_user_query(user_id, domain, roles) do
+     roles = Enum.map(roles, &to_string/1)
+ 
+diff --git a/lib/plausible/teams.ex b/lib/plausible/teams.ex
+index d72a8d4262b0..605345d3051e 100644
+--- a/lib/plausible/teams.ex
++++ b/lib/plausible/teams.ex
+@@ -16,6 +16,17 @@ defmodule Plausible.Teams do
+     not is_nil(team) and FunWithFlags.enabled?(:teams, for: team)
+   end
+ 
++  @spec get(pos_integer() | binary() | nil) :: Teams.Team.t() | nil
++  def get(nil), do: nil
++
++  def get(team_id) when is_integer(team_id) do
++    Repo.get(Teams.Team, team_id)
++  end
++
++  def get(team_identifier) when is_binary(team_identifier) do
++    Repo.get_by(Teams.Team, identifier: team_identifier)
++  end
++
+   @spec get!(pos_integer() | binary()) :: Teams.Team.t()
+   def get!(team_id) when is_integer(team_id) do
+     Repo.get!(Teams.Team, team_id)
+@@ -25,15 +36,6 @@ defmodule Plausible.Teams do
+     Repo.get_by!(Teams.Team, identifier: team_identifier)
+   end
+ 
+-  @spec get_owner(Teams.Team.t()) ::
+-          {:ok, Auth.User.t()} | {:error, :no_owner | :multiple_owners}
+-  def get_owner(team) do
+-    case Repo.preload(team, :owner).owner do
+-      nil -> {:error, :no_owner}
+-      owner_user -> {:ok, owner_user}
+-    end
+-  end
+-
+   @spec on_trial?(Teams.Team.t() | nil) :: boolean()
+   on_ee do
+     def on_trial?(nil), do: false
+@@ -110,27 +112,6 @@ defmodule Plausible.Teams do
+     |> Enum.any?(&Plausible.Sites.has_stats?/1)
+   end
+ 
+-  @doc """
+-  Create (when necessary) and load team relation for provided site.
+-
+-  Used for sync logic to work smoothly during transitional period.
+-  """
+-  def load_for_site(site) do
+-    site = Repo.preload(site, [:team, :owner])
+-
+-    if site.team do
+-      site
+-    else
+-      {:ok, team} = get_or_create(site.owner)
+-
+-      site
+-      |> Ecto.Changeset.change()
+-      |> Ecto.Changeset.put_assoc(:team, team)
+-      |> Ecto.Changeset.force_change(:updated_at, site.updated_at)
+-      |> Repo.update!()
+-    end
+-  end
+-
+   @doc """
+   Get or create user's team.
+ 
+@@ -156,6 +137,25 @@ defmodule Plausible.Teams do
+     end
+   end
+ 
++  @spec force_create_my_team(Auth.User.t()) :: Teams.Team.t()
++  def force_create_my_team(user) do
++    {:ok, team} =
++      Repo.transaction(fn ->
++        Repo.update_all(
++          from(tm in Teams.Membership,
++            where: tm.user_id == ^user.id,
++            where: tm.is_autocreated == true
++          ),
++          set: [is_autocreated: false]
++        )
++
++        {:ok, team} = create_my_team(user)
++        team
++      end)
++
++    team
++  end
++
+   @spec get_by_owner(Auth.User.t() | pos_integer()) ::
+           {:ok, Teams.Team.t()} | {:error, :no_team | :multiple_teams}
+   def get_by_owner(user_id) when is_integer(user_id) do
+diff --git a/lib/plausible/teams/billing.ex b/lib/plausible/teams/billing.ex
+index 44cdb9227424..ba356601d498 100644
+--- a/lib/plausible/teams/billing.ex
++++ b/lib/plausible/teams/billing.ex
+@@ -382,7 +382,7 @@ defmodule Plausible.Teams.Billing do
+   def team_member_usage(nil, _), do: 0
+ 
+   def team_member_usage(team, opts) do
+-    {:ok, owner} = Teams.get_owner(team)
++    [owner | _] = Repo.preload(team, :owners).owners
+     exclude_emails = Keyword.get(opts, :exclude_emails, []) ++ [owner.email]
+ 
+     pending_site_ids = Keyword.get(opts, :pending_ownership_site_ids, [])
+diff --git a/lib/plausible/teams/invitations.ex b/lib/plausible/teams/invitations.ex
+index 93becf11cc13..e8b1ece88fc3 100644
+--- a/lib/plausible/teams/invitations.ex
++++ b/lib/plausible/teams/invitations.ex
+@@ -143,7 +143,7 @@ defmodule Plausible.Teams.Invitations do
+   end
+ 
+   def invite(%Plausible.Site{} = site, invitee_email, role, inviter) do
+-    site = Teams.load_for_site(site)
++    site = Repo.preload(site, :team)
+ 
+     if role == :owner do
+       create_site_transfer(
+@@ -188,10 +188,9 @@ defmodule Plausible.Teams.Invitations do
+     )
+   end
+ 
+-  def accept_site_transfer(site_transfer, user) do
++  def accept_site_transfer(site_transfer, team) do
+     {:ok, _} =
+       Repo.transaction(fn ->
+-        {:ok, team} = Teams.get_or_create(user)
+         :ok = transfer_site_ownership(site_transfer.site, team, NaiveDateTime.utc_now(:second))
+         Repo.delete_all(from st in Teams.SiteTransfer, where: st.id == ^site_transfer.id)
+       end)
+@@ -199,10 +198,9 @@ defmodule Plausible.Teams.Invitations do
+     :ok
+   end
+ 
+-  def transfer_site(site, user) do
++  def transfer_site(site, team) do
+     {:ok, _} =
+       Repo.transaction(fn ->
+-        {:ok, team} = Teams.get_or_create(user)
+         :ok = transfer_site_ownership(site, team, NaiveDateTime.utc_now(:second))
+       end)
+ 
+@@ -335,7 +333,7 @@ defmodule Plausible.Teams.Invitations do
+     site =
+       Repo.preload(site, [
+         :team,
+-        :owner,
++        :owners,
+         guest_memberships: [team_membership: :user],
+         guest_invitations: [team_invitation: :inviter]
+       ])
+@@ -392,19 +390,21 @@ defmodule Plausible.Teams.Invitations do
+     Repo.delete_all(from gm in Teams.GuestMembership, where: gm.id in ^old_guest_ids)
+     :ok = Teams.Memberships.prune_guests(prior_team)
+ 
+-    {:ok, prior_owner} = Teams.get_owner(prior_team)
++    prior_owners = Repo.preload(prior_team, :owners).owners
+ 
+-    {:ok, prior_owner_team_membership} = create_team_membership(team, :guest, prior_owner, now)
++    for prior_owner <- prior_owners do
++      {:ok, prior_owner_team_membership} = create_team_membership(team, :guest, prior_owner, now)
+ 
+-    if prior_owner_team_membership.role == :guest do
+-      {:ok, _} =
+-        prior_owner_team_membership
+-        |> Teams.GuestMembership.changeset(site, :editor)
+-        |> Repo.insert(
+-          on_conflict: [set: [updated_at: now, role: :editor]],
+-          conflict_target: [:team_membership_id, :site_id],
+-          returning: true
+-        )
++      if prior_owner_team_membership.role == :guest do
++        {:ok, _} =
++          prior_owner_team_membership
++          |> Teams.GuestMembership.changeset(site, :editor)
++          |> Repo.insert(
++            on_conflict: [set: [updated_at: now, role: :editor]],
++            conflict_target: [:team_membership_id, :site_id],
++            returning: true
++          )
++      end
+     end
+ 
+     on_ee do
+diff --git a/lib/plausible/teams/invitations/invite_to_team.ex b/lib/plausible/teams/invitations/invite_to_team.ex
+index f8ce8eddb173..ea2bfe277a2e 100644
+--- a/lib/plausible/teams/invitations/invite_to_team.ex
++++ b/lib/plausible/teams/invitations/invite_to_team.ex
+@@ -12,7 +12,7 @@ defmodule Plausible.Teams.Invitations.InviteToTeam do
+   def invite(team, inviter, invitee_email, role, opts \\ [])
+ 
+   def invite(team, inviter, invitee_email, role, opts) when role in @valid_roles do
+-    with team <- Repo.preload(team, [:owner]),
++    with team <- Repo.preload(team, [:owners]),
+          :ok <-
+            Teams.Invitations.check_invitation_permissions(
+              team,
+diff --git a/lib/plausible/teams/memberships.ex b/lib/plausible/teams/memberships.ex
+index 31e466fae357..1c102cc2e09a 100644
+--- a/lib/plausible/teams/memberships.ex
++++ b/lib/plausible/teams/memberships.ex
+@@ -46,6 +46,26 @@ defmodule Plausible.Teams.Memberships do
+     end
+   end
+ 
++  def can_add_site?(team, user) do
++    case team_role(team, user) do
++      {:ok, role} when role in [:owner, :admin, :editor] ->
++        true
++
++      _ ->
++        false
++    end
++  end
++
++  def can_transfer_site?(team, user) do
++    case team_role(team, user) do
++      {:ok, role} when role in [:owner, :admin] ->
++        true
++
++      _ ->
++        false
++    end
++  end
++
+   def site_role(_site, nil), do: {:error, :not_a_member}
+ 
+   def site_role(site, user) do
+diff --git a/lib/plausible/teams/sites.ex b/lib/plausible/teams/sites.ex
+index c09ee1a8b6b9..b0a3b423047c 100644
+--- a/lib/plausible/teams/sites.ex
++++ b/lib/plausible/teams/sites.ex
+@@ -8,18 +8,21 @@ defmodule Plausible.Teams.Sites do
+   alias Plausible.Site
+   alias Plausible.Teams
+ 
+-  @type list_opt() :: {:filter_by_domain, String.t()}
++  @type list_opt() :: {:filter_by_domain, String.t()} | {:team, Teams.Team.t() | nil}
+ 
+   @spec list(Auth.User.t(), map(), [list_opt()]) :: Scrivener.Page.t()
+   def list(user, pagination_params, opts \\ []) do
+     domain_filter = Keyword.get(opts, :filter_by_domain)
++    team = Keyword.get(opts, :team)
+ 
+     team_membership_query =
+-      from tm in Teams.Membership,
++      from(tm in Teams.Membership,
+         inner_join: t in assoc(tm, :team),
+         inner_join: s in assoc(t, :sites),
+         where: tm.user_id == ^user.id and tm.role != :guest,
+         select: %{site_id: s.id, entry_type: "site"}
++      )
++      |> maybe_filter_by_team(team)
+ 
+     guest_membership_query =
+       from tm in Teams.Membership,
+@@ -71,9 +74,10 @@ defmodule Plausible.Teams.Sites do
+   @spec list_with_invitations(Auth.User.t(), map(), [list_opt()]) :: Scrivener.Page.t()
+   def list_with_invitations(user, pagination_params, opts \\ []) do
+     domain_filter = Keyword.get(opts, :filter_by_domain)
++    team = Keyword.get(opts, :team)
+ 
+     team_membership_query =
+-      from tm in Teams.Membership,
++      from(tm in Teams.Membership,
+         inner_join: t in assoc(tm, :team),
+         inner_join: u in assoc(tm, :user),
+         as: :user,
+@@ -94,6 +98,8 @@ defmodule Plausible.Teams.Sites do
+           role: tm.role,
+           transfer_id: 0
+         }
++      )
++      |> maybe_filter_by_team(team)
+ 
+     guest_membership_query =
+       from(tm in Teams.Membership,
+@@ -265,6 +271,12 @@ defmodule Plausible.Teams.Sites do
+     end)
+   end
+ 
++  defp maybe_filter_by_team(team_membership_query, %Teams.Team{} = team) do
++    where(team_membership_query, [tm], tm.team_id == ^team.id)
++  end
++
++  defp maybe_filter_by_team(team_membership_query, _), do: team_membership_query
++
+   defp maybe_filter_by_domain(query, domain)
+        when byte_size(domain) >= 1 and byte_size(domain) <= 64 do
+     where(query, [site: s], ilike(s.domain, ^"%#{domain}%"))
+diff --git a/lib/plausible/teams/team.ex b/lib/plausible/teams/team.ex
+index 78d74e9afe7e..b4b1ea191b7b 100644
+--- a/lib/plausible/teams/team.ex
++++ b/lib/plausible/teams/team.ex
+@@ -37,8 +37,11 @@ defmodule Plausible.Teams.Team do
+     has_one :subscription, Plausible.Billing.Subscription
+     has_one :enterprise_plan, Plausible.Billing.EnterprisePlan
+ 
+-    has_one :ownership, Plausible.Teams.Membership, where: [role: :owner]
+-    has_one :owner, through: [:ownership, :user]
++    has_many :ownerships, Plausible.Teams.Membership,
++      where: [role: :owner],
++      preload_order: [asc: :id]
++
++    has_many :owners, through: [:ownerships, :user]
+ 
+     timestamps()
+   end
+diff --git a/lib/plausible/teams/team_admin.ex b/lib/plausible/teams/team_admin.ex
+new file mode 100644
+index 000000000000..b08f174e6010
+--- /dev/null
++++ b/lib/plausible/teams/team_admin.ex
+@@ -0,0 +1,222 @@
++defmodule Plausible.Teams.TeamAdmin do
++  @moduledoc """
++  Kaffy CRM definition for Team.
++  """
++
++  use Plausible
++  use Plausible.Repo
++
++  alias Plausible.Billing.Subscription
++  alias Plausible.Teams
++
++  require Plausible.Billing.Subscription.Status
++
++  def custom_index_query(conn, _schema, query) do
++    search =
++      (conn.params["custom_search"] || "")
++      |> String.trim()
++      |> String.replace("%", "\%")
++      |> String.replace("_", "\_")
++
++    search_term = "%#{search}%"
++
++    member_query =
++      from t in Plausible.Teams.Team,
++        left_join: tm in assoc(t, :team_memberships),
++        left_join: u in assoc(tm, :user),
++        where: t.id == parent_as(:team).id,
++        where: ilike(u.email, ^search_term) or ilike(u.name, ^search_term),
++        select: 1
++
++    from(t in query,
++      as: :team,
++      left_lateral_join: s in subquery(Teams.last_subscription_join_query()),
++      on: true,
++      preload: [:owners, team_memberships: :user, subscription: s],
++      or_where: ilike(t.name, ^search_term),
++      or_where: exists(member_query)
++    )
++  end
++
++  def index(_) do
++    [
++      name: %{value: &team_name/1},
++      inserted_at: %{name: "Created at", value: &format_date(&1.inserted_at)},
++      owners: %{value: &get_owners/1},
++      other_members: %{value: &get_other_members/1},
++      trial_expiry_date: %{name: "Trial expiry", value: &format_date(&1.trial_expiry_date)},
++      subscription_plan: %{value: &Phoenix.HTML.raw(subscription_plan(&1))},
++      subscription_status: %{value: &Phoenix.HTML.raw(subscription_status(&1))},
++      grace_period: %{value: &Phoenix.HTML.raw(grace_period_status(&1))},
++      accept_traffic_until: %{
++        name: "Accept traffic until",
++        value: &format_date(&1.accept_traffic_until)
++      }
++    ]
++  end
++
++  def form_fields(_) do
++    [
++      identifier: %{create: :hidden, update: :readonly},
++      name: nil,
++      trial_expiry_date: %{
++        help_text: "Change will also update Accept Traffic Until date"
++      },
++      allow_next_upgrade_override: nil,
++      accept_traffic_until: %{
++        help_text: "Change will take up to 15 minutes to propagate"
++      }
++    ]
++  end
++
++  def resource_actions(_) do
++    [
++      unlock: %{
++        name: "Unlock",
++        action: fn _, team -> unlock(team) end
++      },
++      lock: %{
++        name: "Lock",
++        action: fn _, team -> lock(team) end
++      }
++    ]
++  end
++
++  def delete(_conn, %{data: _team}) do
++    # TODO: Implement custom team removal
++    "Cannot remove the team for now"
++  end
++
++  def grace_period_status(team) do
++    grace_period = team.grace_period
++
++    case grace_period do
++      nil ->
++        "--"
++
++      %{manual_lock: true, is_over: true} ->
++        "Manually locked"
++
++      %{manual_lock: true, is_over: false} ->
++        "Waiting for manual lock"
++
++      %{is_over: true} ->
++        "ended"
++
++      %{end_date: %Date{} = end_date} ->
++        days_left = Date.diff(end_date, Date.utc_today())
++        "#{days_left} days left"
++    end
++  end
++
++  def subscription_plan(team) do
++    subscription = team.subscription
++
++    if Subscription.Status.active?(subscription) && subscription.paddle_subscription_id do
++      quota = PlausibleWeb.AuthView.subscription_quota(subscription)
++      interval = PlausibleWeb.AuthView.subscription_interval(subscription)
++
++      ~s(<a href="#{manage_url(subscription)}">#{quota} \(#{interval}\)</a>)
++    else
++      "--"
++    end
++  end
++
++  def subscription_status(team) do
++    cond do
++      team && team.subscription ->
++        status_str =
++          PlausibleWeb.SettingsView.present_subscription_status(team.subscription.status)
++
++        if team.subscription.paddle_subscription_id do
++          ~s(<a href="#{manage_url(team.subscription)}">#{status_str}</a>)
++        else
++          status_str
++        end
++
++      Plausible.Teams.on_trial?(team) ->
++        "On trial"
++
++      true ->
++        "Trial expired"
++    end
++  end
++
++  defp lock(team) do
++    if team.grace_period do
++      Plausible.Billing.SiteLocker.set_lock_status_for(team, true)
++      Plausible.Teams.end_grace_period(team)
++      {:ok, team}
++    else
++      {:error, team, "No active grace period on this team"}
++    end
++  end
++
++  defp unlock(team) do
++    if team.grace_period do
++      Plausible.Teams.remove_grace_period(team)
++      Plausible.Billing.SiteLocker.set_lock_status_for(team, false)
++      {:ok, team}
++    else
++      {:error, team, "No active grace period on this team"}
++    end
++  end
++
++  defp team_name(team) do
++    case team.owners do
++      [owner] ->
++        if team.name == "My Team" do
++          owner.name
++        else
++          team.name
++        end
++
++      [_ | _] ->
++        team.name
++    end
++  end
++
++  defp manage_url(%{paddle_subscription_id: paddle_id} = _subscription) do
++    Plausible.Billing.PaddleApi.vendors_domain() <>
++      "/subscriptions/customers/manage/" <> paddle_id
++  end
++
++  defp get_owners(team) do
++    team.owners
++    |> Enum.map_join("<br><br>\n", fn owner ->
++      name = html_escape(owner.name)
++      email = html_escape(owner.email)
++
++      """
++      <a href="/crm/auth/user/#{owner.id}">#{name}</a><br>#{email}
++      """
++    end)
++    |> Phoenix.HTML.raw()
++  end
++
++  defp get_other_members(team) do
++    team.team_memberships
++    |> Enum.reject(&(&1.role == :owner))
++    |> Enum.map_join("<br>\n", fn tm ->
++      email = html_escape(tm.user.email)
++      role = html_escape(tm.role)
++
++      """
++      <a href="/crm/auth/user/#{tm.user.id}">#{email <> " (#{role})"}</a>
++      """
++    end)
++    |> Phoenix.HTML.raw()
++  end
++
++  defp format_date(nil), do: "--"
++
++  defp format_date(date) do
++    Calendar.strftime(date, "%b %-d, %Y")
++  end
++
++  def html_escape(string) do
++    string
++    |> Phoenix.HTML.html_escape()
++    |> Phoenix.HTML.safe_to_string()
++  end
++end
+diff --git a/lib/plausible/teams/users.ex b/lib/plausible/teams/users.ex
+index bd2144bde886..60f01886f9bb 100644
+--- a/lib/plausible/teams/users.ex
++++ b/lib/plausible/teams/users.ex
+@@ -8,6 +8,31 @@ defmodule Plausible.Teams.Users do
+   alias Plausible.Repo
+   alias Plausible.Teams
+ 
++  def owned_teams(user) do
++    Repo.all(
++      from(
++        tm in Teams.Membership,
++        inner_join: t in assoc(tm, :team),
++        where: tm.user_id == ^user.id,
++        where: tm.role == :owner,
++        select: t
++      )
++    )
++  end
++
++  def teams(user) do
++    from(
++      tm in Teams.Membership,
++      inner_join: t in assoc(tm, :team),
++      where: tm.user_id == ^user.id,
++      where: tm.role != :guest,
++      select: t,
++      order_by: [t.name, t.id]
++    )
++    |> Repo.all()
++    |> Repo.preload(:owners)
++  end
++
+   def team_member?(user, opts \\ []) do
+     excluded_team_ids = Keyword.get(opts, :except, [])
+ 
+diff --git a/lib/plausible_web/controllers/admin_controller.ex b/lib/plausible_web/controllers/admin_controller.ex
+index 69c6ef5f1cbd..b99a15f64857 100644
+--- a/lib/plausible_web/controllers/admin_controller.ex
++++ b/lib/plausible_web/controllers/admin_controller.ex
+@@ -8,18 +8,13 @@ defmodule PlausibleWeb.AdminController do
+   alias Plausible.Teams
+ 
+   def usage(conn, params) do
+-    user_id = String.to_integer(params["user_id"])
++    team_id = String.to_integer(params["team_id"])
+ 
+     team =
+-      case Teams.get_by_owner(user_id) do
+-        {:ok, team} ->
+-          team
+-          |> Teams.with_subscription()
+-          |> Plausible.Repo.preload(:owner)
+-
+-        {:error, :no_team} ->
+-          nil
+-      end
++      team_id
++      |> Teams.get()
++      |> Repo.preload([:owners, team_memberships: :user])
++      |> Teams.with_subscription()
+ 
+     usage = Teams.Billing.quota_usage(team, with_features: true)
+ 
+@@ -36,17 +31,35 @@ defmodule PlausibleWeb.AdminController do
+     |> send_resp(200, html_response)
+   end
+ 
+-  def current_plan(conn, params) do
++  def user_info(conn, params) do
+     user_id = String.to_integer(params["user_id"])
+ 
+-    team =
+-      case Teams.get_by_owner(user_id) do
+-        {:ok, team} ->
+-          Teams.with_subscription(team)
++    user =
++      Plausible.Auth.User
++      |> Repo.get!(user_id)
++      |> Repo.preload(:owned_teams)
+ 
+-        {:error, :no_team} ->
+-          nil
+-      end
++    teams_list = Plausible.Auth.UserAdmin.teams(user.owned_teams)
++
++    html_response = """
++      <div style="margin-bottom: 1.1em;">
++        <p><b>Owned teams:</b></p>
++        #{teams_list}
++      </div>
++    """
++
++    conn
++    |> put_resp_content_type("text/html")
++    |> send_resp(200, html_response)
++  end
++
++  def current_plan(conn, params) do
++    team_id = String.to_integer(params["team_id"])
++
++    team =
++      team_id
++      |> Teams.get()
++      |> Teams.with_subscription()
+ 
+     plan =
+       case team && team.subscription &&
+@@ -74,21 +87,39 @@ defmodule PlausibleWeb.AdminController do
+     |> send_resp(200, json_response)
+   end
+ 
+-  def user_by_id(conn, params) do
+-    id = params["user_id"]
++  def team_by_id(conn, params) do
++    id = params["team_id"]
+ 
+     entry =
+       Repo.one(
+-        from u in Plausible.Auth.User,
+-          where: u.id == ^id,
+-          select: fragment("concat(?, ?, ?, ?)", u.name, " (", u.email, ")")
++        from t in Plausible.Teams.Team,
++          inner_join: o in assoc(t, :owners),
++          where: t.id == ^id,
++          group_by: t.id,
++          select:
++            fragment(
++              """
++              case when ? = ? then 
++                string_agg(concat(?, ' (', ?, ')'), ',') 
++              else 
++                concat(?, ' [', string_agg(concat(?, ' (', ?, ')'), ','), ']') 
++              end
++              """,
++              t.name,
++              "My Team",
++              o.name,
++              o.email,
++              t.name,
++              o.name,
++              o.email
++            )
+       ) || ""
+ 
+     conn
+     |> send_resp(200, entry)
+   end
+ 
+-  def user_search(conn, params) do
++  def team_search(conn, params) do
+     search =
+       (params["search"] || "")
+       |> String.trim()
+@@ -102,20 +133,47 @@ defmodule PlausibleWeb.AdminController do
+ 
+         term = "%#{term}%"
+ 
+-        user_id =
++        team_id =
+           case Integer.parse(search) do
+             {id, ""} -> id
+             _ -> 0
+           end
+ 
+-        if user_id != 0 do
++        if team_id != 0 do
+           []
+         else
+           Repo.all(
+-            from u in Plausible.Auth.User,
+-              where: u.id == ^user_id or ilike(u.name, ^term) or ilike(u.email, ^term),
+-              order_by: [u.name, u.id],
+-              select: [fragment("concat(?, ?, ?, ?)", u.name, " (", u.email, ")"), u.id],
++            from t in Teams.Team,
++              inner_join: o in assoc(t, :owners),
++              where:
++                t.id == ^team_id or
++                  type(t.identifier, :string) == ^search or
++                  ilike(t.name, ^term) or
++                  ilike(o.email, ^term) or
++                  ilike(o.name, ^term),
++              order_by: [t.name, t.id],
++              group_by: t.id,
++              select: [
++                fragment(
++                  """
++                  case when ? = ? then 
++                    concat(string_agg(concat(?, ' (', ?, ')'), ','), ' - ', ?)
++                  else 
++                    concat(concat(?, ' [', string_agg(concat(?, ' (', ?, ')'), ','), ']'), ' - ', ?)
++                  end
++                  """,
++                  t.name,
++                  "My Team",
++                  o.name,
++                  o.email,
++                  t.identifier,
++                  t.name,
++                  o.name,
++                  o.email,
++                  t.identifier
++                ),
++                t.id
++              ],
+               limit: 20
+           )
+         end
+@@ -131,12 +189,17 @@ defmodule PlausibleWeb.AdminController do
+   defp usage_and_limits_html(team, usage, limits, embed?) do
+     content = """
+       <ul>
+-        <li>Team: <b>#{team && team.name}</b></li>
++        <li>Team: <b>#{team.name}</b></li>
++        <li>Subscription plan: #{Teams.TeamAdmin.subscription_plan(team)}</li>
++        <li>Subscription status: #{Teams.TeamAdmin.subscription_status(team)}</li>
++        <li>Grace period: #{Teams.TeamAdmin.grace_period_status(team)}</li>
+         <li>Sites: <b>#{usage.sites}</b> / #{limits.sites}</li>
+         <li>Team members: <b>#{usage.team_members}</b> / #{limits.team_members}</li>
+         <li>Features: #{features_usage(usage.features)}</li>
+         <li>Monthly pageviews: #{monthly_pageviews_usage(usage.monthly_pageviews, limits.monthly_pageviews)}</li>
+         #{sites_count_row(team)}
++        <li>Owners: #{get_owners(team)}</li>
++        <li>Team members: #{get_other_members(team)}</li>
+       </ul>
+     """
+ 
+@@ -177,7 +240,7 @@ defmodule PlausibleWeb.AdminController do
+ 
+       sites_link =
+         Routes.kaffy_resource_url(PlausibleWeb.Endpoint, :index, :sites, :site,
+-          custom_search: team.owner.email
++          custom_search: team.identifier
+         )
+ 
+       """
+@@ -210,4 +273,34 @@ defmodule PlausibleWeb.AdminController do
+ 
+     "<ul>#{Enum.join(list_items)}</ul>"
+   end
++
++  defp get_owners(team) do
++    team.owners
++    |> Enum.map_join(", ", fn owner ->
++      email = html_escape(owner.email)
++
++      """
++      <a href="/crm/auth/user/#{owner.id}">#{email}</a>
++      """
++    end)
++  end
++
++  defp get_other_members(team) do
++    team.team_memberships
++    |> Enum.reject(&(&1.role == :owner))
++    |> Enum.map_join(", ", fn tm ->
++      email = html_escape(tm.user.email)
++      role = html_escape(tm.role)
++
++      """
++      <a href="/crm/auth/user/#{tm.user.id}">#{email <> " (#{role})"}</a>
++      """
++    end)
++  end
++
++  def html_escape(string) do
++    string
++    |> Phoenix.HTML.html_escape()
++    |> Phoenix.HTML.safe_to_string()
++  end
+ end
+diff --git a/lib/plausible_web/controllers/api/external_query_api_controller.ex b/lib/plausible_web/controllers/api/external_query_api_controller.ex
+index f64414ee7ef0..7fc17e0e64ee 100644
+--- a/lib/plausible_web/controllers/api/external_query_api_controller.ex
++++ b/lib/plausible_web/controllers/api/external_query_api_controller.ex
+@@ -7,7 +7,7 @@ defmodule PlausibleWeb.Api.ExternalQueryApiController do
+   alias Plausible.Stats.Query
+ 
+   def query(conn, params) do
+-    site = Repo.preload(conn.assigns.site, :owner)
++    site = Repo.preload(conn.assigns.site, :owners)
+ 
+     case Query.build(site, conn.assigns.schema_type, params, debug_metadata(conn)) do
+       {:ok, query} ->
+diff --git a/lib/plausible_web/controllers/api/external_stats_controller.ex b/lib/plausible_web/controllers/api/external_stats_controller.ex
+index 9bf8edd7c202..6890d470585b 100644
+--- a/lib/plausible_web/controllers/api/external_stats_controller.ex
++++ b/lib/plausible_web/controllers/api/external_stats_controller.ex
+@@ -10,7 +10,7 @@ defmodule PlausibleWeb.Api.ExternalStatsController do
+   end
+ 
+   def aggregate(conn, params) do
+-    site = Repo.preload(conn.assigns.site, :owner)
++    site = Repo.preload(conn.assigns.site, :owners)
+ 
+     params = Map.put(params, "property", nil)
+ 
+@@ -31,7 +31,7 @@ defmodule PlausibleWeb.Api.ExternalStatsController do
+   end
+ 
+   def breakdown(conn, params) do
+-    site = Repo.preload(conn.assigns.site, :owner)
++    site = Repo.preload(conn.assigns.site, :owners)
+ 
+     with :ok <- validate_period(params),
+          :ok <- validate_date(params),
+@@ -239,7 +239,7 @@ defmodule PlausibleWeb.Api.ExternalStatsController do
+   defp event_only_property?(_), do: false
+ 
+   def timeseries(conn, params) do
+-    site = Repo.preload(conn.assigns.site, :owner)
++    site = Repo.preload(conn.assigns.site, :owners)
+ 
+     params = Map.put(params, "property", nil)
+ 
+diff --git a/lib/plausible_web/controllers/api/internal_controller.ex b/lib/plausible_web/controllers/api/internal_controller.ex
+index 4f6cba764d12..3b54c7fdb14b 100644
+--- a/lib/plausible_web/controllers/api/internal_controller.ex
++++ b/lib/plausible_web/controllers/api/internal_controller.ex
+@@ -6,9 +6,10 @@ defmodule PlausibleWeb.Api.InternalController do
+ 
+   def sites(conn, _params) do
+     current_user = conn.assigns[:current_user]
++    current_team = conn.assigns[:current_team]
+ 
+     if current_user do
+-      sites = sites_for(current_user)
++      sites = sites_for(current_user, current_team)
+ 
+       json(conn, %{data: sites})
+     else
+@@ -54,8 +55,8 @@ defmodule PlausibleWeb.Api.InternalController do
+     end
+   end
+ 
+-  defp sites_for(user) do
+-    pagination = Sites.list(user, %{page_size: 9})
++  defp sites_for(user, team) do
++    pagination = Sites.list(user, %{page_size: 9}, team: team)
+     Enum.map(pagination.entries, &%{domain: &1.domain})
+   end
+ end
+diff --git a/lib/plausible_web/controllers/auth_controller.ex b/lib/plausible_web/controllers/auth_controller.ex
+index 19315a50d62a..7e989ba60e27 100644
+--- a/lib/plausible_web/controllers/auth_controller.ex
++++ b/lib/plausible_web/controllers/auth_controller.ex
+@@ -3,6 +3,7 @@ defmodule PlausibleWeb.AuthController do
+   use Plausible.Repo
+ 
+   alias Plausible.Auth
++  alias Plausible.Teams
+   alias PlausibleWeb.TwoFactor
+   alias PlausibleWeb.UserAuth
+ 
+@@ -33,7 +34,9 @@ defmodule PlausibleWeb.AuthController do
+            :verify_2fa_setup_form,
+            :verify_2fa_setup,
+            :disable_2fa,
+-           :generate_2fa_recovery_codes
++           :generate_2fa_recovery_codes,
++           :select_team,
++           :switch_team
+          ]
+   )
+ 
+@@ -52,6 +55,67 @@ defmodule PlausibleWeb.AuthController do
+     TwoFactor.Session.clear_2fa_user(conn)
+   end
+ 
++  def select_team(conn, _params) do
++    current_user = conn.assigns.current_user
++
++    owner_name_fn = fn owner ->
++      if owner.id == current_user.id do
++        "You"
++      else
++        owner.name
++      end
++    end
++
++    teams =
++      current_user
++      |> Teams.Users.teams()
++      |> Enum.map(fn team ->
++        current_team? = team.id == conn.assigns.current_team.id
++
++        owners =
++          Enum.map_join(team.owners, ", ", &owner_name_fn.(&1))
++
++        many_owners? = length(team.owners) > 1
++
++        %{
++          identifier: team.identifier,
++          name: team.name,
++          current?: current_team?,
++          many_owners?: many_owners?,
++          owners: owners
++        }
++      end)
++
++    render(conn, "select_team.html", teams: teams)
++  end
++
++  def switch_team(conn, params) do
++    current_user = conn.assigns.current_user
++    team = Teams.get(params["team_id"])
++
++    if team do
++      case Teams.Memberships.team_role(team, current_user) do
++        {:ok, role} when role != :guest ->
++          conn
++          |> put_session("current_team_id", team.identifier)
++          |> put_flash(
++            :success,
++            "You have switched to \"#{conn.assigns.current_team.name}\" team"
++          )
++          |> redirect(to: Routes.site_path(conn, :index))
++
++        _ ->
++          conn
++          |> put_flash(:error, "You have select an invalid team")
++          |> redirect(to: Routes.site_path(conn, :index))
++      end
++    else
++      conn
++      |> put_flash(:error, "You have select an invalid team")
++      |> redirect(to: Routes.site_path(conn, :index))
++    end
++  end
++
+   def activate_form(conn, params) do
+     user = conn.assigns.current_user
+     flow = params["flow"] || PlausibleWeb.Flows.register()
+@@ -433,9 +497,18 @@ defmodule PlausibleWeb.AuthController do
+   end
+ 
+   def delete_me(conn, params) do
+-    Plausible.Auth.delete_user(conn.assigns[:current_user])
++    case Plausible.Auth.delete_user(conn.assigns[:current_user]) do
++      {:ok, :deleted} ->
++        logout(conn, params)
+ 
+-    logout(conn, params)
++      {:error, :is_only_team_owner} ->
++        conn
++        |> put_flash(
++          :error,
++          "You can't delete your account when you are the only owner on a team."
++        )
++        |> redirect(to: Routes.settings_path(conn, :danger_zone))
++    end
+   end
+ 
+   def logout(conn, params) do
+diff --git a/lib/plausible_web/controllers/invitation_controller.ex b/lib/plausible_web/controllers/invitation_controller.ex
+index 8bc3186b12bf..9279a22dfc8f 100644
+--- a/lib/plausible_web/controllers/invitation_controller.ex
++++ b/lib/plausible_web/controllers/invitation_controller.ex
+@@ -7,7 +7,10 @@ defmodule PlausibleWeb.InvitationController do
+        [:owner, :editor, :admin] when action in [:remove_invitation]
+ 
+   def accept_invitation(conn, %{"invitation_id" => invitation_id}) do
+-    case Plausible.Site.Memberships.accept_invitation(invitation_id, conn.assigns.current_user) do
++    current_user = conn.assigns.current_user
++    team = conn.assigns.current_team
++
++    case Plausible.Site.Memberships.accept_invitation(invitation_id, current_user, team) do
+       {:ok, result} ->
+         team = result.team
+ 
+@@ -38,9 +41,9 @@ defmodule PlausibleWeb.InvitationController do
+         |> put_flash(:error, "Invitation missing or already accepted")
+         |> redirect(to: "/sites")
+ 
+-      {:error, :already_other_team_member} ->
++      {:error, :permission_denied} ->
+         conn
+-        |> put_flash(:error, "You already are a team member in another team")
++        |> put_flash(:error, "You can't add sites in the current team")
+         |> redirect(to: "/sites")
+ 
+       {:error, :no_plan} ->
+diff --git a/lib/plausible_web/controllers/site/membership_controller.ex b/lib/plausible_web/controllers/site/membership_controller.ex
+index 9476373128dd..18dde77f6de7 100644
+--- a/lib/plausible_web/controllers/site/membership_controller.ex
++++ b/lib/plausible_web/controllers/site/membership_controller.ex
+@@ -3,7 +3,7 @@ defmodule PlausibleWeb.Site.MembershipController do
+     This controller deals with user management via the UI in Site Settings -> People. It's important to enforce permissions in this controller.
+ 
+     Owner - Can manage users, can trigger a 'transfer ownership' request
+-    Admin - Can manage users
++    Admin and Editor - Can manage users
+     Viewer - Can not access user management settings
+     Anyone - Can accept invitations
+ 
+@@ -27,7 +27,7 @@ defmodule PlausibleWeb.Site.MembershipController do
+     site =
+       conn.assigns.current_user
+       |> Plausible.Sites.get_for_user!(conn.assigns.site.domain)
+-      |> Plausible.Repo.preload(:owner)
++      |> Plausible.Repo.preload(:owners)
+ 
+     limit = Plausible.Teams.Billing.team_member_limit(site.team)
+     usage = Plausible.Teams.Billing.team_member_usage(site.team)
+@@ -48,7 +48,7 @@ defmodule PlausibleWeb.Site.MembershipController do
+ 
+     site =
+       Plausible.Sites.get_for_user!(conn.assigns.current_user, site_domain)
+-      |> Plausible.Repo.preload(:owner)
++      |> Plausible.Repo.preload(:owners)
+ 
+     case Memberships.create_invitation(site, conn.assigns.current_user, email, role) do
+       {:ok, invitation} ->
+diff --git a/lib/plausible_web/controllers/site_controller.ex b/lib/plausible_web/controllers/site_controller.ex
+index f7cffb0d84a8..5711fd687418 100644
+--- a/lib/plausible_web/controllers/site_controller.ex
++++ b/lib/plausible_web/controllers/site_controller.ex
+@@ -26,12 +26,13 @@ defmodule PlausibleWeb.SiteController do
+   end
+ 
+   def create_site(conn, %{"site" => site_params}) do
+-    team = conn.assigns.my_team
++    current_team = conn.assigns.current_team
++    team = Plausible.Teams.get(site_params["team_id"]) || current_team
+     user = conn.assigns.current_user
+     first_site? = Plausible.Teams.Billing.site_usage(team) == 0
+     flow = conn.params["flow"]
+ 
+-    case Sites.create(user, site_params) do
++    case Sites.create(user, site_params, team) do
+       {:ok, %{site: site}} ->
+         if first_site? do
+           PlausibleWeb.Email.welcome_email(user)
+@@ -46,6 +47,18 @@ defmodule PlausibleWeb.SiteController do
+             )
+         )
+ 
++      {:error, _, :permission_denied, _} ->
++        conn
++        |> put_flash(:error, "You are not permitted to add sites in the current team")
++        |> render("new.html",
++          changeset: Plausible.Site.changeset(%Plausible.Site{}),
++          first_site?: first_site?,
++          site_limit: Plausible.Teams.Billing.site_limit(team),
++          site_limit_exceeded?: false,
++          flow: flow,
++          form_submit_url: "/sites?flow=#{flow}"
++        )
++
+       {:error, _, {:over_limit, limit}, _} ->
+         render(conn, "new.html",
+           changeset: Plausible.Site.changeset(%Plausible.Site{}),
+diff --git a/lib/plausible_web/controllers/stats_controller.ex b/lib/plausible_web/controllers/stats_controller.ex
+index e46f6bbed041..5023fccfbc94 100644
+--- a/lib/plausible_web/controllers/stats_controller.ex
++++ b/lib/plausible_web/controllers/stats_controller.ex
+@@ -58,7 +58,7 @@ defmodule PlausibleWeb.StatsController do
+   )
+ 
+   def stats(%{assigns: %{site: site}} = conn, _params) do
+-    site = Plausible.Repo.preload(site, :owner)
++    site = Plausible.Repo.preload(site, :owners)
+     current_user = conn.assigns[:current_user]
+     stats_start_date = Plausible.Sites.stats_start_date(site)
+     can_see_stats? = not Sites.locked?(site) or conn.assigns[:site_role] == :super_admin
+@@ -94,7 +94,7 @@ defmodule PlausibleWeb.StatsController do
+         redirect(conn, external: Routes.site_path(conn, :verification, site.domain))
+ 
+       Sites.locked?(site) ->
+-        site = Plausible.Repo.preload(site, :owner)
++        site = Plausible.Repo.preload(site, :owners)
+         render(conn, "site_locked.html", site: site, dogfood_page_path: dogfood_page_path)
+     end
+   end
+@@ -119,7 +119,7 @@ defmodule PlausibleWeb.StatsController do
+   """
+   def csv_export(conn, params) do
+     if is_nil(params["interval"]) or Plausible.Stats.Interval.valid?(params["interval"]) do
+-      site = Plausible.Repo.preload(conn.assigns.site, :owner)
++      site = Plausible.Repo.preload(conn.assigns.site, :owners)
+       query = Query.from(site, params, debug_metadata(conn))
+ 
+       date_range = Query.date_range(query)
+@@ -346,7 +346,7 @@ defmodule PlausibleWeb.StatsController do
+     cond do
+       !shared_link.site.locked ->
+         current_user = conn.assigns[:current_user]
+-        shared_link = Plausible.Repo.preload(shared_link, site: :owner)
++        shared_link = Plausible.Repo.preload(shared_link, site: :owners)
+         stats_start_date = Plausible.Sites.stats_start_date(shared_link.site)
+ 
+         scroll_depth_visible? =
+@@ -377,10 +377,10 @@ defmodule PlausibleWeb.StatsController do
+         )
+ 
+       Sites.locked?(shared_link.site) ->
+-        owner = Plausible.Repo.preload(shared_link.site, :owner)
++        owners = Plausible.Repo.preload(shared_link.site, :owners)
+ 
+         render(conn, "site_locked.html",
+-          owner: owner,
++          owners: owners,
+           site: shared_link.site,
+           dogfood_page_path: "/share/:dashboard"
+         )
+diff --git a/lib/plausible_web/email.ex b/lib/plausible_web/email.ex
+index 0da3118e56b0..326b36749a8f 100644
+--- a/lib/plausible_web/email.ex
++++ b/lib/plausible_web/email.ex
+@@ -94,15 +94,7 @@ defmodule PlausibleWeb.Email do
+     |> render("trial_one_week_reminder.html", user: user)
+   end
+ 
+-  def trial_upgrade_email(user, day, usage) do
+-    team =
+-      case Plausible.Teams.get_by_owner(user) do
+-        {:ok, team} -> team
+-        _ -> nil
+-      end
+-
+-    suggested_plan = Plausible.Billing.Plans.suggest(team, usage.total)
+-
++  def trial_upgrade_email(user, day, usage, suggested_plan) do
+     base_email()
+     |> to(user)
+     |> tag("trial-upgrade-email")
+@@ -198,22 +190,22 @@ defmodule PlausibleWeb.Email do
+     })
+   end
+ 
+-  def yearly_renewal_notification(team) do
++  def yearly_renewal_notification(team, owner) do
+     date = Calendar.strftime(team.subscription.next_bill_date, "%B %-d, %Y")
+ 
+     priority_email()
+-    |> to(team.owner)
++    |> to(owner)
+     |> tag("yearly-renewal")
+     |> subject("Your Plausible subscription is up for renewal")
+     |> render("yearly_renewal_notification.html", %{
+-      user: team.owner,
++      user: owner,
+       date: date,
+       next_bill_amount: team.subscription.next_bill_amount,
+       currency: team.subscription.currency_code
+     })
+   end
+ 
+-  def yearly_expiration_notification(team) do
++  def yearly_expiration_notification(team, owner) do
+     next_bill_date = Calendar.strftime(team.subscription.next_bill_date, "%B %-d, %Y")
+ 
+     accept_traffic_until =
+@@ -222,11 +214,11 @@ defmodule PlausibleWeb.Email do
+       |> Calendar.strftime("%B %-d, %Y")
+ 
+     priority_email()
+-    |> to(team.owner)
++    |> to(owner)
+     |> tag("yearly-expiration")
+     |> subject("Your Plausible subscription is about to expire")
+     |> render("yearly_expiration_notification.html", %{
+-      user: team.owner,
++      user: owner,
+       next_bill_date: next_bill_date,
+       accept_traffic_until: accept_traffic_until
+     })
+diff --git a/lib/plausible_web/live/auth_context.ex b/lib/plausible_web/live/auth_context.ex
+index 9099ed656bc9..c823f1519ae5 100644
+--- a/lib/plausible_web/live/auth_context.ex
++++ b/lib/plausible_web/live/auth_context.ex
+@@ -31,12 +31,49 @@ defmodule PlausibleWeb.Live.AuthContext do
+           _ -> nil
+         end
+       end)
+-      |> assign_new(:my_team, fn context ->
+-        case context.current_user do
+-          nil -> nil
+-          %{team_memberships: [%{team: team}]} -> team
+-          %{team_memberships: []} -> nil
+-        end
++      |> assign_new(:team_from_session, fn
++        %{current_user: nil} ->
++          nil
++
++        %{current_user: user} ->
++          if current_team_id = session["current_team_id"] do
++            user.team_memberships
++            |> Enum.find(%{}, &(&1.team_id == current_team_id))
++            |> Map.get(:team)
++          end
++      end)
++      |> assign_new(:my_team, fn
++        %{current_user: nil} ->
++          nil
++
++        %{current_user: user} = context ->
++          current_team = context.team_from_session
++
++          current_team_owner? =
++            (current_team || %{})
++            |> Map.get(:owners, [])
++            |> Enum.any?(&(&1.id == user.id))
++
++          if current_team_owner? do
++            current_team
++          else
++            user.team_memberships
++            # NOTE: my_team should eventually only hold user's personal team. This requires
++            # additional adjustments, which will be done in follow-up work.
++            # |> Enum.find(%{}, &(&1.role == :owner and &1.team.setup_complete == false))
++            |> List.first(%{})
++            |> Map.get(:team)
++          end
++      end)
++      |> assign_new(:current_team, fn context ->
++        context.team_from_session || context.my_team
++      end)
++      |> assign_new(:teams_count, fn
++        %{current_user: nil} -> 0
++        %{current_user: user} -> length(user.team_memberships)
++      end)
++      |> assign_new(:multiple_teams?, fn context ->
++        context.teams_count > 1
+       end)
+ 
+     {:cont, socket}
+diff --git a/lib/plausible_web/live/goal_settings.ex b/lib/plausible_web/live/goal_settings.ex
+index c9162b702d07..c0328dde23b5 100644
+--- a/lib/plausible_web/live/goal_settings.ex
++++ b/lib/plausible_web/live/goal_settings.ex
+@@ -16,7 +16,7 @@ defmodule PlausibleWeb.Live.GoalSettings do
+       socket
+       |> assign_new(:site, fn %{current_user: current_user} ->
+         current_user
+-        |> Plausible.Sites.get_for_user!(domain, [:owner, :admin, :super_admin])
++        |> Plausible.Sites.get_for_user!(domain, [:owner, :admin, :editor, :super_admin])
+       end)
+       |> assign_new(:all_goals, fn %{site: site} ->
+         Goals.for_site(site, preload_funnels?: true)
+diff --git a/lib/plausible_web/live/goal_settings/form.ex b/lib/plausible_web/live/goal_settings/form.ex
+index c66c63b56d52..ad2cbbbc759c 100644
+--- a/lib/plausible_web/live/goal_settings/form.ex
++++ b/lib/plausible_web/live/goal_settings/form.ex
+@@ -9,7 +9,7 @@ defmodule PlausibleWeb.Live.GoalSettings.Form do
+   alias Plausible.Repo
+ 
+   def update(assigns, socket) do
+-    site = Repo.preload(assigns.site, [:team, :owner])
++    site = Repo.preload(assigns.site, [:team, :owners])
+ 
+     has_access_to_revenue_goals? =
+       Plausible.Billing.Feature.RevenueGoals.check_availability(site.team) == :ok
+@@ -297,7 +297,7 @@ defmodule PlausibleWeb.Live.GoalSettings.Form do
+     ~H"""
+     <div class="mt-6 space-y-3" x-data={@js_data}>
+       <PlausibleWeb.Components.Billing.Notice.premium_feature
+-        billable_user={@site.owner}
++        billable_user={List.first(@site.owners)}
+         current_user={@current_user}
+         current_team={@site_team}
+         feature_mod={Plausible.Billing.Feature.RevenueGoals}
+diff --git a/lib/plausible_web/live/imports_exports_settings.ex b/lib/plausible_web/live/imports_exports_settings.ex
+index 328f4834163d..4fdeb3dbec26 100644
+--- a/lib/plausible_web/live/imports_exports_settings.ex
++++ b/lib/plausible_web/live/imports_exports_settings.ex
+@@ -18,6 +18,7 @@ defmodule PlausibleWeb.Live.ImportsExportsSettings do
+         Plausible.Sites.get_for_user!(current_user, domain, [
+           :owner,
+           :admin,
++          :editor,
+           :super_admin
+         ])
+       end)
+diff --git a/lib/plausible_web/live/installation.ex b/lib/plausible_web/live/installation.ex
+index 4d6bd56be298..92a948856645 100644
+--- a/lib/plausible_web/live/installation.ex
++++ b/lib/plausible_web/live/installation.ex
+@@ -35,6 +35,7 @@ defmodule PlausibleWeb.Live.Installation do
+       Plausible.Sites.get_for_user!(socket.assigns.current_user, domain, [
+         :owner,
+         :admin,
++        :editor,
+         :super_admin,
+         :viewer
+       ])
+diff --git a/lib/plausible_web/live/plugins/api/settings.ex b/lib/plausible_web/live/plugins/api/settings.ex
+index b521f7ef9dbb..62fb62af31ad 100644
+--- a/lib/plausible_web/live/plugins/api/settings.ex
++++ b/lib/plausible_web/live/plugins/api/settings.ex
+@@ -14,6 +14,7 @@ defmodule PlausibleWeb.Live.Plugins.API.Settings do
+         Plausible.Sites.get_for_user!(current_user, domain, [
+           :owner,
+           :admin,
++          :editor,
+           :super_admin
+         ])
+       end)
+diff --git a/lib/plausible_web/live/plugins/api/token_form.ex b/lib/plausible_web/live/plugins/api/token_form.ex
+index fd44530d30e0..f8630916390a 100644
+--- a/lib/plausible_web/live/plugins/api/token_form.ex
++++ b/lib/plausible_web/live/plugins/api/token_form.ex
+@@ -22,6 +22,7 @@ defmodule PlausibleWeb.Live.Plugins.API.TokenForm do
+         Plausible.Sites.get_for_user!(current_user, domain, [
+           :owner,
+           :admin,
++          :editor,
+           :super_admin
+         ])
+       end)
+diff --git a/lib/plausible_web/live/props_settings.ex b/lib/plausible_web/live/props_settings.ex
+index ae9b32d2bd9c..de565f23e79a 100644
+--- a/lib/plausible_web/live/props_settings.ex
++++ b/lib/plausible_web/live/props_settings.ex
+@@ -14,6 +14,7 @@ defmodule PlausibleWeb.Live.PropsSettings do
+         Plausible.Sites.get_for_user!(current_user, domain, [
+           :owner,
+           :admin,
++          :editor,
+           :super_admin
+         ])
+       end)
+diff --git a/lib/plausible_web/live/props_settings/form.ex b/lib/plausible_web/live/props_settings/form.ex
+index 2528b8062243..460cf7d8dd96 100644
+--- a/lib/plausible_web/live/props_settings/form.ex
++++ b/lib/plausible_web/live/props_settings/form.ex
+@@ -21,6 +21,7 @@ defmodule PlausibleWeb.Live.PropsSettings.Form do
+         Plausible.Sites.get_for_user!(current_user, domain, [
+           :owner,
+           :admin,
++          :editor,
+           :super_admin
+         ])
+       end)
+diff --git a/lib/plausible_web/live/shields/countries.ex b/lib/plausible_web/live/shields/countries.ex
+index 74398b89ffab..08956d522c06 100644
+--- a/lib/plausible_web/live/shields/countries.ex
++++ b/lib/plausible_web/live/shields/countries.ex
+@@ -17,6 +17,7 @@ defmodule PlausibleWeb.Live.Shields.Countries do
+         Plausible.Sites.get_for_user!(current_user, domain, [
+           :owner,
+           :admin,
++          :editor,
+           :super_admin
+         ])
+       end)
+diff --git a/lib/plausible_web/live/shields/hostnames.ex b/lib/plausible_web/live/shields/hostnames.ex
+index d2d10eb402f1..da05b0d4f869 100644
+--- a/lib/plausible_web/live/shields/hostnames.ex
++++ b/lib/plausible_web/live/shields/hostnames.ex
+@@ -13,6 +13,7 @@ defmodule PlausibleWeb.Live.Shields.Hostnames do
+         Plausible.Sites.get_for_user!(current_user, domain, [
+           :owner,
+           :admin,
++          :editor,
+           :super_admin
+         ])
+       end)
+diff --git a/lib/plausible_web/live/shields/ip_addresses.ex b/lib/plausible_web/live/shields/ip_addresses.ex
+index 91d71bb1f9ec..106e255991f3 100644
+--- a/lib/plausible_web/live/shields/ip_addresses.ex
++++ b/lib/plausible_web/live/shields/ip_addresses.ex
+@@ -20,6 +20,7 @@ defmodule PlausibleWeb.Live.Shields.IPAddresses do
+         Plausible.Sites.get_for_user!(current_user, domain, [
+           :owner,
+           :admin,
++          :editor,
+           :super_admin
+         ])
+       end)
+diff --git a/lib/plausible_web/live/shields/pages.ex b/lib/plausible_web/live/shields/pages.ex
+index ec86025a7e8d..a0192b176ca6 100644
+--- a/lib/plausible_web/live/shields/pages.ex
++++ b/lib/plausible_web/live/shields/pages.ex
+@@ -13,6 +13,7 @@ defmodule PlausibleWeb.Live.Shields.Pages do
+         Plausible.Sites.get_for_user!(current_user, domain, [
+           :owner,
+           :admin,
++          :editor,
+           :super_admin
+         ])
+       end)
+diff --git a/lib/plausible_web/live/sites.ex b/lib/plausible_web/live/sites.ex
+index 0ffbb1855b51..3b6dc22d802a 100644
+--- a/lib/plausible_web/live/sites.ex
++++ b/lib/plausible_web/live/sites.ex
+@@ -651,7 +651,8 @@ defmodule PlausibleWeb.Live.Sites do
+   defp load_sites(%{assigns: assigns} = socket) do
+     sites =
+       Sites.list_with_invitations(assigns.current_user, assigns.params,
+-        filter_by_domain: assigns.filter_text
++        filter_by_domain: assigns.filter_text,
++        team: assigns.current_team
+       )
+ 
+     hourly_stats =
+@@ -664,7 +665,7 @@ defmodule PlausibleWeb.Live.Sites do
+         end)
+       end
+ 
+-    invitations = extract_invitations(sites.entries, assigns.current_user)
++    invitations = extract_invitations(sites.entries, assigns.current_team)
+ 
+     assign(
+       socket,
+@@ -674,20 +675,14 @@ defmodule PlausibleWeb.Live.Sites do
+     )
+   end
+ 
+-  defp extract_invitations(sites, user) do
++  defp extract_invitations(sites, team) do
+     sites
+     |> Enum.filter(&(&1.entry_type == "invitation"))
+     |> Enum.flat_map(& &1.invitations)
+-    |> Enum.map(&check_limits(&1, user))
++    |> Enum.map(&check_limits(&1, team))
+   end
+ 
+-  defp check_limits(%{role: :owner, site: site} = invitation, user) do
+-    team =
+-      case Plausible.Teams.get_by_owner(user) do
+-        {:ok, team} -> team
+-        _ -> nil
+-      end
+-
++  defp check_limits(%{role: :owner, site: site} = invitation, team) do
+     case ensure_can_take_ownership(site, team) do
+       :ok ->
+         check_features(invitation, team)
+diff --git a/lib/plausible_web/live/verification.ex b/lib/plausible_web/live/verification.ex
+index 44cbaad57a91..731c61b7fdc6 100644
+--- a/lib/plausible_web/live/verification.ex
++++ b/lib/plausible_web/live/verification.ex
+@@ -21,6 +21,7 @@ defmodule PlausibleWeb.Live.Verification do
+       Plausible.Sites.get_for_user!(socket.assigns.current_user, domain, [
+         :owner,
+         :admin,
++        :editor,
+         :super_admin,
+         :viewer
+       ])
+diff --git a/lib/plausible_web/plugs/auth_plug.ex b/lib/plausible_web/plugs/auth_plug.ex
+index 83bb521fa5e9..2f2027169adc 100644
+--- a/lib/plausible_web/plugs/auth_plug.ex
++++ b/lib/plausible_web/plugs/auth_plug.ex
+@@ -7,7 +7,6 @@ defmodule PlausibleWeb.AuthPlug do
+   """
+ 
+   import Plug.Conn
+-  use Plausible.Repo
+ 
+   alias PlausibleWeb.UserAuth
+ 
+@@ -20,22 +19,44 @@ defmodule PlausibleWeb.AuthPlug do
+       {:ok, user_session} ->
+         user = user_session.user
+ 
+-        team =
+-          case user.team_memberships do
+-            [%{team: team}] ->
+-              team
++        current_team_id = Plug.Conn.get_session(conn, "current_team_id")
+ 
+-            [] ->
+-              nil
++        current_team =
++          if current_team_id do
++            user.team_memberships
++            |> Enum.find(%{}, &(&1.team_id == current_team_id))
++            |> Map.get(:team)
+           end
+ 
++        current_team_owner? =
++          (current_team || %{})
++          |> Map.get(:owners, [])
++          |> Enum.any?(&(&1.id == user.id))
++
++        my_team =
++          if current_team_owner? do
++            current_team
++          else
++            user.team_memberships
++            # NOTE: my_team should eventually only hold user's personal team. This requires
++            # additional adjustments, which will be done in follow-up work.
++            # |> Enum.find(%{}, &(&1.role == :owner and &1.team.setup_complete == false))
++            |> List.first(%{})
++            |> Map.get(:team)
++          end
++
++        teams_count = length(user.team_memberships)
++
+         Plausible.OpenTelemetry.add_user_attributes(user)
+         Sentry.Context.set_user_context(%{id: user.id, name: user.name, email: user.email})
+ 
+         conn
+         |> assign(:current_user, user)
+         |> assign(:current_user_session, user_session)
+-        |> assign(:my_team, team)
++        |> assign(:my_team, my_team)
++        |> assign(:current_team, current_team || my_team)
++        |> assign(:teams_count, teams_count)
++        |> assign(:multiple_teams?, teams_count > 1)
+ 
+       _ ->
+         conn
+diff --git a/lib/plausible_web/plugs/authorize_public_api.ex b/lib/plausible_web/plugs/authorize_public_api.ex
+index 7cad9beaaa94..a9f094eb3ae7 100644
+--- a/lib/plausible_web/plugs/authorize_public_api.ex
++++ b/lib/plausible_web/plugs/authorize_public_api.ex
+@@ -134,11 +134,7 @@ defmodule PlausibleWeb.Plugs.AuthorizePublicAPI do
+   end
+ 
+   defp verify_site_access(api_key, site) do
+-    team =
+-      case Plausible.Teams.get_by_owner(api_key.user) do
+-        {:ok, team} -> team
+-        _ -> nil
+-      end
++    team = Repo.preload(site, :team).team
+ 
+     is_member? = Plausible.Teams.Memberships.site_member?(site, api_key.user)
+     is_super_admin? = Auth.is_super_admin?(api_key.user_id)
+diff --git a/lib/plausible_web/plugs/authorize_site_access.ex b/lib/plausible_web/plugs/authorize_site_access.ex
+index 53cb4c340c4a..50b29369e485 100644
+--- a/lib/plausible_web/plugs/authorize_site_access.ex
++++ b/lib/plausible_web/plugs/authorize_site_access.ex
+@@ -112,7 +112,7 @@ defmodule PlausibleWeb.Plugs.AuthorizeSiteAccess do
+         site =
+           site
+           |> Repo.preload([
+-            :owner,
++            :owners,
+             :completed_imports,
+             team: [subscription: Plausible.Teams.last_subscription_query()]
+           ])
+diff --git a/lib/plausible_web/router.ex b/lib/plausible_web/router.ex
+index df5736539411..3d5e38f2bb67 100644
+--- a/lib/plausible_web/router.ex
++++ b/lib/plausible_web/router.ex
+@@ -100,10 +100,11 @@ defmodule PlausibleWeb.Router do
+   on_ee do
+     scope "/crm", PlausibleWeb do
+       pipe_through :flags
+-      get "/auth/user/:user_id/usage", AdminController, :usage
+-      get "/billing/user/:user_id/current_plan", AdminController, :current_plan
+-      get "/billing/search/user-by-id/:user_id", AdminController, :user_by_id
+-      post "/billing/search/user", AdminController, :user_search
++      get "/teams/team/:team_id/usage", AdminController, :usage
++      get "/auth/user/:user_id/info", AdminController, :user_info
++      get "/billing/team/:team_id/current_plan", AdminController, :current_plan
++      get "/billing/search/team-by-id/:team_id", AdminController, :team_by_id
++      post "/billing/search/team", AdminController, :team_search
+     end
+   end
+ 
+@@ -406,6 +407,9 @@ defmodule PlausibleWeb.Router do
+     get "/logout", AuthController, :logout
+     delete "/me", AuthController, :delete_me
+ 
++    get "/team/select", AuthController, :select_team
++    post "/team/select/:team_id", AuthController, :switch_team
++
+     get "/auth/google/callback", AuthController, :google_auth_callback
+ 
+     on_ee do
+diff --git a/lib/plausible_web/templates/auth/select_team.html.heex b/lib/plausible_web/templates/auth/select_team.html.heex
+new file mode 100644
+index 000000000000..6beca119eff5
+--- /dev/null
++++ b/lib/plausible_web/templates/auth/select_team.html.heex
+@@ -0,0 +1,32 @@
++<.focus_box>
++  <:title>Switch Team</:title>
++
++  <:subtitle>Switch your current team.</:subtitle>
++
++  <div>
++    <ul>
++      <li
++        :for={team <- @teams}
++        class={if team.current?, do: ["border-indigo-400 border-l-4 m-2"], else: ["m-2"]}
++      >
++        <.unstyled_link
++          method={if team.current?, do: "get", else: "post"}
++          href={
++            if team.current?,
++              do: "#",
++              else: Routes.auth_path(@conn, :switch_team, team.identifier)
++          }
++        >
++          <div class="hover:bg-indigo-100 dark:hover:bg-gray-700 p-4">
++            <p class="truncate font-medium text-gray-900 dark:text-gray-100" role="none">
++              {team.name}
++            </p>
++            <p class="text-xs text-gray-500 dark:text-gray-400">
++              Owner{if team.many_owners?, do: "s"}: {team.owners}
++            </p>
++          </div>
++        </.unstyled_link>
++      </li>
++    </ul>
++  </div>
++</.focus_box>
+diff --git a/lib/plausible_web/templates/layout/_header.html.heex b/lib/plausible_web/templates/layout/_header.html.heex
+index f699cb1259e7..050cc729d37b 100644
+--- a/lib/plausible_web/templates/layout/_header.html.heex
++++ b/lib/plausible_web/templates/layout/_header.html.heex
+@@ -72,10 +72,30 @@
+                         {@conn.assigns[:current_user].email}
+                       </p>
+                     </.dropdown_item>
++                    <.dropdown_item :if={@conn.assigns[:multiple_teams?]}>
++                      <div class="text-xs text-gray-500 dark:text-gray-400">Team</div>
++                      <p class="truncate font-medium text-gray-900 dark:text-gray-100" role="none">
++                        {@current_team.name}
++                      </p>
++                    </.dropdown_item>
++
+                     <.dropdown_divider />
+                     <.dropdown_item href={Routes.settings_path(@conn, :index)}>
+                       Account Settings
+                     </.dropdown_item>
++
++                    <div :if={Plausible.Teams.enabled?(@my_team) and not @my_team.setup_complete}>
++                      <.dropdown_item class="flex" href={Routes.team_setup_path(@conn, :setup)}>
++                        <span class="flex-1">
++                          Create a Team
++                        </span>
++                        <span class="ml-1 bg-indigo-700 text-gray-100 text-xs p-1 rounded">
++                          NEW
++                        </span>
++                      </.dropdown_item>
++                      <.dropdown_divider />
++                    </div>
++
+                     <div :if={Plausible.Teams.enabled?(@my_team) and @my_team.setup_complete}>
+                       <.dropdown_item
+                         class="flex"
+@@ -85,6 +105,12 @@
+                           Team Settings
+                         </span>
+                       </.dropdown_item>
++                      <.dropdown_item
++                        :if={@conn.assigns[:multiple_teams?]}
++                        href={Routes.auth_path(@conn, :select_team)}
++                      >
++                        Switch Team
++                      </.dropdown_item>
+                       <.dropdown_divider />
+                     </div>
+                     <.dropdown_item
+@@ -118,18 +144,6 @@
+                     >
+                       Github Repo
+                     </.dropdown_item>
+-                    <.dropdown_divider />
+-                    <div :if={Plausible.Teams.enabled?(@my_team) and not @my_team.setup_complete}>
+-                      <.dropdown_item class="flex" href={Routes.team_setup_path(@conn, :setup)}>
+-                        <span class="flex-1">
+-                          Create a Team
+-                        </span>
+-                        <span class="ml-1 bg-indigo-700 text-gray-100 text-xs p-1 rounded">
+-                          NEW
+-                        </span>
+-                      </.dropdown_item>
+-                      <.dropdown_divider />
+-                    </div>
+                     <.dropdown_item href="/logout">Log Out</.dropdown_item>
+                   </:menu>
+                 </.dropdown>
+diff --git a/lib/plausible_web/templates/site/membership/invite_member_form.html.heex b/lib/plausible_web/templates/site/membership/invite_member_form.html.heex
+index 359d6046c988..d9cb6cd42338 100644
+--- a/lib/plausible_web/templates/site/membership/invite_member_form.html.heex
++++ b/lib/plausible_web/templates/site/membership/invite_member_form.html.heex
+@@ -12,7 +12,7 @@
+     <PlausibleWeb.Components.Billing.Notice.limit_exceeded
+       :if={Map.get(assigns, :is_at_limit, false)}
+       current_user={@current_user}
+-      billable_user={@site.owner}
++      billable_user={List.first(@site.owners)}
+       current_team={@site_team}
+       limit={Map.get(assigns, :team_member_limit, 0)}
+       resource="team members"
+diff --git a/lib/plausible_web/templates/site/settings_funnels.html.heex b/lib/plausible_web/templates/site/settings_funnels.html.heex
+index 756404f9983c..3aa2a195918c 100644
+--- a/lib/plausible_web/templates/site/settings_funnels.html.heex
++++ b/lib/plausible_web/templates/site/settings_funnels.html.heex
+@@ -13,7 +13,7 @@
+     </:subtitle>
+ 
+     <PlausibleWeb.Components.Billing.Notice.premium_feature
+-      billable_user={@site.owner}
++      billable_user={List.first(@site.owners)}
+       current_user={@current_user}
+       current_team={@site_team}
+       feature_mod={Plausible.Billing.Feature.Funnels}
+diff --git a/lib/plausible_web/templates/site/settings_props.html.heex b/lib/plausible_web/templates/site/settings_props.html.heex
+index b66cca331c78..28b4e1757a10 100644
+--- a/lib/plausible_web/templates/site/settings_props.html.heex
++++ b/lib/plausible_web/templates/site/settings_props.html.heex
+@@ -14,7 +14,7 @@
+     </:subtitle>
+ 
+     <PlausibleWeb.Components.Billing.Notice.premium_feature
+-      billable_user={@site.owner}
++      billable_user={List.first(@site.owners)}
+       current_user={@current_user}
+       current_team={@site_team}
+       feature_mod={Plausible.Billing.Feature.Props}
+diff --git a/lib/plausible_web/templates/stats/site_locked.html.heex b/lib/plausible_web/templates/stats/site_locked.html.heex
+index 40fb38ab4974..7964c8b0a38a 100644
+--- a/lib/plausible_web/templates/stats/site_locked.html.heex
++++ b/lib/plausible_web/templates/stats/site_locked.html.heex
+@@ -44,14 +44,17 @@
+           <div class="mt-3 text-gray-600 dark:text-gray-300 text-center">
+             <p>
+               This dashboard is currently locked and cannot be accessed. The site owner
+-              <b>{@site.owner.email}</b>
++              <b>{List.first(@site.owners).email}</b>
+               must upgrade their subscription plan in order to
+               unlock the stats.
+             </p>
+-            <div class="mt-6 text-sm text-gray-500">
++            <div
++              :if={not Plausible.Teams.enabled?(@conn.assigns[:my_team])}
++              class="mt-6 text-sm text-gray-500"
++            >
+               <p>Want to pay for this site with the account you're logged in with?</p>
+               <p class="mt-1">
+-                Contact {@site.owner.email} and ask them to
++                Contact {List.first(@site.owners).email} and ask them to
+                 <.styled_link href="https://plausible.io/docs/transfer-ownership" new_tab={true}>
+                   transfer the ownership
+                 </.styled_link>
+diff --git a/lib/plausible_web/user_auth.ex b/lib/plausible_web/user_auth.ex
+index a5a7e366d5a6..de21f6934361 100644
+--- a/lib/plausible_web/user_auth.ex
++++ b/lib/plausible_web/user_auth.ex
+@@ -134,15 +134,19 @@ defmodule PlausibleWeb.UserAuth do
+         inner_join: u in assoc(us, :user),
+         as: :user,
+         left_join: tm in assoc(u, :team_memberships),
+-        # NOTE: whenever my_team.subscription is used to prevent user action, we must check whether the team association is ownership.
+-        # Otherwise regular members will be limited by team owner in cases like deleting their own account.
++        # NOTE: whenever my_team.subscription is used to prevent user action,
++        # we must check whether the team association is ownership.
++        # Otherwise regular members will be limited by team owner in cases
++        # like deleting their own account.
+         on: tm.role != :guest,
+         left_join: t in assoc(tm, :team),
+         as: :team,
++        left_join: o in assoc(t, :owners),
+         left_lateral_join: ts in subquery(last_team_subscription_query),
+         on: true,
+         where: us.token == ^token and us.timeout_at > ^now,
+-        preload: [user: {u, team_memberships: {tm, team: {t, subscription: ts}}}]
++        order_by: t.id,
++        preload: [user: {u, team_memberships: {tm, team: {t, subscription: ts, owners: o}}}]
+       )
+ 
+     case Repo.one(token_query) do
+diff --git a/lib/workers/accept_traffic_until_notification.ex b/lib/workers/accept_traffic_until_notification.ex
+index 585c9c2aff56..ae28beae07ad 100644
+--- a/lib/workers/accept_traffic_until_notification.ex
++++ b/lib/workers/accept_traffic_until_notification.ex
+@@ -26,14 +26,14 @@ defmodule Plausible.Workers.AcceptTrafficUntil do
+     # send at most one notification per user, per day
+     sent_today_query =
+       from s in "sent_accept_traffic_until_notifications",
+-        where: s.user_id == parent_as(:user).id and s.sent_on == ^today,
++        where: s.user_id == parent_as(:users).id and s.sent_on == ^today,
+         select: true
+ 
+     notifications =
+       Repo.all(
+         from t in Plausible.Teams.Team,
+-          inner_join: u in assoc(t, :owner),
+-          as: :user,
++          inner_join: u in assoc(t, :owners),
++          as: :users,
+           inner_join: s in assoc(t, :sites),
+           where: t.accept_traffic_until == ^tomorrow or t.accept_traffic_until == ^next_week,
+           where: not exists(sent_today_query),
+diff --git a/lib/workers/check_usage.ex b/lib/workers/check_usage.ex
+index b9fddcfab0be..a6e72e12cc08 100644
+--- a/lib/workers/check_usage.ex
++++ b/lib/workers/check_usage.ex
+@@ -40,7 +40,7 @@ defmodule Plausible.Workers.CheckUsage do
+       Repo.all(
+         from(t in Teams.Team,
+           as: :team,
+-          inner_join: o in assoc(t, :owner),
++          inner_join: o in assoc(t, :owners),
+           inner_lateral_join: s in subquery(Teams.last_subscription_join_query()),
+           on: true,
+           left_join: ep in Plausible.Billing.EnterprisePlan,
+@@ -58,7 +58,7 @@ defmodule Plausible.Workers.CheckUsage do
+             least(day_of_month(s.last_bill_date), day_of_month(last_day_of_month(^yesterday))) ==
+               day_of_month(^yesterday),
+           order_by: t.id,
+-          preload: [subscription: s, enterprise_plan: ep, owner: o]
++          preload: [subscription: s, enterprise_plan: ep, owners: o]
+         )
+       )
+ 
+@@ -110,8 +110,10 @@ defmodule Plausible.Workers.CheckUsage do
+         suggested_plan =
+           Plausible.Billing.Plans.suggest(subscriber, pageview_usage.last_cycle.total)
+ 
+-        PlausibleWeb.Email.over_limit_email(subscriber.owner, pageview_usage, suggested_plan)
+-        |> Plausible.Mailer.send()
++        for owner <- subscriber.owners do
++          PlausibleWeb.Email.over_limit_email(owner, pageview_usage, suggested_plan)
++          |> Plausible.Mailer.send()
++        end
+ 
+         Plausible.Teams.start_grace_period(subscriber)
+ 
+@@ -129,13 +131,15 @@ defmodule Plausible.Workers.CheckUsage do
+         nil
+ 
+       {{_, pageview_usage}, {_, {site_usage, site_allowance}}} ->
+-        PlausibleWeb.Email.enterprise_over_limit_internal_email(
+-          subscriber.owner,
+-          pageview_usage,
+-          site_usage,
+-          site_allowance
+-        )
+-        |> Plausible.Mailer.send()
++        for owner <- subscriber.owners do
++          PlausibleWeb.Email.enterprise_over_limit_internal_email(
++            owner,
++            pageview_usage,
++            site_usage,
++            site_allowance
++          )
++          |> Plausible.Mailer.send()
++        end
+ 
+         Plausible.Teams.start_manual_lock_grace_period(subscriber)
+     end
+diff --git a/lib/workers/notify_annual_renewal.ex b/lib/workers/notify_annual_renewal.ex
+index e959e22abdb1..aeb0f8385c0b 100644
+--- a/lib/workers/notify_annual_renewal.ex
++++ b/lib/workers/notify_annual_renewal.ex
+@@ -25,7 +25,7 @@ defmodule Plausible.Workers.NotifyAnnualRenewal do
+       Repo.all(
+         from t in Teams.Team,
+           as: :team,
+-          inner_join: o in assoc(t, :owner),
++          inner_join: o in assoc(t, :owners),
+           inner_lateral_join: s in subquery(Teams.last_subscription_join_query()),
+           on: true,
+           left_join: sent in ^sent_notification,
+@@ -35,29 +35,38 @@ defmodule Plausible.Workers.NotifyAnnualRenewal do
+           where:
+             s.next_bill_date > fragment("now()::date") and
+               s.next_bill_date <= fragment("now()::date + INTERVAL '7 days'"),
+-          preload: [owner: o, subscription: s]
++          preload: [owners: o, subscription: s]
+       )
+ 
+     for team <- teams do
+       case team.subscription.status do
+         Subscription.Status.active() ->
+-          template = PlausibleWeb.Email.yearly_renewal_notification(team)
+-          Plausible.Mailer.send(template)
++          for owner <- team.owners do
++            template = PlausibleWeb.Email.yearly_renewal_notification(team, owner)
++            Plausible.Mailer.send(template)
++          end
+ 
+         Subscription.Status.deleted() ->
+-          template = PlausibleWeb.Email.yearly_expiration_notification(team)
+-          Plausible.Mailer.send(template)
++          for owner <- team.owners do
++            template = PlausibleWeb.Email.yearly_expiration_notification(team, owner)
++            Plausible.Mailer.send(template)
++          end
+ 
+         _ ->
+-          Sentry.capture_message("Invalid subscription for renewal", team: team, user: team.owner)
++          Sentry.capture_message("Invalid subscription for renewal",
++            team: team,
++            user: List.first(team.owner)
++          )
+       end
+ 
+-      Repo.insert_all("sent_renewal_notifications", [
+-        %{
+-          user_id: team.owner.id,
+-          timestamp: NaiveDateTime.utc_now()
+-        }
+-      ])
++      for owner <- team.owners do
++        Repo.insert_all("sent_renewal_notifications", [
++          %{
++            user_id: owner.id,
++            timestamp: NaiveDateTime.utc_now()
++          }
++        ])
++      end
+     end
+ 
+     :ok
+diff --git a/lib/workers/send_site_setup_emails.ex b/lib/workers/send_site_setup_emails.ex
+index db34d9366dec..02678022a194 100644
+--- a/lib/workers/send_site_setup_emails.ex
++++ b/lib/workers/send_site_setup_emails.ex
+@@ -44,16 +44,16 @@ defmodule Plausible.Workers.SendSiteSetupEmails do
+         on: se.site_id == s.id,
+         where: is_nil(se.id),
+         where: s.inserted_at > fragment("(now() at time zone 'utc') - '72 hours'::interval"),
+-        preload: [:owner, :team]
++        preload: [:owners, :team]
+       )
+ 
+     for site <- Repo.all(q) do
+-      owner = site.owner
++      owners = site.owners
+       setup_completed = Plausible.Sites.has_stats?(site)
+       hours_passed = NaiveDateTime.diff(DateTime.utc_now(), site.inserted_at, :hour)
+ 
+       if !setup_completed && hours_passed > 47 do
+-        send_setup_help_email(owner, site)
++        send_setup_help_email(owners, site)
+       end
+     end
+   end
+@@ -66,7 +66,7 @@ defmodule Plausible.Workers.SendSiteSetupEmails do
+         where: is_nil(se.id),
+         inner_join: t in assoc(s, :team),
+         where: s.inserted_at > fragment("(now() at time zone 'utc') - '72 hours'::interval"),
+-        preload: [:owner, team: t]
++        preload: [:owners, team: t]
+       )
+ 
+     for site <- Repo.all(q) do
+@@ -89,8 +89,10 @@ defmodule Plausible.Workers.SendSiteSetupEmails do
+   end
+ 
+   defp send_setup_success_email(site) do
+-    PlausibleWeb.Email.site_setup_success(site.owner, site.team, site)
+-    |> Plausible.Mailer.send()
++    for owner <- site.owners do
++      PlausibleWeb.Email.site_setup_success(owner, site.team, site)
++      |> Plausible.Mailer.send()
++    end
+ 
+     Repo.insert_all("setup_success_emails", [
+       %{
+@@ -100,9 +102,11 @@ defmodule Plausible.Workers.SendSiteSetupEmails do
+     ])
+   end
+ 
+-  defp send_setup_help_email(user, site) do
+-    PlausibleWeb.Email.site_setup_help(user, site)
+-    |> Plausible.Mailer.send()
++  defp send_setup_help_email(users, site) do
++    for user <- users do
++      PlausibleWeb.Email.site_setup_help(user, site)
++      |> Plausible.Mailer.send()
++    end
+ 
+     Repo.insert_all("setup_help_emails", [
+       %{
+diff --git a/lib/workers/send_trial_notifications.ex b/lib/workers/send_trial_notifications.ex
+index bb082752c252..b5b67a0e65a5 100644
+--- a/lib/workers/send_trial_notifications.ex
++++ b/lib/workers/send_trial_notifications.ex
+@@ -14,34 +14,34 @@ defmodule Plausible.Workers.SendTrialNotifications do
+     teams =
+       Repo.all(
+         from t in Teams.Team,
+-          inner_join: o in assoc(t, :owner),
++          inner_join: o in assoc(t, :owners),
+           left_join: s in assoc(t, :subscription),
+           where: not is_nil(t.trial_expiry_date),
+           where: is_nil(s.id),
+           order_by: t.inserted_at,
+-          preload: [owner: o]
++          preload: [owners: o]
+       )
+ 
+     for team <- teams do
+       case Date.diff(team.trial_expiry_date, Date.utc_today()) do
+         7 ->
+           if Teams.has_active_sites?(team) do
+-            send_one_week_reminder(team.owner)
++            send_one_week_reminder(team.owners)
+           end
+ 
+         1 ->
+           if Teams.has_active_sites?(team) do
+-            send_tomorrow_reminder(team.owner, team)
++            send_tomorrow_reminder(team.owners, team)
+           end
+ 
+         0 ->
+           if Teams.has_active_sites?(team) do
+-            send_today_reminder(team.owner, team)
++            send_today_reminder(team.owners, team)
+           end
+ 
+         -1 ->
+           if Teams.has_active_sites?(team) do
+-            send_over_reminder(team.owner)
++            send_over_reminder(team.owners)
+           end
+ 
+         _ ->
+@@ -52,27 +52,37 @@ defmodule Plausible.Workers.SendTrialNotifications do
+     :ok
+   end
+ 
+-  defp send_one_week_reminder(user) do
+-    PlausibleWeb.Email.trial_one_week_reminder(user)
+-    |> Plausible.Mailer.send()
++  defp send_one_week_reminder(users) do
++    for user <- users do
++      PlausibleWeb.Email.trial_one_week_reminder(user)
++      |> Plausible.Mailer.send()
++    end
+   end
+ 
+-  defp send_tomorrow_reminder(user, team) do
++  defp send_tomorrow_reminder(users, team) do
+     usage = Plausible.Teams.Billing.usage_cycle(team, :last_30_days)
++    suggested_plan = Plausible.Billing.Plans.suggest(team, usage.total)
+ 
+-    PlausibleWeb.Email.trial_upgrade_email(user, "tomorrow", usage)
+-    |> Plausible.Mailer.send()
++    for user <- users do
++      PlausibleWeb.Email.trial_upgrade_email(user, "tomorrow", usage, suggested_plan)
++      |> Plausible.Mailer.send()
++    end
+   end
+ 
+-  defp send_today_reminder(user, team) do
++  defp send_today_reminder(users, team) do
+     usage = Plausible.Teams.Billing.usage_cycle(team, :last_30_days)
++    suggested_plan = Plausible.Billing.Plans.suggest(team, usage.total)
+ 
+-    PlausibleWeb.Email.trial_upgrade_email(user, "today", usage)
+-    |> Plausible.Mailer.send()
++    for user <- users do
++      PlausibleWeb.Email.trial_upgrade_email(user, "today", usage, suggested_plan)
++      |> Plausible.Mailer.send()
++    end
+   end
+ 
+-  defp send_over_reminder(user) do
+-    PlausibleWeb.Email.trial_over_email(user)
+-    |> Plausible.Mailer.send()
++  defp send_over_reminder(users) do
++    for user <- users do
++      PlausibleWeb.Email.trial_over_email(user)
++      |> Plausible.Mailer.send()
++    end
+   end
+ end
+diff --git a/test/plausible/auth/auth_test.exs b/test/plausible/auth/auth_test.exs
+index dac250d49754..28914857d389 100644
+--- a/test/plausible/auth/auth_test.exs
++++ b/test/plausible/auth/auth_test.exs
+@@ -64,6 +64,15 @@ defmodule Plausible.AuthTest do
+       assert {:error, :upgrade_required} =
+                Auth.create_api_key(user, "my new key", Ecto.UUID.generate())
+     end
++
++    test "creates a key for user on a growth plan when they are an owner of more than one team" do
++      user = new_user() |> subscribe_to_growth_plan()
++      another_site = new_site()
++      add_member(another_site.team, user: user, role: :owner)
++
++      assert {:ok, %Auth.ApiKey{}} =
++               Auth.create_api_key(user, "my new key", Ecto.UUID.generate())
++    end
+   end
+ 
+   describe "delete_api_key/2" do
+diff --git a/test/plausible/billing/enterprise_plan_admin_test.exs b/test/plausible/billing/enterprise_plan_admin_test.exs
+index 0d064ed86932..cfb2570697cc 100644
+--- a/test/plausible/billing/enterprise_plan_admin_test.exs
++++ b/test/plausible/billing/enterprise_plan_admin_test.exs
+@@ -9,10 +9,12 @@ defmodule Plausible.Billing.EnterprisePlanAdminTest do
+ 
+   test "sanitizes number inputs and whitespace" do
+     user = new_user()
++    _site = new_site(owner: user)
++    team = team_of(user)
+ 
+     changeset =
+       EnterprisePlanAdmin.create_changeset(%EnterprisePlan{}, %{
+-        "user_id" => to_string(user.id),
++        "team_id" => to_string(team.id),
+         "paddle_plan_id" => " . 123456 ",
+         "billing_interval" => "monthly",
+         "monthly_pageview_limit" => "100,000,000",
+@@ -34,10 +36,12 @@ defmodule Plausible.Billing.EnterprisePlanAdminTest do
+ 
+   test "scrubs empty attrs" do
+     user = new_user()
++    _site = new_site(owner: user)
++    team = team_of(user)
+ 
+     changeset =
+       EnterprisePlanAdmin.create_changeset(%EnterprisePlan{}, %{
+-        "user_id" => to_string(user.id),
++        "team_id" => to_string(team.id),
+         "paddle_plan_id" => " ,.     ",
+         "billing_interval" => "monthly",
+         "monthly_pageview_limit" => "100,000,000",
+diff --git a/test/plausible/help_scout_test.exs b/test/plausible/help_scout_test.exs
+index ad39086aa88b..b252b05d67ef 100644
+--- a/test/plausible/help_scout_test.exs
++++ b/test/plausible/help_scout_test.exs
+@@ -55,13 +55,14 @@ defmodule Plausible.HelpScoutTest do
+ 
+     describe "get_details_for_customer/2" do
+       test "returns details for user on trial" do
+-        %{id: user_id, email: email} = new_user(trial_expiry_date: Date.utc_today())
++        %{email: email} = user = new_user(trial_expiry_date: Date.utc_today())
+         stub_help_scout_requests(email)
++        team = team_of(user)
+ 
+-        crm_url = "#{PlausibleWeb.Endpoint.url()}/crm/auth/user/#{user_id}"
++        crm_url = "#{PlausibleWeb.Endpoint.url()}/crm/teams/team/#{team.id}"
+ 
+         owned_sites_url =
+-          "#{PlausibleWeb.Endpoint.url()}/crm/sites/site?custom_search=#{URI.encode_www_form(email)}"
++          "#{PlausibleWeb.Endpoint.url()}/crm/sites/site?custom_search=#{URI.encode_www_form(team.identifier)}"
+ 
+         assert {:ok,
+                 %{
+@@ -405,12 +406,13 @@ defmodule Plausible.HelpScoutTest do
+ 
+     describe "get_details_for_emails/2" do
+       test "returns details for user and persists mapping" do
+-        %{id: user_id, email: email} = new_user(trial_expiry_date: Date.utc_today())
++        %{email: email} = user = new_user(trial_expiry_date: Date.utc_today())
++        team = team_of(user)
+ 
+-        crm_url = "#{PlausibleWeb.Endpoint.url()}/crm/auth/user/#{user_id}"
++        crm_url = "#{PlausibleWeb.Endpoint.url()}/crm/teams/team/#{team.id}"
+ 
+         owned_sites_url =
+-          "#{PlausibleWeb.Endpoint.url()}/crm/sites/site?custom_search=#{URI.encode_www_form(email)}"
++          "#{PlausibleWeb.Endpoint.url()}/crm/sites/site?custom_search=#{URI.encode_www_form(team.identifier)}"
+ 
+         assert {:ok,
+                 %{
+@@ -444,11 +446,12 @@ defmodule Plausible.HelpScoutTest do
+         user2 = new_user()
+         new_site(owner: user2)
+         new_site(owner: user2)
++        team2 = team_of(user2)
+ 
+-        crm_url = "#{PlausibleWeb.Endpoint.url()}/crm/auth/user/#{user2.id}"
++        crm_url = "#{PlausibleWeb.Endpoint.url()}/crm/teams/team/#{team2.id}"
+ 
+         owned_sites_url =
+-          "#{PlausibleWeb.Endpoint.url()}/crm/sites/site?custom_search=#{URI.encode_www_form(user2.email)}"
++          "#{PlausibleWeb.Endpoint.url()}/crm/sites/site?custom_search=#{URI.encode_www_form(team2.identifier)}"
+ 
+         assert {:ok,
+                 %{
+diff --git a/test/plausible/site/admin_test.exs b/test/plausible/site/admin_test.exs
+index 20ef337cfb10..0281826b80b8 100644
+--- a/test/plausible/site/admin_test.exs
++++ b/test/plausible/site/admin_test.exs
+@@ -89,6 +89,64 @@ defmodule Plausible.Site.AdminTest do
+                action.(conn, [site], %{"email" => current_owner.email})
+     end
+ 
++    test "the provided team identifier must be valid UUID format", %{
++      conn: conn,
++      transfer_direct_action: action
++    } do
++      today = Date.utc_today()
++      current_owner = new_user()
++      site = new_site(owner: current_owner)
++
++      new_owner =
++        new_user()
++        |> subscribe_to_growth_plan(last_bill_date: Date.shift(today, day: -5))
++
++      assert {:error, "The provided team identifier is invalid"} =
++               action.(conn, [site], %{"email" => new_owner.email, "team_id" => "invalid"})
++    end
++
++    test "new owner must be owner on a single team if no team identifier provided", %{
++      conn: conn,
++      transfer_direct_action: action
++    } do
++      today = Date.utc_today()
++      current_owner = new_user()
++      site = new_site(owner: current_owner)
++
++      new_owner =
++        new_user()
++        |> subscribe_to_growth_plan(last_bill_date: Date.shift(today, day: -5))
++
++      another_site = new_site()
++      add_member(another_site.team, user: new_owner, role: :owner)
++
++      assert {:error, "The new owner owns more than one team"} =
++               action.(conn, [site], %{"email" => new_owner.email})
++    end
++
++    test "new owner must be permitted to add sites in the selected team", %{
++      conn: conn,
++      transfer_direct_action: action
++    } do
++      today = Date.utc_today()
++      current_owner = new_user()
++      site = new_site(owner: current_owner)
++
++      new_owner =
++        new_user()
++        |> subscribe_to_growth_plan(last_bill_date: Date.shift(today, day: -5))
++
++      another_site = new_site()
++      new_team = another_site.team
++      add_member(new_team, user: new_owner, role: :viewer)
++
++      assert {:error, "The new owner can't add sites in the selected team"} =
++               action.(conn, [site], %{
++                 "email" => new_owner.email,
++                 "team_id" => new_team.identifier
++               })
++    end
++
+     @tag :ee_only
+     test "new owner's plan must accommodate the transferred site", %{
+       conn: conn,
+@@ -126,5 +184,32 @@ defmodule Plausible.Site.AdminTest do
+ 
+       assert :ok = action.(conn, [site1, site2], %{"email" => new_owner.email})
+     end
++
++    test "executes ownership transfer for multiple sites in one action for provided team", %{
++      conn: conn,
++      transfer_direct_action: action
++    } do
++      today = Date.utc_today()
++      current_owner = new_user()
++
++      new_owner = new_user()
++
++      another_owner =
++        new_user()
++        |> subscribe_to_growth_plan(last_bill_date: Date.shift(today, day: -5))
++
++      another_site = new_site(owner: another_owner)
++      another_team = another_site.team
++      add_member(another_team, user: new_owner, role: :admin)
++
++      site1 = new_site(owner: current_owner)
++      site2 = new_site(owner: current_owner)
++
++      assert :ok =
++               action.(conn, [site1, site2], %{
++                 "email" => new_owner.email,
++                 "team_id" => another_team.identifier
++               })
++    end
+   end
+ end
+diff --git a/test/plausible/site/memberships/accept_invitation_test.exs b/test/plausible/site/memberships/accept_invitation_test.exs
+index 2814e2f33556..908a793ba068 100644
+--- a/test/plausible/site/memberships/accept_invitation_test.exs
++++ b/test/plausible/site/memberships/accept_invitation_test.exs
+@@ -46,6 +46,66 @@ defmodule Plausible.Site.Memberships.AcceptInvitationTest do
+       assert_team_membership(new_owner, site2.team, :owner)
+     end
+ 
++    test "does not allow transferring ownership without selecting team for owner of more than one team" do
++      new_owner = new_user() |> subscribe_to_growth_plan()
++
++      other_site1 = new_site()
++      add_member(other_site1.team, user: new_owner, role: :owner)
++      other_site2 = new_site()
++      add_member(other_site2.team, user: new_owner, role: :owner)
++
++      current_owner = new_user()
++      site1 = new_site(owner: current_owner)
++      site2 = new_site(owner: current_owner)
++
++      assert {:error, :multiple_teams} =
++               AcceptInvitation.bulk_transfer_ownership_direct(
++                 [site1, site2],
++                 new_owner
++               )
++    end
++
++    test "does not allow transferring ownership to a team where user has no permission" do
++      other_owner = new_user() |> subscribe_to_growth_plan()
++      other_team = team_of(other_owner)
++      new_owner = new_user()
++      add_member(other_team, user: new_owner, role: :viewer)
++
++      current_owner = new_user()
++      site1 = new_site(owner: current_owner)
++      site2 = new_site(owner: current_owner)
++
++      assert {:error, :permission_denied} =
++               AcceptInvitation.bulk_transfer_ownership_direct(
++                 [site1, site2],
++                 new_owner,
++                 other_team
++               )
++    end
++
++    test "allows transferring ownership to a team where user has permission" do
++      other_owner = new_user() |> subscribe_to_growth_plan()
++      other_team = team_of(other_owner)
++      new_owner = new_user()
++      add_member(other_team, user: new_owner, role: :admin)
++
++      current_owner = new_user()
++      site1 = new_site(owner: current_owner)
++      site2 = new_site(owner: current_owner)
++
++      assert {:ok, _} =
++               AcceptInvitation.bulk_transfer_ownership_direct(
++                 [site1, site2],
++                 new_owner,
++                 other_team
++               )
++
++      assert Repo.reload(site1).team_id == other_team.id
++      assert_guest_membership(other_team, site1, current_owner, :editor)
++      assert Repo.reload(site2).team_id == other_team.id
++      assert_guest_membership(other_team, site2, current_owner, :editor)
++    end
++
+     @tag :ee_only
+     test "does not allow transferring ownership to a non-member user when at team members limit" do
+       old_owner = new_user() |> subscribe_to_business_plan()
+@@ -160,7 +220,7 @@ defmodule Plausible.Site.Memberships.AcceptInvitationTest do
+     end
+ 
+     for role <- @roles do
+-      test "does not allow accepting invite by a member of another team (role: #{role})" do
++      test "does allow accepting invite by a member of another team (role: #{role})" do
+         user = new_user()
+         _site = new_site(owner: user)
+         team = team_of(user)
+@@ -169,7 +229,7 @@ defmodule Plausible.Site.Memberships.AcceptInvitationTest do
+ 
+         invitation = invite_member(team, member, inviter: user, role: unquote(role))
+ 
+-        assert {:error, :already_other_team_member} =
++        assert {:ok, _} =
+                  AcceptInvitation.accept_invitation(invitation.invitation_id, member)
+       end
+     end
+@@ -358,6 +418,56 @@ defmodule Plausible.Site.Memberships.AcceptInvitationTest do
+       end
+     end
+ 
++    test "does not allow transferring ownership without selecting team for owner of more than one team" do
++      old_owner = new_user() |> subscribe_to_business_plan()
++      new_owner = new_user() |> subscribe_to_growth_plan()
++      site = new_site(owner: old_owner)
++
++      site1 = new_site()
++      add_member(site1.team, user: new_owner, role: :owner)
++      site2 = new_site()
++      add_member(site2.team, user: new_owner, role: :owner)
++
++      transfer = invite_transfer(site, new_owner, inviter: old_owner)
++
++      assert {:error, :multiple_teams} =
++               AcceptInvitation.accept_invitation(transfer.transfer_id, new_owner)
++    end
++
++    test "does not allow transferring ownership to a team where user has no permission" do
++      old_owner = new_user() |> subscribe_to_business_plan()
++      new_owner = new_user() |> subscribe_to_growth_plan()
++      site = new_site(owner: old_owner)
++
++      another_site = new_site()
++      another_team = another_site.team
++      add_member(another_team, user: new_owner, role: :viewer)
++
++      transfer = invite_transfer(site, new_owner, inviter: old_owner)
++
++      assert {:error, :permission_denied} =
++               AcceptInvitation.accept_invitation(transfer.transfer_id, new_owner, another_team)
++    end
++
++    test "allows transferring ownership to a team where user has permission" do
++      old_owner = new_user() |> subscribe_to_business_plan()
++      new_owner = new_user()
++      site = new_site(owner: old_owner)
++
++      another_owner = new_user() |> subscribe_to_growth_plan()
++      another_site = new_site(owner: another_owner)
++      another_team = another_site.team
++      add_member(another_team, user: new_owner, role: :admin)
++
++      transfer = invite_transfer(site, new_owner, inviter: old_owner)
++
++      assert {:ok, _} =
++               AcceptInvitation.accept_invitation(transfer.transfer_id, new_owner, another_team)
++
++      assert_guest_membership(another_team, site, old_owner, :editor)
++      assert Repo.reload(site).team_id == another_team.id
++    end
++
+     @tag :ee_only
+     test "does not allow transferring ownership to a non-member user when at team members limit" do
+       old_owner = new_user() |> subscribe_to_business_plan()
+diff --git a/test/plausible/site/sites_test.exs b/test/plausible/site/sites_test.exs
+index 9fd70b922d2a..d1db4644e363 100644
+--- a/test/plausible/site/sites_test.exs
++++ b/test/plausible/site/sites_test.exs
+@@ -48,6 +48,48 @@ defmodule Plausible.SitesTest do
+       assert {:error, :site, %{errors: [timezone: {"is invalid", []}]}, %{}} =
+                Sites.create(user, params)
+     end
++
++    test "fails for user owning more than one team without explicit pick" do
++      user = new_user()
++      _site1 = new_site(owner: user)
++      site2 = new_site()
++      add_member(site2.team, user: user, role: :owner)
++
++      params = %{"domain" => "example.com", "timezone" => "Europe/London"}
++
++      assert {:error, _, :multiple_teams, _} = Sites.create(user, params)
++    end
++
++    test "fails for user not being permitted to add sites in selected team" do
++      user = new_user()
++      site = new_site()
++      viewer_team = site.team
++      add_member(viewer_team, user: user, role: :viewer)
++      other_site = new_site()
++      other_team = other_site.team
++
++      params = %{"domain" => "example.com", "timezone" => "Europe/London"}
++
++      assert {:error, _, :permission_denied, _} = Sites.create(user, params, viewer_team)
++      assert {:error, _, :permission_denied, _} = Sites.create(user, params, other_team)
++    end
++
++    test "succeeds for user being permitted to add sites in selected team" do
++      user = new_user()
++      viewer_site = new_site()
++      viewer_team = viewer_site.team
++      editor_site = new_site()
++      editor_team = editor_site.team
++
++      add_member(viewer_team, user: user, role: :viewer)
++      add_member(editor_team, user: user, role: :editor)
++
++      params = %{"domain" => "example.com", "timezone" => "Europe/London"}
++
++      assert {:ok, %{site: site}} = Sites.create(user, params, editor_team)
++
++      assert site.team_id == editor_team.id
++    end
+   end
+ 
+   describe "stats_start_date" do
+@@ -416,6 +458,51 @@ defmodule Plausible.SitesTest do
+              } = Sites.list_with_invitations(user1, %{}, filter_by_domain: "first")
+     end
+ 
++    test "scopes by team when provided" do
++      user1 = new_user()
++      user2 = new_user()
++      user3 = new_user()
++
++      site1 = new_site(owner: user1, domain: "first.example.com")
++      site2 = new_site(owner: user2, domain: "first-transfer.example.com")
++      site3 = new_site(owner: user3, domain: "first-invitation.example.com")
++      site4 = new_site(domain: "zzzsitefromanotherteam.com")
++
++      invite_guest(site3, user1, role: :viewer, inviter: user3)
++      invite_transfer(site2, user1, inviter: user2)
++      add_member(site4.team, user: user1, role: :editor)
++
++      assert_matches %{
++                       entries: [
++                         %{id: ^site1.id},
++                         %{id: ^site4.id}
++                       ]
++                     } = Sites.list(user1, %{})
++
++      assert_matches %{
++                       entries: [
++                         %{id: ^site3.id},
++                         %{id: ^site2.id},
++                         %{id: ^site1.id},
++                         %{id: ^site4.id}
++                       ]
++                     } = Sites.list_with_invitations(user1, %{})
++
++      assert_matches %{
++                       entries: [
++                         %{id: ^site4.id}
++                       ]
++                     } = Sites.list(user1, %{}, team: site4.team)
++
++      assert_matches %{
++                       entries: [
++                         %{id: ^site3.id},
++                         %{id: ^site2.id},
++                         %{id: ^site4.id}
++                       ]
++                     } = Sites.list_with_invitations(user1, %{}, team: site4.team)
++    end
++
+     test "handles pagination correctly" do
+       user1 = new_user()
+       user2 = new_user()
+diff --git a/test/plausible/teams_test.exs b/test/plausible/teams_test.exs
+index 641feaaf6b98..53ada585a6e3 100644
+--- a/test/plausible/teams_test.exs
++++ b/test/plausible/teams_test.exs
+@@ -6,6 +6,217 @@ defmodule Plausible.TeamsTest do
+   alias Plausible.Teams
+   alias Plausible.Repo
+ 
++  describe "get_or_create/1" do
++    test "creates 'My Team' if user is a member of none" do
++      today = Date.utc_today()
++      user = new_user()
++      user_id = user.id
++
++      assert {:ok, team} = Teams.get_or_create(user)
++
++      assert team.name == "My Team"
++      assert Date.compare(team.trial_expiry_date, today) == :gt
++
++      assert [
++               %{user_id: ^user_id, role: :owner, is_autocreated: true}
++             ] = Repo.preload(team, :team_memberships).team_memberships
++    end
++
++    test "returns existing 'My Team' if user already owns one" do
++      user = new_user(trial_expiry_date: ~D[2020-04-01])
++      user_id = user.id
++      existing_team = team_of(user)
++
++      assert {:ok, team} = Teams.get_or_create(user)
++
++      assert team.id == existing_team.id
++      assert Date.compare(team.trial_expiry_date, ~D[2020-04-01])
++
++      assert [
++               %{user_id: ^user_id, role: :owner, is_autocreated: true}
++             ] = Repo.preload(team, :team_memberships).team_memberships
++    end
++
++    test "returns existing owned team even if explicitly assigned as owner" do
++      user = new_user()
++      user_id = user.id
++      site = new_site()
++      existing_team = site.team
++      add_member(existing_team, user: user, role: :owner)
++
++      assert {:ok, team} = Teams.get_or_create(user)
++
++      assert team.id == existing_team.id
++
++      assert [
++               %{role: :owner},
++               %{user_id: ^user_id, role: :owner, is_autocreated: false}
++             ] =
++               team
++               |> Repo.preload(:team_memberships)
++               |> Map.fetch!(:team_memberships)
++               |> Enum.sort_by(& &1.id)
++    end
++
++    test "creates 'My Team' if user is a guest on another team" do
++      user = new_user()
++      user_id = user.id
++      site = new_site()
++      existing_team = site.team
++      add_guest(site, user: user, role: :editor)
++
++      assert {:ok, team} = Teams.get_or_create(user)
++
++      assert team.id != existing_team.id
++
++      assert [%{user_id: ^user_id, role: :owner, is_autocreated: true}] =
++               team
++               |> Repo.preload(:team_memberships)
++               |> Map.fetch!(:team_memberships)
++    end
++
++    test "creates 'My Team' if user is a non-owner member on existing teams" do
++      user = new_user()
++      user_id = user.id
++      site1 = new_site()
++      team1 = site1.team
++      site2 = new_site()
++      team2 = site2.team
++      add_member(team1, user: user, role: :viewer)
++      add_member(team2, user: user, role: :editor)
++
++      assert {:ok, team} = Teams.get_or_create(user)
++
++      assert team.id != team1.id
++      assert team.id != team2.id
++
++      assert [%{user_id: ^user_id, role: :owner, is_autocreated: true}] =
++               team
++               |> Repo.preload(:team_memberships)
++               |> Map.fetch!(:team_memberships)
++    end
++
++    test "returns existing owned team if user is also a non-owner member on existing teams" do
++      user = new_user()
++      _site = new_site(owner: user)
++      user_id = user.id
++      owned_team = team_of(user)
++      site1 = new_site()
++      team1 = site1.team
++      site2 = new_site()
++      team2 = site2.team
++      add_member(team1, user: user, role: :viewer)
++      add_member(team2, user: user, role: :editor)
++
++      assert {:ok, team} = Teams.get_or_create(user)
++
++      assert team.id == owned_team.id
++
++      assert [%{user_id: ^user_id, role: :owner, is_autocreated: true}] =
++               team
++               |> Repo.preload(:team_memberships)
++               |> Map.fetch!(:team_memberships)
++    end
++
++    test "returns error if user is an owner of more than one team already" do
++      user = new_user()
++      site1 = new_site()
++      team1 = site1.team
++      site2 = new_site()
++      team2 = site2.team
++      add_member(team1, user: user, role: :owner)
++      add_member(team2, user: user, role: :owner)
++
++      assert {:error, :multiple_teams} = Teams.get_or_create(user)
++    end
++  end
++
++  describe "get_by_owner/1" do
++    test "returns error if user does not own any team" do
++      user = new_user()
++
++      assert {:error, :no_team} = Teams.get_by_owner(user)
++    end
++
++    test "returns error if user does not exist anymore" do
++      user = new_user()
++      _site = new_site(owner: user)
++      Repo.delete!(user)
++
++      assert {:error, :no_team} = Teams.get_by_owner(user)
++    end
++
++    test "returns existing 'My Team' if user already owns one" do
++      user = new_user(trial_expiry_date: ~D[2020-04-01])
++      user_id = user.id
++      existing_team = team_of(user)
++
++      assert {:ok, team} = Teams.get_by_owner(user)
++
++      assert team.id == existing_team.id
++      assert Date.compare(team.trial_expiry_date, ~D[2020-04-01])
++
++      assert [
++               %{user_id: ^user_id, role: :owner, is_autocreated: true}
++             ] = Repo.preload(team, :team_memberships).team_memberships
++    end
++
++    test "returns existing owned team if explicitly assigned as owner" do
++      user = new_user()
++      user_id = user.id
++      site = new_site()
++      existing_team = site.team
++      add_member(existing_team, user: user, role: :owner)
++
++      assert {:ok, team} = Teams.get_by_owner(user)
++
++      assert team.id == existing_team.id
++
++      assert [
++               %{role: :owner},
++               %{user_id: ^user_id, role: :owner, is_autocreated: false}
++             ] =
++               team
++               |> Repo.preload(:team_memberships)
++               |> Map.fetch!(:team_memberships)
++               |> Enum.sort_by(& &1.id)
++    end
++
++    test "returns existing owned team if user is also a non-owner member on existing teams" do
++      user = new_user()
++      _site = new_site(owner: user)
++      user_id = user.id
++      owned_team = team_of(user)
++      site1 = new_site()
++      team1 = site1.team
++      site2 = new_site()
++      team2 = site2.team
++      add_member(team1, user: user, role: :viewer)
++      add_member(team2, user: user, role: :editor)
++
++      assert {:ok, team} = Teams.get_by_owner(user)
++
++      assert team.id == owned_team.id
++
++      assert [%{user_id: ^user_id, role: :owner, is_autocreated: true}] =
++               team
++               |> Repo.preload(:team_memberships)
++               |> Map.fetch!(:team_memberships)
++    end
++
++    test "returns error if user is an owner of more than one team" do
++      user = new_user()
++      site1 = new_site()
++      team1 = site1.team
++      site2 = new_site()
++      team2 = site2.team
++      add_member(team1, user: user, role: :owner)
++      add_member(team2, user: user, role: :owner)
++
++      assert {:error, :multiple_teams} = Teams.get_by_owner(user)
++    end
++  end
++
+   describe "trial_days_left" do
+     test "is 30 days for new signup" do
+       user = new_user(trial_expiry_date: Teams.Team.trial_expiry())
+diff --git a/test/plausible_web/controllers/admin_controller_test.exs b/test/plausible_web/controllers/admin_controller_test.exs
+index 5eccef884ac2..ab3f2887e56c 100644
+--- a/test/plausible_web/controllers/admin_controller_test.exs
++++ b/test/plausible_web/controllers/admin_controller_test.exs
+@@ -4,26 +4,30 @@ defmodule PlausibleWeb.AdminControllerTest do
+ 
+   alias Plausible.Repo
+ 
+-  describe "GET /crm/auth/user/:user_id/usage" do
+-    setup [:create_user, :log_in]
++  describe "GET /crm/teams/team/:team_id/usage" do
++    setup [:create_user, :log_in, :create_team]
+ 
+     @tag :ee_only
+     test "returns 403 if the logged in user is not a super admin", %{conn: conn} do
+-      conn = get(conn, "/crm/auth/user/1/usage")
++      conn = get(conn, "/crm/teams/team/1/usage")
+       assert response(conn, 403) == "Not allowed"
+     end
+ 
+     @tag :ee_only
+-    test "returns usage data as a standalone page", %{conn: conn, user: user} do
++    test "returns usage data as a standalone page", %{conn: conn, user: user, team: team} do
+       patch_env(:super_admin_user_ids, [user.id])
+-      conn = get(conn, "/crm/auth/user/#{user.id}/usage")
++      conn = get(conn, "/crm/teams/team/#{team.id}/usage")
+       assert response(conn, 200) =~ "<html"
+     end
+ 
+     @tag :ee_only
+-    test "returns usage data in embeddable form when requested", %{conn: conn, user: user} do
++    test "returns usage data in embeddable form when requested", %{
++      conn: conn,
++      user: user,
++      team: team
++    } do
+       patch_env(:super_admin_user_ids, [user.id])
+-      conn = get(conn, "/crm/auth/user/#{user.id}/usage?embed=true")
++      conn = get(conn, "/crm/teams/team/#{team.id}/usage?embed=true")
+       refute response(conn, 200) =~ "<html"
+     end
+   end
+@@ -102,23 +106,25 @@ defmodule PlausibleWeb.AdminControllerTest do
+ 
+     @tag :ee_only
+     test "returns 403 if the logged in user is not a super admin", %{conn: conn} do
+-      conn = get(conn, "/crm/billing/user/0/current_plan")
++      conn = get(conn, "/crm/billing/team/0/current_plan")
+       assert response(conn, 403) == "Not allowed"
+     end
+ 
+     @tag :ee_only
+-    test "returns empty state for non-existent user", %{conn: conn, user: user} do
++    test "returns empty state for non-existent team", %{conn: conn, user: user} do
+       patch_env(:super_admin_user_ids, [user.id])
+ 
+-      conn = get(conn, "/crm/billing/user/0/current_plan")
++      conn = get(conn, "/crm/billing/team/0/current_plan")
+       assert json_response(conn, 200) == %{"features" => []}
+     end
+ 
+     @tag :ee_only
+     test "returns empty state for user without subscription", %{conn: conn, user: user} do
+       patch_env(:super_admin_user_ids, [user.id])
++      _site = new_site(owner: user)
++      team = team_of(user)
+ 
+-      conn = get(conn, "/crm/billing/user/#{user.id}/current_plan")
++      conn = get(conn, "/crm/billing/team/#{team.id}/current_plan")
+       assert json_response(conn, 200) == %{"features" => []}
+     end
+ 
+@@ -131,7 +137,9 @@ defmodule PlausibleWeb.AdminControllerTest do
+ 
+       subscribe_to_plan(user, "does-not-exist")
+ 
+-      conn = get(conn, "/crm/billing/user/#{user.id}/current_plan")
++      team = team_of(user)
++
++      conn = get(conn, "/crm/billing/team/#{team.id}/current_plan")
+       assert json_response(conn, 200) == %{"features" => []}
+     end
+ 
+@@ -140,8 +148,9 @@ defmodule PlausibleWeb.AdminControllerTest do
+       patch_env(:super_admin_user_ids, [user.id])
+ 
+       subscribe_to_plan(user, "857104")
++      team = team_of(user)
+ 
+-      conn = get(conn, "/crm/billing/user/#{user.id}/current_plan")
++      conn = get(conn, "/crm/billing/team/#{team.id}/current_plan")
+ 
+       assert json_response(conn, 200) == %{
+                "features" => ["goals"],
+diff --git a/test/plausible_web/controllers/api/external_sites_controller_test.exs b/test/plausible_web/controllers/api/external_sites_controller_test.exs
+index f1f6884eade3..c0588f31c777 100644
+--- a/test/plausible_web/controllers/api/external_sites_controller_test.exs
++++ b/test/plausible_web/controllers/api/external_sites_controller_test.exs
+@@ -567,6 +567,23 @@ defmodule PlausibleWeb.Api.ExternalSitesControllerTest do
+                } = json_response(conn, 200)
+       end
+ 
++      test "returns sites scoped to a given team for full memberships", %{conn: conn, user: user} do
++        _owned_site = new_site(owner: user)
++        other_site = new_site()
++        add_guest(other_site, user: user, role: :viewer)
++        other_team_site = new_site()
++        add_member(other_team_site.team, user: user, role: :viewer)
++
++        conn = get(conn, "/api/v1/sites?team_id=" <> other_team_site.team.identifier)
++
++        assert_matches %{
++                         "sites" => [
++                           %{"domain" => ^other_team_site.domain},
++                           %{"domain" => ^other_site.domain}
++                         ]
++                       } = json_response(conn, 200)
++      end
++
+       test "handles pagination correctly", %{conn: conn, user: user} do
+         [
+           %{domain: site1_domain},
+diff --git a/test/plausible_web/controllers/auth_controller_test.exs b/test/plausible_web/controllers/auth_controller_test.exs
+index 5e7bd90537f0..78efbd933baf 100644
+--- a/test/plausible_web/controllers/auth_controller_test.exs
++++ b/test/plausible_web/controllers/auth_controller_test.exs
+@@ -610,6 +610,62 @@ defmodule PlausibleWeb.AuthControllerTest do
+       assert Repo.get(Plausible.Site, viewer_site.id)
+       refute Repo.get(Plausible.Site, owner_site.id)
+     end
++
++    test "refuses to delete user when an only owner of a setup team", %{
++      conn: conn,
++      user: user,
++      site: site
++    } do
++      site.team
++      |> Plausible.Teams.Team.setup_changeset()
++      |> Repo.update!()
++
++      conn = delete(conn, "/me")
++
++      assert redirected_to(conn, 302) == Routes.settings_path(conn, :danger_zone)
++
++      assert Phoenix.Flash.get(conn.assigns.flash, :error) =~
++               "You can't delete your account when you are the only owner on a team"
++
++      assert Repo.reload(user)
++    end
++
++    test "refuses to delete user when an only owner of multiple setup teams", %{
++      conn: conn,
++      user: user,
++      site: site
++    } do
++      site.team
++      |> Plausible.Teams.Team.setup_changeset()
++      |> Repo.update!()
++
++      another_owner = new_user()
++      another_site = new_site(owner: another_owner)
++      add_member(another_site.team, user: user, role: :owner)
++      Repo.delete!(another_owner)
++
++      conn = delete(conn, "/me")
++
++      assert redirected_to(conn, 302) == Routes.settings_path(conn, :danger_zone)
++
++      assert Phoenix.Flash.get(conn.assigns.flash, :error) =~
++               "You can't delete your account when you are the only owner on a team"
++
++      assert Repo.reload(user)
++    end
++
++    test "allows to delete user when not the only owner of a setup team", %{
++      conn: conn,
++      user: user
++    } do
++      another_owner = new_user()
++      another_site = new_site(owner: another_owner)
++      add_member(another_site.team, user: user, role: :owner)
++
++      delete(conn, "/me")
++
++      refute Repo.reload(user)
++    end
+   end
+ 
+   describe "GET /auth/google/callback" do
+diff --git a/test/plausible_web/controllers/invitation_controller_test.exs b/test/plausible_web/controllers/invitation_controller_test.exs
+index 5f060ede15b4..54d596394662 100644
+--- a/test/plausible_web/controllers/invitation_controller_test.exs
++++ b/test/plausible_web/controllers/invitation_controller_test.exs
+@@ -91,6 +91,24 @@ defmodule PlausibleWeb.Site.InvitationControllerTest do
+       assert_team_attached(site, new_team.id)
+     end
+ 
++    test "fails when new owner has no permissions for current team", %{conn: conn, user: user} do
++      old_owner = new_user()
++      site = new_site(owner: old_owner)
++
++      other_owner = new_user() |> subscribe_to_growth_plan()
++      new_team = team_of(other_owner)
++      add_member(new_team, user: user, role: :viewer)
++
++      transfer = invite_transfer(site, user, inviter: old_owner)
++
++      conn = post(conn, "/sites/invitations/#{transfer.transfer_id}/accept")
++
++      assert redirected_to(conn, 302) == "/sites"
++
++      assert Phoenix.Flash.get(conn.assigns.flash, :error) =~
++               "You can't add sites in the current team"
++    end
++
+     @tag :ee_only
+     test "fails when new owner has no plan", %{conn: conn, user: user} do
+       old_owner = new_user()
+diff --git a/test/plausible_web/controllers/site_controller_test.exs b/test/plausible_web/controllers/site_controller_test.exs
+index b872dc8b67f8..f236917a05a0 100644
+--- a/test/plausible_web/controllers/site_controller_test.exs
++++ b/test/plausible_web/controllers/site_controller_test.exs
+@@ -256,6 +256,21 @@ defmodule PlausibleWeb.SiteControllerTest do
+       assert html_response(conn, 200) =~ "can&#39;t be blank"
+     end
+ 
++    test "fails to create site when not allowed to in selected team", %{conn: conn, user: user} do
++      site = new_site()
++      add_member(site.team, user: user, role: :viewer)
++
++      conn =
++        post(conn, "/sites", %{
++          "site" => %{
++            "domain" => "example.com",
++            "timezone" => "Europe/London"
++          }
++        })
++
++      assert html_response(conn, 200) =~ "You are not permitted to add sites in the current team"
++    end
++
+     test "starts trial if user does not have trial yet", %{conn: conn, user: user} do
+       refute team_of(user)
+ 
+diff --git a/test/plausible_web/controllers/stats_controller_test.exs b/test/plausible_web/controllers/stats_controller_test.exs
+index 2cced7b9b2b9..52ecadeed5b0 100644
+--- a/test/plausible_web/controllers/stats_controller_test.exs
++++ b/test/plausible_web/controllers/stats_controller_test.exs
+@@ -287,8 +287,8 @@ defmodule PlausibleWeb.StatsControllerTest do
+     } do
+       {:ok, site} = Plausible.Props.allow(site, ["author"])
+ 
+-      site = Repo.preload(site, :owner)
+-      subscribe_to_growth_plan(site.owner)
++      [owner | _] = Repo.preload(site, :owners).owners
++      subscribe_to_growth_plan(owner)
+ 
+       populate_stats(site, [
+         build(:pageview, "meta.key": ["author"], "meta.value": ["a"]),
+@@ -315,8 +315,8 @@ defmodule PlausibleWeb.StatsControllerTest do
+     } do
+       {:ok, site} = Plausible.Props.allow(site, ["author"])
+ 
+-      site = Repo.preload(site, :owner)
+-      subscribe_to_growth_plan(site.owner)
++      [owner | _] = Repo.preload(site, :owners).owners
++      subscribe_to_growth_plan(owner)
+ 
+       populate_stats(site, [
+         build(:pageview, "meta.key": ["author"], "meta.value": ["a"])
+diff --git a/test/plausible_web/live/choose_plan_test.exs b/test/plausible_web/live/choose_plan_test.exs
+index 7c277865fc09..d3345afa1381 100644
+--- a/test/plausible_web/live/choose_plan_test.exs
++++ b/test/plausible_web/live/choose_plan_test.exs
+@@ -999,7 +999,8 @@ defmodule PlausibleWeb.Live.ChoosePlanTest do
+       user: user
+     } do
+       user
+-      |> Plausible.Auth.User.changeset(%{trial_expiry_date: nil})
++      |> team_of()
++      |> Ecto.Changeset.change(trial_expiry_date: nil)
+       |> Repo.update!()
+ 
+       {:ok, lv, _doc} = get_liveview(conn)
+diff --git a/test/plausible_web/plugins/api/controllers/capabilities_test.exs b/test/plausible_web/plugins/api/controllers/capabilities_test.exs
+index 4c46621ba306..dc32d73d03f9 100644
+--- a/test/plausible_web/plugins/api/controllers/capabilities_test.exs
++++ b/test/plausible_web/plugins/api/controllers/capabilities_test.exs
+@@ -88,8 +88,8 @@ defmodule PlausibleWeb.Plugins.API.Controllers.CapabilitiesTest do
+ 
+     @tag :ee_only
+     test "growth", %{conn: conn, site: site, token: token} do
+-      site = Plausible.Repo.preload(site, :owner)
+-      subscribe_to_growth_plan(site.owner)
++      [owner | _] = Plausible.Repo.preload(site, :owners).owners
++      subscribe_to_growth_plan(owner)
+ 
+       resp =
+         conn
+diff --git a/test/plausible_web/plugins/api/controllers/custom_props_test.exs b/test/plausible_web/plugins/api/controllers/custom_props_test.exs
+index e7b461e597b5..12589c5dd17e 100644
+--- a/test/plausible_web/plugins/api/controllers/custom_props_test.exs
++++ b/test/plausible_web/plugins/api/controllers/custom_props_test.exs
+@@ -42,8 +42,8 @@ defmodule PlausibleWeb.Plugins.API.Controllers.CustomPropsTest do
+       token: token,
+       conn: conn
+     } do
+-      site = Plausible.Repo.preload(site, :owner)
+-      subscribe_to_growth_plan(site.owner)
++      [owner | _] = Plausible.Repo.preload(site, :owners).owners
++      subscribe_to_growth_plan(owner)
+ 
+       url = Routes.plugins_api_custom_props_url(PlausibleWeb.Endpoint, :enable)
+ 
+@@ -66,8 +66,8 @@ defmodule PlausibleWeb.Plugins.API.Controllers.CustomPropsTest do
+       token: token,
+       conn: conn
+     } do
+-      site = Plausible.Repo.preload(site, :owner)
+-      subscribe_to_growth_plan(site.owner)
++      [owner | _] = Plausible.Repo.preload(site, :owners).owners
++      subscribe_to_growth_plan(owner)
+ 
+       url = Routes.plugins_api_custom_props_url(PlausibleWeb.Endpoint, :enable)
+ 
+diff --git a/test/plausible_web/plugins/api/controllers/funnels_test.exs b/test/plausible_web/plugins/api/controllers/funnels_test.exs
+index cba0f6267427..8ed2d40be78e 100644
+--- a/test/plausible_web/plugins/api/controllers/funnels_test.exs
++++ b/test/plausible_web/plugins/api/controllers/funnels_test.exs
+@@ -249,8 +249,8 @@ defmodule PlausibleWeb.Plugins.API.Controllers.FunnelsTest do
+       end
+ 
+       test "fails for insufficient plan", %{conn: conn, token: token, site: site} do
+-        site = Plausible.Repo.preload(site, :owner)
+-        subscribe_to_growth_plan(site.owner)
++        [owner | _] = Plausible.Repo.preload(site, :owners).owners
++        subscribe_to_growth_plan(owner)
+ 
+         url = Routes.plugins_api_funnels_url(PlausibleWeb.Endpoint, :create)
+ 
+diff --git a/test/plausible_web/plugins/api/controllers/goals_test.exs b/test/plausible_web/plugins/api/controllers/goals_test.exs
+index aea1053dd78e..129d374f0409 100644
+--- a/test/plausible_web/plugins/api/controllers/goals_test.exs
++++ b/test/plausible_web/plugins/api/controllers/goals_test.exs
+@@ -53,8 +53,8 @@ defmodule PlausibleWeb.Plugins.API.Controllers.GoalsTest do
+       token: token,
+       conn: conn
+     } do
+-      site = Plausible.Repo.preload(site, :owner)
+-      subscribe_to_growth_plan(site.owner)
++      [owner | _] = Plausible.Repo.preload(site, :owners).owners
++      subscribe_to_growth_plan(owner)
+ 
+       url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+ 
+@@ -79,8 +79,8 @@ defmodule PlausibleWeb.Plugins.API.Controllers.GoalsTest do
+       token: token,
+       conn: conn
+     } do
+-      site = Plausible.Repo.preload(site, :owner)
+-      subscribe_to_growth_plan(site.owner)
++      [owner | _] = Plausible.Repo.preload(site, :owners).owners
++      subscribe_to_growth_plan(owner)
+ 
+       url = Routes.plugins_api_goals_url(PlausibleWeb.Endpoint, :create)
+ 
+diff --git a/test/plausible_web/plugs/authorize_public_api_test.exs b/test/plausible_web/plugs/authorize_public_api_test.exs
+index e7dec4ce6613..d832df668132 100644
+--- a/test/plausible_web/plugs/authorize_public_api_test.exs
++++ b/test/plausible_web/plugs/authorize_public_api_test.exs
+@@ -62,6 +62,30 @@ defmodule PlausibleWeb.Plugs.AuthorizePublicAPITest do
+     assert json_response(conn, 400)["error"] =~ "Missing site ID."
+   end
+ 
++  @tag :ee_only
++  test "halts with error when site's team lacks feature access", %{conn: conn} do
++    user = new_user()
++    _site = new_site(owner: user)
++    api_key = insert(:api_key, user: user)
++
++    another_owner =
++      new_user() |> subscribe_to_enterprise_plan(paddle_plan_id: "123321", features: [])
++
++    another_site = new_site(owner: another_owner)
++
++    conn =
++      conn
++      |> put_req_header("authorization", "Bearer #{api_key.key}")
++      |> get("/", %{"site_id" => another_site.domain})
++      |> assign(:api_scope, "stats:read:*")
++      |> AuthorizePublicAPI.call(nil)
++
++    assert conn.halted
++
++    assert json_response(conn, 402)["error"] =~
++             "The account that owns this API key does not have access"
++  end
++
+   @tag :ee_only
+   test "halts with error when upgrade is required", %{conn: conn} do
+     user = new_user() |> subscribe_to_enterprise_plan(paddle_plan_id: "123321", features: [])
+diff --git a/test/support/teams/test.ex b/test/support/teams/test.ex
+index da5358c2a145..05f7240f0f74 100644
+--- a/test/support/teams/test.ex
++++ b/test/support/teams/test.ex
+@@ -20,9 +20,11 @@ defmodule Plausible.Teams.Test do
+   def new_site(args \\ []) do
+     args =
+       if user = args[:owner] do
++        {owner, args} = Keyword.pop(args, :owner)
+         {:ok, team} = Teams.get_or_create(user)
+ 
+         args
++        |> Keyword.put(:owners, [owner])
+         |> Keyword.put(:team, team)
+       else
+         user = new_user()
+@@ -299,11 +301,13 @@ defmodule Plausible.Teams.Test do
+   end
+ 
+   def assert_team_attached(site, team_id \\ nil) do
+-    assert site = %{team: team} = site |> Repo.reload!() |> Repo.preload([:team, :owner])
++    assert site = %{team: team} = site |> Repo.reload!() |> Repo.preload([:team, :owners])
+ 
+-    assert membership = assert_team_membership(site.owner, team)
++    for owner <- site.owners do
++      assert membership = assert_team_membership(owner, team)
+ 
+-    assert membership.team_id == team.id
++      assert membership.team_id == team.id
++    end
+ 
+     if team_id do
+       assert team.id == team_id
+diff --git a/test/workers/send_trial_notifications_test.exs b/test/workers/send_trial_notifications_test.exs
+index 1927d9a6b771..2a400e53350d 100644
+--- a/test/workers/send_trial_notifications_test.exs
++++ b/test/workers/send_trial_notifications_test.exs
+@@ -62,6 +62,7 @@ defmodule Plausible.Workers.SendTrialNotificationsTest do
+       user = new_user(trial_expiry_date: Date.utc_today() |> Date.shift(day: 1))
+       site = new_site(owner: user)
+       usage = %{total: 3, custom_events: 0}
++      suggested_plan = Plausible.Billing.Plans.suggest(site.team, usage.total)
+ 
+       populate_stats(site, [
+         build(:pageview),
+@@ -71,13 +72,16 @@ defmodule Plausible.Workers.SendTrialNotificationsTest do
+ 
+       perform_job(SendTrialNotifications, %{})
+ 
+-      assert_delivered_email(PlausibleWeb.Email.trial_upgrade_email(user, "tomorrow", usage))
++      assert_delivered_email(
++        PlausibleWeb.Email.trial_upgrade_email(user, "tomorrow", usage, suggested_plan)
++      )
+     end
+ 
+     test "sends an upgrade email the day the trial ends" do
+       user = new_user(trial_expiry_date: Date.utc_today())
+       site = new_site(owner: user)
+       usage = %{total: 3, custom_events: 0}
++      suggested_plan = Plausible.Billing.Plans.suggest(site.team, usage.total)
+ 
+       populate_stats(site, [
+         build(:pageview),
+@@ -87,14 +91,18 @@ defmodule Plausible.Workers.SendTrialNotificationsTest do
+ 
+       perform_job(SendTrialNotifications, %{})
+ 
+-      assert_delivered_email(PlausibleWeb.Email.trial_upgrade_email(user, "today", usage))
++      assert_delivered_email(
++        PlausibleWeb.Email.trial_upgrade_email(user, "today", usage, suggested_plan)
++      )
+     end
+ 
+     test "does not include custom event note if user has not used custom events" do
+       user = new_user(trial_expiry_date: Date.utc_today())
++      site = new_site(owner: user)
+       usage = %{total: 9_000, custom_events: 0}
++      suggested_plan = Plausible.Billing.Plans.suggest(site.team, usage.total)
+ 
+-      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage)
++      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage, suggested_plan)
+ 
+       assert email.html_body =~
+                "In the last month, your account has used 9,000 billable pageviews."
+@@ -102,9 +110,11 @@ defmodule Plausible.Workers.SendTrialNotificationsTest do
+ 
+     test "includes custom event note if user has used custom events" do
+       user = new_user(trial_expiry_date: Date.utc_today())
++      site = new_site(owner: user)
+       usage = %{total: 9_100, custom_events: 100}
++      suggested_plan = Plausible.Billing.Plans.suggest(site.team, usage.total)
+ 
+-      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage)
++      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage, suggested_plan)
+ 
+       assert email.html_body =~
+                "In the last month, your account has used 9,100 billable pageviews and custom events in total."
+@@ -146,82 +156,102 @@ defmodule Plausible.Workers.SendTrialNotificationsTest do
+   describe "Suggested plans" do
+     test "suggests 10k/mo plan" do
+       user = new_user()
++      site = new_site(owner: user)
+       usage = %{total: 9_000, custom_events: 0}
++      suggested_plan = Plausible.Billing.Plans.suggest(site.team, usage.total)
+ 
+-      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage)
++      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage, suggested_plan)
+       assert email.html_body =~ "we recommend you select a 10k/mo plan."
+     end
+ 
+     test "suggests 100k/mo plan" do
+       user = new_user()
++      site = new_site(owner: user)
+       usage = %{total: 90_000, custom_events: 0}
++      suggested_plan = Plausible.Billing.Plans.suggest(site.team, usage.total)
+ 
+-      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage)
++      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage, suggested_plan)
+       assert email.html_body =~ "we recommend you select a 100k/mo plan."
+     end
+ 
+     test "suggests 200k/mo plan" do
+       user = new_user()
++      site = new_site(owner: user)
+       usage = %{total: 180_000, custom_events: 0}
++      suggested_plan = Plausible.Billing.Plans.suggest(site.team, usage.total)
+ 
+-      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage)
++      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage, suggested_plan)
+       assert email.html_body =~ "we recommend you select a 200k/mo plan."
+     end
+ 
+     test "suggests 500k/mo plan" do
+       user = new_user()
++      site = new_site(owner: user)
+       usage = %{total: 450_000, custom_events: 0}
++      suggested_plan = Plausible.Billing.Plans.suggest(site.team, usage.total)
+ 
+-      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage)
++      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage, suggested_plan)
+       assert email.html_body =~ "we recommend you select a 500k/mo plan."
+     end
+ 
+     test "suggests 1m/mo plan" do
+       user = new_user()
++      site = new_site(owner: user)
+       usage = %{total: 900_000, custom_events: 0}
++      suggested_plan = Plausible.Billing.Plans.suggest(site.team, usage.total)
+ 
+-      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage)
++      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage, suggested_plan)
+       assert email.html_body =~ "we recommend you select a 1M/mo plan."
+     end
+ 
+     test "suggests 2m/mo plan" do
+       user = new_user()
++      site = new_site(owner: user)
+       usage = %{total: 1_800_000, custom_events: 0}
++      suggested_plan = Plausible.Billing.Plans.suggest(site.team, usage.total)
+ 
+-      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage)
++      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage, suggested_plan)
+       assert email.html_body =~ "we recommend you select a 2M/mo plan."
+     end
+ 
+     test "suggests 5m/mo plan" do
+       user = new_user()
++      site = new_site(owner: user)
+       usage = %{total: 4_500_000, custom_events: 0}
++      suggested_plan = Plausible.Billing.Plans.suggest(site.team, usage.total)
+ 
+-      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage)
++      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage, suggested_plan)
+       assert email.html_body =~ "we recommend you select a 5M/mo plan."
+     end
+ 
+     test "suggests 10m/mo plan" do
+       user = new_user()
++      site = new_site(owner: user)
+       usage = %{total: 9_000_000, custom_events: 0}
++      suggested_plan = Plausible.Billing.Plans.suggest(site.team, usage.total)
+ 
+-      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage)
++      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage, suggested_plan)
+       assert email.html_body =~ "we recommend you select a 10M/mo plan."
+     end
+ 
+     test "does not suggest a plan above that" do
+       user = new_user()
++      site = new_site(owner: user)
+       usage = %{total: 20_000_000, custom_events: 0}
++      suggested_plan = Plausible.Billing.Plans.suggest(site.team, usage.total)
+ 
+-      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage)
++      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage, suggested_plan)
+       assert email.html_body =~ "please reply back to this email to get a quote for your volume"
+     end
+ 
+     test "does not suggest a plan when user is switching to an enterprise plan" do
+       user = new_user()
++      site = new_site(owner: user)
+       usage = %{total: 10_000, custom_events: 0}
+       subscribe_to_enterprise_plan(user, paddle_plan_id: "enterprise-plan-id")
++      suggested_plan = Plausible.Billing.Plans.suggest(site.team, usage.total)
+ 
+-      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage)
++      email = PlausibleWeb.Email.trial_upgrade_email(user, "today", usage, suggested_plan)
+       assert email.html_body =~ "please reply back to this email to get a quote for your volume"
+     end
+   end

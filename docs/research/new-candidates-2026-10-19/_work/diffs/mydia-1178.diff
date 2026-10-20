@@ -1,0 +1,267 @@
+diff --git a/lib/mydia_web/schema/query_types.ex b/lib/mydia_web/schema/query_types.ex
+index f9f987dcd..5919bf37e 100644
+--- a/lib/mydia_web/schema/query_types.ex
++++ b/lib/mydia_web/schema/query_types.ex
+@@ -225,6 +225,10 @@ defmodule MydiaWeb.Schema.QueryTypes do
+ 
+     @desc "Why this item is on the rail: continue for a resume point, next for the successor of a finished episode"
+     field :state, :string
++
++    @desc "When the viewer last watched this title; for an episode, the newest watch across its whole show. The rail is ordered by it."
++    field :last_activity_at, :datetime
++
+     @desc "Playable files for this item, used to start playback straight from the rail"
+     field :files, list_of(:media_file)
+ 
+diff --git a/lib/mydia_web/schema/resolvers/discovery_resolver.ex b/lib/mydia_web/schema/resolvers/discovery_resolver.ex
+index 36cb26de9..8094cf91b 100644
+--- a/lib/mydia_web/schema/resolvers/discovery_resolver.ex
++++ b/lib/mydia_web/schema/resolvers/discovery_resolver.ex
+@@ -272,6 +272,7 @@ defmodule MydiaWeb.Schema.Resolvers.DiscoveryResolver do
+       artwork: ItemBuilder.artwork(entry.media_item),
+       progress: format_progress(entry.progress),
+       state: Atom.to_string(entry.state),
++      last_activity_at: entry.sort_at,
+       files: entry.files,
+       show_id: nil,
+       show_title: nil,
+@@ -291,6 +292,7 @@ defmodule MydiaWeb.Schema.Resolvers.DiscoveryResolver do
+       artwork: build_episode_artwork(entry.episode, entry.show),
+       progress: format_progress(entry.progress),
+       state: Atom.to_string(entry.state),
++      last_activity_at: entry.sort_at,
+       files: entry.files,
+       show_id: entry.show.id,
+       show_title: entry.show.title,
+diff --git a/player/lib/core/sources/mydia/mydia_mapping.dart b/player/lib/core/sources/mydia/mydia_mapping.dart
+index c56e275a0..57855206e 100644
+--- a/player/lib/core/sources/mydia/mydia_mapping.dart
++++ b/player/lib/core/sources/mydia/mydia_mapping.dart
+@@ -194,7 +194,10 @@ ItemSummary? continueWatchingSummary(SourceId sid, Map<String, dynamic> c) {
+     index: c['episodeNumber'] as int?,
+     parentIndex: c['seasonNumber'] as int?,
+     defaultVersionId: _firstFileId(c['files']),
+-    lastPlayedAt: _instant(_map(c['progress'])['lastWatchedAt']),
++    // The show's newest watch, which the server ranks the rail by. A next
++    // card's own episode was never played, so its progress has no date.
++    lastPlayedAt: _instant(c['lastActivityAt']) ??
++        _instant(_map(c['progress'])['lastWatchedAt']),
+     externalIds: kind == ItemKind.movie ? _ids(c) : ExternalIds.none,
+     showRef: kind == ItemKind.episode && c['showId'] != null
+         ? _ref(sid, ItemKind.show, c['showId'].toString())
+diff --git a/player/lib/graphql/queries/mydia_documents.graphql b/player/lib/graphql/queries/mydia_documents.graphql
+index 34be2fbc1..a5b78b4c3 100644
+--- a/player/lib/graphql/queries/mydia_documents.graphql
++++ b/player/lib/graphql/queries/mydia_documents.graphql
+@@ -21,6 +21,7 @@ query MydiaContinueWatching($first: Int) {
+     showTitle
+     seasonNumber
+     episodeNumber
++    lastActivityAt
+     artwork {
+       ...ArtworkFragment
+     }
+diff --git a/player/test/core/sources/mydia/mydia_mapping_test.dart b/player/test/core/sources/mydia/mydia_mapping_test.dart
+index 66c5f7c93..e98fec093 100644
+--- a/player/test/core/sources/mydia/mydia_mapping_test.dart
++++ b/player/test/core/sources/mydia/mydia_mapping_test.dart
+@@ -158,6 +158,48 @@ void main() {
+     expect(d.showBackdrop, isNotNull);
+   });
+ 
++  test('continue watching dates a card by its activity, not its episode', () {
++    Map<String, dynamic> card({Object? activity, Object? watchedAt}) => {
++          'id': 'e-22',
++          'type': 'EPISODE',
++          'title': 'High Water',
++          'showId': 's-1',
++          'showTitle': 'Lantern Street',
++          'seasonNumber': 2,
++          'episodeNumber': 2,
++          if (activity != null) 'lastActivityAt': activity,
++          'progress': {
++            'positionSeconds': 0,
++            'durationSeconds': 1440,
++            'percentage': 0.0,
++            'watched': false,
++            'lastWatchedAt': watchedAt,
++          },
++          'files': <Object>[],
++        };
++
++    // A next card: its own episode was never started, the show was watched.
++    expect(
++        continueWatchingSummary(s, card(activity: '2026-10-17T12:38:36Z'))!
++            .lastPlayedAt,
++        DateTime.utc(2026, 10, 17, 12, 38, 36));
++    // The activity wins over the episode's own date.
++    expect(
++        continueWatchingSummary(
++                s,
++                card(
++                    activity: '2026-10-17T12:38:36Z',
++                    watchedAt: '2026-10-01T09:00:00Z'))!
++            .lastPlayedAt,
++        DateTime.utc(2026, 10, 17, 12, 38, 36));
++    // A server without the field: the episode's own date, as before.
++    expect(
++        continueWatchingSummary(s, card(watchedAt: '2026-10-01T09:00:00Z'))!
++            .lastPlayedAt,
++        DateTime.utc(2026, 10, 1, 9));
++    expect(continueWatchingSummary(s, card())!.lastPlayedAt, isNull);
++  });
++
+   test('continue watching maps movies and episodes, skips unknown types', () {
+     final movie = continueWatchingSummary(s, {
+       'id': 'm-1',
+diff --git a/player/test/presentation/screens/home/home_rows_test.dart b/player/test/presentation/screens/home/home_rows_test.dart
+index 4f992c326..2a0e0cfce 100644
+--- a/player/test/presentation/screens/home/home_rows_test.dart
++++ b/player/test/presentation/screens/home/home_rows_test.dart
+@@ -4,6 +4,7 @@
+ 
+ import 'package:flutter_riverpod/flutter_riverpod.dart';
+ import 'package:flutter_test/flutter_test.dart';
++import 'package:player/core/sources/mydia/mydia_mapping.dart';
+ import 'package:player/core/sources/source.dart';
+ import 'package:player/domain/sources/item.dart';
+ import 'package:player/domain/sources/library.dart';
+@@ -203,6 +204,42 @@ void main() {
+     expect(rows.isEmpty, isTrue);
+   });
+ 
++  test('a next card for a show watched today outranks a stale resume', () {
++    Map<String, dynamic> card(String id, String type,
++            {String? activity, String? watchedAt, int position = 0}) =>
++        {
++          'id': id,
++          'type': type,
++          'title': id,
++          if (type == 'EPISODE') 'showId': 'show-$id',
++          if (activity != null) 'lastActivityAt': activity,
++          'progress': {
++            'positionSeconds': position,
++            'durationSeconds': 1440,
++            'percentage': 0.0,
++            'watched': false,
++            'lastWatchedAt': watchedAt,
++          },
++          'files': <Object>[],
++        };
++
++    final stale = continueWatchingSummary(
++        a.id,
++        card('half-watched', 'MOVIE',
++            activity: '2026-10-02T20:46:44Z',
++            watchedAt: '2026-10-02T20:46:44Z',
++            position: 672))!;
++    final binge = continueWatchingSummary(
++        a.id, card('next-up', 'EPISODE', activity: '2026-10-17T12:38:36Z'))!;
++
++    // The server's order, which the merge must not undo.
++    final rows = buildHomeRows([
++      feeds(a, resuming: [binge, stale])
++    ]);
++    expect(rows.continueWatching.map((i) => i.ref.externalId),
++        ['next-up', 'half-watched']);
++  });
++
+   test('copies on two servers are one card with a count', () {
+     const ids = ExternalIds(tmdb: '7');
+     final rows = buildHomeRows([
+diff --git a/priv/graphql/schema.graphql b/priv/graphql/schema.graphql
+index 63c7a1661..cddd31275 100644
+--- a/priv/graphql/schema.graphql
++++ b/priv/graphql/schema.graphql
+@@ -297,6 +297,9 @@ type ContinueWatchingItem {
+   "Why this item is on the rail: continue for a resume point, next for the successor of a finished episode"
+   state: String
+ 
++  "When the viewer last watched this title; for an episode, the newest watch across its whole show. The rail is ordered by it."
++  lastActivityAt: DateTime
++
+   "Playable files for this item, used to start playback straight from the rail"
+   files: [MediaFile]
+ 
+diff --git a/server/crates/api/src/types/discovery.rs b/server/crates/api/src/types/discovery.rs
+index a4f1c2bae..0d872eca7 100644
+--- a/server/crates/api/src/types/discovery.rs
++++ b/server/crates/api/src/types/discovery.rs
+@@ -6,6 +6,7 @@
+ //! RemoteAccessStatus, ServerCompatibility, CalendarEntry, CalendarEntryKind.
+ 
+ use async_graphql::{Enum, SimpleObject, ID};
++use chrono::{DateTime, Utc};
+ 
+ use crate::types::{
+     common::{MediaType, SearchResultType},
+@@ -28,6 +29,9 @@ pub struct ContinueWatchingItem {
+     /// Why this item is on the rail: continue for a resume point, next for the
+     /// successor of a finished episode.
+     pub state: Option<String>,
++    /// When the viewer last watched this title; for an episode, the newest
++    /// watch across its whole show. The rail is ordered by it.
++    pub last_activity_at: Option<DateTime<Utc>>,
+     /// TMDB id of the movie or show. Null for episodes and collections.
+     pub tmdb_id: Option<i32>,
+     /// TVDB id of the movie or show. Null for episodes and collections.
+diff --git a/test/mydia_web/schema/continue_watching_test.exs b/test/mydia_web/schema/continue_watching_test.exs
+index 8d0f8ae15..774b0f300 100644
+--- a/test/mydia_web/schema/continue_watching_test.exs
++++ b/test/mydia_web/schema/continue_watching_test.exs
+@@ -4,6 +4,8 @@ defmodule MydiaWeb.Schema.ContinueWatchingTest do
+   alias Mydia.AccountsFixtures
+   alias Mydia.MediaFixtures
+   alias Mydia.Playback
++  alias Mydia.Playback.Progress
++  alias Mydia.Repo
+ 
+   @query """
+   query ContinueWatching($first: Int) {
+@@ -12,6 +14,7 @@ defmodule MydiaWeb.Schema.ContinueWatchingTest do
+       type
+       title
+       state
++      lastActivityAt
+       showId
+       showTitle
+       seasonNumber
+@@ -92,6 +95,38 @@ defmodule MydiaWeb.Schema.ContinueWatchingTest do
+     assert item["progress"]["positionSeconds"] == 600
+   end
+ 
++  test "a next item carries the show's newest watch as lastActivityAt", ctx do
++    [e1, e2, _e3] = ctx.episodes
++    :changed = Playback.ensure_watched(ctx.user.id, episode_id: e1.id)
++    watched_at = Repo.get_by!(Progress, user_id: ctx.user.id, episode_id: e1.id).last_watched_at
++
++    assert {:ok, %{data: %{"continueWatching" => [item]}}} =
++             run_query(@query, %{"first" => 10}, ctx.user)
++
++    assert item["id"] == e2.id
++    assert item["state"] == "next"
++    # The successor has no progress row, so this is the only date the
++    # player can rank the card by.
++    assert item["lastActivityAt"] == DateTime.to_iso8601(watched_at)
++  end
++
++  test "a movie's lastActivityAt is its own last watch", ctx do
++    movie = MediaFixtures.media_item_fixture(%{type: "movie", title: "Paper Lighthouse"})
++    MediaFixtures.media_file_fixture(%{media_item_id: movie.id})
++
++    {:ok, progress} =
++      Playback.save_progress(
++        ctx.user.id,
++        [media_item_id: movie.id],
++        %{position_seconds: 900, duration_seconds: 7200}
++      )
++
++    assert {:ok, %{data: %{"continueWatching" => [item]}}} =
++             run_query(@query, %{"first" => 10}, ctx.user)
++
++    assert item["lastActivityAt"] == DateTime.to_iso8601(progress.last_watched_at)
++  end
++
+   test "a never-started show returns nothing", ctx do
+     assert {:ok, %{data: %{"continueWatching" => []}}} =
+              run_query(@query, %{"first" => 10}, ctx.user)

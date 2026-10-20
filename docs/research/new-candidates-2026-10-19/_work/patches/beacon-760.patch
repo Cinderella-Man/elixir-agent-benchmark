@@ -1,0 +1,207 @@
+From 796e289fddde1657b65266961b87db42b5f60247 Mon Sep 17 00:00:00 2001
+From: APB9785 <74077809+APB9785@users.noreply.github.com>
+Date: Thu, 13 Feb 2025 12:14:03 -0600
+Subject: [PATCH] add lifecycle stage after_unpublish_page
+
+---
+ lib/beacon/config.ex         |  6 ++++-
+ lib/beacon/content.ex        | 44 +++++++++++++++++++++++++++++-------
+ lib/beacon/lifecycle/page.ex | 11 +++++++++
+ test/beacon/config_test.exs  |  1 +
+ test/beacon/content_test.exs | 17 ++++++++++++++
+ test/test_helper.exs         |  6 +++++
+ 6 files changed, 76 insertions(+), 9 deletions(-)
+
+diff --git a/lib/beacon/config.ex b/lib/beacon/config.ex
+index e80b8bb9b..7435b8780 100644
+--- a/lib/beacon/config.ex
++++ b/lib/beacon/config.ex
+@@ -169,6 +169,7 @@ defmodule Beacon.Config do
+           | {:after_create_page, [{identifier :: atom(), fun :: (Content.Page.t() -> {:cont, Content.Page.t()} | {:halt, Exception.t()})}]}
+           | {:after_update_page, [{identifier :: atom(), fun :: (Content.Page.t() -> {:cont, Content.Page.t()} | {:halt, Exception.t()})}]}
+           | {:after_publish_page, [{identifier :: atom(), fun :: (Content.Page.t() -> {:cont, Content.Page.t()} | {:halt, Exception.t()})}]}
++          | {:after_unpublish_page, [{identifier :: atom(), fun :: (Content.Page.t() -> {:cont, Content.Page.t()} | {:halt, Exception.t()})}]}
+           | {:upload_asset,
+              [
+                {identifier :: atom(), fun :: (Ecto.Schema.t(), Beacon.MediaLibrary.UploadMetadata.t() -> {:cont, any()} | {:halt, Exception.t()})}
+@@ -259,7 +260,8 @@ defmodule Beacon.Config do
+               render_template: @default_render_template,
+               after_create_page: [],
+               after_update_page: [],
+-              after_publish_page: []
++              after_publish_page: [],
++              after_unpublish_page: []
+             ],
+             extra_page_fields: [],
+             extra_asset_fields: [],
+@@ -407,6 +409,7 @@ defmodule Beacon.Config do
+           after_publish_page: [
+             notify_admin: #Function<42.3316493/1 in :erl_eval.expr/6>
+           ],
++          after_unpublish_page: [],
+           upload_asset: [],
+         ],
+         extra_page_fields: [],
+@@ -442,6 +445,7 @@ defmodule Beacon.Config do
+       after_create_page: get_in(opts, [:lifecycle, :after_create_page]) || [],
+       after_update_page: get_in(opts, [:lifecycle, :after_update_page]) || [],
+       after_publish_page: get_in(opts, [:lifecycle, :after_publish_page]) || [],
++      after_unpublish_page: get_in(opts, [:lifecycle, :after_unpublish_page]) || [],
+       upload_asset: get_in(opts, [:lifecycle, :upload_asset]) || [thumbnail: &Beacon.Lifecycle.Asset.thumbnail/2]
+     ]
+ 
+diff --git a/lib/beacon/content.ex b/lib/beacon/content.ex
+index a6ca8a214..be5a193da 100644
+--- a/lib/beacon/content.ex
++++ b/lib/beacon/content.ex
+@@ -709,18 +709,25 @@ defmodule Beacon.Content do
+   @doc """
+   Unpublish `page`.
+ 
+-  Note that page will be removed from your site
+-  and it will return error 404 for new requests.
++  The page will be removed from your site and it will return error 404 for new requests.
++
++  This operation is serialized.
+   """
+   @doc type: :pages
+   @spec unpublish_page(Page.t()) :: {:ok, Page.t()} | {:error, Changeset.t()}
+   def unpublish_page(%Page{} = page) do
+-    transact(repo(page), fn ->
+-      with {:ok, _event} <- create_page_event(page, "unpublished") do
+-        :ok = Beacon.PubSub.page_unpublished(page)
+-        {:ok, page}
+-      end
+-    end)
++    case Beacon.Config.fetch!(page.site).mode do
++      :live ->
++        GenServer.call(name(page.site), {:unpublish_page, page})
++
++      :testing ->
++        page
++        |> insert_unpublished_page()
++        |> tap(fn {:ok, page} -> clear_cache(page.site, page.id) end)
++
++      :manual ->
++        insert_unpublished_page(page)
++    end
+   end
+ 
+   @doc false
+@@ -4443,6 +4450,18 @@ defmodule Beacon.Content do
+     end
+   end
+ 
++  @doc false
++  def handle_call({:unpublish_page, page}, _from, config) do
++    case insert_unpublished_page(page) do
++      {:ok, page} ->
++        :ok = Beacon.PubSub.page_unpublished(page)
++        {:reply, {:ok, page}, config}
++
++      error ->
++        {:reply, error, config}
++    end
++  end
++
+   @doc false
+   def handle_call({:publish_layout, layout}, _from, config) do
+     case do_publish_layout(layout) do
+@@ -4512,6 +4531,15 @@ defmodule Beacon.Content do
+     end)
+   end
+ 
++  defp insert_unpublished_page(page) do
++    transact(repo(page), fn ->
++      with {:ok, _event} <- create_page_event(page, "unpublished"),
++           %Page{} = page <- Lifecycle.Page.after_unpublish_page(page) do
++        {:ok, page}
++      end
++    end)
++  end
++
+   @doc false
+   def reset_published_layout(site, id) do
+     clear_cache(site, id)
+diff --git a/lib/beacon/lifecycle/page.ex b/lib/beacon/lifecycle/page.ex
+index 02281e45d..833fc4d06 100644
+--- a/lib/beacon/lifecycle/page.ex
++++ b/lib/beacon/lifecycle/page.ex
+@@ -43,9 +43,20 @@ defmodule Beacon.Lifecycle.Page do
+   @doc """
+   Execute all steps for stage `:after_publish_page`.
+ 
++  It's executed in the same repo transaction, after the `page_event` and `page_snapshot` records are saved into the database.
+   """
+   @spec after_publish_page(Page.t()) :: Page.t()
+   def after_publish_page(page) do
+     Lifecycle.execute(__MODULE__, page.site, :after_publish_page, page).output
+   end
++
++  @doc """
++  Execute all steps for stage `:after_unpublish_page`.
++
++  It's executed in the same repo transaction, after the `page_event` record is saved into the database.
++  """
++  @spec after_unpublish_page(Page.t()) :: Page.t()
++  def after_unpublish_page(page) do
++    Lifecycle.execute(__MODULE__, page.site, :after_unpublish_page, page).output
++  end
+ end
+diff --git a/test/beacon/config_test.exs b/test/beacon/config_test.exs
+index 0ce5eae52..3df5f6da0 100644
+--- a/test/beacon/config_test.exs
++++ b/test/beacon/config_test.exs
+@@ -96,6 +96,7 @@ defmodule Beacon.ConfigTest do
+                  after_create_page: [],
+                  after_update_page: [],
+                  after_publish_page: [],
++                 after_unpublish_page: [],
+                  upload_asset: [{:thumbnail, _}]
+                ]
+              } = Beacon.Config.new(site: :site, endpoint: :endpoint, router: :router, repo: @repo, lifecycle: [load_template: []])
+diff --git a/test/beacon/content_test.exs b/test/beacon/content_test.exs
+index 74e60ced2..0830a95df 100644
+--- a/test/beacon/content_test.exs
++++ b/test/beacon/content_test.exs
+@@ -392,6 +392,23 @@ defmodule Beacon.ContentTest do
+       assert %{title: "updated after publish page"} = Beacon.Content.get_page(page.site, page.id)
+     end
+ 
++    test "lifecycle after_unpublish_page" do
++      layout = beacon_layout_fixture(site: :lifecycle_test)
++
++      page =
++        Content.create_page!(%{
++          site: "lifecycle_test",
++          path: "/",
++          title: "home",
++          template: "<p>page</p>",
++          layout_id: layout.id
++        })
++
++      Content.unpublish_page(page)
++
++      assert %{title: "updated after unpublish page"} = Beacon.Content.get_page(page.site, page.id)
++    end
++
+     test "save raw_schema" do
+       layout = beacon_layout_fixture(site: :raw_schema_test)
+ 
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index 2dd15c53c..a84cf9fc5 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -144,6 +144,12 @@ Supervisor.start_link(
+                {:ok, page} = Beacon.Content.update_page(page, %{title: "updated after publish page"})
+                {:cont, page}
+              end
++           ],
++           after_unpublish_page: [
++             maybe_unpublish_page: fn page ->
++               {:ok, page} = Beacon.Content.update_page(page, %{title: "updated after unpublish page"})
++               {:cont, page}
++             end
+            ]
+          ]
+        ],

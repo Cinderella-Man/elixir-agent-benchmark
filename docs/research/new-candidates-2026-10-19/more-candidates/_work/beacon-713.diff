@@ -1,0 +1,156 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 7b0d20aa3..75cb56e01 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## Unreleased
+ 
++### Fixes
++
++  - Fixed a bug where MediaLibrary could check for file contents on the wrong node in multi-node deployments
++
+ ## 0.3.3 (2024-12-13)
+ 
+ ### Fixes
+diff --git a/lib/beacon/loader/worker.ex b/lib/beacon/loader/worker.ex
+index c4177f8af..81af88b4d 100644
+--- a/lib/beacon/loader/worker.ex
++++ b/lib/beacon/loader/worker.ex
+@@ -44,6 +44,7 @@ defmodule Beacon.Loader.Worker do
+         Beacon.MediaLibrary.UploadMetadata.new(
+           site,
+           path,
++          Node.self(),
+           name: "beacon.png",
+           extra: %{"alt" => "logo"}
+         )
+diff --git a/lib/beacon/media_library.ex b/lib/beacon/media_library.ex
+index d3e2c42e1..692fbea94 100644
+--- a/lib/beacon/media_library.ex
++++ b/lib/beacon/media_library.ex
+@@ -347,4 +347,37 @@ defmodule Beacon.MediaLibrary do
+       _ -> :error
+     end
+   end
++
++  @doc """
++  Returns the contents of an uploaded file as a binary.
++  """
++  @spec read_binary(UploadMetadata.t()) :: {:ok, binary()} | {:error, any()}
++  def read_binary(metadata) do
++    :erpc.call(metadata.node, File, :read, [metadata.path])
++  rescue
++    error -> {:error, error}
++  end
++
++  @doc """
++  Same as `read_binary/1` but raises if the file is not found.
++  """
++  @spec read_binary!(UploadMetadata.t()) :: binary()
++  def read_binary!(metadata) do
++    case read_binary(metadata) do
++      {:ok, binary} -> binary
++      {:error, error} -> raise RuntimeError, "Failed to read #{metadata.path} on #{metadata.node}: #{inspect(error)}"
++    end
++  end
++
++  @doc """
++  Returns information about the uploaded file.
++
++  See `File.stat/2` for more information.
++  """
++  @spec file_stat(String.t(), Node.t()) :: {:ok, File.Stat.t()} | {:error, any()}
++  def file_stat(path, node) do
++    :erpc.call(node, File, :stat, [path])
++  rescue
++    error -> {:error, error}
++  end
+ end
+diff --git a/lib/beacon/media_library/processors/default.ex b/lib/beacon/media_library/processors/default.ex
+index af072c422..2933d1aa8 100644
+--- a/lib/beacon/media_library/processors/default.ex
++++ b/lib/beacon/media_library/processors/default.ex
+@@ -3,7 +3,7 @@ defmodule Beacon.MediaLibrary.Processors.Default do
+   alias Beacon.MediaLibrary.UploadMetadata
+ 
+   def process!(%UploadMetadata{} = metadata) do
+-    output = File.read!(metadata.path)
++    output = Beacon.MediaLibrary.read_binary!(metadata)
+ 
+     config = UploadMetadata.config_for_media_type(metadata, metadata.media_type)
+ 
+diff --git a/lib/beacon/media_library/processors/image.ex b/lib/beacon/media_library/processors/image.ex
+index 3b675bdbd..61100a356 100644
+--- a/lib/beacon/media_library/processors/image.ex
++++ b/lib/beacon/media_library/processors/image.ex
+@@ -10,8 +10,9 @@ defmodule Beacon.MediaLibrary.Processors.Image do
+     target_file_type = ".webp"
+ 
+     output =
+-      metadata.path
+-      |> Image.open!(access: :random)
++      metadata
++      |> MediaLibrary.read_binary!()
++      |> Image.from_binary!(access: :random)
+       |> Image.write!(:memory, suffix: target_file_type)
+ 
+     name = rename_to_target_file_type(metadata.name, target_file_type)
+diff --git a/lib/beacon/media_library/upload_metadata.ex b/lib/beacon/media_library/upload_metadata.ex
+index 15d876856..93faee458 100644
+--- a/lib/beacon/media_library/upload_metadata.ex
++++ b/lib/beacon/media_library/upload_metadata.ex
+@@ -6,7 +6,7 @@ defmodule Beacon.MediaLibrary.UploadMetadata do
+   alias Beacon.MediaLibrary.Asset
+   alias Beacon.MediaTypes
+ 
+-  defstruct [:site, :config, :allowed_media_accept_types, :path, :name, :media_type, :size, :output, :resource, :extra]
++  defstruct [:site, :config, :allowed_media_accept_types, :path, :name, :media_type, :size, :output, :resource, :node, :extra]
+ 
+   @type t :: %__MODULE__{
+           site: Beacon.Types.Site.t(),
+@@ -18,12 +18,13 @@ defmodule Beacon.MediaLibrary.UploadMetadata do
+           size: integer() | nil,
+           output: any(),
+           resource: Ecto.Changeset.t(%Asset{}),
++          node: Node.t(),
+           extra: map() | nil
+         }
+ 
+   # TODO: https://github.com/BeaconCMS/beacon/pull/239#discussion_r1194160478
+   @doc false
+-  def new(site, path, opts \\ []) do
++  def new(site, path, node, opts \\ []) do
+     opts =
+       Keyword.reject(opts, fn
+         {_, ""} -> true
+@@ -40,7 +41,7 @@ defmodule Beacon.MediaLibrary.UploadMetadata do
+ 
+     size =
+       Keyword.get_lazy(opts, :size, fn ->
+-        case File.stat(path) do
++        case Beacon.MediaLibrary.file_stat(path, node) do
+           {:ok, stat} -> stat.size
+           _ -> nil
+         end
+@@ -60,6 +61,7 @@ defmodule Beacon.MediaLibrary.UploadMetadata do
+       size: size,
+       output: output,
+       resource: resource,
++      node: node,
+       extra: extra
+     }
+   end
+diff --git a/lib/beacon/test/fixtures.ex b/lib/beacon/test/fixtures.ex
+index df0ecc055..94052742d 100644
+--- a/lib/beacon/test/fixtures.ex
++++ b/lib/beacon/test/fixtures.ex
+@@ -368,7 +368,7 @@ defmodule Beacon.Test.Fixtures do
+ 
+     attrs = Map.put_new(attrs, :file_path, path_for(attrs.file_name))
+ 
+-    UploadMetadata.new(attrs.site, attrs.file_path, name: attrs.file_name, size: attrs.file_size, extra: attrs.extra)
++    UploadMetadata.new(attrs.site, attrs.file_path, Node.self(), name: attrs.file_name, size: attrs.file_size, extra: attrs.extra)
+   end
+ 
+   defp path_for(file_name) do

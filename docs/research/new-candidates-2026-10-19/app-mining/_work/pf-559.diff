@@ -1,0 +1,502 @@
+diff --git a/lib/pinchflat/downloading/media_download_worker.ex b/lib/pinchflat/downloading/media_download_worker.ex
+index ff1459b5d..9a9d906f4 100644
+--- a/lib/pinchflat/downloading/media_download_worker.ex
++++ b/lib/pinchflat/downloading/media_download_worker.ex
+@@ -115,7 +115,7 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+   defp action_on_error(message) do
+     # This will attempt re-download at the next indexing, but it won't be retried
+     # immediately as part of job failure logic
+-    non_retryable_errors = ["Video unavailable"]
++    non_retryable_errors = ["Video unavailable", "Sign in to confirm"]
+ 
+     if String.contains?(to_string(message), non_retryable_errors) do
+       Logger.error("yt-dlp download will not be retried: #{inspect(message)}")
+diff --git a/lib/pinchflat/media/media_item.ex b/lib/pinchflat/media/media_item.ex
+index 7a4fb3289..8eeb97e1a 100644
+--- a/lib/pinchflat/media/media_item.ex
++++ b/lib/pinchflat/media/media_item.ex
+@@ -112,6 +112,9 @@ defmodule Pinchflat.Media.MediaItem do
+     |> dynamic_default(:uuid, fn _ -> Ecto.UUID.generate() end)
+     |> update_upload_date_index()
+     |> validate_required(@required_fields)
++    # Validate that the title does NOT start with "youtube video #" since that indicates a restriction by YouTube.
++    # See issue #549 for more information.
++    |> validate_format(:title, ~r/^(?!youtube video #)/)
+     |> unique_constraint([:media_id, :source_id])
+   end
+ 
+diff --git a/lib/pinchflat/settings/setting.ex b/lib/pinchflat/settings/setting.ex
+index 8e63fc789..be644f2b8 100644
+--- a/lib/pinchflat/settings/setting.ex
++++ b/lib/pinchflat/settings/setting.ex
+@@ -14,15 +14,17 @@ defmodule Pinchflat.Settings.Setting do
+     :apprise_server,
+     :video_codec_preference,
+     :audio_codec_preference,
+-    :youtube_api_key
++    :youtube_api_key,
++    :extractor_sleep_interval_seconds
+   ]
+ 
+-  @required_fields ~w(
+-    onboarding
+-    pro_enabled
+-    video_codec_preference
+-    audio_codec_preference
+-  )a
++  @required_fields [
++    :onboarding,
++    :pro_enabled,
++    :video_codec_preference,
++    :audio_codec_preference,
++    :extractor_sleep_interval_seconds
++  ]
+ 
+   schema "settings" do
+     field :onboarding, :boolean, default: true
+@@ -32,6 +34,7 @@ defmodule Pinchflat.Settings.Setting do
+     field :apprise_server, :string
+     field :youtube_api_key, :string
+     field :route_token, :string
++    field :extractor_sleep_interval_seconds, :integer, default: 0
+ 
+     field :video_codec_preference, :string
+     field :audio_codec_preference, :string
+@@ -42,5 +45,6 @@ defmodule Pinchflat.Settings.Setting do
+     setting
+     |> cast(attrs, @allowed_fields)
+     |> validate_required(@required_fields)
++    |> validate_number(:extractor_sleep_interval_seconds, greater_than: 0)
+   end
+ end
+diff --git a/lib/pinchflat/sources/sources.ex b/lib/pinchflat/sources/sources.ex
+index ecbe7d412..99b4a5668 100644
+--- a/lib/pinchflat/sources/sources.ex
++++ b/lib/pinchflat/sources/sources.ex
+@@ -180,9 +180,12 @@ defmodule Pinchflat.Sources do
+   end
+ 
+   defp add_source_details_to_changeset(source, changeset) do
++    original_url = changeset.changes.original_url
+     use_cookies = Ecto.Changeset.get_field(changeset, :use_cookies)
++    # Skipping sleep interval since this is UI blocking and we want to keep this as fast as possible
++    addl_opts = [use_cookies: use_cookies, skip_sleep_interval: true]
+ 
+-    case MediaCollection.get_source_details(changeset.changes.original_url, [], use_cookies: use_cookies) do
++    case MediaCollection.get_source_details(original_url, [], addl_opts) do
+       {:ok, source_details} ->
+         add_source_details_by_collection_type(source, changeset, source_details)
+ 
+diff --git a/lib/pinchflat/utils/number_utils.ex b/lib/pinchflat/utils/number_utils.ex
+index b7128f8c2..d86002b27 100644
+--- a/lib/pinchflat/utils/number_utils.ex
++++ b/lib/pinchflat/utils/number_utils.ex
+@@ -36,4 +36,18 @@ defmodule Pinchflat.Utils.NumberUtils do
+       end
+     end)
+   end
++
++  @doc """
++  Adds jitter to a number based on a percentage. Returns 0 if the number is less than or equal to 0.
++
++  Returns integer()
++  """
++  def add_jitter(num, jitter_percentage \\ 0.5)
++  def add_jitter(num, _jitter_percentage) when num <= 0, do: 0
++
++  def add_jitter(num, jitter_percentage) do
++    jitter = :rand.uniform(round(num * jitter_percentage))
++
++    round(num + jitter)
++  end
+ end
+diff --git a/lib/pinchflat/yt_dlp/command_runner.ex b/lib/pinchflat/yt_dlp/command_runner.ex
+index 8391b5c10..a2454a88c 100644
+--- a/lib/pinchflat/yt_dlp/command_runner.ex
++++ b/lib/pinchflat/yt_dlp/command_runner.ex
+@@ -5,7 +5,9 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+ 
+   require Logger
+ 
++  alias Pinchflat.Settings
+   alias Pinchflat.Utils.CliUtils
++  alias Pinchflat.Utils.NumberUtils
+   alias Pinchflat.YtDlp.YtDlpCommandRunner
+   alias Pinchflat.Utils.FilesystemUtils, as: FSUtils
+ 
+@@ -22,23 +24,23 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+       for a file watcher.
+     - :use_cookies - if true, will add a cookie file to the command options. Will not
+       attach a cookie file if the user hasn't set one up.
++    - :skip_sleep_interval - if true, will not add the sleep interval options to the command.
++      Usually only used for commands that would be UI-blocking
+ 
+   Returns {:ok, binary()} | {:error, output, status}.
+   """
+   @impl YtDlpCommandRunner
+   def run(url, action_name, command_opts, output_template, addl_opts \\ []) do
+     Logger.debug("Running yt-dlp command for action: #{action_name}")
+-    # This approach lets us mock the command for testing
+-    command = backend_executable()
+ 
+     output_filepath = generate_output_filepath(addl_opts)
+     print_to_file_opts = [{:print_to_file, output_template}, output_filepath]
+-    user_configured_opts = cookie_file_options(addl_opts)
++    user_configured_opts = cookie_file_options(addl_opts) ++ sleep_interval_opts(addl_opts)
+     # These must stay in exactly this order, hence why I'm giving it its own variable.
+     all_opts = command_opts ++ print_to_file_opts ++ user_configured_opts ++ global_options()
+     formatted_command_opts = [url] ++ CliUtils.parse_options(all_opts)
+ 
+-    case CliUtils.wrap_cmd(command, formatted_command_opts, stderr_to_stdout: true) do
++    case CliUtils.wrap_cmd(backend_executable(), formatted_command_opts, stderr_to_stdout: true) do
+       # yt-dlp exit codes:
+       #   0 = Everything is successful
+       #   100 = yt-dlp must restart for update to complete
+@@ -96,6 +98,20 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+     end
+   end
+ 
++  defp sleep_interval_opts(addl_opts) do
++    sleep_interval = Settings.get!(:extractor_sleep_interval_seconds)
++
++    if sleep_interval <= 0 || Keyword.get(addl_opts, :skip_sleep_interval) do
++      []
++    else
++      [
++        sleep_requests: NumberUtils.add_jitter(sleep_interval),
++        sleep_interval: NumberUtils.add_jitter(sleep_interval),
++        sleep_subtitles: NumberUtils.add_jitter(sleep_interval)
++      ]
++    end
++  end
++
+   defp add_cookie_file do
+     base_dir = Application.get_env(:pinchflat, :extras_directory)
+     filename_options_map = %{cookies: "cookies.txt"}
+diff --git a/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex b/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
+index 7fe2c94d1..52ae08dd8 100644
+--- a/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
++++ b/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
+@@ -29,7 +29,7 @@
+   <section class="mt-8">
+     <section>
+       <h3 class="text-2xl text-black dark:text-white">
+-        Indexing Settings
++        Extractor Settings
+       </h3>
+ 
+       <.input
+@@ -41,6 +41,14 @@
+         html_help={true}
+         inputclass="font-mono text-sm mr-4"
+       />
++
++      <.input
++        field={f[:extractor_sleep_interval_seconds]}
++        placeholder="0"
++        type="number"
++        label="Sleep Interval (seconds)"
++        help="Sleep interval in seconds between each extractor request. Must be a positive whole number (or set to 0 to disable)"
++      />
+     </section>
+   </section>
+ 
+diff --git a/priv/repo/erd.png b/priv/repo/erd.png
+index 270eca50e..60d5efd74 100644
+Binary files a/priv/repo/erd.png and b/priv/repo/erd.png differ
+diff --git a/priv/repo/migrations/20250110231704_add_extractor_sleep_interval_to_settings.exs b/priv/repo/migrations/20250110231704_add_extractor_sleep_interval_to_settings.exs
+new file mode 100644
+index 000000000..17dd7359f
+--- /dev/null
++++ b/priv/repo/migrations/20250110231704_add_extractor_sleep_interval_to_settings.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddExtractorSleepIntervalToSettings do
++  use Ecto.Migration
++
++  def change do
++    alter table(:settings) do
++      add :extractor_sleep_interval_seconds, :number, null: false, default: 0
++    end
++  end
++end
+diff --git a/test/pinchflat/downloading/media_download_worker_test.exs b/test/pinchflat/downloading/media_download_worker_test.exs
+index 6932fcbcf..3f3bf4f6b 100644
+--- a/test/pinchflat/downloading/media_download_worker_test.exs
++++ b/test/pinchflat/downloading/media_download_worker_test.exs
+@@ -127,6 +127,19 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+       end)
+     end
+ 
++    test "does not set the job to retryable if youtube thinks you're a bot", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, "Sign in to confirm you're not a bot", 1}
++      end)
++
++      Oban.Testing.with_testing_mode(:inline, fn ->
++        {:ok, job} = Oban.insert(MediaDownloadWorker.new(%{id: media_item.id, quality_upgrade?: true}))
++
++        assert job.state == "completed"
++      end)
++    end
++
+     test "it ensures error are returned in a 2-item tuple", %{media_item: media_item} do
+       expect(YtDlpRunnerMock, :run, 2, fn
+         _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
+diff --git a/test/pinchflat/media_test.exs b/test/pinchflat/media_test.exs
+index 891502c07..6becd5b0b 100644
+--- a/test/pinchflat/media_test.exs
++++ b/test/pinchflat/media_test.exs
+@@ -921,6 +921,14 @@ defmodule Pinchflat.MediaTest do
+       media_item = media_item_fixture()
+       assert %Ecto.Changeset{} = Media.change_media_item(media_item)
+     end
++
++    test "validates the title doesn't start with 'youtube video #'" do
++      # This is to account for youtube restricting indexing. See issue #549 for more
++      media_item = media_item_fixture()
++
++      assert %Ecto.Changeset{valid?: false} = Media.change_media_item(media_item, %{title: "youtube video #123"})
++      assert %Ecto.Changeset{valid?: true} = Media.change_media_item(media_item, %{title: "any other title"})
++    end
+   end
+ 
+   describe "change_media_item/1 when testing upload_date_index and source is a channel" do
+diff --git a/test/pinchflat/settings_test.exs b/test/pinchflat/settings_test.exs
+index 944eaf172..56b9579c3 100644
+--- a/test/pinchflat/settings_test.exs
++++ b/test/pinchflat/settings_test.exs
+@@ -77,5 +77,13 @@ defmodule Pinchflat.SettingsTest do
+ 
+       assert %Ecto.Changeset{} = Settings.change_setting(setting, %{onboarding: true})
+     end
++
++    test "ensures the extractor sleep interval is positive" do
++      setting = Settings.record()
++
++      assert %Ecto.Changeset{valid?: true} = Settings.change_setting(setting, %{extractor_sleep_interval_seconds: 1})
++      assert %Ecto.Changeset{valid?: true} = Settings.change_setting(setting, %{extractor_sleep_interval_seconds: 0})
++      assert %Ecto.Changeset{valid?: false} = Settings.change_setting(setting, %{extractor_sleep_interval_seconds: -1})
++    end
+   end
+ end
+diff --git a/test/pinchflat/slow_indexing/slow_indexing_helpers_test.exs b/test/pinchflat/slow_indexing/slow_indexing_helpers_test.exs
+index e410b3cda..f1368c26f 100644
+--- a/test/pinchflat/slow_indexing/slow_indexing_helpers_test.exs
++++ b/test/pinchflat/slow_indexing/slow_indexing_helpers_test.exs
+@@ -290,6 +290,29 @@ defmodule Pinchflat.SlowIndexing.SlowIndexingHelpersTest do
+       assert %Ecto.Changeset{} = changeset
+     end
+ 
++    test "doesn't blow up if the media item cannot be saved", %{source: source} do
++      stub(YtDlpRunnerMock, :run, fn _url, :get_media_attributes_for_collection, _opts, _ot, _addl_opts ->
++        response =
++          Phoenix.json_library().encode!(%{
++            id: "video1",
++            # This is a disallowed title - see MediaItem changeset or issue #549
++            title: "youtube video #123",
++            original_url: "https://example.com/video1",
++            live_status: "not_live",
++            description: "desc1",
++            aspect_ratio: 1.67,
++            duration: 12.34,
++            upload_date: "20210101"
++          })
++
++        {:ok, response}
++      end)
++
++      assert [changeset] = SlowIndexingHelpers.index_and_enqueue_download_for_media_items(source)
++
++      assert %Ecto.Changeset{} = changeset
++    end
++
+     test "passes the source's download options to the yt-dlp runner", %{source: source} do
+       expect(YtDlpRunnerMock, :run, fn _url, :get_media_attributes_for_collection, opts, _ot, _addl_opts ->
+         assert {:output, "/tmp/test/media/%(title)S.%(ext)S"} in opts
+diff --git a/test/pinchflat/sources_test.exs b/test/pinchflat/sources_test.exs
+index e72c05cd0..766c71f88 100644
+--- a/test/pinchflat/sources_test.exs
++++ b/test/pinchflat/sources_test.exs
+@@ -354,7 +354,56 @@ defmodule Pinchflat.SourcesTest do
+     end
+   end
+ 
+-  describe "create_source/2 when testing options" do
++  describe "create_source/2 when testing yt-dlp options" do
++    test "sets use_cookies to true if the source has been set to use cookies" do
++      expect(YtDlpRunnerMock, :run, fn _url, :get_source_details, _opts, _ot, addl ->
++        assert Keyword.get(addl, :use_cookies)
++
++        {:ok, playlist_return()}
++      end)
++
++      valid_attrs = %{
++        media_profile_id: media_profile_fixture().id,
++        original_url: "https://www.youtube.com/channel/abc123",
++        use_cookies: true
++      }
++
++      assert {:ok, %Source{}} = Sources.create_source(valid_attrs)
++    end
++
++    test "does not set use_cookies to false if the source has not been set to use cookies" do
++      expect(YtDlpRunnerMock, :run, fn _url, :get_source_details, _opts, _ot, addl ->
++        refute Keyword.get(addl, :use_cookies)
++
++        {:ok, playlist_return()}
++      end)
++
++      valid_attrs = %{
++        media_profile_id: media_profile_fixture().id,
++        original_url: "https://www.youtube.com/channel/abc123",
++        use_cookies: false
++      }
++
++      assert {:ok, %Source{}} = Sources.create_source(valid_attrs)
++    end
++
++    test "skips sleep interval" do
++      expect(YtDlpRunnerMock, :run, fn _url, :get_source_details, _opts, _ot, addl ->
++        assert Keyword.get(addl, :skip_sleep_interval)
++
++        {:ok, playlist_return()}
++      end)
++
++      valid_attrs = %{
++        media_profile_id: media_profile_fixture().id,
++        original_url: "https://www.youtube.com/channel/abc123"
++      }
++
++      assert {:ok, %Source{}} = Sources.create_source(valid_attrs)
++    end
++  end
++
++  describe "create_source/2 when testing its options" do
+     test "run_post_commit_tasks: false won't enqueue post-commit tasks" do
+       expect(YtDlpRunnerMock, :run, &channel_mock/5)
+ 
+@@ -902,28 +951,30 @@ defmodule Pinchflat.SourcesTest do
+   end
+ 
+   defp playlist_mock(_url, :get_source_details, _opts, _ot, _addl) do
+-    {
+-      :ok,
+-      Phoenix.json_library().encode!(%{
+-        channel: nil,
+-        channel_id: nil,
+-        playlist_id: "some_playlist_id_#{:rand.uniform(1_000_000)}",
+-        playlist_title: "some playlist name"
+-      })
+-    }
++    {:ok, playlist_return()}
+   end
+ 
+   defp channel_mock(_url, :get_source_details, _opts, _ot, _addl) do
++    {:ok, channel_return()}
++  end
++
++  defp playlist_return do
++    Phoenix.json_library().encode!(%{
++      channel: nil,
++      channel_id: nil,
++      playlist_id: "some_playlist_id_#{:rand.uniform(1_000_000)}",
++      playlist_title: "some playlist name"
++    })
++  end
++
++  defp channel_return do
+     channel_id = "some_channel_id_#{:rand.uniform(1_000_000)}"
+ 
+-    {
+-      :ok,
+-      Phoenix.json_library().encode!(%{
+-        channel: "some channel name",
+-        channel_id: channel_id,
+-        playlist_id: channel_id,
+-        playlist_title: "some channel name - videos"
+-      })
+-    }
++    Phoenix.json_library().encode!(%{
++      channel: "some channel name",
++      channel_id: channel_id,
++      playlist_id: channel_id,
++      playlist_title: "some channel name - videos"
++    })
+   end
+ end
+diff --git a/test/pinchflat/utils/number_utils_test.exs b/test/pinchflat/utils/number_utils_test.exs
+index db17e1cc6..1eae570a9 100644
+--- a/test/pinchflat/utils/number_utils_test.exs
++++ b/test/pinchflat/utils/number_utils_test.exs
+@@ -47,4 +47,21 @@ defmodule Pinchflat.Utils.NumberUtilsTest do
+       assert NumberUtils.human_byte_size(nil) == {0, "B"}
+     end
+   end
++
++  describe "add_jitter/2" do
++    test "returns 0 when the number is less than or equal to 0" do
++      assert NumberUtils.add_jitter(0) == 0
++      assert NumberUtils.add_jitter(-1) == 0
++    end
++
++    test "returns the number with jitter added" do
++      assert NumberUtils.add_jitter(100) in 100..150
++    end
++
++    test "optionally takes a jitter percentage" do
++      assert NumberUtils.add_jitter(100, 0.1) in 90..110
++      assert NumberUtils.add_jitter(100, 0.5) in 50..150
++      assert NumberUtils.add_jitter(100, 1) in 0..200
++    end
++  end
+ end
+diff --git a/test/pinchflat/yt_dlp/command_runner_test.exs b/test/pinchflat/yt_dlp/command_runner_test.exs
+index 898e64b7e..9f8382ba5 100644
+--- a/test/pinchflat/yt_dlp/command_runner_test.exs
++++ b/test/pinchflat/yt_dlp/command_runner_test.exs
+@@ -1,6 +1,7 @@
+ defmodule Pinchflat.YtDlp.CommandRunnerTest do
+   use Pinchflat.DataCase
+ 
++  alias Pinchflat.Settings
+   alias Pinchflat.Utils.FilesystemUtils
+ 
+   alias Pinchflat.YtDlp.CommandRunner, as: Runner
+@@ -95,6 +96,36 @@ defmodule Pinchflat.YtDlp.CommandRunnerTest do
+     end
+   end
+ 
++  describe "run/4 when testing sleep interval options" do
++    test "includes sleep interval options by default" do
++      Settings.set(extractor_sleep_interval_seconds: 5)
++
++      assert {:ok, output} = Runner.run(@media_url, :foo, [], "")
++
++      assert String.contains?(output, "--sleep-interval")
++      assert String.contains?(output, "--sleep-requests")
++      assert String.contains?(output, "--sleep-subtitles")
++    end
++
++    test "doesn't include sleep interval options when skip_sleep_interval is true" do
++      assert {:ok, output} = Runner.run(@media_url, :foo, [], "", skip_sleep_interval: true)
++
++      refute String.contains?(output, "--sleep-interval")
++      refute String.contains?(output, "--sleep-requests")
++      refute String.contains?(output, "--sleep-subtitles")
++    end
++
++    test "doesn't include sleep interval options when extractor_sleep_interval_seconds is 0" do
++      Settings.set(extractor_sleep_interval_seconds: 0)
++
++      assert {:ok, output} = Runner.run(@media_url, :foo, [], "")
++
++      refute String.contains?(output, "--sleep-interval")
++      refute String.contains?(output, "--sleep-requests")
++      refute String.contains?(output, "--sleep-subtitles")
++    end
++  end
++
+   describe "run/4 when testing global options" do
+     test "creates windows-safe filenames" do
+       assert {:ok, output} = Runner.run(@media_url, :foo, [], "")

@@ -1,0 +1,802 @@
+diff --git a/lib/cachex/errors.ex b/lib/cachex/errors.ex
+index 37600904..f6e945e4 100644
+--- a/lib/cachex/errors.ex
++++ b/lib/cachex/errors.ex
+@@ -12,11 +12,14 @@ defmodule Cachex.Errors do
+   than bloating blocks with potentially large error messages.
+   """
+   @known_errors [
+-    :invalid_command,  :invalid_expiration, :invalid_fallback,
+-    :invalid_hook,     :invalid_limit,      :invalid_match,
+-    :invalid_name,     :invalid_option,     :invalid_pairs,
+-    :janitor_disabled, :no_cache,           :non_numeric_value,
+-    :not_started,      :stats_disabled,     :unreachable_file
++    :invalid_command,   :invalid_expiration,
++    :invalid_fallback,  :invalid_hook,
++    :invalid_limit,     :invalid_match,
++    :invalid_name,      :invalid_option,
++    :invalid_pairs,     :invalid_warmer,
++    :janitor_disabled,  :no_cache,
++    :non_numeric_value, :not_started,
++    :stats_disabled,    :unreachable_file
+   ]
+ 
+   ##########
+@@ -73,6 +76,8 @@ defmodule Cachex.Errors do
+     do: "Invalid option syntax provided"
+   def long_form(:invalid_pairs),
+     do: "Invalid insertion pairs provided"
++  def long_form(:invalid_warmer),
++    do: "Invalid warmer definition provided"
+   def long_form(:janitor_disabled),
+     do: "Specified janitor process running"
+   def long_form(:no_cache),
+diff --git a/lib/cachex/options.ex b/lib/cachex/options.ex
+index c41bb15b..fab47f62 100644
+--- a/lib/cachex/options.ex
++++ b/lib/cachex/options.ex
+@@ -51,6 +51,7 @@ defmodule Cachex.Options do
+          { :ok,   commands } <- setup_commands(name, options),
+          { :ok,   fallback } <- setup_fallbacks(name, options),
+          { :ok, expiration } <- setup_expiration(name, options),
++         { :ok,    warmers } <- setup_warmers(name, options),
+ 
+          # basic parsing which doesn't have the opportunity to fail
+          transactional = get(options, :transactional, &is_boolean/1, false)
+@@ -62,7 +63,8 @@ defmodule Cachex.Options do
+           fallback: fallback,
+           hooks: hooks,
+           limit: limit,
+-          transactional: transactional
++          transactional: transactional,
++          warmers: warmers
+         ]) }
+       end
+   end
+@@ -213,8 +215,8 @@ defmodule Cachex.Options do
+       |> List.wrap
+     ])
+ 
+-    # validation of all hooks and division into a hooks record
+-    case Enum.all?(hooks, &Validator.valid?(:hook, &1)) do
++    # validation and division into a hooks record
++    case validated?(hooks, :hook) do
+       false ->
+         error(:invalid_hook)
+       true  ->
+@@ -244,4 +246,30 @@ defmodule Cachex.Options do
+       true  -> { :ok, limit }
+     end
+   end
++
++  # Configures any warmers assigned to the cache.
++  #
++  # This will return a list of warmer records to be associated to the
++  # cache at startup in the incubator service. All warmer records are
++  # passed through validation beforehand in order to ensure correctness.
++  defp setup_warmers(_name, options) do
++    # pull warmers
++    warmers =
++      options
++      |> Keyword.get(:warmers, [])
++      |> List.wrap
++
++    # validation of all warmer records
++    case validated?(warmers, :warmer) do
++      false -> error(:invalid_warmer)
++      true  -> { :ok, warmers }
++    end
++  end
++
++  # Shorthand validation of a record type.
++  #
++  # This just iterates and ensures all elements in the provided enum
++  # are validated using the specification validation for the given type.
++  defp validated?(enum, type),
++    do: Enum.all?(enum, &Validator.valid?(type, &1))
+ end
+diff --git a/lib/cachex/services.ex b/lib/cachex/services.ex
+index 8dfaabea..30e47c6b 100644
+--- a/lib/cachex/services.ex
++++ b/lib/cachex/services.ex
+@@ -49,6 +49,7 @@ defmodule Cachex.Services do
+     |> Enum.concat(table_spec(cache))
+     |> Enum.concat(locksmith_spec(cache))
+     |> Enum.concat(informant_spec(cache))
++    |> Enum.concat(incubator_spec(cache))
+     |> Enum.concat(courier_spec(cache))
+     |> Enum.concat(janitor_spec(cache))
+     |> Enum.concat(limit_spec(cache))
+@@ -66,6 +67,14 @@ defmodule Cachex.Services do
+   defp courier_spec(cache() = cache),
+     do: [ worker(Services.Courier, [ cache ]) ]
+ 
++  # Creates a specification for the Incubator supervisor.
++  #
++  # The incubator is essentially a supervisor around all warmers in assigned
++  # to a cache so they're managed correctly. If no warmers are associated to
++  # the cache, this supervisor will essentially no-op at startup.
++  defp incubator_spec(cache() = cache),
++    do: [ supervisor(Services.Incubator, [ cache ]) ]
++
+   # Creates a specification for the Informant supervisor.
+   #
+   # The Informant acts as a parent to all hooks running against a cache. It
+diff --git a/lib/cachex/services/incubator.ex b/lib/cachex/services/incubator.ex
+new file mode 100644
+index 00000000..699cbda4
+--- /dev/null
++++ b/lib/cachex/services/incubator.ex
+@@ -0,0 +1,38 @@
++defmodule Cachex.Services.Incubator do
++  @moduledoc """
++  Parent module for all warmer definitions for a cache.
++
++  The Incubator will control the supervision tree for all warmers that
++  are associated with a cache. This is very minimal supervision, with
++  no linking back except via the `Supervisor` access functions.
++  """
++  import Cachex.Spec
++
++  ##############
++  # Public API #
++  ##############
++
++  @doc """
++  Starts a new incubation service for a cache.
++
++  This will start a Supervisor to hold all warmer processes as defined in
++  the provided cache record. If no warmers are attached in the cache record,
++  this will skip creation to avoid unnecessary processes running.
++  """
++  @spec start_link(Spec.cache) :: Supervisor.on_start
++  def start_link(cache(warmers: [])),
++    do: :ignore
++  def start_link(cache(warmers: warmers) = cache) do
++    warmers
++    |> Enum.map(&spec(&1, cache))
++    |> Supervisor.start_link(strategy: :one_for_one)
++  end
++
++  ###############
++  # Private API #
++  ###############
++
++  # Generates a Supervisor specification for a hook.
++  defp spec(warmer(module: module, state: state), cache),
++    do: Supervisor.Spec.worker(GenServer, [ module, { cache, state } ], [ id: module ])
++end
+diff --git a/lib/cachex/spec.ex b/lib/cachex/spec.ex
+index b8f87dcf..c3632a38 100644
+--- a/lib/cachex/spec.ex
++++ b/lib/cachex/spec.ex
+@@ -31,7 +31,8 @@ defmodule Cachex.Spec do
+     fallback: fallback,
+     hooks: hooks,
+     limit: limit,
+-    transactional: boolean
++    transactional: boolean,
++    warmers: [ warmer ]
+   )
+ 
+   # Record specification for a command instance
+@@ -82,6 +83,12 @@ defmodule Cachex.Spec do
+     options: Keyword.t
+   )
+ 
++  # Record specification for a cache warmer
++  @type warmer :: record(:warmer,
++    module: atom,
++    state: any
++  )
++
+   ###########
+   # Records #
+   ###########
+@@ -100,7 +107,8 @@ defmodule Cachex.Spec do
+     fallback: nil,
+     hooks: nil,
+     limit: nil,
+-    transactional: false
++    transactional: false,
++    warmers: []
+ 
+   @doc """
+   Creates a command record from the provided values.
+@@ -219,6 +227,19 @@ defmodule Cachex.Spec do
+     reclaim: 0.1,
+     options: []
+ 
++  @doc """
++  Creates a warmer record from the provided values.
++
++  A warmer record represents cache warmer processes to be run to populate keys.
++
++  A warmer should have a valid module provided, which correctly implements the behaviour
++  associated with `Cachex.Warmer`. A state can also be provided, which will be passed
++  to the execution callback of the provided module (which defaults to `nil`).
++  """
++  defrecord :warmer,
++    module: nil,
++    state: nil
++
+   ###############
+   # Record Docs #
+   ###############
+@@ -271,6 +292,12 @@ defmodule Cachex.Spec do
+   @spec limit(limit, Keyword.t) :: limit
+   defmacro limit(record, args)
+ 
++  @doc """
++  Updates a warmer record from the provided values.
++  """
++  @spec warmer(warmer, Keyword.t) :: warmer
++  defmacro warmer(record, args)
++
+   #############
+   # Constants #
+   #############
+diff --git a/lib/cachex/spec/validator.ex b/lib/cachex/spec/validator.ex
+index ba2d1854..7e4bb992 100644
+--- a/lib/cachex/spec/validator.ex
++++ b/lib/cachex/spec/validator.ex
+@@ -17,7 +17,8 @@ defmodule Cachex.Spec.Validator do
+                   Cachex.Spec.fallback |
+                   Cachex.Spec.hook |
+                   Cachex.Spec.hooks |
+-                  Cachex.Spec.limit
++                  Cachex.Spec.limit |
++                  Cachex.Spec.warmer
+ 
+   ##############
+   # Public API #
+@@ -54,9 +55,9 @@ defmodule Cachex.Spec.Validator do
+   # This has to validate the default/interval values as being a nillable integers,
+   # and the lazy value has to be a boolean value (which can not be nil).
+   def valid?(:expiration, expiration(default: default, interval: interval, lazy: lazy)),
+-    do: nillable?(default, &is_positive_integer/1) and
+-        nillable?(interval, &is_positive_integer/1) and
+-        is_boolean(lazy)
++    do: nillable?(default, &is_positive_integer/1)
++          and nillable?(interval, &is_positive_integer/1)
++          and is_boolean(lazy)
+ 
+   # Validates a fallback specification record.
+   #
+@@ -79,24 +80,14 @@ defmodule Cachex.Spec.Validator do
+   # It might be that this is too strict for basic validation, but seeing
+   # as the cache creation requires valid hooks it seems to make sense to
+   # be this strict at this point.
+-  def valid?(:hook, hook(module: module, name: name)) do
+-    # unpack the extra properties we need to validate
+-    type = module.type()
+-    async = module.async?()
+-    actions = module.actions()
+-    timeout = module.timeout()
+-    provisions = module.provisions()
+-
+-    # run the rest of the basic validations
+-    with true <- is_boolean(async),
+-         true <- nillable?(name, &(is_atom(&1) or is_pid(&1))),
+-         true <- nillable?(timeout, &is_positive_integer/1),
+-         true <- enum?(actions, &is_atom/1) or actions == :all,
+-         true <- enum?(provisions, &is_atom/1),
+-     do: (type in [ :post, :pre ])
+-  rescue
+-    _ -> false
+-  end
++  def valid?(:hook, hook(module: module, name: name)),
++    do: behaviour?(module, Cachex.Hook)
++          and is_boolean(module.async?())
++          and nillable?(name, &(is_atom(&1) or is_pid(&1)))
++          and nillable?(module.timeout(), &is_positive_integer/1)
++          and (enum?(module.actions(), &is_atom/1) or module.actions() == :all)
++          and enum?(module.provisions(), &is_atom/1)
++          and module.type() in [ :post, :pre ]
+ 
+   # Validates a hooks specification record.
+   #
+@@ -104,23 +95,31 @@ defmodule Cachex.Spec.Validator do
+   # is a valid hook instance. This is done using the valid?/1 clause
+   # for a base hook record, rather than reimplementing here.
+   def valid?(:hooks, hooks(pre: pre, post: post)),
+-    do: is_list(pre) and
+-        is_list(post) and
+-        enum?(pre ++ post, &valid?(:hook, &1))
++    do: is_list(pre)
++          and is_list(post)
++          and enum?(pre ++ post, &valid?(:hook, &1))
+ 
+   # Validates a limit specification record.
+   #
+   # This has to validate all fields in the record, with the size being a nillable integer,
+   # the policy being a valid module, the reclaim space being a valid float between 0 and 1,
+   # and a valid keyword list as the options.
+-  def valid?(:limit, limit(size: size, policy: policy, reclaim: reclaim, options: options)) do
+-    with true <- module?(policy),
+-         true <- nillable?(size, &is_positive_integer/1),
+-         true <- (is_number(reclaim) and reclaim > 0 and reclaim <= 1),
+-     do: Keyword.keyword?(options)
+-  rescue
+-    _ -> false
+-  end
++  def valid?(:limit, limit(size: size, policy: policy, reclaim: reclaim, options: options)),
++    do: module?(policy)
++          and nillable?(size, &is_positive_integer/1)
++          and is_number(reclaim)
++          and reclaim > 0
++          and reclaim <= 1
++          and Keyword.keyword?(options)
++
++  # Validates a warmer specification record.
++  #
++  # This will validate that the provided module correctly implements
++  # the behaviour of `Cachex.Warmer` via function checking.
++  def valid?(:warmer, warmer(module: module)),
++    do: behaviour?(module, Cachex.Warmer)
++          and { :interval, 0 } in module.__info__(:functions)
++          and { :execute,  1 } in module.__info__(:functions)
+ 
+   # Catch-all for invalid records.
+   def valid?(_tag, _val),
+@@ -130,6 +129,14 @@ defmodule Cachex.Spec.Validator do
+   # Private API #
+   ###############
+ 
++  @doc false
++  # Determines if a module implements a behaviour.
++  defp behaviour?(module, behaviour) do
++    unsafe?(fn ->
++      { :behaviour, [ behaviour ] } in module.__info__(:attributes)
++    end)
++  end
++
+   @doc false
+   # Determines if the provided value is an enum.
+   defp enum?(enum, condition),
+diff --git a/lib/cachex/warmer.ex b/lib/cachex/warmer.ex
+new file mode 100644
+index 00000000..d7b037c1
+--- /dev/null
++++ b/lib/cachex/warmer.ex
+@@ -0,0 +1,105 @@
++defmodule Cachex.Warmer do
++  @moduledoc """
++  Module controlling cache warmer behaviour definitions.
++
++  This module defines the cache warming implementation for Cachex, allowing the
++  user to register warmers against a cache to populate the tables on an interval.
++  Doing this allows for easy pulling against expensive values (such as those from
++  a backing database or remote server), without risking heavy usage.
++
++  Warmers are fired on a schedule, and are exposed via a very simple behaviour of
++  just an interval and a block to execute on the interval. It should be noted that
++  this is a moving interval, and it resets after execution has completed.
++  """
++
++  #############
++  # Behaviour #
++  #############
++
++  @doc """
++  Returns the interval this warmer will execute on.
++
++  This must be an integer representing a count of milliseconds to wait before
++  the next execution of the warmer. Anything else will cause either invalidation
++  errors on cache startup, or crashes at runtime.
++  """
++  @callback interval :: integer
++
++  @doc """
++  Executes actions to warm a cache instance on interval.
++
++  This can either return values to set in the cache, or the atom `:ignore` to
++  signal that there's nothing to be set at this point in time. Values to be set
++  should be returned as `{ :ok, pairs }` where pairs is a list of `{ key, value }`
++  pairs to place into the cache via `Cachex.put_many/3`.
++
++  If you wish to provide expiration against the keys, you can return a Tuple in
++  the form `{ :ok, pairs, opts }` where `opts` is a list of options as accepted
++  by the `Cachex.put_many/3` function, thus allowing you to expire your warmed
++  data. Unless this is provided, there is no explicit expiration associated with
++  warmed values (as predicting the appropriate expiration is not possible).
++
++  The argument provided here is the one provided as state to the warmer records
++  at cache configuration time; it will be `nil` if none was provided.
++  """
++  @callback execute(state :: any) :: :ignore
++    | { :ok, pairs :: [ { key :: any, value :: any } ] }
++    | { :ok, pairs :: [ { key :: any, value :: any } ], options :: Keyword.t }
++
++  ##################
++  # Implementation #
++  ##################
++
++  @doc false
++  defmacro __using__(_) do
++    quote location: :keep do
++      use GenServer
++
++      # enforce the behaviour
++      @behaviour Cachex.Warmer
++
++      @doc false
++      # Initializes the warmer from a provided state.
++      #
++      # Initialization will trigger an initial cache warming, and store
++      # the provided state for later to provide during further warming.
++      def init(state),
++        do: { send(self(), :cachex_warmer) && :ok, state }
++
++      @doc false
++      # Warms a number of keys in a cache.
++      #
++      # This is done by calling the `execute/1` callback with the state
++      # stored in the main process state. The results are placed into the
++      # cache via `Cachex.put_many/3` if returns in a Tuple tagged with the
++      # `:ok` atom. If `:ignore` is returned, nothing happens aside from
++      # scheduling the next execution of the warming to occur on interval.
++      def handle_info(:cachex_warmer, { cache, state } = process_state) do
++        try do
++          # execute, passing state
++          case execute(state) do
++            # no changes
++            :ignore ->
++              :ignore
++
++            # set pairs without options
++            { :ok, pairs } ->
++              Cachex.put_many(cache, pairs)
++
++            # set pairs with options
++            { :ok, pairs, options } ->
++              Cachex.put_many(cache, pairs, options)
++          end
++        rescue
++          _ -> nil
++        end
++
++        # trigger the warming to happen again after the interval
++        :erlang.send_after(interval(), self(), :cachex_warmer)
++
++        # no reply, and the state persist
++        { :noreply, process_state }
++      end
++    end
++  end
++end
+diff --git a/test/cachex/errors_test.exs b/test/cachex/errors_test.exs
+index 2cb60937..aea59f4f 100644
+--- a/test/cachex/errors_test.exs
++++ b/test/cachex/errors_test.exs
+@@ -15,6 +15,7 @@ defmodule Cachex.ErrorsTest do
+       invalid_name:       "Invalid cache name provided",
+       invalid_option:     "Invalid option syntax provided",
+       invalid_pairs:      "Invalid insertion pairs provided",
++      invalid_warmer:     "Invalid warmer definition provided",
+       janitor_disabled:   "Specified janitor process running",
+       no_cache:           "Specified cache not running",
+       non_numeric_value:  "Attempted arithmetic operations on a non-numeric value",
+diff --git a/test/cachex/options_test.exs b/test/cachex/options_test.exs
+index e2cdfe73..fcb84f47 100644
+--- a/test/cachex/options_test.exs
++++ b/test/cachex/options_test.exs
+@@ -291,6 +291,35 @@ defmodule Cachex.OptionsTest do
+     refute trans3
+   end
+ 
++  test "parsing :warmers flags" do
++    # grab a cache name
++    name = Helper.create_name()
++
++    # define our warmer to pass through to the cache
++    Helper.create_warmer(:options_test_warmer, 50, fn(_) ->
++      :ignore
++    end)
++
++    # parse some warmers using the options parser
++    results1 = Cachex.Options.parse(name, [ warmers: [] ])
++    results2 = Cachex.Options.parse(name, [ warmers: warmer(module: :options_test_warmer) ])
++    results3 = Cachex.Options.parse(name, [ warmers: [ warmer(module: :options_test_warmer) ] ])
++    results4 = Cachex.Options.parse(name, [ warmers: [ "warmer" ] ])
++
++    # the first three should all be valid
++    { :ok, cache(warmers: warmers1) } = results1
++    { :ok, cache(warmers: warmers2) } = results2
++    { :ok, cache(warmers: warmers3) } = results3
++
++    # and then we check the warmers...
++    assert warmers1 == []
++    assert warmers2 == [ warmer(module: :options_test_warmer) ]
++    assert warmers3 == warmers2
++
++    # the last one should be invalid
++    assert results4 == { :error, :invalid_warmer }
++  end
++
+   # This test simply validates the ability to retrieve and transform an option
+   # from inside a Keyword List. We validate both existing and missing options in
+   # order to make sure there are no issues when retrieving. We also verify the
+diff --git a/test/cachex/services_test.exs b/test/cachex/services_test.exs
+index 2125ee22..e6580a34 100644
+--- a/test/cachex/services_test.exs
++++ b/test/cachex/services_test.exs
+@@ -18,6 +18,7 @@ defmodule Cachex.ServicesTest do
+       { Eternal, _, _, _, _, _ },
+       { Services.Locksmith.Queue, _, _, _, _, _ },
+       { Services.Informant, _, _, _, _, _ },
++      { Services.Incubator, _, _, _, _, _ },
+       { Services.Courier, _, _, _, _, _ },
+       { Services.Janitor, _, _, _, _, _ }
+     ] = Services.cache_spec(cache)
+@@ -33,6 +34,7 @@ defmodule Cachex.ServicesTest do
+       { Eternal, _, _, _, _, _ },
+       { Services.Locksmith.Queue, _, _, _, _, _ },
+       { Services.Informant, _, _, _, _, _ },
++      { Services.Incubator, _, _, _, _, _ },
+       { Services.Courier, _, _, _, _, _ },
+       { Services.Janitor, _, _, _, _, _ },
+       { Supervisor, { Supervisor, _, [ [ { __MODULE__.TestPolicy, _, _, _, _, _ } ], _ ] }, _, _, _, _ }
+@@ -49,6 +51,7 @@ defmodule Cachex.ServicesTest do
+       { Eternal, _, _, _, _, _ },
+       { Services.Locksmith.Queue, _, _, _, _, _ },
+       { Services.Informant, _, _, _, _, _ },
++      { Services.Incubator, _, _, _, _, _ },
+       { Services.Courier, _, _, _, _, _ },
+     ] = Services.cache_spec(cache)
+   end
+diff --git a/test/cachex/spec/validator_test.exs b/test/cachex/spec/validator_test.exs
+index 0631fccc..5f70bed5 100644
+--- a/test/cachex/spec/validator_test.exs
++++ b/test/cachex/spec/validator_test.exs
+@@ -204,4 +204,23 @@ defmodule Cachex.Spec.ValidatorTest do
+     refute Validator.valid?(:limit, limit7)
+     refute Validator.valid?(:limit, limit8)
+   end
++
++  test "validation of warmer records" do
++    # create a warmer for validation
++    Helper.create_warmer(:validator_warmer, 1000, fn(_) ->
++      :ignore
++    end)
++
++    # define some records
++    warmer1 = warmer(module: :validator_warmer)
++    warmer2 = warmer(module: __MODULE__)
++    warmer3 = warmer(module: :missing)
++
++    # ensure the first is valid
++    assert Validator.valid?(:warmer, warmer1)
++
++    # the others are all invalid
++    refute Validator.valid?(:warmer, warmer2)
++    refute Validator.valid?(:warmer, warmer3)
++  end
+ end
+diff --git a/test/cachex/warmer_test.exs b/test/cachex/warmer_test.exs
+new file mode 100644
+index 00000000..18332c84
+--- /dev/null
++++ b/test/cachex/warmer_test.exs
+@@ -0,0 +1,82 @@
++defmodule Cachex.WarmerTest do
++  use CachexCase
++
++  test "warmers which set basic values" do
++    # create a test warmer to pass to the cache
++    Helper.create_warmer(:basic_warmer, 50, fn(_) ->
++      { :ok, [ { 1, 1 } ] }
++    end)
++
++    # create a cache instance with a warmer
++    cache = Helper.create_cache([
++      warmers: [ warmer(module: :basic_warmer) ]
++    ])
++
++    # wait a while for it to fire
++    :timer.sleep(100)
++
++    # check that the key was warmed
++    assert Cachex.get!(cache, 1) == 1
++  end
++
++  test "warmers which set values with options" do
++    # create a test warmer to pass to the cache
++    Helper.create_warmer(:options_warmer, 50, fn(_) ->
++      { :ok, [ { 1, 1 } ], [ ttl: 60000 ] }
++    end)
++
++    # create a cache instance with a warmer
++    cache = Helper.create_cache([
++      warmers: [ warmer(module: :options_warmer) ]
++    ])
++
++    # wait a while for it to fire
++    :timer.sleep(100)
++
++    # check that the key was warmed
++    assert Cachex.get!(cache, 1) == 1
++
++    # check that there's a TTL
++    assert Cachex.ttl!(cache, 1) != nil
++  end
++
++  test "warmers which don't set values" do
++    # create a test warmer to pass to the cache
++    Helper.create_warmer(:ignore_warmer, 50, fn(_) ->
++      :ignore
++    end)
++
++    # create a cache instance with a warmer
++    cache = Helper.create_cache([
++      warmers: [ warmer(module: :ignore_warmer) ]
++    ])
++
++    # wait a while for it to fire
++    :timer.sleep(100)
++
++    # check that the cache is empty
++    assert Cachex.empty?!(cache)
++  end
++
++
++  test "providing warmers with states" do
++    # create a test warmer to pass to the cache
++    Helper.create_warmer(:state_warmer, 50, fn(state) ->
++      { :ok, [ { "state", state } ] }
++    end)
++
++    # current timestamp to use as state
++    state = :os.timestamp()
++
++    # create a cache instance with a warmer
++    cache = Helper.create_cache([
++      warmers: [ warmer(module: :state_warmer, state: state) ]
++    ])
++
++    # wait a while for it to fire
++    :timer.sleep(100)
++
++    # check that the key was warmed with state
++    assert Cachex.get!(cache, "state") == state
++  end
++end
+diff --git a/test/lib/cachex_case.ex b/test/lib/cachex_case.ex
+index 8807d87a..7d8944b5 100644
+--- a/test/lib/cachex_case.ex
++++ b/test/lib/cachex_case.ex
+@@ -13,6 +13,7 @@ defmodule CachexCase do
+       import Cachex.Errors
+       import ExUnit.CaptureLog
+ 
++      require Helper
+       require ExecuteHook
+       require ForwardHook
+     end
+diff --git a/test/lib/cachex_case/helper.ex b/test/lib/cachex_case/helper.ex
+index eb7a27ab..eec553a0 100644
+--- a/test/lib/cachex_case/helper.ex
++++ b/test/lib/cachex_case/helper.ex
+@@ -1,10 +1,10 @@
+ defmodule CachexCase.Helper do
+   @moduledoc false
+-  # This module contains various helper functions for tests, such as shorthanding
+-  # the ability to create caches, polling for messages, and polling for conditions.
+-  # Generally it just makes writing tests a lot easier and more convenient.
+-
+-  # import assertion stuff
++  # This module contains various helper functions for tests.
++  #
++  # Utilities such as shorthanding the ability to create caches, polling
++  # for messages, and polling for conditions. Generally it just makes writing
++  # tests a lot easier and more convenient.
+   import Cachex.Spec
+   import ExUnit.Assertions
+ 
+@@ -12,10 +12,12 @@ defmodule CachexCase.Helper do
+   @alphabet Enum.to_list(?a..?z)
+ 
+   @doc false
+-  # Creates a cache using the given arguments to construct the cache options. We
+-  # return the name in case we're using the defaults, so that callers can generate
+-  # a random cache with a random name. We make sure to trigger a delete to happen
+-  # on test exit in order to avoid bloating ETS and memory unnecessarily.
++  # Creates a cache using the given arguments to construct the cache options.
++  #
++  # We return the name in case we're using the defaults, so that callers can
++  # generate a random cache with a random name. We make sure to trigger a
++  # delete to happen  on test exit in order to avoid bloating ETS and memory
++  # unnecessarily.
+   def create_cache(name \\ [], args \\ []) do
+     { name, args } = cond do
+       is_atom(name) and is_list(args) ->
+@@ -30,8 +32,31 @@ defmodule CachexCase.Helper do
+   end
+ 
+   @doc false
+-  # Creates a cache name. These names are atoms of 8 random characters between
+-  # the letters A - Z. This is used to generate random cache names for tests.
++  # Creates a warmer module.
++  #
++  # This will name the module after the provided name, and create it with
++  # the provided interval definition and execution. This is a shorthand to
++  # avoid having to define modules all over the codebase, but does not change
++  # the outcomes in any way (still a new module being defined).
++  defmacro create_warmer(name, interval, execution) do
++    quote do
++      defmodule unquote(name) do
++        use Cachex.Warmer
++
++        def interval,
++          do: unquote(interval)
++
++        def execute(state),
++          do: apply(unquote(execution), [ state ])
++      end
++    end
++  end
++
++  @doc false
++  # Creates a cache name.
++  #
++  # These names are atoms of 8 random characters between the letters A - Z. This
++  # is used to generate random cache names for tests.
+   def create_name do
+     8
+     |> gen_rand_bytes
+@@ -39,15 +64,15 @@ defmodule CachexCase.Helper do
+   end
+ 
+   @doc false
+-  # Triggers a cache to be deleted at the end of the test. We have to pass this
+-  # through to the TestHelper module as we don't have a valid ExUnit context to
+-  # be able to define the execution hook correctly.
++  # Triggers a cache to be deleted at the end of the test.
++  #
++  # We have to pass this through to the `TestHelper` module as we don't have a
++  # valid ExUnit context to be able to define the execution hook correctly.
+   def delete_on_exit(name),
+     do: TestHelper.delete_on_exit(name) && name
+ 
+   @doc false
+-  # Flush all messages in the process queue. If there is no message in the mailbox,
+-  # then we immediately return nil.
++  # Flush all messages in the process queue.
+   def flush do
+     receive do
+       _ -> flush()
+@@ -57,8 +82,10 @@ defmodule CachexCase.Helper do
+   end
+ 
+   @doc false
+-  # Generates a number of random bytes to be returned as a binary, for use when
+-  # creating random messages and cache names.
++  # Generates a number of random bytes.
++  #
++  # Bytes will be returned as a binary, and can be used to generate alphabetic
++  # names and (sufficiently) random keys throughout test cycles.
+   def gen_rand_bytes(num) when is_number(num) do
+     1..num
+     |> Enum.map(fn(_) -> Enum.random(@alphabet) end)
+@@ -66,10 +93,11 @@ defmodule CachexCase.Helper do
+   end
+ 
+   @doc false
+-  # Provides the ability to poll for a condition to become true. Truthiness is
+-  # calculated using assertions. If the condition fails, we try again over and
+-  # over until a threshold is hit. Once the threshold is hit, we raise the last
+-  # known assertion error, as it's unlikely the test will pass going forward.
++  # Provides the ability to poll for a condition to become true.
++  #
++  # Truthiness is  calculated using assertions. If the condition fails, we try
++  # again over and over until a threshold is hit. Once the threshold is hit, we
++  # raise the last known assertion error to bubble back to ExUnit.
+   def poll(timeout, expected, generator, start_time \\ now()) do
+     try do
+       assert(generator.() == expected)
+@@ -81,5 +109,4 @@ defmodule CachexCase.Helper do
+         poll(timeout, expected, generator, start_time)
+     end
+   end
+-
+ end

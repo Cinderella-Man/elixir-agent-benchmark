@@ -1,0 +1,136 @@
+From 240ac88634bcdcf147546f76ee7f5b35fa2b9d0c Mon Sep 17 00:00:00 2001
+From: Jakob Lichterfeld <jakob-lichterfeld@gmx.de>
+Date: Sat, 3 Oct 2026 09:46:49 +0200
+Subject: [PATCH] fix: re-assign drives and charges only when a geofence's
+ location or radius changes
+
+Saving a geofence re-assigned all drives and charging sessions around it, even when only its name or costs changed. On large databases this can take longer than the database timeout, so changing the price per kWh failed.
+The assignment depends only on latitude, longitude and radius, so it is now skipped when none of them changed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md                                  |  1 +
+ elixir/lib/teslamate/locations.ex             | 29 +++++++---
+ .../teslamate/locations/geofences_test.exs    | 57 +++++++++++++++++++
+ 3 files changed, 78 insertions(+), 9 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 2464fcfc0e..4c65f00b77 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,6 +9,7 @@
+ - feat: use Grafana 13.2.3 (#5803 - @swiffer)
+ - fix(docker): install the CA certificates, so Tzdata can verify TLS and download time zone updates (#5808 - @JakobLichterfeld)
+ - fix: use the position's latitude when re-assigning drives and charges to geofences (#5820 - @JakobLichterfeld)
++- fix: re-assign drives and charges only when a geofence's location or radius changes (#5823 - @JakobLichterfeld)
+ 
+ #### Build, CI, internal
+ 
+diff --git a/elixir/lib/teslamate/locations.ex b/elixir/lib/teslamate/locations.ex
+index 93bce8d8b8..bd8d4684a5 100644
+--- a/elixir/lib/teslamate/locations.ex
++++ b/elixir/lib/teslamate/locations.ex
+@@ -191,15 +191,26 @@ defmodule TeslaMate.Locations do
+   end
+ 
+   def update_geofence(%GeoFence{id: id} = geofence, attrs) do
+-    Repo.transaction(fn ->
+-      with :ok <- apply_geofence(geofence, except: id),
+-           {:ok, geofence} <- geofence |> GeoFence.changeset(attrs) |> Repo.update(),
+-           :ok <- apply_geofence(geofence) do
+-        geofence
+-      else
+-        {:error, reason} -> Repo.rollback(reason)
+-      end
+-    end)
++    changeset = GeoFence.changeset(geofence, attrs)
++
++    if location_changed?(changeset) do
++      Repo.transaction(fn ->
++        with :ok <- apply_geofence(geofence, except: id),
++             {:ok, geofence} <- Repo.update(changeset),
++             :ok <- apply_geofence(geofence) do
++          geofence
++        else
++          {:error, reason} -> Repo.rollback(reason)
++        end
++      end)
++    else
++      Repo.update(changeset)
++    end
++  end
++
++  # Drives and charging processes are assigned to geofences by location and radius only
++  defp location_changed?(changeset) do
++    Enum.any?([:latitude, :longitude, :radius], &Ecto.Changeset.changed?(changeset, &1))
+   end
+ 
+   def delete_geofence(%GeoFence{id: id} = geofence) do
+diff --git a/elixir/test/teslamate/locations/geofences_test.exs b/elixir/test/teslamate/locations/geofences_test.exs
+index 45e6118742..7b5d750c89 100644
+--- a/elixir/test/teslamate/locations/geofences_test.exs
++++ b/elixir/test/teslamate/locations/geofences_test.exs
+@@ -247,6 +247,63 @@ defmodule TeslaMate.LocationsGeofencesTest do
+       assert %ChargingProcess{geofence_id: ^geofence_id} = Repo.get(ChargingProcess, cproc_id)
+     end
+ 
++    test "update_geofence/2 does not re-assign drives and charging processes if the location is unchanged" do
++      car = car_fixture()
++      position = %{latitude: 52.51500, longitude: 13.35100}
++
++      %ChargingProcess{id: cproc_id} = create_charging_process(car, position)
++      %Drive{id: drive_id} = create_drive(car, position, position)
++
++      assert {:ok, %GeoFence{id: geofence_id} = geofence} =
++               Locations.create_geofence(%{
++                 name: "foo",
++                 latitude: 52.514521,
++                 longitude: 13.350144,
++                 radius: 250
++               })
++
++      assert %Drive{start_geofence_id: ^geofence_id, end_geofence_id: ^geofence_id} =
++               Repo.get(Drive, drive_id)
++
++      assert %ChargingProcess{geofence_id: ^geofence_id} = Repo.get(ChargingProcess, cproc_id)
++
++      # Detach both, so that a re-assignment would become visible
++
++      Repo.get!(Drive, drive_id)
++      |> Ecto.Changeset.change(start_geofence_id: nil, end_geofence_id: nil)
++      |> Repo.update!()
++
++      Repo.get!(ChargingProcess, cproc_id)
++      |> Ecto.Changeset.change(geofence_id: nil)
++      |> Repo.update!()
++
++      # The form submits all fields, including the unchanged location
++
++      assert {:ok, %GeoFence{id: ^geofence_id, name: "bar"}} =
++               Locations.update_geofence(geofence, %{
++                 "name" => "bar",
++                 "latitude" => "52.514521",
++                 "longitude" => "13.350144",
++                 "radius" => "250",
++                 "billing_type" => "per_minute",
++                 "cost_per_unit" => "0.0079",
++                 "session_fee" => "5.0"
++               })
++
++      assert %Drive{start_geofence_id: nil, end_geofence_id: nil} = Repo.get(Drive, drive_id)
++      assert %ChargingProcess{geofence_id: nil} = Repo.get(ChargingProcess, cproc_id)
++    end
++
++    test "update_geofence/2 with invalid data and an unchanged location returns error changeset" do
++      geofence = geofence_fixture()
++
++      assert {:error, %Ecto.Changeset{} = changeset} =
++               Locations.update_geofence(geofence, %{session_fee: -0.01})
++
++      assert %{session_fee: ["must be greater than or equal to 0"]} = errors_on(changeset)
++      assert geofence == Locations.get_geofence!(geofence.id)
++    end
++
+     test "delete_geofence/1 deletes the geofence" do
+       geofence = geofence_fixture()
+       assert {:ok, %GeoFence{}} = Locations.delete_geofence(geofence)

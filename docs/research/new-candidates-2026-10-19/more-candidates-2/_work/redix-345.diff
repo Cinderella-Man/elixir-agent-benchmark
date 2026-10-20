@@ -1,0 +1,1691 @@
+diff --git a/lib/redix/cluster.ex b/lib/redix/cluster.ex
+index 72733fc..914e004 100644
+--- a/lib/redix/cluster.ex
++++ b/lib/redix/cluster.ex
+@@ -5,33 +5,33 @@ defmodule Redix.Cluster do
+   For a higher-level guide, see the [Cluster guide](cluster.html).
+ 
+   The design of this module follows the same low-level philosophy as the rest of Redix:
+-  it builds on existing `Redix` connections (one per cluster node), uses ETS for fast slot
+-  lookups, and mostly mirrors the `Redix` API.
++  it builds on existing `Redix` connections, uses ETS for fast slot lookups, and mostly
++  mirrors the `Redix` API. By default it opens one connection per cluster node, but that's
++  tunable via options.
+ 
+   ## Usage
+ 
+   You can start connections to a Redis Cluster similarly to how you'd start a single
+   `Redix` connection, but specifying a *list of seed nodes* and a *name*:
+ 
+-      {:ok, cluster} = Redix.Cluster.start_link(
+-        name: :my_cluster,
+-        nodes: ["redis://localhost:7000"]
+-      )
++      {:ok, cluster} =
++        Redix.Cluster.start_link(
++          name: :my_cluster,
++          nodes: ["redis://localhost:7000"]
++        )
+ 
+       Redix.Cluster.command(:my_cluster, ["SET", "mykey", "myvalue"])
+       #=> {:ok, "OK"}
+       Redix.Cluster.command(:my_cluster, ["GET", "mykey"])
+       #=> {:ok, "myvalue"}
+ 
+-  Like single-node `Redix` connections, the cluster starts even if no seed node is
+-  currently reachable: the topology is discovered in the background, retrying with
+-  exponential backoff. Commands issued while the *initial* discovery attempt is in
+-  flight wait for it to complete (just like a single Redix connection postpones
+-  commands while it's connecting), so the common "start the cluster, issue a
+-  command right away" pattern works without retries. If that first attempt fails,
+-  commands return `{:error, %Redix.ConnectionError{reason: :closed}}` until a seed
+-  node becomes reachable. Pass `sync_connect: true` to `start_link/1` to block
+-  until the topology has been discovered instead.
++  Like single-node `Redix` connections, the cluster starts even if no seed node
++  is currently reachable: the topology is discovered in the background, retrying
++  with exponential backoff. Commands issued while the *initial* discovery
++  attempt is in flight wait for it to complete, but if that first attempt fails,
++  commands return an error until a seed node becomes reachable. Pass
++  `sync_connect: true` to `start_link/1` to block until the topology has been
++  discovered instead.
+ 
+   ### Pipelines
+ 
+@@ -60,9 +60,9 @@ defmodule Redix.Cluster do
+   ### Reading from replicas
+ 
+   By default all commands are routed to primaries. To allow reads from replicas,
+-  start the cluster with `read_from_replicas: true` (which opens and supervises a
+-  connection to each replica, issuing `READONLY` on it) and pass a `:route` option
+-  **per call**:
++  start the cluster with `read_from_replicas: true` (which opens and supervises
++  connections to each replica, issuing `READONLY` on them) and pass a `:route`
++  option **per call**:
+ 
+       Redix.Cluster.start_link(
+         name: :my_cluster,
+@@ -81,7 +81,7 @@ defmodule Redix.Cluster do
+   ### Limitations
+ 
+     * Only database `0` is supported (Redis Cluster does not support `SELECT`).
+-    * Pub/Sub is not supported through the cluster interface (*yet*).
++    * Pub/Sub is not supported through the cluster interface.
+     * The `:noreply_*` functions are not supported in cluster mode.
+ 
+   ## Telemetry
+@@ -125,8 +125,7 @@ defmodule Redix.Cluster do
+       type: :atom,
+       required: true,
+       doc: """
+-      An atom to register the cluster process under.
+-      All internal resources (ETS tables, Registry, connection supervisor) are named
++      An atom to register the cluster process under. All internal resources are named
+       deterministically based on this name. You use this name to issue commands:
+ 
+           Redix.Cluster.start_link(name: :my_cluster, nodes: [...])
+@@ -163,14 +162,39 @@ defmodule Redix.Cluster do
+       default: 30_000,
+       doc: "How often (in milliseconds) to refresh the cluster topology."
+     ],
++    primary_pool_size: [
++      type: :pos_integer,
++      default: 1,
++      doc: """
++      The number of connections to open to **each** primary node in the cluster. During
++      normal routing, commands from one caller process use the same connection in a node's
++      pool while that connection is available. Redirects keep the original caller choice.
++      If the selected connection is unavailable, Redix uses another live pool member.
++      Workloads with few caller processes might not use all pool members. Redis is
++      single-threaded anyways, so use this only if it makes sense for your workload (and
++      possibly after benchmarking!). *Available since 1.7.0*.
++      """
++    ],
++    replica_pool_size: [
++      type: :pos_integer,
++      default: 1,
++      doc: """
++      The number of connections to open to **each** replica node when `read_from_replicas: true`
++      is set. This is independent from `:primary_pool_size`, because primary and replica
++      traffic can need different pool sizes. Redis is single-threaded anyways, so use
++      this only if it makes sense for your workload (and possibly after benchmarking!).
++      *Available since 1.7.0*.
++      """
++    ],
+     read_from_replicas: [
+       type: :boolean,
+       default: false,
+       doc: """
+-      if `true`, the cluster also opens (and supervises) a connection to every replica
+-      node discovered via `CLUSTER SLOTS`, issuing `READONLY` on each so it can serve
+-      reads. This is required to use `route: :replica` or `route: :prefer_replica` (see
+-      `command/3`). Defaults to `false`, in which case only primaries are connected.
++      If `true`, the cluster also opens (and supervises) `:replica_pool_size`
++      connections to every replica node discovered via `CLUSTER SLOTS`, issuing
++      `READONLY` on each so it can serve reads. This is required to use
++      `route: :replica` or `route: :prefer_replica` (see `command/3`). Defaults to
++      `false`, in which case only primaries are connected.
+       """
+     ]
+   ]
+@@ -193,6 +217,16 @@ defmodule Redix.Cluster do
+   cluster mode (the cluster supervises node connections and handles disconnections
+   itself).
+ 
++  ## Resources
++
++  Each cluster uses:
++
++    * Two ETS tables.
++    * One `Registry` (which starts another ETS table).
++    * `:primary_pool_size` connections for each primary node.
++    * `:replica_pool_size` connections for each replica node when
++      `read_from_replicas: true` is set.
++
+   ## TLS and credentials in seed URIs
+ 
+   The full topology is discovered from a seed node, and every node connection
+@@ -234,6 +268,8 @@ defmodule Redix.Cluster do
+     name = Keyword.fetch!(cluster_opts, :name)
+     parsed_nodes = Keyword.fetch!(cluster_opts, :nodes)
+     refresh_interval = Keyword.fetch!(cluster_opts, :topology_refresh_interval)
++    primary_pool_size = Keyword.fetch!(cluster_opts, :primary_pool_size)
++    replica_pool_size = Keyword.fetch!(cluster_opts, :replica_pool_size)
+     read_from_replicas = Keyword.fetch!(cluster_opts, :read_from_replicas)
+     sync_connect = Keyword.fetch!(cluster_opts, :sync_connect)
+ 
+@@ -288,6 +324,8 @@ defmodule Redix.Cluster do
+        pool_supervisor: pool_name(name),
+        conn_opts: conn_opts,
+        refresh_interval: refresh_interval,
++       primary_pool_size: primary_pool_size,
++       replica_pool_size: replica_pool_size,
+        read_from_replicas: read_from_replicas,
+        sync_connect: sync_connect,
+        table_name: slot_table_name(name),
+@@ -409,8 +447,8 @@ defmodule Redix.Cluster do
+   When a pipeline spans multiple nodes and only *some* of those nodes fail (for
+   example, it times out or its task crashes), the call still returns `{:ok,
+   results}`. The positions of the commands routed to a failed node are filled
+-  with the relevant error *value* (a `%Redix.ConnectionError{}`, or a
+-  `%Redix.Error{}` for a Redis-level error) at their original indices, while the
++  with the relevant error *value* (a `Redix.ConnectionError`, or a
++  `Redix.Error` for a Redis-level error) at their original indices, while the
+   results from nodes that succeeded stay visible. This extends Redix's "errors
+   are values" philosophy to the cross-node connection-error case, so a failure
+   affecting one node no longer discards the work that committed on the others.
+@@ -504,12 +542,13 @@ defmodule Redix.Cluster do
+     registry = registry_name(cluster)
+ 
+     await_topology_discovery(cluster, slot_table, opts)
++    {primary_pool_size, _replica_pool_size} = pool_sizes(slot_table)
+ 
+     # From here on, the whole transaction—the initial MULTI/EXEC plus every
+     # MOVED/ASK hop and on-demand connect it spawns—shares one deadline derived
+     # from the caller's :timeout, so a redirect chain can't run for the full
+     # timeout per hop (issue #337).
+-    opts = put_deadline(opts)
++    opts = put_request_context(opts)
+ 
+     # All commands in a transaction must target the same slot.
+     indexed_commands =
+@@ -532,7 +571,7 @@ defmodule Redix.Cluster do
+ 
+     case slots do
+       [slot] ->
+-        case Manager.get_connection(slot_table, registry, slot) do
++        case Manager.get_connection(slot_table, registry, slot, primary_pool_size) do
+           {:ok, conn} ->
+             execute_transaction(
+               cluster,
+@@ -675,7 +714,7 @@ defmodule Redix.Cluster do
+     # hop and on-demand connect it spawns—shares one deadline derived from the
+     # caller's :timeout, so a redirect chain can't run for the full timeout per
+     # hop (issue #337). Each group's task reads the *remaining* budget off it.
+-    opts = put_deadline(opts)
++    opts = put_request_context(opts)
+ 
+     # Group commands by target node
+     indexed_commands =
+@@ -712,16 +751,28 @@ defmodule Redix.Cluster do
+   defp group_by_node(slot_table, registry, indexed_commands, route) do
+     # Resolve a single connection per distinct slot and reuse it for every command
+     # on that slot, so same-slot commands land in one group (and thus one pipeline).
+-    # This matters for replica routes: resolve_connection/4 picks a random replica
++    # This matters for replica routes: resolve_connection/5 picks a random replica
+     # per call, so without "memoizing", two reads on the same slot could resolve to
+     # different replica pids and be split across parallel tasks (issue #315).
++    pool_sizes = pool_sizes(slot_table)
++
+     resolved_by_slot =
+       indexed_commands
+       |> Enum.map(fn {_idx, _cmd, slot} -> slot end)
+       |> Enum.uniq()
+       |> Map.new(fn
+-        :no_slot -> {:no_slot, :random}
+-        slot -> {slot, resolve_connection(slot_table, registry, slot, route)}
++        :no_slot ->
++          {:no_slot, :random}
++
++        slot ->
++          {slot,
++           resolve_connection(
++             slot_table,
++             registry,
++             slot,
++             route,
++             pool_sizes
++           )}
+       end)
+ 
+     indexed_commands
+@@ -877,7 +928,7 @@ defmodule Redix.Cluster do
+     # :timeout handed to Redix.pipeline/3 is the time *remaining*, not a fresh
+     # full timeout. If the deadline already elapsed on an earlier hop, fail fast
+     # with a timeout error instead of starting another full-timeout request. The
+-    # private :__deadline__ key is stripped so it never reaches Redix.pipeline/3
++    # Private request keys are stripped so they never reach Redix.pipeline/3
+     # (which rejects unknown options). pop_lazy keeps this robust if a caller ever
+     # reaches here without a deadline set — it derives one from the opts :timeout.
+     {deadline, opts} =
+@@ -885,6 +936,8 @@ defmodule Redix.Cluster do
+         deadline_from_timeout(Keyword.get(opts, :timeout, @default_timeout))
+       end)
+ 
++    opts = Keyword.delete(opts, :__caller__)
++
+     case deadline_remaining(deadline) do
+       0 ->
+         {:error, %Redix.ConnectionError{reason: :timeout}}
+@@ -994,12 +1047,23 @@ defmodule Redix.Cluster do
+   # SLOTS, for ASK), so we trust it rather than surfacing a fake "unreachable" error.
+   # The next `ensure_connections` adopts the connection or drops it (issues #319, #293).
+   defp connect_for_redirect(cluster, host, port, opts) do
+-    case Manager.get_connection_by_node(registry_name(cluster), {host, port}) do
++    caller = Keyword.fetch!(opts, :__caller__)
++
++    case Manager.get_connection_by_node(
++           registry_name(cluster),
++           {host, port},
++           caller
++         ) do
+       {:ok, conn} ->
+         {:ok, conn}
+ 
+       :error ->
+-        Manager.connect_to_node(manager_name(cluster), {host, port}, connect_timeout(opts))
++        Manager.connect_to_node(
++          manager_name(cluster),
++          {host, port},
++          connect_timeout(opts),
++          caller
++        )
+     end
+   end
+ 
+@@ -1131,6 +1195,12 @@ defmodule Redix.Cluster do
+     Keyword.put(opts, :__deadline__, deadline)
+   end
+ 
++  defp put_request_context(opts) do
++    opts
++    |> put_deadline()
++    |> Keyword.put(:__caller__, self())
++  end
++
+   defp deadline_from_timeout(:infinity), do: :infinity
+ 
+   defp deadline_from_timeout(timeout) when is_integer(timeout) do
+@@ -1145,23 +1215,56 @@ defmodule Redix.Cluster do
+   end
+ 
+   # Resolves the connection for a slot according to the routing choice. Returns
+-  # `{:ok, pid}` or `:error` (the same shape `Manager.get_connection/3` returns),
++  # `{:ok, pid}` or `:error` (the same shape `Manager.get_connection/4` returns),
+   # so the grouping/execution path handles a missing connection uniformly.
+-  defp resolve_connection(slot_table, registry, slot, :primary) do
+-    Manager.get_connection(slot_table, registry, slot)
++  defp resolve_connection(
++         slot_table,
++         registry,
++         slot,
++         :primary,
++         {primary_pool_size, _replica_pool_size}
++       ) do
++    Manager.get_connection(slot_table, registry, slot, primary_pool_size)
+   end
+ 
+-  defp resolve_connection(slot_table, registry, slot, :replica) do
+-    Manager.get_replica_connection(slot_table, registry, slot)
++  defp resolve_connection(
++         slot_table,
++         registry,
++         slot,
++         :replica,
++         {_primary_pool_size, replica_pool_size}
++       ) do
++    Manager.get_replica_connection(slot_table, registry, slot, replica_pool_size)
+   end
+ 
+-  defp resolve_connection(slot_table, registry, slot, :prefer_replica) do
+-    case Manager.get_replica_connection(slot_table, registry, slot) do
++  defp resolve_connection(
++         slot_table,
++         registry,
++         slot,
++         :prefer_replica,
++         {primary_pool_size, replica_pool_size}
++       ) do
++    case Manager.get_replica_connection(slot_table, registry, slot, replica_pool_size) do
+       {:ok, _pid} = ok -> ok
+-      :error -> Manager.get_connection(slot_table, registry, slot)
++      :error -> Manager.get_connection(slot_table, registry, slot, primary_pool_size)
+     end
+   end
+ 
++  defp pool_sizes(slot_table) do
++    Manager.guard_missing_table(
++      fn ->
++        case :ets.lookup(slot_table, :pool_sizes) do
++          [{:pool_sizes, {primary_pool_size, replica_pool_size}}] ->
++            {primary_pool_size, replica_pool_size}
++
++          [] ->
++            {1, 1}
++        end
++      end,
++      {1, 1}
++    )
++  end
++
+   defp validate_and_pop_route!(opts) do
+     case Keyword.pop(opts, :route, :primary) do
+       {route, opts} when route in @valid_routes ->
+diff --git a/lib/redix/cluster/manager.ex b/lib/redix/cluster/manager.ex
+index 8e6bd67..b61e997 100644
+--- a/lib/redix/cluster/manager.ex
++++ b/lib/redix/cluster/manager.ex
+@@ -21,12 +21,14 @@ defmodule Redix.Cluster.Manager do
+     :conn_opts,
+     :seed_nodes,
+     :refresh_interval,
++    :primary_pool_size,
++    :replica_pool_size,
+     # Tracks the exponential backoff between initial topology fetch attempts
+     # while in the :disconnected state (async connect).
+     :backoff_current,
+     read_from_replicas: false,
+-    # Maps a monitor ref to `{node_id, role}` so a crashed connection is
+-    # restarted with the same role (and therefore the same READONLY behavior).
++    # Maps a monitor ref to `{node_id, index, role}` so a crashed pool member is
++    # restarted with the same index and role (and therefore the same READONLY behavior).
+     monitors: %{},
+     # Maps a node_id (canonical, resolved-IP form) to the literal host it was
+     # actually reached at (a hostname or an IP, whichever the server gave us).
+@@ -70,13 +72,17 @@ defmodule Redix.Cluster.Manager do
+ 
+   Reads the slot table from ETS and then looks up the connection in the Registry.
+   """
+-  @spec get_connection(atom(), atom(), non_neg_integer()) :: {:ok, pid()} | :error
+-  def get_connection(slot_table, registry, slot) when is_integer(slot) do
++  @spec get_connection(atom(), atom(), non_neg_integer(), pos_integer()) ::
++          {:ok, pid()} | :error
++  def get_connection(slot_table, registry, slot, pool_size) when is_integer(slot) do
+     guard_missing_table(
+       fn ->
+         case :ets.lookup(slot_table, slot) do
+-          [{^slot, primary_id, _replica_ids}] -> lookup_connection(registry, primary_id)
+-          [] -> :error
++          [{^slot, primary_id, _replica_ids}] ->
++            lookup_connection(registry, primary_id, pool_size)
++
++          [] ->
++            :error
+         end
+       end,
+       :error
+@@ -91,8 +97,9 @@ defmodule Redix.Cluster.Manager do
+   disabled, in which case no replicas are tracked). Callers that want to fall back
+   to the primary should do so explicitly (see `Redix.Cluster`'s `:prefer_replica`).
+   """
+-  @spec get_replica_connection(atom(), atom(), non_neg_integer()) :: {:ok, pid()} | :error
+-  def get_replica_connection(slot_table, registry, slot) when is_integer(slot) do
++  @spec get_replica_connection(atom(), atom(), non_neg_integer(), pos_integer()) ::
++          {:ok, pid()} | :error
++  def get_replica_connection(slot_table, registry, slot, pool_size) when is_integer(slot) do
+     guard_missing_table(
+       fn ->
+         case :ets.lookup(slot_table, slot) do
+@@ -100,7 +107,7 @@ defmodule Redix.Cluster.Manager do
+             replica_ids
+             |> Enum.shuffle()
+             |> Enum.find_value(:error, fn replica_id ->
+-              case lookup_connection(registry, replica_id) do
++              case lookup_connection(registry, replica_id, pool_size) do
+                 {:ok, pid} -> {:ok, pid}
+                 :error -> false
+               end
+@@ -119,10 +126,11 @@ defmodule Redix.Cluster.Manager do
+ 
+   Used for `MOVED`/`ASK` redirection to a specific node.
+   """
+-  @spec get_connection_by_node(atom(), {String.t(), non_neg_integer()}) :: {:ok, pid()} | :error
+-  def get_connection_by_node(registry, {host, port}) do
++  @spec get_connection_by_node(atom(), {String.t(), non_neg_integer()}, pid()) ::
++          {:ok, pid()} | :error
++  def get_connection_by_node(registry, {host, port}, caller) do
+     guard_missing_table(
+-      fn -> lookup_connection(registry, canonical_node_id(host, port)) end,
++      fn -> lookup_node_connection(registry, canonical_node_id(host, port), caller) end,
+       :error
+     )
+   end
+@@ -139,12 +147,12 @@ defmodule Redix.Cluster.Manager do
+   def get_random_connection(registry) do
+     guard_missing_table(
+       fn ->
+-        case Registry.select(registry, [{{:_, :"$1", :primary}, [], [:"$1"]}]) do
++        case Registry.select(registry, [{{{:_, :_}, :"$1", :primary}, [], [:"$1"]}]) do
+           [_ | _] = pids ->
+             {:ok, Enum.random(pids)}
+ 
+           [] ->
+-            case Registry.select(registry, [{{:_, :"$1", :_}, [], [:"$1"]}]) do
++            case Registry.select(registry, [{{{:_, :_}, :"$1", :_}, [], [:"$1"]}]) do
+               [] -> :error
+               pids -> {:ok, Enum.random(pids)}
+             end
+@@ -226,6 +234,17 @@ defmodule Redix.Cluster.Manager do
+   @spec connect_to_node(:gen_statem.server_ref(), {String.t(), :inet.port_number()}, timeout()) ::
+           {:ok, pid()} | {:error, term()}
+   def connect_to_node(manager, {host, port}, timeout) do
++    connect_to_node(manager, {host, port}, timeout, self())
++  end
++
++  @doc false
++  @spec connect_to_node(
++          :gen_statem.server_ref(),
++          {String.t(), :inet.port_number()},
++          timeout(),
++          pid()
++        ) :: {:ok, pid()} | {:error, term()}
++  def connect_to_node(manager, {host, port}, timeout, caller) do
+     # This runs in the command hot path, so a Manager that's briefly busy (say,
+     # mid-refresh against slow nodes) must not crash the caller: degrade to an
+     # error tuple, which the MOVED handler turns into a normal Redix error. The
+@@ -234,7 +253,7 @@ defmodule Redix.Cluster.Manager do
+     # slow refresh against a partially-down cluster blocks every on-demand connect
+     # (and thus every MOVED/ASK redirect) for the whole refresh (issue #327). On
+     # timeout the `:exit` is caught and degrades to the documented error path.
+-    :gen_statem.call(manager, {:connect_to_node, host, port}, timeout)
++    :gen_statem.call(manager, {:connect_to_node, host, port, caller}, timeout)
+   catch
+     :exit, reason -> {:error, reason}
+   end
+@@ -255,11 +274,14 @@ defmodule Redix.Cluster.Manager do
+     command_cache_name = Keyword.fetch!(opts, :command_cache_table)
+     registry = Keyword.fetch!(opts, :registry)
+     read_from_replicas = Keyword.fetch!(opts, :read_from_replicas)
++    primary_pool_size = Keyword.fetch!(opts, :primary_pool_size)
++    replica_pool_size = Keyword.fetch!(opts, :replica_pool_size)
+     sync_connect = Keyword.fetch!(opts, :sync_connect)
+ 
+     # :protected, not :public: only the Manager (the owner) ever writes the slot
+     # table; callers only read it, so :protected is free hardening.
+     slot_table = :ets.new(table_name, [:named_table, :protected, :set, {:read_concurrency, true}])
++    :ets.insert(slot_table, {:pool_sizes, {primary_pool_size, replica_pool_size}})
+ 
+     # Caches the key specification (first-key position / movable / no-key) of commands
+     # outside CommandParser's static table, learned via COMMAND INFO. Written from
+@@ -282,6 +304,8 @@ defmodule Redix.Cluster.Manager do
+       conn_opts: conn_opts,
+       seed_nodes: seed_nodes,
+       refresh_interval: refresh_interval,
++      primary_pool_size: primary_pool_size,
++      replica_pool_size: replica_pool_size,
+       read_from_replicas: read_from_replicas
+     }
+ 
+@@ -416,8 +440,8 @@ defmodule Redix.Cluster.Manager do
+     {:keep_state, handle_down(data, ref, reason)}
+   end
+ 
+-  defp handle_common_event({:call, from}, {:connect_to_node, host, port}, data) do
+-    handle_connect_to_node(from, host, port, data)
++  defp handle_common_event({:call, from}, {:connect_to_node, host, port, caller}, data) do
++    handle_connect_to_node(from, host, port, caller, data)
+   end
+ 
+   defp handle_common_event({:call, from}, :await_topology_discovery, _data) do
+@@ -451,10 +475,10 @@ defmodule Redix.Cluster.Manager do
+     {backoff_current, %{data | backoff_current: backoff_current}}
+   end
+ 
+-  defp handle_connect_to_node(from, host, port, data) do
++  defp handle_connect_to_node(from, host, port, caller, data) do
+     node_id = canonical_node_id(host, port)
+ 
+-    case lookup_connection(data.registry, node_id) do
++    case lookup_node_connection(data.registry, node_id, caller) do
+       {:ok, pid} ->
+         # Returns the existing connection whatever role it's registered under. Just
+         # after a failover that role can be stale (a target promoted to primary may
+@@ -465,8 +489,9 @@ defmodule Redix.Cluster.Manager do
+ 
+       :error ->
+         # MOVED is authoritative and always points at the slot's primary, so an
+-        # on-demand connection is registered as a primary.
+-        {result, data} = start_and_monitor_connection(data, node_id, host, port, :primary)
++        # on-demand pool is registered as primary connections.
++        {first_result, data} = start_and_monitor_node_pool(data, node_id, host, port, :primary)
++        result = lookup_node_connection(data.registry, node_id, caller, first_result)
+         {:keep_state, data, [{:reply, from, result}]}
+     end
+   end
+@@ -476,7 +501,7 @@ defmodule Redix.Cluster.Manager do
+     data = %{data | monitors: monitors}
+ 
+     case node_info do
+-      {node_id, role} -> handle_node_down(data, node_id, role, reason)
++      {node_id, index, role} -> handle_node_down(data, node_id, index, role, reason)
+       nil -> data
+     end
+   end
+@@ -488,7 +513,7 @@ defmodule Redix.Cluster.Manager do
+   # changing the node (or our config) can, and there's no bound on when. So we
+   # deliberately do *not* restart it here. Instead we leave it to the periodic
+   # topology refresh.
+-  defp handle_node_down(data, node_id, _role, %Redix.Error{} = reason) do
++  defp handle_node_down(data, node_id, _index, _role, %Redix.Error{} = reason) do
+     :telemetry.execute([:redix, :cluster, :node_connection_failed], %{}, %{
+       cluster: data.cluster_name,
+       address: node_id,
+@@ -503,10 +528,10 @@ defmodule Redix.Cluster.Manager do
+   # failure never reaches here: `Redix.Connection` handles it internally (it moves
+   # to its own :disconnected state and reconnects) rather than stopping, so this
+   # path can't degenerate into a fast restart loop.
+-  defp handle_node_down(data, node_id, role, _reason) do
++  defp handle_node_down(data, node_id, index, role, _reason) do
+     {:ok, _canonical_host, port} = split_host_port(node_id)
+     host = Map.fetch!(data.node_addresses, node_id)
+-    {_result, data} = start_and_monitor_connection(data, node_id, host, port, role)
++    {_result, data} = start_and_monitor_connection(data, node_id, index, host, port, role)
+     data
+   end
+ 
+@@ -516,7 +541,7 @@ defmodule Redix.Cluster.Manager do
+   defp demonitor_node(data, node_id) do
+     monitors =
+       data.monitors
+-      |> Enum.filter(fn {ref, {id, _role}} ->
++      |> Enum.filter(fn {ref, {id, _index, _role}} ->
+         if id == node_id do
+           Process.demonitor(ref, [:flush])
+           false
+@@ -529,14 +554,53 @@ defmodule Redix.Cluster.Manager do
+     %{data | monitors: monitors}
+   end
+ 
+-  defp monitoring_node?(data, node_id) do
+-    Enum.any?(data.monitors, fn {_ref, {id, _role}} -> id == node_id end)
++  defp monitoring_member?(data, node_id, index) do
++    Enum.any?(data.monitors, fn {_ref, {id, member_index, _role}} ->
++      id == node_id and member_index == index
++    end)
++  end
++
++  defp lookup_connection(registry, node_id, pool_size) do
++    index = :erlang.phash2(self(), pool_size)
++
++    case Registry.lookup(registry, {node_id, index}) do
++      [{pid, _value}] ->
++        {:ok, pid}
++
++      [] ->
++        lookup_other_connection(registry, node_id, index, pool_size)
++    end
++  end
++
++  defp lookup_other_connection(registry, node_id, preferred_index, pool_size) do
++    0..(pool_size - 1)
++    |> Enum.reject(&(&1 == preferred_index))
++    |> Enum.find_value(:error, fn index ->
++      case Registry.lookup(registry, {node_id, index}) do
++        [{pid, _value}] -> {:ok, pid}
++        [] -> false
++      end
++    end)
+   end
+ 
+-  defp lookup_connection(registry, node_id) do
+-    case Registry.lookup(registry, node_id) do
+-      [{pid, _value}] -> {:ok, pid}
+-      [] -> :error
++  # A redirect target can already be registered under either role. Search all live
++  # members instead of limiting the lookup to one role's pool size.
++  defp lookup_node_connection(registry, node_id, caller, default \\ :error) do
++    members =
++      registry
++      |> Registry.select([{{{node_id, :"$1"}, :"$2", :_}, [], [{{:"$1", :"$2"}}]}])
++      |> Enum.filter(fn {_index, pid} -> Process.alive?(pid) end)
++      |> Enum.sort_by(&elem(&1, 0))
++
++    case members do
++      [] ->
++        default
++
++      members ->
++        {last_index, _pid} = List.last(members)
++        preferred_index = :erlang.phash2(caller, last_index + 1)
++        {_index, pid} = List.keyfind(members, preferred_index, 0, hd(members))
++        {:ok, pid}
+     end
+   end
+ 
+@@ -601,7 +665,8 @@ defmodule Redix.Cluster.Manager do
+   # slot map covered.
+   defp get_known_nodes(data) do
+     data.registry
+-    |> Registry.select([{{:"$1", :_, :_}, [], [:"$1"]}])
++    |> Registry.select([{{{:"$1", :_}, :_, :_}, [], [:"$1"]}])
++    |> Enum.uniq()
+     |> Enum.map(fn node_id ->
+       {:ok, _canonical_host, port} = split_host_port(node_id)
+       {Map.fetch!(data.node_addresses, node_id), port}
+@@ -833,42 +898,29 @@ defmodule Redix.Cluster.Manager do
+   defp ensure_connections(data, slots_data) do
+     needed_nodes = nodes_to_connect(data, slots_data)
+ 
++    registered_nodes =
++      data.registry
++      |> Registry.select([
++        {{{:"$1", :"$2"}, :"$3", :"$4"}, [], [{{:"$1", :"$2", :"$3", :"$4"}}]}
++      ])
++      |> Enum.group_by(&elem(&1, 0), fn {_node_id, index, pid, role} -> {index, pid, role} end)
++
+     data =
+       Enum.reduce(needed_nodes, data, fn {node_id, host, port, role}, acc ->
+-        case Registry.lookup(acc.registry, node_id) do
+-          [{pid, registered_role}] when is_pid(pid) ->
+-            cond do
+-              not Process.alive?(pid) ->
+-                {_result, acc} = start_and_monitor_connection(acc, node_id, host, port, role)
+-                acc
+-
+-              # The node is still connected but its role changed since we last
+-              # connected it (a failover: a primary demoted to replica or a
+-              # replica promoted to primary). The live connection can't be reused
+-              # as-is — a demoted primary never issued READONLY (so replica reads
+-              # bounce back MOVED) and a promoted replica still carries
+-              # `readonly: true`, and in both cases the Registry value used for
+-              # keyless-command routing is stale. Terminate and restart so the
+-              # role, the READONLY state, and routing all reflect reality (#318).
+-              registered_role != role ->
+-                restart_connection(acc, node_id, pid, host, port, role)
+-
+-              true ->
+-                acc
+-            end
++        members = Map.get(registered_nodes, node_id, [])
+ 
+-          [] ->
+-            {_result, acc} = start_and_monitor_connection(acc, node_id, host, port, role)
+-            acc
++        if Enum.any?(members, fn {_index, _pid, registered_role} -> registered_role != role end) do
++          # Every member carries the node role and its matching READONLY state. A
++          # failover must replace the full pool so no member keeps the old state.
++          restart_node_pool(acc, node_id, members, host, port, role)
++        else
++          ensure_node_pool(acc, node_id, members, host, port, role)
+         end
+       end)
+ 
+     needed_ids = MapSet.new(needed_nodes, fn {node_id, _, _, _} -> node_id end)
+ 
+-    registered_nodes =
+-      Registry.select(data.registry, [{{:"$1", :"$2", :_}, [], [{{:"$1", :"$2"}}]}])
+-
+-    Enum.reduce(registered_nodes, data, fn {node_id, pid}, acc ->
++    Enum.reduce(registered_nodes, data, fn {node_id, members}, acc ->
+       if node_id in needed_ids do
+         acc
+       else
+@@ -878,15 +930,40 @@ defmodule Redix.Cluster.Manager do
+         acc = demonitor_node(acc, node_id)
+         acc = %{acc | node_addresses: Map.delete(acc.node_addresses, node_id)}
+ 
+-        if Process.alive?(pid) do
+-          DynamicSupervisor.terminate_child(acc.pool_supervisor, pid)
+-        end
++        Enum.each(members, fn {_index, pid, _role} ->
++          if Process.alive?(pid) do
++            DynamicSupervisor.terminate_child(acc.pool_supervisor, pid)
++          end
++        end)
+ 
+         acc
+       end
+     end)
+   end
+ 
++  defp ensure_node_pool(data, node_id, members, host, port, role) do
++    members_by_index =
++      Map.new(members, fn {index, pid, member_role} -> {index, {pid, member_role}} end)
++
++    Enum.reduce(0..(pool_size_for_role(data, role) - 1), data, fn index, acc ->
++      case Map.get(members_by_index, index) do
++        {pid, ^role} when is_pid(pid) ->
++          if Process.alive?(pid) do
++            acc
++          else
++            {_result, acc} =
++              start_and_monitor_connection(acc, node_id, index, host, port, role)
++
++            acc
++          end
++
++        nil ->
++          {_result, acc} = start_and_monitor_connection(acc, node_id, index, host, port, role)
++          acc
++      end
++    end)
++  end
++
+   # Builds the list of `{node_id, host, port, role}` tuples the cluster should be
+   # connected to. Primaries always; replicas only when `:read_from_replicas` is on.
+   # Primaries are listed first so `uniq_by` keeps the primary role if a node ever
+@@ -910,25 +987,51 @@ defmodule Redix.Cluster.Manager do
+     Enum.uniq_by(primaries ++ replicas, fn {node_id, _, _, _} -> node_id end)
+   end
+ 
+-  # Tears down the connection registered for `node_id` and starts a fresh one with
++  # Tears down all connections registered for `node_id` and starts a fresh pool with
+   # the given `role`. Used when a node's role changed after a failover (#318).
+   # Demonitors *before* terminating (like the no-longer-needed branch in
+   # `ensure_connections/2`) so the deliberate `terminate_child` DOWN doesn't land
+   # in `handle_down/3` and resurrect the connection under its *old* role.
+-  defp restart_connection(data, node_id, pid, host, port, role) do
++  defp restart_node_pool(data, node_id, members, host, port, role) do
+     data = demonitor_node(data, node_id)
+-    DynamicSupervisor.terminate_child(data.pool_supervisor, pid)
+-    {_result, data} = start_and_monitor_connection(data, node_id, host, port, role)
++
++    Enum.each(members, fn {_index, pid, _registered_role} ->
++      DynamicSupervisor.terminate_child(data.pool_supervisor, pid)
++    end)
++
++    {_result, data} = start_and_monitor_node_pool(data, node_id, host, port, role)
+     data
+   end
+ 
++  # Starts all pool members and returns the first successful member. A redirect needs
++  # one PID for its current command, while later commands use sticky lookup.
++  defp start_and_monitor_node_pool(data, node_id, host, port, role) do
++    Enum.reduce(0..(pool_size_for_role(data, role) - 1), {nil, data}, fn
++      index, {first_result, acc} ->
++        {result, acc} = start_and_monitor_connection(acc, node_id, index, host, port, role)
++
++        first_result =
++          case {first_result, result} do
++            {nil, result} -> result
++            {{:error, _reason}, {:ok, _pid}} -> result
++            {first_result, _next_result} -> first_result
++          end
++
++        {first_result, acc}
++    end)
++  end
++
++  defp pool_size_for_role(data, :primary), do: data.primary_pool_size
++  defp pool_size_for_role(data, :replica), do: data.replica_pool_size
++
+   # Returns `{result, data}` where `result` is `{:ok, pid}` or `{:error, reason}`.
+   # Callers that only care about the updated data can discard the result.
+-  defp start_and_monitor_connection(data, node_id, host, port, role) do
++  defp start_and_monitor_connection(data, node_id, index, host, port, role) do
+     case start_connection(
+            data.pool_supervisor,
+            data.registry,
+            node_id,
++           index,
+            host,
+            port,
+            data.conn_opts,
+@@ -937,7 +1040,7 @@ defmodule Redix.Cluster.Manager do
+       {:ok, pid} ->
+         ref = Process.monitor(pid)
+         data = %{data | node_addresses: Map.put(data.node_addresses, node_id, host)}
+-        {{:ok, pid}, %{data | monitors: Map.put(data.monitors, ref, {node_id, role})}}
++        {{:ok, pid}, %{data | monitors: Map.put(data.monitors, ref, {node_id, index, role})}}
+ 
+       # A concurrent monitor restart (or the connection's own retry) may have
+       # already registered this node. Treat it as success — but make sure we're
+@@ -946,11 +1049,12 @@ defmodule Redix.Cluster.Manager do
+       {:error, {:already_started, pid}} ->
+         data = %{data | node_addresses: Map.put(data.node_addresses, node_id, host)}
+ 
+-        if monitoring_node?(data, node_id) do
++        if monitoring_member?(data, node_id, index) do
+           {{:ok, pid}, data}
+         else
+           ref = Process.monitor(pid)
+-          {{:ok, pid}, %{data | monitors: Map.put(data.monitors, ref, {node_id, role})}}
++
++          {{:ok, pid}, %{data | monitors: Map.put(data.monitors, ref, {node_id, index, role})}}
+         end
+ 
+       {:error, reason} ->
+@@ -964,7 +1068,16 @@ defmodule Redix.Cluster.Manager do
+     end
+   end
+ 
+-  defp start_connection(pool_supervisor, registry, node_id, host, port, conn_opts, role) do
++  defp start_connection(
++         pool_supervisor,
++         registry,
++         node_id,
++         index,
++         host,
++         port,
++         conn_opts,
++         role
++       ) do
+     opts =
+       conn_opts
+       |> Keyword.delete(:name)
+@@ -974,7 +1087,7 @@ defmodule Redix.Cluster.Manager do
+         sync_connect: false,
+         # The Registry value records the node's role so keyless commands can be
+         # routed to primaries (see `get_random_connection/1`).
+-        name: {:via, Registry, {registry, node_id, role}}
++        name: {:via, Registry, {registry, {node_id, index}, role}}
+       )
+       |> maybe_put_readonly(role)
+ 
+diff --git a/pages/Cluster.md b/pages/Cluster.md
+index 849ac4a..8951a6f 100644
+--- a/pages/Cluster.md
++++ b/pages/Cluster.md
+@@ -17,10 +17,11 @@ The API for `Redix.Cluster` will feel familiar to folks used to `Redix`.
+ 
+ ```elixir
+ # Start a cluster connection with a name and one or more seed nodes.
+-{:ok, _pid} = Redix.Cluster.start_link(
+-  name: :my_cluster,
+-  nodes: ["redis://localhost:7000", "redis://localhost:7001"]
+-)
++{:ok, _pid} =
++  Redix.Cluster.start_link(
++    name: :my_cluster,
++    nodes: ["redis://localhost:7000", "redis://localhost:7001"]
++  )
+ 
+ # Issue commands across the cluster.
+ Redix.Cluster.command(:my_cluster, ["SET", "mykey", "myvalue"])
+@@ -33,9 +34,9 @@ Redix.Cluster.command(:my_cluster, ["GET", "mykey"])
+ 
+ Like single-node `Redix` connections, starting a cluster does **not** require any node to be reachable. By default, `Redix.Cluster.start_link/1` returns right away and discovers the cluster topology in the background, retrying with exponential backoff (controlled by the `:backoff_initial` and `:backoff_max` options) until a seed node answers. This means a `Redix.Cluster` in your supervision tree won't crash-loop your application at boot if Redis comes up *after* your app.
+ 
+-Commands issued while the *initial* discovery attempt is in flight **wait for it to complete** (up to their `:timeout`), just like a single `Redix` connection postpones commands while it's connecting — so starting a cluster and issuing commands right away works without retries. Once that first attempt fails (no seed node is reachable), commands stop waiting and return `{:error, %Redix.ConnectionError{reason: :closed}}` until a node becomes reachable.
++Commands issued while the *initial* discovery attempt is in flight **wait for it to complete** (up to their `:timeout`), just like a single `Redix` connection postpones commands while it's connecting (so starting a cluster and issuing commands right away works without retries). Once that first attempt fails (no seed node is reachable), commands stop waiting and return an error until a node becomes reachable.
+ 
+-If you prefer to block until the topology has been discovered—and fail fast if no seed node is reachable—pass `sync_connect: true`:
++If you'd prefer to block until the topology has been discovered—and fail fast if no seed node is reachable—pass `sync_connect: true`:
+ 
+ ```elixir
+ Redix.Cluster.start_link(
+@@ -45,6 +46,40 @@ Redix.Cluster.start_link(
+ )
+ ```
+ 
++## Connection Pools
++
++By default, Redix opens one connection to each node. Set `:primary_pool_size` to open
++more connections to each primary:
++
++```elixir
++Redix.Cluster.start_link(
++  name: :my_cluster,
++  nodes: ["redis://localhost:7000"],
++  primary_pool_size: 5
++)
++```
++
++A larger pool can help when many processes send commands to the same node. This can
++occur with a serverless or proxy service that sends all commands through one endpoint.
++
++Replica pools have a separate size. This avoids opening a large number of connections
++to every replica when only primary traffic needs more capacity:
++
++```elixir
++Redix.Cluster.start_link(
++  name: :my_cluster,
++  nodes: ["redis://localhost:7000"],
++  primary_pool_size: 5,
++  replica_pool_size: 2,
++  read_from_replicas: true
++)
++```
++
++During normal routing, Redix uses the caller process to select a pool member. One caller
++process uses the same member for a node while that member is available. Redirects keep
++the original caller choice. If the selected member is unavailable, Redix uses another
++live member. A workload with only a few caller processes might not use all members.
++
+ ## Pipelines
+ 
+ Pipelines that span multiple hash slots are transparently split across nodes, executed in parallel, and reassembled in the original order:
+@@ -81,7 +116,7 @@ Redis Cluster handles slot migrations transparently:
+   * `MOVED`: the slot has permanently moved to another node. Redix updates its topology map and retries the command on the new node.
+   * `ASK`: the slot is being migrated. Redix sends `ASKING` followed by the command to the target node without updating the topology map.
+ 
+-Up to 5 redirections are followed before returning an error.
++Up to five redirections are followed before returning an error.
+ 
+ ## Reading from Replicas
+ 
+@@ -101,11 +136,4 @@ Redix.Cluster.command(:my_cluster, ["GET", "mykey"], route: :replica)
+ Redix.Cluster.command(:my_cluster, ["GET", "mykey"], route: :prefer_replica)
+ ```
+ 
+-See the `Redix.Cluster` module documentation for details.
+-
+-## Limitations
+-
+-  * **Database `0` only**: Redis Cluster does not support the `SELECT` command. Passing a non-zero `:database` option raises an error.
+-  * **Basic replica reads**: replica reads pick a random reachable replica. There is no read-load balancing strategy, staleness tolerance, or zone/locality awareness yet.
+-  * **No Pub/Sub**: Redis Cluster Pub/Sub has different semantics (messages broadcast to all nodes). Use `Redix.PubSub` with a direct connection instead.
+-  * **No `noreply_*` functions**: fire-and-forget commands are not supported in cluster mode.
++See the `Redix.Cluster` module documentation for details and present limitations.
+diff --git a/test/redix/cluster/fake_node_test.exs b/test/redix/cluster/fake_node_test.exs
+index cfcaac5..e2cea67 100644
+--- a/test/redix/cluster/fake_node_test.exs
++++ b/test/redix/cluster/fake_node_test.exs
+@@ -27,6 +27,30 @@ defmodule Redix.Cluster.FakeNodeTest do
+   describe "MOVED/ASK redirection" do
+     setup :wire_cluster
+ 
++    test "finds a redirect target at an index above the primary pool size", %{
++      cluster: cluster
++    } do
++      slot = Hash.hash_slot("x")
++
++      target =
++        FakeNode.reserve()
++        |> FakeNode.connect(cluster, index: 2, role: :replica)
++        |> FakeNode.serve(fn
++          ["ASKING"] -> "+OK\r\n"
++          ["GET", _] -> "$3\r\nbar\r\n"
++        end)
++
++      owner =
++        FakeNode.start_connected(cluster, fn
++          ["GET", _] -> "-ASK #{slot} #{target}\r\n"
++        end)
++
++      route_slot(cluster, slot, owner)
++
++      assert Redix.Cluster.command(cluster, ["GET", "x"]) == {:ok, "bar"}
++      assert [{_pid, :replica}] = Registry.lookup(:"#{cluster}_registry", {target.id, 2})
++    end
++
+     test "follows an ASK -> ASK chain to the final node", %{cluster: cluster} do
+       slot = Hash.hash_slot("x")
+ 
+@@ -337,8 +361,8 @@ defmodule Redix.Cluster.FakeNodeTest do
+       # straight to the connection already registered from CLUSTER SLOTS.
+       assert FakeNode.connections_accepted(node) == baseline
+ 
+-      assert Registry.lookup(registry, "localhost:#{node.port}") == []
+-      assert [{_pid, :primary}] = Registry.lookup(registry, node.id)
++      assert Registry.lookup(registry, {"localhost:#{node.port}", 0}) == []
++      assert [{_pid, :primary}] = Registry.lookup(registry, {node.id, 0})
+     end
+ 
+     # Reproduces issue #325: redirect messages are server-controlled input, so a
+@@ -544,7 +568,7 @@ defmodule Redix.Cluster.FakeNodeTest do
+                {:error, %Redix.ConnectionError{reason: :closed}}
+     end
+ 
+-    test "Manager.get_connection/3 and get_replica_connection/3 return :error instead of " <>
++    test "Manager.get_connection/4 and get_replica_connection/4 return :error instead of " <>
+            "raising when the slot table is momentarily gone",
+          %{cluster: cluster} do
+       slot_table = :"#{cluster}_slots"
+@@ -552,11 +576,11 @@ defmodule Redix.Cluster.FakeNodeTest do
+ 
+       :ets.delete(slot_table)
+ 
+-      assert Redix.Cluster.Manager.get_connection(slot_table, registry, 0) == :error
+-      assert Redix.Cluster.Manager.get_replica_connection(slot_table, registry, 0) == :error
++      assert Redix.Cluster.Manager.get_connection(slot_table, registry, 0, 1) == :error
++      assert Redix.Cluster.Manager.get_replica_connection(slot_table, registry, 0, 1) == :error
+     end
+ 
+-    test "Manager.get_random_connection/1 and get_connection_by_node/2 return :error " <>
++    test "Manager.get_random_connection/1 and get_connection_by_node/3 return :error " <>
+            "instead of raising when the registry doesn't exist" do
+       # A registry name with no backing ETS table at all — whichever moment mid-restart
+       # a caller catches, there's no table for that name yet, same as here. (A live
+@@ -572,7 +596,12 @@ defmodule Redix.Cluster.FakeNodeTest do
+       registry = :"never_started_registry_#{System.unique_integer([:positive])}"
+ 
+       assert Redix.Cluster.Manager.get_random_connection(registry) == :error
+-      assert Redix.Cluster.Manager.get_connection_by_node(registry, {"127.0.0.1", 7000}) == :error
++
++      assert Redix.Cluster.Manager.get_connection_by_node(
++               registry,
++               {"127.0.0.1", 7000},
++               self()
++             ) == :error
+     end
+   end
+ 
+@@ -620,7 +649,12 @@ defmodule Redix.Cluster.FakeNodeTest do
+       end)
+ 
+       start_supervised!(
+-        {Redix.Cluster, name: cluster, nodes: ["redis://#{node}"], sync_connect: true}
++        {Redix.Cluster,
++         name: cluster,
++         nodes: ["redis://#{node}"],
++         primary_pool_size: 3,
++         replica_pool_size: 2,
++         sync_connect: true}
+       )
+ 
+       slot_table = :"#{cluster}_slots"
+@@ -647,6 +681,7 @@ defmodule Redix.Cluster.FakeNodeTest do
+       # Slots still covered are untouched.
+       assert :ets.lookup(slot_table, 0) == [{0, node_id, []}]
+       assert :ets.lookup(slot_table, 8_191) == [{8_191, node_id, []}]
++      assert :ets.lookup(slot_table, :pool_sizes) == [{:pool_sizes, {3, 2}}]
+     end
+ 
+     # A healthy cluster always covers all 16384 slots, so the "slot becomes
+@@ -889,7 +924,12 @@ defmodule Redix.Cluster.FakeNodeTest do
+ 
+       start_supervised!(
+         {Redix.Cluster,
+-         name: cluster, nodes: ["redis://#{node_a}"], read_from_replicas: true, sync_connect: true}
++         name: cluster,
++         nodes: ["redis://#{node_a}"],
++         primary_pool_size: 3,
++         replica_pool_size: 2,
++         read_from_replicas: true,
++         sync_connect: true}
+       )
+ 
+       registry = :"#{cluster}_registry"
+@@ -899,11 +939,14 @@ defmodule Redix.Cluster.FakeNodeTest do
+       # Node connections are async (sync_connect: false regardless of the cluster
+       # option), so wait for both to register and for the replica to issue READONLY.
+       wait_until(fn ->
+-        role(registry, a_id) == :primary and role(registry, b_id) == :replica and
+-          Agent.get(b_readonly, & &1) >= 1
++        map_size(member_pids(registry, a_id)) == 3 and
++          map_size(member_pids(registry, b_id)) == 2 and role(registry, a_id) == :primary and
++          role(registry, b_id) == :replica and
++          Agent.get(b_readonly, & &1) >= 2
+       end)
+ 
+-      [{a_pid, _}] = Registry.lookup(registry, a_id)
++      a_pids = member_pids(registry, a_id)
++      assert map_size(a_pids) == 3
+       # A was the primary, so it never issued READONLY.
+       assert Agent.get(a_readonly, & &1) == 0
+ 
+@@ -911,17 +954,67 @@ defmodule Redix.Cluster.FakeNodeTest do
+       Agent.update(topology, fn _ -> FakeNode.cluster_slots([{0, 16_383, node_b, [node_a]}]) end)
+       Redix.Cluster.Manager.refresh_topology(:"#{cluster}_manager")
+ 
+-      # A's connection must be torn down and restarted as a replica: new pid, a
+-      # `:replica` Registry value, and a fresh READONLY. With the bug the stale
+-      # `:primary` connection is kept, so the role never flips and READONLY is never
+-      # sent — leaving `route: :replica` reads to bounce back MOVED forever.
++      # A's full pool must be torn down and restarted as replicas with new PIDs,
++      # `:replica` Registry values, and fresh READONLY commands.
+       wait_until(fn ->
+-        match?([{new_pid, :replica}] when new_pid != a_pid, Registry.lookup(registry, a_id)) and
+-          Agent.get(a_readonly, & &1) >= 1
++        new_a_pids = member_pids(registry, a_id)
++
++        role(registry, a_id) == :replica and map_size(new_a_pids) == 2 and
++          Enum.all?(new_a_pids, fn {index, pid} -> pid != Map.fetch!(a_pids, index) end) and
++          Agent.get(a_readonly, & &1) >= 2
+       end)
+ 
+-      # And B is now registered as a primary.
++      # B's full pool is now registered as primary connections.
+       assert role(registry, b_id) == :primary
++      assert map_size(member_pids(registry, b_id)) == 3
++    end
++  end
++
++  describe "pooled connection lifecycle" do
++    @tag :capture_log
++    test "a semantic exit parks one member until a topology refresh" do
++      cluster = :"park_member_#{System.unique_integer([:positive])}"
++      node = FakeNode.reserve()
++
++      FakeNode.serve(node, fn
++        ["CLUSTER", "SLOTS"] -> FakeNode.cluster_slots([{0, 16_383, node, []}])
++        ["PING"] -> "+PONG\r\n"
++        _other -> "+OK\r\n"
++      end)
++
++      start_supervised!(
++        {Redix.Cluster,
++         name: cluster, nodes: ["redis://#{node}"], primary_pool_size: 3, sync_connect: true}
++      )
++
++      registry = :"#{cluster}_registry"
++      manager = :"#{cluster}_manager"
++
++      wait_until(fn -> map_size(member_pids(registry, node.id)) == 3 end)
++      original_pids = member_pids(registry, node.id)
++      failed_pid = Map.fetch!(original_pids, 1)
++
++      :ok = :sys.terminate(failed_pid, %Redix.Error{message: "ERR forced semantic failure"})
++
++      wait_until(fn ->
++        member_pids(registry, node.id) == Map.delete(original_pids, 1)
++      end)
++
++      assert Process.alive?(Process.whereis(manager))
++      assert Redix.Cluster.command(cluster, ["PING"]) == {:ok, "PONG"}
++
++      Redix.Cluster.Manager.refresh_topology(manager)
++
++      wait_until(fn ->
++        case member_pids(registry, node.id) do
++          %{0 => pid0, 1 => pid1, 2 => pid2} ->
++            pid0 == Map.fetch!(original_pids, 0) and pid1 != failed_pid and
++              pid2 == Map.fetch!(original_pids, 2)
++
++          _other ->
++            false
++        end
++      end)
+     end
+   end
+ 
+@@ -1125,6 +1218,7 @@ defmodule Redix.Cluster.FakeNodeTest do
+ 
+     :ets.new(:"#{cluster}_slots", [:named_table, :public, :set])
+     :ets.insert(:"#{cluster}_slots", {:discovery_attempted, true})
++    :ets.insert(:"#{cluster}_slots", {:pool_sizes, {1, 3}})
+ 
+     %{cluster: cluster}
+   end
+@@ -1142,7 +1236,7 @@ defmodule Redix.Cluster.FakeNodeTest do
+ 
+     pid =
+       spawn(fn ->
+-        {:ok, _} = Registry.register(:"#{cluster}_registry", node_id, _value = :primary)
++        {:ok, _} = Registry.register(:"#{cluster}_registry", {node_id, 0}, _value = :primary)
+         send(test, {:registered, self()})
+ 
+         receive do
+@@ -1174,9 +1268,20 @@ defmodule Redix.Cluster.FakeNodeTest do
+   end
+ 
+   defp role(registry, node_id) do
+-    case Registry.lookup(registry, node_id) do
+-      [{_pid, role}] -> role
+-      [] -> nil
++    case registry_members(registry, node_id) |> Enum.map(&elem(&1, 2)) |> Enum.uniq() do
++      [role] -> role
++      _other -> nil
+     end
+   end
++
++  defp member_pids(registry, node_id) do
++    Map.new(registry_members(registry, node_id), fn {index, pid, _role} -> {index, pid} end)
++  end
++
++  defp registry_members(registry, node_id) do
++    Registry.select(
++      registry,
++      [{{{node_id, :"$1"}, :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}]
++    )
++  end
+ end
+diff --git a/test/redix/cluster/manager_test.exs b/test/redix/cluster/manager_test.exs
+index fcbff95..24d27f3 100644
+--- a/test/redix/cluster/manager_test.exs
++++ b/test/redix/cluster/manager_test.exs
+@@ -17,7 +17,9 @@ defmodule Redix.Cluster.ManagerTest do
+   setup do
+     cluster_name = :"mgr_test_#{System.unique_integer([:positive])}"
+ 
+-    start_supervised!({Redix.Cluster, nodes: @nodes, name: cluster_name, sync_connect: true})
++    start_supervised!(
++      {Redix.Cluster, nodes: @nodes, name: cluster_name, primary_pool_size: 3, sync_connect: true}
++    )
+ 
+     %{
+       cluster: cluster_name,
+@@ -111,30 +113,144 @@ defmodule Redix.Cluster.ManagerTest do
+   end
+ 
+   describe "connection lifecycle" do
+-    test "connections are started for all master nodes", %{registry: registry} do
++    test "pool members are started for all primary nodes", %{registry: registry} do
+       registered =
+-        Registry.select(registry, [{{:"$1", :"$2", :_}, [], [{{:"$1", :"$2"}}]}])
++        Registry.select(
++          registry,
++          [{{{:"$1", :"$2"}, :"$3", :"$4"}, [], [{{:"$1", :"$2", :"$3", :"$4"}}]}]
++        )
+ 
+-      # A 3-master cluster should have at least 3 connections.
+-      assert length(registered) >= 3
++      # A 3-primary cluster should have at least 3 pools of 3 connections.
++      assert length(registered) >= 9
+ 
+-      for {node_id, pid} <- registered do
++      for {node_id, index, pid, role} <- registered do
+         assert is_binary(node_id)
+         assert String.contains?(node_id, ":")
++        assert index in 0..2
+         assert Process.alive?(pid)
++        assert role == :primary
+       end
++
++      assert Enum.all?(Enum.group_by(registered, &elem(&1, 0)), fn {_node_id, members} ->
++               Enum.sort(Enum.map(members, &elem(&1, 1))) == [0, 1, 2]
++             end)
+     end
+ 
+-    test "dead connection is restarted with a new PID", %{registry: registry} do
+-      [{node_id, pid} | _] =
++    test "dead pool member is restarted with the same index and a new PID", %{
++      registry: registry
++    } do
++      [{{node_id, index}, pid} | _] =
+         Registry.select(registry, [{{:"$1", :"$2", :_}, [], [{{:"$1", :"$2"}}]}])
+ 
++      sibling_pids =
++        registry
++        |> Registry.select([{{{node_id, :_}, :"$1", :_}, [], [:"$1"]}])
++        |> MapSet.new()
++        |> MapSet.delete(pid)
++
+       Process.exit(pid, :kill)
+ 
+       wait_until_passes(2_000, fn ->
+-        assert [{new_pid, _}] = Registry.lookup(registry, node_id)
++        assert [{new_pid, _}] = Registry.lookup(registry, {node_id, index})
+         assert new_pid != pid
+         assert Process.alive?(new_pid)
++
++        current_siblings =
++          registry
++          |> Registry.select([{{{node_id, :_}, :"$1", :_}, [], [:"$1"]}])
++          |> MapSet.new()
++          |> MapSet.delete(new_pid)
++
++        assert current_siblings == sibling_pids
++      end)
++    end
++
++    test "lookup spreads across callers and keeps each caller sticky through redirects", %{
++      registry: registry,
++      manager: manager
++    } do
++      [node_id | _] =
++        Registry.select(registry, [{{{:"$1", :_}, :_, :_}, [], [:"$1"]}])
++
++      {:ok, host, port} = Redix.Cluster.Manager.split_host_port(node_id)
++      address = {host, port}
++
++      same_caller_pids =
++        for _ <- 1..10 do
++          {:ok, pid} = Redix.Cluster.Manager.get_connection_by_node(registry, address, self())
++          pid
++        end
++
++      assert same_caller_pids |> Enum.uniq() |> length() == 1
++
++      caller_pids =
++        1..24
++        |> Task.async_stream(
++          fn _ -> Redix.Cluster.Manager.get_connection_by_node(registry, address, self()) end,
++          ordered: false
++        )
++        |> Enum.map(fn {:ok, {:ok, pid}} -> pid end)
++
++      assert caller_pids |> Enum.uniq() |> length() > 1
++
++      original_caller = self()
++      [expected_pid] = Enum.uniq(same_caller_pids)
++
++      redirected_pids =
++        1..12
++        |> Task.async_stream(
++          fn _ ->
++            Redix.Cluster.Manager.get_connection_by_node(registry, address, original_caller)
++          end,
++          ordered: false
++        )
++        |> Enum.map(fn {:ok, {:ok, pid}} -> pid end)
++
++      assert Enum.uniq(redirected_pids) == [expected_pid]
++
++      manager_result =
++        Task.async(fn ->
++          Redix.Cluster.Manager.connect_to_node(manager, address, 5_000, original_caller)
++        end)
++        |> Task.await()
++
++      assert manager_result == {:ok, expected_pid}
++    end
++
++    test "lookup uses a sibling while its sticky member is down", %{
++      registry: registry,
++      manager: manager
++    } do
++      [node_id | _] =
++        Registry.select(registry, [{{{:"$1", :_}, :_, :_}, [], [:"$1"]}])
++
++      index = :erlang.phash2(self(), 3)
++      [{pid, _role}] = Registry.lookup(registry, {node_id, index})
++      {:ok, host, port} = Redix.Cluster.Manager.split_host_port(node_id)
++
++      :sys.suspend(manager)
++
++      try do
++        ref = Process.monitor(pid)
++        Process.exit(pid, :kill)
++        assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
++
++        wait_until_passes(1_000, fn ->
++          assert Registry.lookup(registry, {node_id, index}) == []
++        end)
++
++        assert {:ok, sibling_pid} =
++                 Redix.Cluster.Manager.get_connection_by_node(registry, {host, port}, self())
++
++        assert sibling_pid != pid
++        assert Process.alive?(sibling_pid)
++      after
++        :sys.resume(manager)
++      end
++
++      wait_until_passes(2_000, fn ->
++        assert [{new_pid, _role}] = Registry.lookup(registry, {node_id, index})
++        assert new_pid != pid
+       end)
+     end
+   end
+@@ -147,11 +263,11 @@ defmodule Redix.Cluster.ManagerTest do
+     } do
+       {_state, data_before} = :sys.get_state(manager)
+       monitors_before = data_before.monitors
+-      assert map_size(monitors_before) >= 3
++      assert map_size(monitors_before) >= 9
+ 
+-      # Pick a node that we know is in the monitors map.
+-      {old_ref, {node_id, _role}} = Enum.at(monitors_before, 0)
+-      [{pid, _}] = Registry.lookup(registry, node_id)
++      # Pick a pool member that we know is in the monitors map.
++      {old_ref, {node_id, index, _role}} = Enum.at(monitors_before, 0)
++      [{pid, _}] = Registry.lookup(registry, {node_id, index})
+ 
+       Process.exit(pid, :kill)
+ 
+@@ -171,9 +287,9 @@ defmodule Redix.Cluster.ManagerTest do
+       {_state, data_before} = :sys.get_state(manager)
+       monitors_before = data_before.monitors
+ 
+-      # Pick a monitored node and kill its connection.
+-      {_old_ref, {node_id, _role}} = Enum.at(monitors_before, 0)
+-      [{pid, _}] = Registry.lookup(registry, node_id)
++      # Pick a monitored pool member and kill its connection.
++      {_old_ref, {node_id, index, _role}} = Enum.at(monitors_before, 0)
++      [{pid, _}] = Registry.lookup(registry, {node_id, index})
+ 
+       Process.exit(pid, :kill)
+ 
+@@ -181,7 +297,7 @@ defmodule Redix.Cluster.ManagerTest do
+       # restart backs off (issue #334), so the replacement isn't instantaneous —
+       # `assert` (not a bare match) so `wait_until_passes` retries until it lands.
+       wait_until_passes(2_000, fn ->
+-        assert [{new_pid, _}] = Registry.lookup(registry, node_id)
++        assert [{new_pid, _}] = Registry.lookup(registry, {node_id, index})
+         assert new_pid != pid
+         assert Process.alive?(new_pid)
+       end)
+@@ -202,11 +318,15 @@ defmodule Redix.Cluster.ManagerTest do
+ 
+       {:ok, fake_pid} = Redix.Cluster.Manager.connect_to_node(manager, fake_node, 5_000)
+       ref = Process.monitor(fake_pid)
+-      assert [{^fake_pid, _}] = Registry.lookup(registry, fake_id)
++
++      assert 3 ==
++               registry
++               |> Registry.select([{{{fake_id, :_}, :_, :_}, [], [true]}])
++               |> length()
+ 
+       # The Manager should be monitoring it.
+       {_state, data} = :sys.get_state(manager)
+-      assert Enum.any?(data.monitors, fn {_ref, {id, _role}} -> id == fake_id end)
++      assert Enum.count(data.monitors, fn {_ref, {id, _index, _role}} -> id == fake_id end) == 3
+ 
+       :telemetry_test.attach_event_handlers(self(), [[:redix, :cluster, :topology_change]])
+ 
+@@ -224,10 +344,10 @@ defmodule Redix.Cluster.ManagerTest do
+       # and resurrects the node. Give the Manager time to process that DOWN, then
+       # assert it stayed gone — both from the registry and the monitors map.
+       Process.sleep(200)
+-      assert Registry.lookup(registry, fake_id) == []
++      assert Registry.select(registry, [{{{fake_id, :_}, :_, :_}, [], [true]}]) == []
+ 
+       {_state, data} = :sys.get_state(manager)
+-      refute Enum.any?(data.monitors, fn {_ref, {id, _role}} -> id == fake_id end)
++      refute Enum.any?(data.monitors, fn {_ref, {id, _index, _role}} -> id == fake_id end)
+     end
+   end
+ 
+diff --git a/test/redix/cluster_test.exs b/test/redix/cluster_test.exs
+index 419872f..cfb171f 100644
+--- a/test/redix/cluster_test.exs
++++ b/test/redix/cluster_test.exs
+@@ -179,7 +179,7 @@ defmodule Redix.ClusterTest do
+ 
+       conn_for = fn key ->
+         slot = Redix.Cluster.Hash.hash_slot(key)
+-        {:ok, conn} = Redix.Cluster.Manager.get_connection(slot_table, registry, slot)
++        {:ok, conn} = Redix.Cluster.Manager.get_connection(slot_table, registry, slot, 1)
+         conn
+       end
+ 
+@@ -404,6 +404,68 @@ defmodule Redix.ClusterTest do
+     end
+   end
+ 
++  describe "per-node connection pools" do
++    test "primary and replica pool sizes are independent and support all command paths" do
++      name = :"pooled_cluster_#{System.unique_integer([:positive])}"
++
++      start_supervised!(
++        {Redix.Cluster,
++         name: name,
++         nodes: @nodes,
++         primary_pool_size: 3,
++         replica_pool_size: 2,
++         read_from_replicas: true,
++         sync_connect: true},
++        id: name
++      )
++
++      registry = :"#{name}_registry"
++      slot_table = :"#{name}_slots"
++
++      assert :ets.lookup(slot_table, :pool_sizes) == [{:pool_sizes, {3, 2}}]
++      assert :ets.lookup(slot_table, :primary_pool_size) == []
++      assert :ets.lookup(slot_table, :replica_pool_size) == []
++
++      assert wait_until(fn ->
++               members =
++                 Registry.select(
++                   registry,
++                   [
++                     {{{:"$1", :"$2"}, :"$3", :"$4"}, [], [{{:"$1", :"$2", :"$3", :"$4"}}]}
++                   ]
++                 )
++
++               length(members) == 21 and
++                 Enum.frequencies_by(members, &elem(&1, 3)) == %{primary: 9, replica: 12} and
++                 Enum.all?(Enum.group_by(members, &elem(&1, 0)), fn {_node_id, node_members} ->
++                   expected_indexes =
++                     if elem(hd(node_members), 3) == :primary, do: [0, 1, 2], else: [0, 1]
++
++                   Enum.sort(Enum.map(node_members, &elem(&1, 1))) == expected_indexes
++                 end)
++             end)
++
++      assert Redix.Cluster.command(name, ["SET", "pooled", "value"]) == {:ok, "OK"}
++
++      assert Redix.Cluster.pipeline(name, [
++               ["SET", "pooled-a", "a"],
++               ["SET", "pooled-b", "b"],
++               ["GET", "pooled-a"],
++               ["GET", "pooled-b"]
++             ]) == {:ok, ["OK", "OK", "a", "b"]}
++
++      assert Redix.Cluster.transaction_pipeline(name, [
++               ["SET", "{pooled}.a", "1"],
++               ["GET", "{pooled}.a"]
++             ]) == {:ok, ["OK", "1"]}
++
++      assert wait_until(fn ->
++               Redix.Cluster.command(name, ["GET", "pooled"], route: :replica) ==
++                 {:ok, "value"}
++             end)
++    end
++  end
++
+   describe "error handling" do
+     test "name is required" do
+       assert_raise NimbleOptions.ValidationError, ~r/required :name option not found/, fn ->
+@@ -411,6 +473,30 @@ defmodule Redix.ClusterTest do
+       end
+     end
+ 
++    test "primary_pool_size must be a positive integer" do
++      assert_raise NimbleOptions.ValidationError,
++                   ~r/invalid value for :primary_pool_size option/,
++                   fn ->
++                     Redix.Cluster.start_link(
++                       name: :bad_primary_pool_size,
++                       nodes: @nodes,
++                       primary_pool_size: 0
++                     )
++                   end
++    end
++
++    test "replica_pool_size must be a positive integer" do
++      assert_raise NimbleOptions.ValidationError,
++                   ~r/invalid value for :replica_pool_size option/,
++                   fn ->
++                     Redix.Cluster.start_link(
++                       name: :bad_replica_pool_size,
++                       nodes: @nodes,
++                       replica_pool_size: 0
++                     )
++                   end
++    end
++
+     test "database option must be 0 or nil" do
+       assert_raise ArgumentError, ~r/database 0/, fn ->
+         Redix.Cluster.start_link(name: :db_test, nodes: @nodes, database: 1)
+@@ -614,12 +700,12 @@ defmodule Redix.ClusterTest do
+       address = {"127.0.0.1", unknown_port}
+ 
+       # Precondition: the node is not known yet.
+-      assert Redix.Cluster.Manager.get_connection_by_node(registry, address) == :error
++      assert Redix.Cluster.Manager.get_connection_by_node(registry, address, self()) == :error
+ 
+       # On-demand connect succeeds and registers the node.
+       assert {:ok, pid} = Redix.Cluster.Manager.connect_to_node(manager, address, 5_000)
+       assert is_pid(pid)
+-      assert Redix.Cluster.Manager.get_connection_by_node(registry, address) == {:ok, pid}
++      assert Redix.Cluster.Manager.get_connection_by_node(registry, address, self()) == {:ok, pid}
+ 
+       # The connection is real and usable.
+       assert Redix.command(pid, ["PING"]) == {:ok, "PONG"}
+@@ -632,11 +718,13 @@ defmodule Redix.ClusterTest do
+       registry = :"#{cluster}_registry"
+       manager = :"#{cluster}_manager"
+ 
+-      [node_id | _] = Registry.select(registry, [{{:"$1", :_, :_}, [], [:"$1"]}])
++      [node_id | _] = Registry.select(registry, [{{{:"$1", :_}, :_, :_}, [], [:"$1"]}])
+       [host, port_str] = String.split(node_id, ":")
+       address = {host, String.to_integer(port_str)}
+ 
+-      assert {:ok, pid} = Redix.Cluster.Manager.get_connection_by_node(registry, address)
++      assert {:ok, pid} =
++               Redix.Cluster.Manager.get_connection_by_node(registry, address, self())
++
+       assert Redix.Cluster.Manager.connect_to_node(manager, address, 5_000) == {:ok, pid}
+     end
+ 
+@@ -667,10 +755,10 @@ defmodule Redix.ClusterTest do
+     test "the manager re-establishes a node connection when it dies", %{cluster: cluster} do
+       registry = :"#{cluster}_registry"
+ 
+-      [node_id | _] = Registry.select(registry, [{{:"$1", :_, :_}, [], [:"$1"]}])
++      [node_id | _] = Registry.select(registry, [{{{:"$1", :_}, :_, :_}, [], [:"$1"]}])
+ 
+       {:ok, pid} =
+-        Redix.Cluster.Manager.get_connection_by_node(registry, node_id_address(node_id))
++        Redix.Cluster.Manager.get_connection_by_node(registry, node_id_address(node_id), self())
+ 
+       monitor = Process.monitor(pid)
+       Process.exit(pid, :kill)
+@@ -680,7 +768,11 @@ defmodule Redix.ClusterTest do
+       assert wait_until(fn ->
+                match?(
+                  {:ok, new_pid} when new_pid != pid,
+-                 Redix.Cluster.Manager.get_connection_by_node(registry, node_id_address(node_id))
++                 Redix.Cluster.Manager.get_connection_by_node(
++                   registry,
++                   node_id_address(node_id),
++                   self()
++                 )
+                )
+              end)
+ 
+@@ -780,7 +872,7 @@ defmodule Redix.ClusterTest do
+       # returns the id of whichever node actually served it. So a pipeline of
+       # same-slot reads reveals, black-box, how many distinct replicas served it:
+       # the fix groups them onto one connection (one pipeline), so every id is the
+-      # same. Without it, get_replica_connection/3 picks a random replica per
++      # same. Without it, get_replica_connection/4 picks a random replica per
+       # command and the reads scatter across the slot's two replicas.
+       whoami = ["EVAL", "return redis.call('CLUSTER','MYID')", "1", "{315}"]
+ 
+@@ -932,7 +1024,7 @@ defmodule Redix.ClusterTest do
+ 
+   defp registered_ports(registry) do
+     registry
+-    |> Registry.select([{{:"$1", :_, :_}, [], [:"$1"]}])
++    |> Registry.select([{{{:"$1", :_}, :_, :_}, [], [:"$1"]}])
+     |> Enum.map(fn node_id ->
+       node_id |> String.split(":") |> List.last() |> String.to_integer()
+     end)
+@@ -940,7 +1032,7 @@ defmodule Redix.ClusterTest do
+   end
+ 
+   defp replica_pids(registry) do
+-    Registry.select(registry, [{{:_, :"$1", :replica}, [], [:"$1"]}])
++    Registry.select(registry, [{{{:_, :_}, :"$1", :replica}, [], [:"$1"]}])
+   end
+ 
+   defp wait_until(fun, attempts \\ 50) do
+diff --git a/test/redix/stateful_properties/cluster_properties_test.exs b/test/redix/stateful_properties/cluster_properties_test.exs
+index 4927a50..52070c6 100644
+--- a/test/redix/stateful_properties/cluster_properties_test.exs
++++ b/test/redix/stateful_properties/cluster_properties_test.exs
+@@ -57,7 +57,9 @@ defmodule Redix.ClusterPropertiesTest do
+       {:error, _reason} -> flunk("Redis Cluster not available on localhost:7000")
+     end
+ 
+-    start_supervised!({Redix.Cluster, nodes: @nodes, name: @cluster, sync_connect: true})
++    start_supervised!(
++      {Redix.Cluster, nodes: @nodes, name: @cluster, primary_pool_size: 3, sync_connect: true}
++    )
+ 
+     # Persistent per-node connections reused to flush between property runs.
+     flushers =
+diff --git a/test/support/cluster_fake_node.ex b/test/support/cluster_fake_node.ex
+index 9526611..393d8f6 100644
+--- a/test/support/cluster_fake_node.ex
++++ b/test/support/cluster_fake_node.ex
+@@ -110,9 +110,11 @@ defmodule Redix.Cluster.FakeNode do
+   # Register a supervised `Redix` connection to the node under its id in
+   # `cluster`'s registry, so redirection code can resolve it by id. Must be
+   # called from the test process (uses `start_supervised!`). Returns the node.
+-  @spec connect(t(), atom()) :: t()
+-  def connect(%FakeNode{} = node, cluster) do
++  @spec connect(t(), atom(), keyword()) :: t()
++  def connect(%FakeNode{} = node, cluster, opts \\ []) do
+     socket_opts = if node.inet6, do: [socket_opts: [:inet6]], else: []
++    index = Keyword.get(opts, :index, 0)
++    role = Keyword.get(opts, :role, :primary)
+ 
+     ExUnit.Callbacks.start_supervised!(
+       {Redix,
+@@ -120,9 +122,9 @@ defmodule Redix.Cluster.FakeNode do
+          host: node.host,
+          port: node.port,
+          sync_connect: true,
+-         name: {:via, Registry, {:"#{cluster}_registry", node.id}}
++         name: {:via, Registry, {:"#{cluster}_registry", {node.id, index}, role}}
+        ] ++ socket_opts},
+-      id: {:conn, node.id}
++      id: {:conn, node.id, index}
+     )
+ 
+     node

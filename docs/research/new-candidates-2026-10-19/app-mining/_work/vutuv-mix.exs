@@ -1,0 +1,268 @@
+defmodule Vutuv.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :vutuv,
+      version: version(),
+      elixir: "~> 1.20",
+      elixirc_paths: elixirc_paths(Mix.env()),
+      start_permanent: Mix.env() == :prod,
+      aliases: aliases(),
+      deps: deps(),
+      # Lets the dev code reloader coordinate with concurrent `mix` invocations
+      # (without it, hot reload crashes on a Mix.Sync.Lock conflict whenever
+      # another mix process compiles — e.g. `mix test` in a second terminal).
+      listeners: [Phoenix.CodeReloader]
+    ]
+  end
+
+  def application do
+    [
+      mod: {Vutuv.Application, []},
+      extra_applications: [:logger, :runtime_tools]
+    ]
+  end
+
+  # Run `mix precommit` in the test environment so its `test` step is happy.
+  def cli do
+    [preferred_envs: [precommit: :test]]
+  end
+
+  # The version is the date of the commit being built (`2026.8.29`), never a
+  # number somebody edits. Mix insists on a SemVer string, so the date is
+  # spelled without leading zeros (`Version.parse/1` rejects `2026.08.29`).
+  # A hand-written version was one line every open pull request had to change,
+  # so every merge set every other PR to CONFLICTING, and nothing ever compared
+  # the number: NodeInfo, the Mastodon API and the user agent only display it.
+  # What identifies a release is the commit, see `Vutuv.BuildInfo`.
+  # Without git (a checkout that is not a repository) the version is `0.0.0`.
+  defp version do
+    with git when is_binary(git) <- System.find_executable("git"),
+         {date, 0} <- System.cmd(git, ["log", "-1", "--format=%cs"], stderr_to_stdout: true) do
+      calver(String.trim(date))
+    else
+      _ -> "0.0.0"
+    end
+  end
+
+  @doc false
+  def calver(iso_date), do: Calendar.strftime(Date.from_iso8601!(iso_date), "%Y.%-m.%-d")
+
+  @doc """
+  The name of the git worktree this checkout is, or `nil` for the main checkout.
+
+  Several sessions work this repository in parallel worktrees, each running its
+  own `mix phx.server` and its own `mix test` against the same Postgres. Sharing
+  one dev database means one session's `ecto.migrate` or `ecto.reset` lands in
+  everybody else's tree, so `config/dev.exs` and `config/test.exs` suffix the
+  database name with `worktree_suffix/0` and the dev endpoint takes its port
+  from `worktree_port/1`. `DEV_DATABASE`, `MIX_TEST_PARTITION` and `PORT` still
+  win.
+
+  The name comes out of the `.git` **file** a linked worktree has in place of a
+  directory, which reads `gitdir: …/.git/worktrees/<name>`. That is git's own
+  name for the worktree, which `git worktree add` keeps unique — a directory
+  basename is neither unique nor conclusive, and a git **submodule** also has a
+  `.git` file (`gitdir: …/.git/modules/<name>`), so a vendored copy of vutuv
+  would otherwise be handed a worktree's treatment. Reading the file costs one
+  `File.read` per `mix` invocation and no shell-out to git.
+
+  What comes back is cut to what Postgres takes unquoted and to 20 characters,
+  so `vutuv1_test_<name><partition>` stays inside the 63-byte identifier limit.
+  (`Vutuv.SlugHelpers.handleize/1` does the same reduction and is the obvious
+  reuse, but it lives in `lib/`, which is not compiled yet when `config/*.exs`
+  is evaluated — that is also why these two functions are in `mix.exs`.)
+  """
+  def worktree_name(dir \\ __DIR__) do
+    with {:ok, "gitdir: " <> gitdir} <- File.read(Path.join(dir, ".git")),
+         ["worktrees", name] <- gitdir |> String.trim() |> Path.split() |> Enum.take(-2) do
+      name
+      |> String.downcase()
+      |> String.replace(~r/[^a-z0-9]+/, "_")
+      |> String.slice(0, 20)
+    else
+      _not_a_worktree -> nil
+    end
+  end
+
+  @doc """
+  What a worktree appends to a database name: `""` in the main checkout,
+  `"_profile"` in the worktree named `profile`. The one spelling of the naming
+  scheme, so `config/dev.exs` and `config/test.exs` cannot drift apart.
+  """
+  def worktree_suffix(dir \\ __DIR__) do
+    case worktree_name(dir) do
+      nil -> ""
+      name -> "_" <> name
+    end
+  end
+
+  @doc """
+  The dev-server port for a worktree: 4000 in the main checkout, else
+  4100..4899.
+
+  Two dev servers on port 4000 is the collision that makes somebody reach for a
+  `pkill -f "mix phx.server"` and take a parallel session's server down with
+  their own. The port is derived rather than assigned because nothing in a
+  worktree survives to hold an assignment: a rolling hash over the name's bytes
+  (`h = rem(h * 31 + byte, 800)`). 800 slots and no registry, so two names can
+  still land on one port — that fails loudly with `:eaddrinuse`, and `PORT`
+  overrides it.
+  """
+  def worktree_port(name \\ worktree_name())
+  def worktree_port(nil), do: 4000
+
+  def worktree_port(name) when is_binary(name) do
+    4100 + Enum.reduce(:binary.bin_to_list(name), 0, &rem(&2 * 31 + &1, 800))
+  end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
+
+  defp deps do
+    [
+      # Phoenix
+      {:phoenix, "~> 1.8.0"},
+      {:phoenix_html, "~> 4.0"},
+      {:phoenix_html_helpers, "~> 1.0"},
+      {:phoenix_live_view, "~> 1.0"},
+      {:phoenix_live_reload, "~> 1.4", only: :dev},
+      # AI-assisted dev tooling: an MCP endpoint plus an in-page toolbar for
+      # coding agents. Plugged (and explained) in VutuvWeb.Endpoint.
+      {:tidewave, "~> 0.9", only: :dev},
+      # LiveView's test helpers (`Phoenix.LiveViewTest`) parse the rendered DOM
+      # with lazy_html; required for the connected-mount assertions.
+      {:lazy_html, ">= 0.1.0", only: :test},
+      # Chat-message markdown: Earmark renders, HtmlSanitizeEx strips anything
+      # dangerous (user input must never reach the DOM unsanitized).
+      {:earmark, "~> 1.4"},
+      {:html_sanitize_ex, "~> 1.4"},
+      # The HTML5 named/numeric character-reference table (`:mochiweb_charref`),
+      # which `Vutuv.RemoteHtml` decodes a remote server's entities with;
+      # promotes the transitive dep of :html_sanitize_ex to a direct one, the
+      # same reason :nimble_csv is listed below.
+      {:mochiweb, "~> 3.3"},
+      {:bandit, "~> 1.0"},
+      # Resolves the real client IP from X-Forwarded-For behind the nginx
+      # reverse proxy, so `conn.remote_ip` is the visitor's address instead of
+      # the loopback proxy hop. The session fingerprint (security email) and the
+      # rate limiter both key on it (issues #799, #837).
+      {:remote_ip, "~> 1.2"},
+
+      # Database
+      {:ecto_sql, "~> 3.10"},
+      {:phoenix_ecto, "~> 4.4"},
+      {:postgrex, "~> 0.19"},
+
+      # JSON
+      {:jason, "~> 1.4"},
+
+      # CSV parsing (LinkedIn data-export import); promotes the transitive
+      # optional dep of :req to a direct one.
+      {:nimble_csv, "~> 1.2"},
+
+      # Email
+      {:swoosh, "~> 1.17"},
+      {:gen_smtp, "~> 1.0"},
+
+      # HTTP client
+      {:req, "~> 0.5"},
+      # Punycode for umlaut domains before a DNS lookup (Vutuv.Ssrf). Already
+      # locked through Swoosh; named here because vutuv calls it directly.
+      {:idna, "~> 6.1"},
+
+      # Phone numbers: parse/validate/format to E.164 and national formats
+      # (Google's libphonenumber port). Used by Vutuv.Phone to render German
+      # numbers in local format for `de` viewers while keeping E.164 in tel: links.
+      {:ex_phone_number, "~> 0.4"},
+
+      # CLDR territory data (compile-time, no runtime network → intranet-safe):
+      # Vutuv.Cldr.Territory turns the ISO region of an international phone number
+      # (from ex_phone_number) into a flag emoji shown next to the number (#892).
+      {:ex_cldr, "~> 2.47"},
+      {:ex_cldr_territories, "~> 2.12"},
+
+      # IANA time zone database, compiled in from the bundled release (no
+      # runtime network, so an air-gapped intranet install works): the
+      # `Calendar.TimeZoneDatabase` behind `DateTime.shift_zone/2`, which
+      # renders every member-facing timestamp in the viewer's own zone
+      # (`Vutuv.ViewerClock`, issue #1502). The periodic updater
+      # (`Tz.UpdatePeriodically`) is deliberately NOT supervised — a tzdata
+      # release ships with the next vutuv release instead.
+      {:tz, "~> 0.28"},
+
+      # Passkey / WebAuthn (FIDO2) login: server-side verification of the
+      # registration and authentication ceremonies (see Vutuv.Credentials). The
+      # browser ceremony is plain JS in assets/js/webauthn.js. Pulls cbor/x509.
+      {:wax_, "~> 0.7"},
+
+      # Authenticator-app login codes (issue #912): RFC 6238 TOTP generation and
+      # verification (see Vutuv.LoginCodes), plus the QR code the member scans
+      # at enrolment, rendered server-side as SVG (works air-gapped).
+      {:nimble_totp, "~> 1.0"},
+      {:eqrcode, "~> 0.2"},
+
+      # File uploads / image processing (libvips via vix)
+      {:image, "~> 0.67"},
+
+      # i18n
+      {:gettext, "~> 1.0"},
+
+      # Testing
+      {:ex_machina, "~> 2.7", only: :test},
+
+      # PubSub
+      {:phoenix_pubsub, "~> 2.1"},
+
+      # Asset pipeline
+      {:esbuild, "~> 0.8", runtime: Mix.env() == :dev},
+      {:tailwind, "~> 0.2", runtime: Mix.env() == :dev},
+
+      # Code quality
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+    ]
+  end
+
+  defp aliases do
+    [
+      setup: ["deps.get", "ecto.setup", "assets.setup"],
+      "ecto.setup": ["ecto.create", "ecto.migrate", "run priv/repo/seeds.exs"],
+      "ecto.reset": ["ecto.drop", "ecto.setup"],
+      test: ["ecto.create --quiet", "ecto.migrate", "test"],
+      precommit: [
+        "compile --warnings-as-errors",
+        "deps.unlock --unused",
+        "format --check-formatted",
+        "credo --strict",
+        "test"
+      ],
+      # `npm ci` fetches the bundled JS deps (Milkdown) into assets/node_modules
+      # so esbuild can bundle them; runs on `mix setup` and in the blue/green
+      # deploy (scripts/deploy.sh calls `mix assets.setup`). node/npm come from
+      # mise (.tool-versions); assets/node_modules is gitignored, the lockfile is
+      # committed, so the build is reproducible.
+      # The last step vendors @duckduckgo/autoconsent into the consent blocker
+      # the screenshot browser injects (priv/chrome/autoconsent/README.md).
+      # Copied rather than committed so `npm ci` keeps the CMP rules current;
+      # a checkout that skipped it just captures consent dialogs as before.
+      "assets.setup": [
+        "cmd --cd assets npm ci",
+        "tailwind.install --if-missing",
+        "esbuild.install --if-missing",
+        "vutuv.autoconsent.vendor"
+      ],
+      # Two esbuild profiles: app.js and the on-demand markdown editor bundle
+      # (see the esbuild block in config/config.exs for why they are split).
+      # Both must run, or the composer loads a 404 and falls back to the plain
+      # textarea.
+      "assets.build": ["tailwind vutuv", "esbuild vutuv", "esbuild markdown_editor"],
+      "assets.deploy": [
+        "tailwind vutuv --minify",
+        "esbuild vutuv --minify",
+        "esbuild markdown_editor --minify",
+        "phx.digest"
+      ]
+    ]
+  end
+end

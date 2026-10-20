@@ -1,0 +1,318 @@
+diff --git a/lib/cachex/policy/lru.ex b/lib/cachex/policy/lru.ex
+new file mode 100644
+index 00000000..b761a63b
+--- /dev/null
++++ b/lib/cachex/policy/lru.ex
+@@ -0,0 +1,98 @@
++defmodule Cachex.Policy.LRU do
++  @moduledoc """
++  Least recently used eviction policies for Cachex.
++
++  This module provides basic bindings around `Cachex.Policy.LRW` to adapt the
++  LRW caching policies for LRU purposes. As such, please see the documentation
++  of `Cachex.Policy.LRW` for a full list of supported options.
++
++  Adding LRU support is done by attaching an additional hook to enable updates
++  of the modification time in a cache entry on read. This is a very basic way
++  to provide LRU policies, but it should suffice for most cases. It's possible
++  that this may change in future, so this implementation should not be relied upon.
++
++  At the time of writing modification times are *not* updated when executing
++  commands on multiple keys, such as `Cachex.keys/2` and `Cachex.stream/3`, for
++  performance reasons. Again, this may change in future if necessary.
++  """
++  use Cachex.Hook
++  use Cachex.Policy
++
++  # import macros
++  import Cachex.Spec
++
++  # touched actions
++  @actions [
++    :decr,
++    :exists?,
++    :fetch,
++    :get,
++    :incr,
++    :invoke,
++    :ttl,
++    :update
++  ]
++
++  # actions which didn't trigger
++  @ignored [:error, :ignore]
++
++  ####################
++  # Policy Behaviour #
++  ####################
++
++  @doc """
++  Configures hooks required to back this policy.
++  """
++  def hooks(limit() = limit),
++    do: [
++      hook(
++        state: nil,
++        module: __MODULE__
++      )
++      | Cachex.Policy.LRW.hooks(limit)
++    ]
++
++  ##################
++  # Hook Behaviour #
++  ##################
++
++  @doc """
++  Returns the actions this policy should listen on.
++  """
++  @spec actions :: [atom]
++  def actions,
++    do: @actions
++
++  @doc """
++  Returns the provisions this policy requires.
++  """
++  @spec provisions :: [atom]
++  def provisions,
++    do: [:cache]
++
++  ####################
++  # Server Callbacks #
++  ####################
++
++  @doc false
++  # Handles notification of a cache action.
++  #
++  # This will update the modification time of a key if tracked in a successful cache
++  # action. In combination with LRW caching, this provides a simple LRU policy.
++  def handle_notify({_action, [key | _]}, {status, _value}, cache)
++      when status not in @ignored do
++    {:ok, true} = Cachex.touch(cache, key, const(:notify_false))
++    {:ok, cache}
++  end
++
++  def handle_notify(_event, _result, cache),
++    do: {:ok, cache}
++
++  @doc false
++  # Receives a provisioned cache instance.
++  #
++  # The provided cache is then stored in the cache and used for cache calls going
++  # forwards, in order to skip the lookups inside the cache overseer for performance.
++  def handle_provision({:cache, cache}, _cache),
++    do: {:ok, cache}
++end
+diff --git a/test/cachex/policy/lru/evented_test.exs b/test/cachex/policy/lru/evented_test.exs
+new file mode 100644
+index 00000000..904817f1
+--- /dev/null
++++ b/test/cachex/policy/lru/evented_test.exs
+@@ -0,0 +1,110 @@
++defmodule Cachex.Policy.LRU.EventedTest do
++  use Cachex.Test.Case
++
++  test "evicting when a cache crosses a limit" do
++    # create a forwarding hook
++    hook = ForwardHook.create()
++
++    # define our cache limit
++    limit =
++      limit(
++        size: 100,
++        policy: Cachex.Policy.LRU,
++        reclaim: 0.75,
++        options: [batch_size: 25, immediate: true, silent: false]
++      )
++
++    # create a cache with a max size
++    cache = TestUtils.create_cache(hooks: [hook], limit: limit)
++
++    # retrieve the cache state
++    state = Services.Overseer.retrieve(cache)
++
++    # add 100 keys to the cache
++    for x <- 1..100 do
++      # add the entry to the cache
++      {:ok, true} = Cachex.put(state, x, x)
++
++      # tick to make sure each has a new touch time
++      :timer.sleep(1)
++    end
++
++    # retrieve the cache size
++    size1 = Cachex.size!(cache)
++
++    # verify the cache size
++    assert(size1 == 100)
++
++    # flush all existing hook events
++    TestUtils.flush()
++
++    # run a no-op fetch to verify no change
++    {:ignore, nil} =
++      Cachex.fetch(state, 101, fn ->
++        {:ignore, nil}
++      end)
++
++    # retrieve the cache size
++    size2 = Cachex.size!(cache)
++
++    # verify the cache size
++    assert(size2 == 100)
++
++    # store the current mod time
++    previous = :os.system_time(1000)
++
++    # tick to change ms
++    :timer.sleep(1)
++
++    # read the first key to re-touch
++    {:ok, 1} = Cachex.get(state, 1)
++
++    # wait for the touch async
++    TestUtils.poll(250, true, fn ->
++      modified =
++        state
++        |> Cachex.inspect!({:entry, 1})
++        |> entry(:modified)
++
++      assert modified > previous
++    end)
++
++    # add a new key to the cache to trigger evictions
++    {:ok, true} = Cachex.put(state, 101, 101)
++
++    # verify the cache shrinks to 25%
++    TestUtils.poll(250, 25, fn ->
++      Cachex.size!(state)
++    end)
++
++    # our validation step
++    validate = fn range, expected ->
++      # iterate all keys in the range
++      for x <- range do
++        # retrieve whether the key exists
++        exists = Cachex."exists?!"(state, x)
++
++        # verify whether it exists
++        assert(exists == expected)
++      end
++    end
++
++    # verify the 1st key was refreshed
++    validate.(1..1, true)
++
++    # verify the next 76 keys are removed
++    validate.(2..77, false)
++
++    # verify the last 24 are retained
++    validate.(78..101, true)
++
++    # finally, verify hooks are notified
++    assert_receive({{:clear, [[]]}, {:ok, 76}})
++
++    # retrieve the policy hook definition
++    cache(hooks: hooks(post: [hook1 | _])) = state
++
++    # just ensure that notifying errors to the policy doesn't cause a crash
++    Services.Informant.notify([hook1], {:action, []}, {:error, false})
++  end
++end
+diff --git a/test/cachex/policy/lru/scheduled_test.exs b/test/cachex/policy/lru/scheduled_test.exs
+new file mode 100644
+index 00000000..f8ce539b
+--- /dev/null
++++ b/test/cachex/policy/lru/scheduled_test.exs
+@@ -0,0 +1,92 @@
++defmodule Cachex.Policy.LRU.ScheduledTest do
++  use Cachex.Test.Case
++
++  test "evicting when a cache crosses a limit" do
++    # create a forwarding hook
++    hook = ForwardHook.create()
++
++    # define our cache limit
++    limit =
++      limit(
++        size: 100,
++        policy: Cachex.Policy.LRU,
++        reclaim: 0.75,
++        options: [batch_size: 25, frequency: 100]
++      )
++
++    # create a cache with a max size
++    cache = TestUtils.create_cache(hooks: [hook], limit: limit)
++
++    # retrieve the cache state
++    state = Services.Overseer.retrieve(cache)
++
++    # add 1000 keys to the cache
++    for x <- 1..100 do
++      # add the entry to the cache
++      {:ok, true} = Cachex.put(state, x, x)
++
++      # tick to make sure each has a new touch time
++      :timer.sleep(1)
++    end
++
++    # retrieve the cache size
++    size1 = Cachex.size!(cache)
++
++    # verify the cache size
++    assert(size1 == 100)
++
++    # flush all existing hook events
++    TestUtils.flush()
++
++    # store the current mod time
++    previous = :os.system_time(1000)
++
++    # tick to change ms
++    :timer.sleep(1)
++
++    # read the first key to re-touch
++    {:ok, 1} = Cachex.get(state, 1)
++
++    # wait for the touch async
++    TestUtils.poll(250, true, fn ->
++      modified =
++        state
++        |> Cachex.inspect!({:entry, 1})
++        |> entry(:modified)
++
++      assert modified > previous
++    end)
++
++    # add a new key to the cache to trigger evictions
++    {:ok, true} = Cachex.put(state, 101, 101)
++
++    # verify the cache shrinks to 25%
++    TestUtils.poll(250, 25, fn ->
++      Cachex.size!(state)
++    end)
++
++    # our validation step
++    validate = fn range, expected ->
++      # iterate all keys in the range
++      for x <- range do
++        # retrieve whether the key exists
++        exists = Cachex."exists?!"(state, x)
++
++        # verify whether it exists
++        assert(exists == expected)
++      end
++    end
++
++    # verify the 1st key was refreshed
++    validate.(1..1, true)
++
++    # verify the next 76 keys are removed
++    validate.(2..77, false)
++
++    # verify the last 24 are retained
++    validate.(78..101, true)
++
++    # finally, verify hooks are notified
++    assert_receive({{:clear, [[]]}, {:ok, 76}})
++  end
++end

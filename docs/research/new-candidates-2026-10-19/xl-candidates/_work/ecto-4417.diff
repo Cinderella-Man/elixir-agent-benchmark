@@ -1,0 +1,492 @@
+diff --git a/lib/ecto/query.ex b/lib/ecto/query.ex
+index cc3a691f1d..4614df8416 100644
+--- a/lib/ecto/query.ex
++++ b/lib/ecto/query.ex
+@@ -431,6 +431,11 @@ defmodule Ecto.Query do
+     defstruct [:expr, :file, :line, params: []]
+   end
+ 
++  defmodule ByExpr do
++    @moduledoc false
++    defstruct [:expr, :file, :line, params: [], subqueries: []]
++  end
++
+   defmodule BooleanExpr do
+     @moduledoc false
+     defstruct [:op, :expr, :file, :line, params: [], subqueries: []]
+@@ -2866,7 +2871,7 @@ defmodule Ecto.Query do
+     schema = assert_schema!(query)
+     pks = schema.__schema__(:primary_key)
+     expr = for pk <- pks, do: {dir, field(0, pk)}
+-    %QueryExpr{expr: expr, file: __ENV__.file, line: __ENV__.line}
++    %ByExpr{expr: expr, file: __ENV__.file, line: __ENV__.line}
+   end
+ 
+   defp assert_schema!(%{from: %Ecto.Query.FromExpr{source: {_source, schema}}})
+diff --git a/lib/ecto/query/builder/distinct.ex b/lib/ecto/query/builder/distinct.ex
+index 087205e357..a919428190 100644
+--- a/lib/ecto/query/builder/distinct.ex
++++ b/lib/ecto/query/builder/distinct.ex
+@@ -30,11 +30,20 @@ defmodule Ecto.Query.Builder.Distinct do
+   Called at runtime to verify distinct.
+   """
+   def distinct!(query, distinct, file, line) when is_boolean(distinct) do
+-    apply(query, %Ecto.Query.QueryExpr{expr: distinct, params: [], line: line, file: file})
++    apply(query, %Ecto.Query.ByExpr{expr: distinct, params: [], line: line, file: file})
+   end
+   def distinct!(query, distinct, file, line) do
+-    {expr, params} = Builder.OrderBy.order_by_or_distinct!(:distinct, query, distinct, [])
+-    expr = %Ecto.Query.QueryExpr{expr: expr, params: Enum.reverse(params), line: line, file: file}
++    {expr, params, subqueries} =
++      Builder.OrderBy.order_by_or_distinct!(:distinct, query, distinct, [])
++
++    expr = %Ecto.Query.ByExpr{
++      expr: expr,
++      params: Enum.reverse(params),
++      line: line,
++      file: file,
++      subqueries: subqueries
++    }
++
+     apply(query, expr)
+   end
+ 
+@@ -54,12 +63,13 @@ defmodule Ecto.Query.Builder.Distinct do
+ 
+   def build(query, binding, expr, env) do
+     {query, binding} = Builder.escape_binding(query, binding, env)
+-    {expr, {params, _acc}} = escape(expr, {[], %{}}, binding, env)
++    {expr, {params, acc}} = escape(expr, {[], %{subqueries: []}}, binding, env)
+     params = Builder.escape_params(params)
+ 
+-    distinct = quote do: %Ecto.Query.QueryExpr{
++    distinct = quote do: %Ecto.Query.ByExpr{
+                            expr: unquote(expr),
+                            params: unquote(params),
++                           subqueries: unquote(acc.subqueries),
+                            file: unquote(env.file),
+                            line: unquote(env.line)}
+     Builder.apply_query(query, __MODULE__, [distinct], env)
+diff --git a/lib/ecto/query/builder/group_by.ex b/lib/ecto/query/builder/group_by.ex
+index b0f46b7d26..0965d111c6 100644
+--- a/lib/ecto/query/builder/group_by.ex
++++ b/lib/ecto/query/builder/group_by.ex
+@@ -49,21 +49,21 @@ defmodule Ecto.Query.Builder.GroupBy do
+   Shared between group_by and partition_by.
+   """
+   def group_or_partition_by!(kind, query, exprs, params) do
+-    {expr, {params, _}} =
+-      Enum.map_reduce(List.wrap(exprs), {params, length(params)}, fn
++    {expr, {params, _, subqueries}} =
++      Enum.map_reduce(List.wrap(exprs), {params, length(params), []}, fn
+         field, params_count when is_atom(field) ->
+           {to_field(field), params_count}
+ 
+-        %Ecto.Query.DynamicExpr{} = dynamic, {params, count} ->
+-          {expr, params, count} = Builder.Dynamic.partially_expand(kind, query, dynamic, params, count)
+-          {expr, {params, count}}
++        %Ecto.Query.DynamicExpr{} = dynamic, {params, count, subqueries} ->
++          {expr, params, subqueries, _aliases, count} = Builder.Dynamic.partially_expand(query, dynamic, params, subqueries, %{}, count)
++          {expr, {params, count, subqueries}}
+ 
+         other, _params_count ->
+           raise ArgumentError,
+                 "expected a list of fields and dynamics in `#{kind}`, got: `#{inspect other}`"
+       end)
+ 
+-    {expr, params}
++    {expr, params, subqueries}
+   end
+ 
+   defp to_field(field), do: {{:., [], [{:&, [], [0]}, field]}, [], []}
+@@ -72,8 +72,8 @@ defmodule Ecto.Query.Builder.GroupBy do
+   Called at runtime to assemble group_by.
+   """
+   def group_by!(query, group_by, file, line) do
+-    {expr, params} = group_or_partition_by!(:group_by, query, group_by, [])
+-    expr = %Ecto.Query.QueryExpr{expr: expr, params: Enum.reverse(params), line: line, file: file}
++    {expr, params, subqueries} = group_or_partition_by!(:group_by, query, group_by, [])
++    expr = %Ecto.Query.ByExpr{expr: expr, params: Enum.reverse(params), line: line, file: file, subqueries: subqueries}
+     apply(query, expr)
+   end
+ 
+@@ -93,12 +93,13 @@ defmodule Ecto.Query.Builder.GroupBy do
+ 
+   def build(query, binding, expr, env) do
+     {query, binding} = Builder.escape_binding(query, binding, env)
+-    {expr, {params, _acc}} = escape(:group_by, expr, {[], %{}}, binding, env)
++    {expr, {params, acc}} = escape(:group_by, expr, {[], %{subqueries: []}}, binding, env)
+     params = Builder.escape_params(params)
+ 
+-    group_by = quote do: %Ecto.Query.QueryExpr{
++    group_by = quote do: %Ecto.Query.ByExpr{
+                            expr: unquote(expr),
+                            params: unquote(params),
++                           subqueries: unquote(acc.subqueries),
+                            file: unquote(env.file),
+                            line: unquote(env.line)}
+     Builder.apply_query(query, __MODULE__, [group_by], env)
+diff --git a/lib/ecto/query/builder/order_by.ex b/lib/ecto/query/builder/order_by.ex
+index 9b7a94cdef..a529c59852 100644
+--- a/lib/ecto/query/builder/order_by.ex
++++ b/lib/ecto/query/builder/order_by.ex
+@@ -136,8 +136,8 @@ defmodule Ecto.Query.Builder.OrderBy do
+   Shared between order_by and distinct.
+   """
+   def order_by_or_distinct!(kind, query, exprs, params) do
+-    {expr, {params, _}} =
+-      Enum.map_reduce(List.wrap(exprs), {params, length(params)}, fn
++    {expr, {params, _, subqueries}} =
++      Enum.map_reduce(List.wrap(exprs), {params, length(params), []}, fn
+         {dir, expr}, params_count when dir in @directions ->
+           {expr, params} = dynamic_or_field!(kind, expr, query, params_count)
+           {{dir, expr}, params}
+@@ -147,21 +147,35 @@ defmodule Ecto.Query.Builder.OrderBy do
+           {{:asc, expr}, params}
+       end)
+ 
+-    {expr, params}
++    {expr, params, subqueries}
+   end
+ 
+   @doc """
+   Called at runtime to assemble order_by.
+   """
+   def order_by!(query, exprs, op, file, line) do
+-    {expr, params} = order_by_or_distinct!(:order_by, query, exprs, [])
+-    expr = %Ecto.Query.QueryExpr{expr: expr, params: Enum.reverse(params), line: line, file: file}
++    {expr, params, subqueries} = order_by_or_distinct!(:order_by, query, exprs, [])
++    expr = %Ecto.Query.ByExpr{expr: expr, params: Enum.reverse(params), line: line, file: file, subqueries: subqueries}
+     apply(query, expr, op)
+   end
+ 
+-  defp dynamic_or_field!(kind, %Ecto.Query.DynamicExpr{} = dynamic, query, {params, count}) do
+-    {expr, params, count} = Builder.Dynamic.partially_expand(kind, query, dynamic, params, count)
+-    {expr, {params, count}}
++  defp dynamic_or_field!(
++         _kind,
++         %Ecto.Query.DynamicExpr{} = dynamic,
++         query,
++         {params, count, subqueries}
++       ) do
++    {expr, params, subqueries, _aliases, count} =
++      Ecto.Query.Builder.Dynamic.partially_expand(
++        query,
++        dynamic,
++        params,
++        subqueries,
++        %{},
++        count
++      )
++
++    {expr, {params, count, subqueries}}
+   end
+ 
+   defp dynamic_or_field!(_kind, field, _query, params_count) when is_atom(field) do
+@@ -196,13 +210,14 @@ defmodule Ecto.Query.Builder.OrderBy do
+ 
+   def build(query, binding, expr, op, env) do
+     {query, binding} = Builder.escape_binding(query, binding, env)
+-    {expr, {params, _acc}} = escape(:order_by, expr, {[], %{}}, binding, env)
++    {expr, {params, acc}} = escape(:order_by, expr, {[], %{subqueries: []}}, binding, env)
+     params = Builder.escape_params(params)
+ 
+     order_by =
+-      quote do: %Ecto.Query.QueryExpr{
++      quote do: %Ecto.Query.ByExpr{
+               expr: unquote(expr),
+               params: unquote(params),
++              subqueries: unquote(acc.subqueries),
+               file: unquote(env.file),
+               line: unquote(env.line)
+             }
+diff --git a/lib/ecto/query/builder/windows.ex b/lib/ecto/query/builder/windows.ex
+index 65e56b02c6..c5bfb930b6 100644
+--- a/lib/ecto/query/builder/windows.ex
++++ b/lib/ecto/query/builder/windows.ex
+@@ -125,24 +125,25 @@ defmodule Ecto.Query.Builder.Windows do
+   end
+ 
+   defp escape_window(vars, {name, expr}, env) do
+-    {compile_acc, runtime_acc, {params, _acc}} = escape(expr, {[], %{}}, vars, env)
+-    {name, compile_acc, runtime_acc, Builder.escape_params(params)}
++    {compile_acc, runtime_acc, {params, acc}} = escape(expr, {[], %{subqueries: []}}, vars, env)
++    {name, compile_acc, runtime_acc, Builder.escape_params(params), acc}
+   end
+ 
+-  defp build_compile_window({name, compile_acc, _, params}, env) do
++  defp build_compile_window({name, compile_acc, _, params, acc}, env) do
+     {name,
+      quote do
+-       %Ecto.Query.QueryExpr{
++       %Ecto.Query.ByExpr{
+          expr: unquote(compile_acc),
+          params: unquote(params),
++         subqueries: unquote(acc.subqueries),
+          file: unquote(env.file),
+          line: unquote(env.line)
+        }
+      end}
+   end
+ 
+-  defp build_runtime_window({name, compile_acc, runtime_acc, params}, _env) do
+-    {:{}, [], [name, Enum.reverse(compile_acc), runtime_acc, Enum.reverse(params)]}
++  defp build_runtime_window({name, compile_acc, runtime_acc, params, acc}, _env) do
++    {:{}, [], [name, Enum.reverse(compile_acc), runtime_acc, Enum.reverse(params), {:%{}, [], Map.to_list(acc)}]}
+   end
+ 
+   @doc """
+@@ -150,30 +151,32 @@ defmodule Ecto.Query.Builder.Windows do
+   """
+   def runtime!(query, runtime, file, line) do
+     windows =
+-      Enum.map(runtime, fn {name, compile_acc, runtime_acc, params} ->
+-        {acc, params} = do_runtime_window!(runtime_acc, query, compile_acc, params)
+-        expr = %Ecto.Query.QueryExpr{expr: Enum.reverse(acc), params: Enum.reverse(params), file: file, line: line}
++      Enum.map(runtime, fn {name, compile_acc, runtime_acc, params, escape_acc} ->
++        {{acc, subqueries}, params} = do_runtime_window!(runtime_acc, query, {compile_acc, escape_acc.subqueries}, params)
++        expr = %Ecto.Query.ByExpr{expr: Enum.reverse(acc), params: Enum.reverse(params), file: file, line: line, subqueries: subqueries}
+         {name, expr}
+       end)
+ 
+     apply(query, windows)
+   end
+ 
+-  defp do_runtime_window!([{:order_by, order_by} | kw], query, acc, params) do
+-    {order_by, params} = OrderBy.order_by_or_distinct!(:order_by, query, order_by, params)
+-    do_runtime_window!(kw, query, [{:order_by, order_by} | acc], params)
++  defp do_runtime_window!([{:order_by, order_by} | kw], query, {acc, subqueries_acc}, params) do
++    {order_by, params, subqueries} = OrderBy.order_by_or_distinct!(:order_by, query, order_by, params)
++
++    do_runtime_window!(kw, query, {[{:order_by, order_by} | acc], subqueries_acc ++ subqueries}, params)
+   end
+ 
+-  defp do_runtime_window!([{:partition_by, partition_by} | kw], query, acc, params) do
+-    {partition_by, params} = GroupBy.group_or_partition_by!(:partition_by, query, partition_by, params)
+-    do_runtime_window!(kw, query, [{:partition_by, partition_by} | acc], params)
++  defp do_runtime_window!([{:partition_by, partition_by} | kw], query, {acc, subqueries_acc}, params) do
++    {partition_by, params, subqueries} = GroupBy.group_or_partition_by!(:partition_by, query, partition_by, params)
++
++    do_runtime_window!(kw, query, {[{:partition_by, partition_by} | acc], subqueries_acc ++ subqueries}, params)
+   end
+ 
+-  defp do_runtime_window!([{:frame, frame} | kw], query, acc, params) do
++  defp do_runtime_window!([{:frame, frame} | kw], query, {acc, subqueries_acc}, params) do
+     case frame do
+       %Ecto.Query.DynamicExpr{} ->
+         {frame, params, _count} = Builder.Dynamic.partially_expand(:windows, query, frame, params, length(params))
+-        do_runtime_window!(kw, query, [{:frame, frame} | acc], params)
++        do_runtime_window!(kw, query, {[{:frame, frame} | acc], subqueries_acc}, params)
+ 
+       _ ->
+         raise ArgumentError,
+diff --git a/lib/ecto/query/planner.ex b/lib/ecto/query/planner.ex
+index 24728e43fd..6d31631df7 100644
+--- a/lib/ecto/query/planner.ex
++++ b/lib/ecto/query/planner.ex
+@@ -4,6 +4,7 @@ defmodule Ecto.Query.Planner do
+ 
+   alias Ecto.Query.{
+     BooleanExpr,
++    ByExpr,
+     DynamicExpr,
+     FromExpr,
+     JoinExpr,
+@@ -226,6 +227,10 @@ defmodule Ecto.Query.Planner do
+     |> plan_assocs()
+     |> plan_combinations(adapter, cte_names)
+     |> plan_wheres(adapter, cte_names)
++    |> plan_bys(:order_bys, adapter, cte_names)
++    |> plan_bys(:group_bys, adapter, cte_names)
++    |> plan_distinct(adapter, cte_names)
++    |> plan_windows(adapter, cte_names)
+     |> plan_select(adapter, cte_names)
+     |> plan_cache(operation, adapter)
+   rescue
+@@ -835,7 +840,6 @@ defmodule Ecto.Query.Planner do
+     end
+   end
+ 
+-  @spec plan_wheres(Ecto.Query.t(), module, map()) :: Ecto.Query.t()
+   defp plan_wheres(query, adapter, cte_names) do
+     wheres =
+       Enum.map(query.wheres, fn
+@@ -866,7 +870,45 @@ defmodule Ecto.Query.Planner do
+     %{query | wheres: wheres, havings: havings}
+   end
+ 
+-  @spec plan_select(Ecto.Query.t(), module, map()) :: Ecto.Query.t()
++  defp plan_bys(query, key, adapter, cte_names) do
++    order_bys =
++      Enum.map(Map.get(query, key), fn
++        %{subqueries: []} = order_by ->
++          order_by
++
++        %{subqueries: subqueries} = order_by ->
++          %{order_by | subqueries: Enum.map(subqueries, &plan_subquery(&1, query, nil, adapter, false, cte_names))}
++      end)
++
++    Map.put(query, key, order_bys)
++  end
++
++  defp plan_windows(query, adapter, cte_names) do
++    windows =
++      Enum.map(query.windows, fn
++        {key, %{subqueries: []} = window} ->
++          {key, window}
++
++        {key, %{subqueries: subqueries} = window} ->
++          {key, %{window | subqueries: Enum.map(subqueries, &plan_subquery(&1, query, nil, adapter, false, cte_names))}}
++      end)
++
++    %{query | windows: windows}
++  end
++
++  defp plan_distinct(query, adapter, cte_names) do
++    case query.distinct do
++      %Ecto.Query.ByExpr{subqueries: []} ->
++        query
++
++      %Ecto.Query.ByExpr{subqueries: subqueries} = by_expr ->
++        %{query | distinct: %{by_expr | subqueries: Enum.map(subqueries, &plan_subquery(&1, query, nil, adapter, false, cte_names))}}
++
++      _ ->
++        query
++    end
++  end
++
+   defp plan_select(query, adapter, cte_names) do
+     case query do
+       %{select: %{subqueries: [_ | _] = subqueries}} ->
+@@ -999,12 +1041,19 @@ defmodule Ecto.Query.Planner do
+   end
+ 
+   defp expr_to_cache(%QueryExpr{expr: expr}), do: expr
++
+   defp expr_to_cache(%SelectExpr{expr: expr, subqueries: []}), do: expr
+ 
+   defp expr_to_cache(%SelectExpr{expr: expr, subqueries: subqueries}) do
+     {expr, Enum.map(subqueries, fn %{cache: cache} -> {:subquery, cache} end)}
+   end
+ 
++  defp expr_to_cache(%ByExpr{expr: expr, subqueries: []}), do: expr
++
++  defp expr_to_cache(%ByExpr{expr: expr, subqueries: subqueries}) do
++    {expr, Enum.map(subqueries, fn %{cache: cache} -> {:subquery, cache} end)}
++  end
++
+   defp expr_to_cache(%BooleanExpr{op: op, expr: expr, subqueries: []}), do: {op, expr}
+ 
+   defp expr_to_cache(%BooleanExpr{op: op, expr: expr, subqueries: subqueries}) do
+diff --git a/lib/ecto/repo/preloader.ex b/lib/ecto/repo/preloader.ex
+index 23d3902966..987e62149c 100644
+--- a/lib/ecto/repo/preloader.ex
++++ b/lib/ecto/repo/preloader.ex
+@@ -312,7 +312,7 @@ defmodule Ecto.Repo.Preloader do
+           query = add_preload_order(assoc.preload_order, query)
+ 
+           update_in query.order_bys, fn order_bys ->
+-            [%Ecto.Query.QueryExpr{expr: [asc: related_field_ast], params: [],
++            [%Ecto.Query.ByExpr{expr: [asc: related_field_ast], params: [],
+                                    file: __ENV__.file, line: __ENV__.line}|order_bys]
+           end
+ 
+diff --git a/test/ecto/query/builder/distinct_test.exs b/test/ecto/query/builder/distinct_test.exs
+index 0a8ace7c72..d5d99700ae 100644
+--- a/test/ecto/query/builder/distinct_test.exs
++++ b/test/ecto/query/builder/distinct_test.exs
+@@ -63,6 +63,20 @@ defmodule Ecto.Query.Builder.DistinctTest do
+              [{1, {0, :foo}}, {"bar", {0, :bar}}, {2, {0, :baz}}, {"bat", {0, :bat}}]
+     end
+ 
++    test "supports subqueries" do
++      distinct = [
++        asc: dynamic([p], exists(from other_post in "posts", where: other_post.id == parent_as(:p).id))
++      ]
++
++      %{distinct: distinct} = from p in "posts", as: :p, distinct: ^distinct
++      assert distinct.expr ==  [asc: {:exists, [], [subquery: 0]}]
++      assert [_] = distinct.subqueries
++
++      %{distinct: distinct} = from p in "posts", as: :p, distinct: [asc: exists(from other_post in "posts", where: other_post.id == parent_as(:p).id)]
++      assert distinct.expr ==  [asc: {:exists, [], [subquery: 0]}]
++      assert [_] = distinct.subqueries
++    end
++
+     test "raises on non-atoms" do
+       message = "expected a field as an atom in `distinct`, got: `\"temp\"`"
+       assert_raise ArgumentError, message, fn ->
+diff --git a/test/ecto/query/builder/group_by_test.exs b/test/ecto/query/builder/group_by_test.exs
+index 21cb768183..7fbc6d98dc 100644
+--- a/test/ecto/query/builder/group_by_test.exs
++++ b/test/ecto/query/builder/group_by_test.exs
+@@ -53,6 +53,19 @@ defmodule Ecto.Query.Builder.GroupByTest do
+       assert group_by("q", [q], ^[key]).group_bys == group_by("q", [q], [q.title]).group_bys
+     end
+ 
++    test "accepts subqueries" do
++      key = dynamic([p], exists(from other_q in "q", where: other_q.title == parent_as(:q).title))
++      assert [group_by] = group_by("q", [q], ^key).group_bys
++
++      assert group_by.expr == [{:exists, [], [{:subquery, 0}]}]
++      assert [_] = group_by.subqueries
++
++      assert [group_by] = group_by("q", [q], exists(from other_q in "q", where: other_q.title == parent_as(:q).title)).group_bys
++
++      assert group_by.expr == [{:exists, [], [{:subquery, 0}]}]
++      assert [_] = group_by.subqueries
++    end
++
+     test "raises when no a field or a list of fields" do
+       message = "expected a field as an atom in `group_by`, got: `\"temp\"`"
+       assert_raise ArgumentError, message, fn ->
+diff --git a/test/ecto/query/builder/order_by_test.exs b/test/ecto/query/builder/order_by_test.exs
+index 8165699497..f173b37f78 100644
+--- a/test/ecto/query/builder/order_by_test.exs
++++ b/test/ecto/query/builder/order_by_test.exs
+@@ -124,6 +124,20 @@ defmodule Ecto.Query.Builder.OrderByTest do
+              [{1, {0, :foo}}, {"bar", {0, :bar}}, {2, {0, :baz}}, {"bat", {0, :bat}}]
+     end
+ 
++    test "supports subqueries" do
++      order_by = [
++        asc: dynamic([p], exists(from other_post in "posts", where: other_post.id == parent_as(:p).id))
++      ]
++
++      %{order_bys: [order_by]} = from p in "posts", as: :p, order_by: ^order_by
++      assert order_by.expr ==  [asc: {:exists, [], [subquery: 0]}]
++      assert [_] = order_by.subqueries
++
++      %{order_bys: [order_by]} = from p in "posts", as: :p, order_by: [asc: exists(from other_post in "posts", where: other_post.id == parent_as(:p).id)]
++      assert order_by.expr ==  [asc: {:exists, [], [subquery: 0]}]
++      assert [_] = order_by.subqueries
++    end
++
+     test "supports interpolated atomnames in selected_as/1" do
+       query = from p in "posts", select: selected_as(p.id, :ident), order_by: selected_as(^:ident)
+       assert [asc: {:selected_as, [], [:ident]}] = hd(query.order_bys).expr
+diff --git a/test/ecto/query/builder/windows_test.exs b/test/ecto/query/builder/windows_test.exs
+index cc218ed72b..c47bf13c4e 100644
+--- a/test/ecto/query/builder/windows_test.exs
++++ b/test/ecto/query/builder/windows_test.exs
+@@ -77,6 +77,20 @@ defmodule Ecto.Query.Builder.WindowsTest do
+       assert query.windows[:w].params == [{"foo", {0, :foo}}]
+     end
+ 
++    test "supports subqueries" do
++      partition_by = [dynamic([p], exists(from other_q in "q", where: other_q.title == parent_as(:q).title))]
++
++      query = "q" |> windows([p], w: [partition_by: ^partition_by])
++
++      assert query.windows[:w].expr[:partition_by] == [{:exists, [], [subquery: 0]}]
++      assert [_] = query.windows[:w].subqueries
++
++      query = "q" |> windows([p], w: [partition_by: exists(from other_q in "q", where: other_q.title == parent_as(:q).title)])
++
++      assert query.windows[:w].expr[:partition_by] == [{:exists, [], [subquery: 0]}]
++      assert [_] = query.windows[:w].subqueries
++    end
++
+     test "raises on invalid partition by" do
+       assert_raise ArgumentError, ~r"expected a list of fields and dynamics in `partition_by`", fn ->
+         windows("q", w: [partition_by: ^[1]])

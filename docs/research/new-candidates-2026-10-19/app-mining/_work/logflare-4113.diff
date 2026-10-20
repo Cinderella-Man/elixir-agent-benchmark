@@ -1,0 +1,1899 @@
+diff --git a/lib/logflare/backends.ex b/lib/logflare/backends.ex
+index 1dff44a8f4..96e8a7467b 100644
+--- a/lib/logflare/backends.ex
++++ b/lib/logflare/backends.ex
+@@ -13,6 +13,7 @@ defmodule Logflare.Backends do
+   alias Logflare.Backends.ConsolidatedSup
+   alias Logflare.Backends.IngestEventQueue
+   alias Logflare.Backends.SourceRegistry
++  alias Logflare.Backends.SourceSupStarts
+   alias Logflare.Backends.SourcesSup
+   alias Logflare.Backends.SourceSup
+   alias Logflare.Backends.Spool.DurableBuffer.Supervisor, as: SpoolDurableBufferSup
+@@ -39,6 +40,7 @@ defmodule Logflare.Backends do
+ 
+   @max_future_event_us 1 * 3_600 * 1_000_000
+   @max_pending_buffer_len_per_queue IngestEventQueue.max_queue_size()
++  @default_source_sup_start_timeout :timer.seconds(30)
+   @max_pipeline_swap_delay_ms 5_000
+ 
+   @type one_or_list_or_nil :: Backend.t() | [Backend.t()] | nil
+@@ -464,7 +466,7 @@ defmodule Logflare.Backends do
+       ContextCache.bust_keys(cache_keys)
+       clear_list_backends_cache(source.id)
+ 
+-      if source_sup_started?(source) do
++      if source_sup_registered?(source) do
+         sync_backend_children(source, source_with_backends.backends, backends)
+       else
+         :ok
+@@ -638,13 +640,33 @@ defmodule Logflare.Backends do
+   """
+   @type log_param :: map()
+   @spec ingest_logs([log_param()], Source.t()) ::
+-          {:ok, count :: pos_integer()} | {:error, [term()]}
++          {:ok, count :: pos_integer()} | {:error, term()}
+   @spec ingest_logs([log_param()], Source.t(), Backend.t() | nil) ::
+-          {:ok, count :: pos_integer()} | {:error, [term()]}
++          {:ok, count :: pos_integer()} | {:error, term()}
+   @spec ingest_logs([log_param()], Source.t(), Backend.t() | nil, boolean()) ::
+           {:ok, count :: pos_integer()} | {:error, term()}
+   def ingest_logs(event_params, source, backend \\ nil, allow_spooling \\ false) do
+-    ensure_source_sup_started(source)
++    with :ok <- start_for_ingest(source) do
++      do_ingest_logs(event_params, source, backend, allow_spooling)
++    end
++  end
++
++  @doc """
++  Makes sure that the SourceSup of the source is up before an ingest writes events.
++
++  Returns `{:error, :source_not_found}` for a deleted source and `{:error, :source_unavailable}`
++  for any other failed start. The caller must not write the events then.
++  """
++  @spec start_for_ingest(Source.t()) :: :ok | {:error, :source_not_found | :source_unavailable}
++  def start_for_ingest(source) do
++    case ensure_source_sup_started(source) do
++      :ok -> :ok
++      {:error, :not_found} -> {:error, :source_not_found}
++      {:error, _reason} -> {:error, :source_unavailable}
++    end
++  end
++
++  defp do_ingest_logs(event_params, source, backend, allow_spooling) do
+     {log_events, errors} = split_valid_events(source, event_params)
+     count = Enum.count(log_events)
+     increment_counters(source, count)
+@@ -753,10 +775,15 @@ defmodule Logflare.Backends do
+   before `Logflare.Backends.Spool.SpoolAck` acks it — see that module's
+   moduledoc.
+   """
+-  @spec dispatch_from_spool([map()], Source.t(), term()) :: {:ok, non_neg_integer()}
++  @spec dispatch_from_spool([map()], Source.t(), term()) ::
++          {:ok, non_neg_integer()} | {:error, :source_not_found | :source_unavailable}
+   def dispatch_from_spool(spool_records, source, handle \\ nil) do
+-    ensure_source_sup_started(source)
++    with :ok <- start_for_ingest(source) do
++      do_dispatch_from_spool(spool_records, source, handle)
++    end
++  end
+ 
++  defp do_dispatch_from_spool(spool_records, source, handle) do
+     log_events =
+       Enum.map(spool_records, fn record ->
+         LogEvent.make_from_spool(record, source, handle)
+@@ -1080,55 +1107,156 @@ defmodule Logflare.Backends do
+   end
+ 
+   @doc """
+-  Checks if the SourceSup for a given source has been started.
++  Checks if the SourceSup for a given source is up and all its initial children are started.
++
++  A `SourceSup` that is registered but still in its start returns `false`. See
++  `Logflare.Backends.SourceSup.mark_ready/1`.
+   """
+   @spec source_sup_started?(Source.t() | non_neg_integer()) :: boolean()
+   def source_sup_started?(%Source{id: id}), do: source_sup_started?(id)
+ 
+   def source_sup_started?(id) when is_number(id) do
++    match?([{_pid, :ready}], Registry.lookup(SourceRegistry, {id, SourceSup}))
++  end
++
++  @doc """
++  Checks if the SourceSup for a given source is registered. It can still be in its start.
++
++  Backend reconciliation uses this check. A child start or stop on a `SourceSup` in its start
++  waits until its `init/1` returns. Thus a backend change during the start still reaches the
++  `SourceSup`. Ingest must use `source_sup_started?/1`.
++  """
++  @spec source_sup_registered?(Source.t() | non_neg_integer()) :: boolean()
++  def source_sup_registered?(%Source{id: id}), do: source_sup_registered?(id)
++
++  def source_sup_registered?(id) when is_number(id) do
+     Registry.lookup(SourceRegistry, {id, SourceSup}) != []
+   end
+ 
+   @doc """
+-  Starts a given SourceSup for a source. If already started, will return an error tuple.
++  Starts the SourceSup of a source.
++
++  Returns `{:error, :already_started}` when the SourceSup is already up.
++
++  The start has two steps: `SourceSup.prefetch/1` warms the caches, then the `SourcesSup`
++  partition starts the `SourceSup`. The caller waits for both steps for at most the
++  `:source_sup_start_timeout` application environment value. The default is 30 seconds. After
++  that time, the caller gets `{:error, :start_timeout}`. A blocked cache or partition can delay
++  ingest, but it can not hold the callers forever. The partition still completes the start after
++  the timeout.
++
++  A failed start logs its reason, except for `:already_started` and `:not_found`.
+   """
+-  @spec start_source_sup(Source.t()) :: :ok | {:error, :already_started}
+-  def start_source_sup(%Source{} = source) do
++  @spec start_source_sup(Source.t()) ::
++          :ok | {:error, :already_started | :not_found | :start_timeout | term()}
++  def start_source_sup(%Source{} = source), do: do_start_source_sup(source.id, fn -> source end)
++
++  @spec do_start_source_sup(pos_integer(), (-> Source.t() | nil)) ::
++          :ok | {:error, :already_started | :not_found | :start_timeout | term()}
++  defp do_start_source_sup(source_id, load_source) do
++    timeout =
++      Application.get_env(:logflare, :source_sup_start_timeout, @default_source_sup_start_timeout)
++
++    task =
++      Task.Supervisor.async_nolink(
++        {:via, PartitionSupervisor, {Logflare.TaskSupervisors, source_id}},
++        fn -> start_loaded_source_sup(load_source.()) end
++      )
++
++    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
++      {:ok, result} ->
++        result
++        |> handle_start_child_result()
++        |> log_start_failure(source_id)
++
++      {:exit, reason} ->
++        log_start_failure({:error, reason}, source_id)
++
++      nil ->
++        Logger.warning("SourceSup start timed out after #{timeout}ms", source_id: source_id)
++        {:error, :start_timeout}
++    end
++  end
++
++  defp start_loaded_source_sup(%Source{} = source) do
+     if not source_sup_started?(source), do: SourceSup.prefetch(source)
+-    do_start_source_sup(source)
++
++    DynamicSupervisor.start_child(
++      {:via, PartitionSupervisor, {SourcesSup, source.id}},
++      SourceSup.child_spec(source)
++    )
+   end
+ 
+-  defp do_start_source_sup(source) do
+-    case DynamicSupervisor.start_child(
+-           {:via, PartitionSupervisor, {SourcesSup, source.id}},
+-           SourceSup.child_spec(source)
+-         ) do
++  defp start_loaded_source_sup(nil), do: :ignore
++
++  defp handle_start_child_result(result) do
++    case result do
+       {:ok, _pid} ->
+         :ok
+ 
++      :ignore ->
++        {:error, :not_found}
++
+       {:error, {:already_started = reason, _pid}} ->
+         {:error, reason}
+ 
+       {:error, {:shutdown, {:failed_to_start_child, _mod, {:already_started = reason, _pid}}}} ->
+         {:error, reason}
++
++      {:error, _reason} = error ->
++        error
+     end
+   end
+ 
++  defp log_start_failure({:error, reason} = error, source_id)
++       when reason not in [:already_started, :not_found] do
++    Logger.error("SourceSup start failed: #{inspect(reason)}", source_id: source_id)
++    error
++  end
++
++  defp log_start_failure(result, _source_id), do: result
++
+   @doc """
+-  Ensures that a the SourceSup is started.
++  Makes sure that the SourceSup of a source is up.
++
++  Every ingest batch calls this function. When the SourceSup is down, the first caller for the
++  source starts it. The other callers for that source wait for that start. Each caller gets the
++  result of the same start. Thus the `SourcesSup` partition gets one `start_child` call per source.
++
++  The start loads the source by id with `Sources.Cache.get_by_id_or_primary/1`. The lookup, the
++  prefetch and the `start_child` call share the deadline of `start_source_sup/1`. So a stalled
++  cache or primary read returns `{:error, :start_timeout}` to every caller.
++
++  The function also takes a source id. Then the caller does not need its own lookup, which would
++  run outside the deadline.
++
++  A failed start returns `{:error, reason}`. It does not raise.
+   """
+-  @spec ensure_source_sup_started(Source.t()) :: :ok
+-  def ensure_source_sup_started(%Source{} = source) do
+-    if source_sup_started?(source) == false do
+-      case start_source_sup(source) do
+-        :ok -> :ok
+-        {:error, :already_started} -> :ok
+-      end
+-    else
++  @spec ensure_source_sup_started(Source.t() | pos_integer()) ::
++          :ok | {:error, :not_found | :start_timeout | term()}
++  def ensure_source_sup_started(%Source{id: id}), do: ensure_source_sup_started(id)
++
++  def ensure_source_sup_started(id) when is_integer(id) do
++    if source_sup_started?(id) do
+       :ok
++    else
++      SourceSupStarts
++      |> Cachex.fetch(id, &start_source_sup_by_id/1)
++      |> handle_source_sup_start()
+     end
+   end
+ 
++  @spec start_source_sup_by_id(pos_integer()) :: {:ignore, :ok | {:error, term()}}
++  defp start_source_sup_by_id(source_id) do
++    {:ignore,
++     do_start_source_sup(source_id, fn -> Sources.Cache.get_by_id_or_primary(source_id) end)}
++  end
++
++  defp handle_source_sup_start({:ignore, :ok}), do: :ok
++  defp handle_source_sup_start({:ignore, {:error, :already_started}}), do: :ok
++  defp handle_source_sup_start({:ignore, {:error, _reason} = error}), do: error
++  defp handle_source_sup_start({:error, _reason} = error), do: error
++
+   @doc """
+   Stops a given SourceSup for a source. if not started, it will return an error tuple.
+   """
+@@ -1150,7 +1278,7 @@ defmodule Logflare.Backends do
+   Restarts a SourceSup of a given source.
+   """
+   @spec restart_source_sup(Source.t()) ::
+-          :ok | {:error, :already_started} | {:error, :not_started}
++          :ok | {:error, :already_started | :not_started | :not_found | :start_timeout | term()}
+   def restart_source_sup(%Source{} = source) do
+     with :ok <- stop_source_sup(source),
+          :ok <- start_source_sup(source) do
+diff --git a/lib/logflare/backends/source_sup.ex b/lib/logflare/backends/source_sup.ex
+index d6c00350a6..43f8117214 100644
+--- a/lib/logflare/backends/source_sup.ex
++++ b/lib/logflare/backends/source_sup.ex
+@@ -3,6 +3,7 @@ defmodule Logflare.Backends.SourceSup do
+   use Supervisor
+ 
+   alias Logflare.Backends.Backend
++  alias Logflare.Backends.SourceRegistry
+   alias Logflare.Backends.SourceSupWorker
+   alias Logflare.Backends
+   alias Logflare.Sources.Source
+@@ -21,16 +22,27 @@ defmodule Logflare.Backends.SourceSup do
+   alias Logflare.Sources
+   alias Logflare.Backends.AdaptorSupervisor
+ 
+-  def child_spec(%Source{id: id} = arg) do
++  @doc """
++  Returns the child spec for the supervision tree of a source.
++
++  The start arguments hold only the source id. A source with many rules is about 1 MB. The
++  `SourcesSup` partition copies the start arguments into each `start_child` message. The
++  partition also keeps them in its state. `init/1` loads the source and its rules from the cache.
++  """
++  @spec child_spec(Source.t() | pos_integer()) :: Supervisor.child_spec()
++  def child_spec(%Source{id: id}), do: child_spec(id)
++
++  def child_spec(source_id) when is_integer(source_id) do
+     %{
+-      id: {__MODULE__, id},
+-      start: {__MODULE__, :start_link, [arg]},
++      id: {__MODULE__, source_id},
++      start: {__MODULE__, :start_link, [source_id]},
+       restart: :transient
+     }
+   end
+ 
+-  def start_link(%Source{} = source) do
+-    Supervisor.start_link(__MODULE__, source, name: Backends.via_source(source, __MODULE__))
++  @spec start_link(pos_integer()) :: Supervisor.on_start()
++  def start_link(source_id) when is_integer(source_id) do
++    Supervisor.start_link(__MODULE__, source_id, name: Backends.via_source(source_id, __MODULE__))
+   end
+ 
+   @doc """
+@@ -74,7 +86,21 @@ defmodule Logflare.Backends.SourceSup do
+     :ok
+   end
+ 
+-  def init(source) do
++  @doc """
++  Loads the source and starts its children. Returns `:ignore` when the source does not exist.
++
++  The cache can hold `nil` for a source that exists. The children read the source from the same
++  cache entry. Thus `init/1` uses `Sources.Cache.get_by_id_or_primary/1`, which reads the primary
++  database on a cached `nil` and repairs the entry.
++  """
++  def init(source_id) do
++    case Sources.Cache.get_by_id_or_primary(source_id) do
++      nil -> :ignore
++      source -> init_children(source)
++    end
++  end
++
++  defp init_children(source) do
+     ingest_backends =
+       Backends.Cache.list_backends(source_id: source.id)
+       |> Enum.reject(& &1.consolidated_ingest?)
+@@ -109,11 +135,33 @@ defmodule Logflare.Backends.SourceSup do
+         if(Application.get_env(:logflare, :env) != :test,
+           do: [{SourceSupWorker, [source: source]}],
+           else: []
+-        ) ++ specs
++        ) ++ specs ++ [ready_marker_spec(source.id)]
+ 
+     Supervisor.init(children, strategy: :one_for_one)
+   end
+ 
++  defp ready_marker_spec(source_id) do
++    Supervisor.child_spec(%{id: :ready_marker, start: {__MODULE__, :mark_ready, [source_id]}},
++      restart: :temporary
++    )
++  end
++
++  @doc """
++  Sets the `SourceRegistry` value of the `SourceSup` to `:ready`.
++
++  `Supervisor.start_link/3` registers the name before the children start. So a registered
++  `SourceSup` can still be in its start. The `SourceSup` calls this function as the start of its
++  last child. The supervisor process runs child starts in order, so all other children are up
++  then. The function returns `:ignore`, so it starts no process.
++  """
++  @spec mark_ready(pos_integer()) :: :ignore
++  def mark_ready(source_id) do
++    {:ready, _old} =
++      Registry.update_value(SourceRegistry, {source_id, __MODULE__}, fn _ -> :ready end)
++
++    :ignore
++  end
++
+   @doc """
+   Checks if a rule child is started for a given source/rule.
+   Must be a backend rule.
+diff --git a/lib/logflare/backends/spool/consumer_pipeline.ex b/lib/logflare/backends/spool/consumer_pipeline.ex
+index a07efa7072..6b5fbf98fa 100644
+--- a/lib/logflare/backends/spool/consumer_pipeline.ex
++++ b/lib/logflare/backends/spool/consumer_pipeline.ex
+@@ -236,8 +236,7 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline do
+         []
+ 
+       source ->
+-        {:ok, _} = Backends.dispatch_from_spool(lines, source, handle)
+-        []
++        dispatch_source(source_id, source, lines, handle)
+     end
+   rescue
+     exception ->
+@@ -252,6 +251,28 @@ defmodule Logflare.Backends.Spool.ConsumerPipeline do
+       [source_id]
+   end
+ 
++  defp dispatch_source(source_id, source, lines, handle) do
++    case Backends.dispatch_from_spool(lines, source, handle) do
++      {:ok, _count} ->
++        []
++
++      {:error, :source_not_found} ->
++        emit_skipped_telemetry(:unknown_source_id, length(lines))
++        []
++
++      {:error, :source_unavailable} ->
++        count = length(lines)
++        emit_skipped_telemetry(:source_unavailable, count)
++
++        Logger.warning(
++          "spool_consumer: SourceSup did not start for source_id=#{source_id}, " <>
++            "failing #{count} events for redelivery"
++        )
++
++        [source_id]
++    end
++  end
++
+   defp emit_skipped_telemetry(reason, count) do
+     :telemetry.execute(
+       [:logflare, :backends, :spool, :consumer, :skipped],
+diff --git a/lib/logflare/backends/supervisor.ex b/lib/logflare/backends/supervisor.ex
+index c2aa62bba9..2965f15ae4 100644
+--- a/lib/logflare/backends/supervisor.ex
++++ b/lib/logflare/backends/supervisor.ex
+@@ -49,6 +49,10 @@ defmodule Logflare.Backends.Supervisor do
+         Backends.Adaptor.PostgresAdaptor.Supervisor,
+         Backends.Adaptor.ClickHouseAdaptor.QueryConnectionSup,
+         Backends.ConsolidatedSup,
++        %{
++          id: Backends.SourceSupStarts,
++          start: {Cachex, :start_link, [Backends.SourceSupStarts, []]}
++        },
+         {PartitionSupervisor, child_spec: DynamicSupervisor, name: Backends.SourcesSup},
+         {Registry,
+          name: Backends.SourceRegistry, keys: :unique, partitions: max(round(base / 8), 1)},
+@@ -57,7 +61,8 @@ defmodule Logflare.Backends.Supervisor do
+         {Registry,
+          name: Backends.BufferProducer.InFlightRegistry,
+          keys: :unique,
+-         partitions: max(round(base / 8), 1)}
++         partitions: max(round(base / 8), 1)},
++        Backends.UserMonitoring.SystemSourceStarter
+       ] ++
+         spool_goth_children ++
+         spool_memory_monitor_children ++ producer_children ++ consumer_children
+diff --git a/lib/logflare/backends/user_monitoring.ex b/lib/logflare/backends/user_monitoring.ex
+index b0be3089de..d708ac35fb 100644
+--- a/lib/logflare/backends/user_monitoring.ex
++++ b/lib/logflare/backends/user_monitoring.ex
+@@ -4,13 +4,17 @@ defmodule Logflare.Backends.UserMonitoring do
+   """
+ 
+   import Telemetry.Metrics
++
++  alias Logflare.Backends
+   alias Logflare.Backends.UserMonitoring.IngestPipeline
++  alias Logflare.Backends.UserMonitoring.SystemSourceStarter
+   alias Logflare.Logs
+   alias Logflare.Logs.Processor
+   alias Logflare.Sources
+   alias Logflare.Users
+ 
+   @store_name :user_metrics_store
++  @delivering_key {__MODULE__, :delivering}
+ 
+   def metrics do
+     [
+@@ -87,21 +91,45 @@ defmodule Logflare.Backends.UserMonitoring do
+   end
+ 
+   @doc """
+-  Intercepts Logger messages related to specific users, and send them to the respective
+-  System Source when the user has activated it
++  Sends a Logger message for a user to the system logs source of that user.
++
++  The filter acts only when the user has turned on system monitoring. It copies internal Logflare
++  log lines, such as adaptor errors, as async system log events. It never sees logs that users
++  ingest.
++
++  The filter runs in the process that logs. That process can be inside a `SourceSup` start. A
++  start from here can wait on the `SourcesSup` partition that starts the logging process. That
++  wait deadlocks the partition. Thus the filter never starts the system logs source itself.
++
++  When the `SourceSup` of the system logs source is up, the filter sends the event to that source.
++  When it is down, the filter drops the system log event and asks `SystemSourceStarter` to start
++  the `SourceSup` in a different process. The original log line is not affected: it still reaches
++  the Logflare logs. Each drop emits `[:logflare, :user_monitoring, :system_logs, :dropped]`.
++
++  Two waits remain in the logging process. The timeout of `Logflare.Backends.start_source_sup/1`
++  limits each of them:
++
++  - A rule on the system logs source routes an event to a sink source whose `SourceSup` is down.
++  - The `SourceSup` of the system logs source stops between the check and the ingest. In that
++    case, the filter drops the system log event after the wait.
++
++  A log line that the ingest emits in the same process does not go through the filter again. The
++  filter ignores it, so a failed ingest can not log, intercept and ingest without end.
+   """
++  @spec log_interceptor(:logger.log_event(), term()) :: :ignore
+   def log_interceptor(%{meta: %{system_source: true}}, _), do: :ignore
+ 
+   def log_interceptor(%{meta: %{user_id: user_id} = meta} = log_event, _)
+       when is_integer(user_id) do
+-    with %{system_monitoring: true} <- Users.Cache.get(user_id),
++    with nil <- Process.get(@delivering_key),
++         %{system_monitoring: true} <- Users.Cache.get(user_id),
+          %Sources.Source{} = source <- get_system_source_logs(user_id) do
+-      log_event.level
+-      |> LogflareLogger.Formatter.format(format_message(log_event), get_datetime(), meta)
+-      |> List.wrap()
+-      |> Processor.ingest(Logs.Raw, source)
++      events =
++        log_event.level
++        |> LogflareLogger.Formatter.format(format_message(log_event), get_datetime(), meta)
++        |> List.wrap()
+ 
+-      # do not block the event from being shipped.
++      deliver(source, events)
+       :ignore
+     else
+       _ -> :ignore
+@@ -113,6 +141,37 @@ defmodule Logflare.Backends.UserMonitoring do
+ 
+   def log_interceptor(_, _), do: :ignore
+ 
++  @spec deliver(Sources.Source.t(), [map()]) :: :ok
++  defp deliver(source, events) do
++    Process.put(@delivering_key, true)
++
++    with true <- Backends.source_sup_started?(source),
++         {:error, reason} when reason in [:source_unavailable, :source_not_found] <-
++           Processor.ingest(events, Logs.Raw, source) do
++      drop(source, events, reason)
++    else
++      false -> drop(source, events, :source_not_started)
++      _result -> :ok
++    end
++  after
++    Process.delete(@delivering_key)
++  end
++
++  @spec drop(
++          Sources.Source.t(),
++          [map()],
++          :source_not_started | :source_unavailable | :source_not_found
++        ) :: :ok
++  defp drop(source, events, reason) do
++    :telemetry.execute(
++      [:logflare, :user_monitoring, :system_logs, :dropped],
++      %{count: length(events)},
++      %{source_id: source.id, reason: reason}
++    )
++
++    SystemSourceStarter.request_start(source.id)
++  end
++
+   defp get_system_source_logs(user_id) do
+     Sources.Cache.get_by_for_ingest(user_id: user_id, system_source_type: :logs)
+     |> Sources.refresh_source_metrics_for_ingest()
+diff --git a/lib/logflare/backends/user_monitoring/system_source_starter.ex b/lib/logflare/backends/user_monitoring/system_source_starter.ex
+new file mode 100644
+index 0000000000..7974bbab7e
+--- /dev/null
++++ b/lib/logflare/backends/user_monitoring/system_source_starter.ex
+@@ -0,0 +1,78 @@
++defmodule Logflare.Backends.UserMonitoring.SystemSourceStarter do
++  @moduledoc """
++  Starts the `SourceSup` of a user's system logs source outside the process that logs.
++
++  `Logflare.Backends.UserMonitoring.log_interceptor/2` copies internal Logflare log lines to the
++  `system.logs` source of a user as async system log events. It runs in the logging process. That
++  process can be inside a `SourceSup` start. A synchronous start from there can wait on the same
++  `SourcesSup` partition. That wait deadlocks the partition. Thus the interceptor casts the source
++  id to this process. This process does not hold any events.
++
++  This process runs each start in an unlinked task. Thus it never waits on a partition. A failed
++  start can not crash it. The task passes only the source id to
++  `Logflare.Backends.ensure_source_sup_started/1`. The source lookup then runs inside the start
++  deadline, so a stalled lookup can not hold the task forever.
++
++  This process skips a request in two cases: a start for that id is in flight, or the `SourceSup`
++  is already up. Thus a log flood causes at most one start per source at a time. After a failed
++  start, the next intercepted log line requests a new start.
++  """
++
++  use GenServer
++
++  alias Logflare.Backends
++
++  @type state :: %{in_flight: %{reference() => pos_integer()}}
++
++  @spec start_link(keyword()) :: GenServer.on_start()
++  def start_link(opts \\ []) do
++    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
++  end
++
++  @doc """
++  Asks for a start of the `SourceSup` of the source id.
++
++  The function returns at once. It does not wait for the start.
++  """
++  @spec request_start(pos_integer()) :: :ok
++  def request_start(source_id) when is_integer(source_id) do
++    GenServer.cast(__MODULE__, {:start, source_id})
++  end
++
++  @doc """
++  Returns an empty state. Tests use it to reset this process.
++  """
++  @spec empty_state() :: state()
++  def empty_state, do: %{in_flight: %{}}
++
++  @impl GenServer
++  @spec init(keyword()) :: {:ok, state()}
++  def init(_opts), do: {:ok, empty_state()}
++
++  @impl GenServer
++  def handle_cast({:start, source_id}, state) do
++    if source_id in Map.values(state.in_flight) or Backends.source_sup_started?(source_id) do
++      {:noreply, state}
++    else
++      %Task{ref: ref} =
++        Task.Supervisor.async_nolink(
++          {:via, PartitionSupervisor, {Logflare.TaskSupervisors, source_id}},
++          fn -> Backends.ensure_source_sup_started(source_id) end
++        )
++
++      {:noreply, put_in(state, [:in_flight, ref], source_id)}
++    end
++  end
++
++  @impl GenServer
++  def handle_info({ref, _result}, state) when is_map_key(state.in_flight, ref) do
++    Process.demonitor(ref, [:flush])
++    {:noreply, %{state | in_flight: Map.delete(state.in_flight, ref)}}
++  end
++
++  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
++    {:noreply, %{state | in_flight: Map.delete(state.in_flight, ref)}}
++  end
++
++  def handle_info(_message, state), do: {:noreply, state}
++end
+diff --git a/lib/logflare/logs/processor.ex b/lib/logflare/logs/processor.ex
+index 664648ad03..90c6e1c75e 100644
+--- a/lib/logflare/logs/processor.ex
++++ b/lib/logflare/logs/processor.ex
+@@ -17,11 +17,27 @@ defmodule Logflare.Logs.Processor do
+ 
+   @doc """
+   Process `data` using `processor` to translate from incoming format to storage format.
++
++  The function first makes sure that the `SourceSup` of the source is up. That wait has a time
++  limit (see `Logflare.Backends.start_source_sup/1`). When the `SourceSup` is still not up after
++  the wait, the function does not ingest and returns `{:error, :source_unavailable}`. The write
++  is not certain then, so the caller must tell the client to send the batch again.
++
++  When the source was deleted after the caller loaded it, the function does not ingest and
++  returns `{:error, :source_not_found}`.
+   """
+   @spec ingest([map()], module(), Logflare.Sources.Source.t()) ::
+-          :ok | {:ok, count :: pos_integer()} | {:error, term()}
++          :ok
++          | {:ok, count :: pos_integer()}
++          | {:error, :source_unavailable | :source_not_found | term()}
+   def ingest(data, processor, %Source{} = source)
+       when is_list(data) and is_atom(processor) do
++    with :ok <- Backends.start_for_ingest(source) do
++      process_and_store(data, processor, source)
++    end
++  end
++
++  defp process_and_store(data, processor, source) do
+     metadata = %{
+       processor: processor,
+       source_token: source.token,
+@@ -43,7 +59,6 @@ defmodule Logflare.Logs.Processor do
+       )
+ 
+       :telemetry.span([:logflare, :logs, :processor, :ingest, :store], metadata, fn ->
+-        Backends.ensure_source_sup_started(source)
+         # allow_spooling: true — this is the genuine client-submitted entry
+         # point (every log_controller.ex/gRPC ingestion action funnels
+         # through here), as opposed to SourceRouter's re-entrant calls,
+diff --git a/lib/logflare/sources/cache.ex b/lib/logflare/sources/cache.ex
+index e7f2007089..dcc30c6969 100644
+--- a/lib/logflare/sources/cache.ex
++++ b/lib/logflare/sources/cache.ex
+@@ -50,6 +50,32 @@ defmodule Logflare.Sources.Cache do
+   def get_by_id_and_preload(arg) when is_atom(arg), do: get_by_and_preload(token: arg)
+ 
+   def get_by(kv), do: apply_repo_fun(__ENV__.function, [kv])
++
++  @doc """
++  Returns the source for the id. Reads the primary database when the cache holds `nil`.
++
++  The cache can hold `nil` for a source that exists, for example after a read from a replica that
++  lags behind. The cache buster does not remove a cached `nil`. When the primary has the source,
++  this function also puts it in the cache entry, so later cache reads get it.
++  """
++  @spec get_by_id_or_primary(pos_integer()) :: Source.t() | nil
++  def get_by_id_or_primary(id) when is_integer(id) do
++    with nil <- get_by_id(id),
++         %Source{} = source <- Sources.get(id) do
++      update_by_id(source)
++      source
++    end
++  end
++
++  @doc """
++  Replaces the cached `get_by(id: id)` entry of the source with the given struct.
++
++  The entry must exist. A cached `nil` counts as an entry.
++  """
++  @spec update_by_id(Source.t()) :: {:ok, boolean()} | {:error, term()}
++  def update_by_id(%Source{id: id} = source),
++    do: Logflare.ContextCache.update(Sources, :get_by, [[id: id]], source)
++
+   def get_by_id(arg) when is_integer(arg), do: get_by(id: arg)
+   def get_by_id(arg) when is_atom(arg), do: get_by(token: arg)
+   def get_source_by_token(arg) when is_atom(arg), do: get_by(token: arg)
+diff --git a/lib/logflare/sources/source/supervisor.ex b/lib/logflare/sources/source/supervisor.ex
+index fb1c6f50b8..f37eeb4195 100644
+--- a/lib/logflare/sources/source/supervisor.ex
++++ b/lib/logflare/sources/source/supervisor.ex
+@@ -156,6 +156,13 @@ defmodule Logflare.Sources.Source.Supervisor do
+       {:error, {:already_started = reason, _pid}} ->
+         {:error, reason}
+ 
++      {:error, :start_timeout} = err ->
++        init_table(source.token)
++        err
++
++      {:error, _reason} = err ->
++        err
++
+       {:error} = err ->
+         err
+     end
+diff --git a/lib/logflare/sources/source_router.ex b/lib/logflare/sources/source_router.ex
+index 520a4dcc8a..42824952c6 100644
+--- a/lib/logflare/sources/source_router.ex
++++ b/lib/logflare/sources/source_router.ex
+@@ -24,12 +24,26 @@ defmodule Logflare.Sources.SourceRouter do
+ 
+   def route_to_sinks_and_ingest(%LE{via_rule_id: nil} = le, source, router) do
+     for %Rule{} = rule <- router.matching_rules(le, source) do
+-      do_routing(rule, le, source)
++      rule
++      |> do_routing(le, source)
++      |> maybe_emit_dropped(rule, source)
+     end
+ 
+     le
+   end
+ 
++  @spec maybe_emit_dropped(term(), Rule.t(), Source.t()) :: :ok
++  defp maybe_emit_dropped({:error, reason}, rule, source)
++       when reason in [:source_unavailable, :source_not_found] do
++    :telemetry.execute(
++      [:logflare, :sources, :source_router, :dropped],
++      %{count: 1},
++      %{reason: reason, source_id: source.id, rule_id: rule.id}
++    )
++  end
++
++  defp maybe_emit_dropped(_result, _rule, _source), do: :ok
++
+   defp do_routing(%Rule{backend_id: backend_id} = rule, %LE{} = le, source)
+        when backend_id != nil do
+     # route to a backend
+@@ -47,7 +61,6 @@ defmodule Logflare.Sources.SourceRouter do
+ 
+     le = %{le | source_id: sink_source.id, via_rule_id: rule.id}
+ 
+-    Backends.ensure_source_sup_started(sink_source)
+     Backends.ingest_logs([le], sink_source)
+   end
+ 
+diff --git a/lib/logflare_grpc/exception_log_filter.ex b/lib/logflare_grpc/exception_log_filter.ex
+index 20bc703fb0..dc51167807 100644
+--- a/lib/logflare_grpc/exception_log_filter.ex
++++ b/lib/logflare_grpc/exception_log_filter.ex
+@@ -1,15 +1,27 @@
+ defmodule LogflareGrpc.ExceptionLogFilter do
+   @moduledoc """
+   Filters expected `GRPC.RPCError` rejections (bad api keys, missing sources,
+-  insufficient scopes, etc.) out of the crash-level exception logs emitted by
+-  `GRPC.Server.Adapters.Cowboy.Handler`, since they are normal control flow
+-  rather than bugs. Unexpected exceptions are still logged.
++  insufficient scopes, a deleted source, a source that is still starting) out of the crash-level
++  exception logs emitted by `GRPC.Server.Adapters.Cowboy.Handler`, since they are
++  normal control flow rather than bugs. Unexpected exceptions are still logged.
++
++  `GRPC.RPCError.exception/1` stores the status as an integer, so the filter
++  matches the integer codes from `GRPC.Status`.
+   """
+ 
+   alias GRPC.Server.Adapters.ReportException
+ 
++  @expected_statuses [
++    GRPC.Status.not_found(),
++    GRPC.Status.permission_denied(),
++    GRPC.Status.unauthenticated(),
++    GRPC.Status.unavailable()
++  ]
++
+   @spec emit_log?(%ReportException{}) :: boolean()
+-  def emit_log?(%ReportException{reason: %GRPC.RPCError{status: :permission_denied}}), do: false
+-  def emit_log?(%ReportException{reason: %GRPC.RPCError{status: :unauthenticated}}), do: false
++  def emit_log?(%ReportException{reason: %GRPC.RPCError{status: status}})
++      when status in @expected_statuses,
++      do: false
++
+   def emit_log?(%ReportException{}), do: true
+ end
+diff --git a/lib/logflare_grpc/logs/server.ex b/lib/logflare_grpc/logs/server.ex
+index 44048a6466..76fa84d5d2 100644
+--- a/lib/logflare_grpc/logs/server.ex
++++ b/lib/logflare_grpc/logs/server.ex
+@@ -20,6 +20,14 @@ defmodule LogflareGrpc.Logs.Server do
+     source = stream.local.source
+ 
+     case Processor.ingest(logs, OtelLog, source) do
++      {:error, :source_not_found} ->
++        raise GRPC.RPCError, status: :not_found, message: "Source not found."
++
++      {:error, :source_unavailable} ->
++        raise GRPC.RPCError,
++          status: :unavailable,
++          message: "Source is unavailable. Send the batch again."
++
+       {:error, errors} when is_list(errors) ->
+         Logger.warning("OTLP gRPC ingest rejected #{length(errors)} event(s) at validation",
+           source_token: source.token,
+diff --git a/lib/logflare_grpc/metrics/server.ex b/lib/logflare_grpc/metrics/server.ex
+index 194e0e7977..598ad2b042 100644
+--- a/lib/logflare_grpc/metrics/server.ex
++++ b/lib/logflare_grpc/metrics/server.ex
+@@ -20,6 +20,14 @@ defmodule LogflareGrpc.Metrics.Server do
+     source = stream.local.source
+ 
+     case Processor.ingest(metrics, OtelMetric, source) do
++      {:error, :source_not_found} ->
++        raise GRPC.RPCError, status: :not_found, message: "Source not found."
++
++      {:error, :source_unavailable} ->
++        raise GRPC.RPCError,
++          status: :unavailable,
++          message: "Source is unavailable. Send the batch again."
++
+       {:error, errors} when is_list(errors) ->
+         Logger.warning("OTLP gRPC ingest rejected #{length(errors)} event(s) at validation",
+           source_token: source.token,
+diff --git a/lib/logflare_grpc/trace/server.ex b/lib/logflare_grpc/trace/server.ex
+index e6ae54da8d..044be0b4c0 100644
+--- a/lib/logflare_grpc/trace/server.ex
++++ b/lib/logflare_grpc/trace/server.ex
+@@ -20,6 +20,14 @@ defmodule LogflareGrpc.Trace.Server do
+     source = stream.local.source
+ 
+     case Processor.ingest(spans, OtelTrace, source) do
++      {:error, :source_not_found} ->
++        raise GRPC.RPCError, status: :not_found, message: "Source not found."
++
++      {:error, :source_unavailable} ->
++        raise GRPC.RPCError,
++          status: :unavailable,
++          message: "Source is unavailable. Send the batch again."
++
+       {:error, errors} when is_list(errors) ->
+         Logger.warning("OTLP gRPC ingest rejected #{length(errors)} event(s) at validation",
+           source_token: source.token,
+diff --git a/lib/logflare_web/channels/log_channel.ex b/lib/logflare_web/channels/log_channel.ex
+index 6b377f4944..4c530d807c 100644
+--- a/lib/logflare_web/channels/log_channel.ex
++++ b/lib/logflare_web/channels/log_channel.ex
+@@ -69,14 +69,10 @@ defmodule LogflareWeb.LogChannel do
+ 
+     # allow_spooling: true — a genuine client-submitted entry point, same as
+     # the HTTP/gRPC controllers routed through Logflare.Logs.Processor.
+-    case Backends.ingest_logs(batch, source, nil, true) do
+-      {:ok, _count} ->
+-        push(socket, "batch", %{message: "Handled batch"})
+-        {:noreply, socket}
+-
+-      {:error, errors} ->
+-        push(socket, "batch", %{message: "Batch error", errors: errors})
+-        {:noreply, socket}
++    with :ok <- Backends.start_for_ingest(source) do
++      ingest_batch(batch, source, socket)
++    else
++      {:error, reason} -> reply_start_error(socket, reason)
+     end
+   end
+ 
+@@ -102,4 +98,33 @@ defmodule LogflareWeb.LogChannel do
+     push(socket, "notify", payload)
+     {:noreply, socket}
+   end
++
++  defp ingest_batch(batch, source, socket) do
++    case Backends.ingest_logs(batch, source, nil, true) do
++      {:ok, _count} ->
++        push(socket, "batch", %{message: "Handled batch"})
++        {:noreply, socket}
++
++      {:error, reason} when reason in [:source_not_found, :source_unavailable] ->
++        reply_start_error(socket, reason)
++
++      {:error, errors} ->
++        push(socket, "batch", %{message: "Batch error", errors: errors})
++        {:noreply, socket}
++    end
++  end
++
++  defp reply_start_error(socket, :source_not_found) do
++    push(socket, "batch", %{message: "Batch error", errors: ["Source not found."]})
++    {:noreply, socket}
++  end
++
++  defp reply_start_error(socket, :source_unavailable) do
++    push(socket, "batch", %{
++      message: "Batch error",
++      errors: ["Source is unavailable. Send the batch again."]
++    })
++
++    {:noreply, socket}
++  end
+ end
+diff --git a/lib/logflare_web/controllers/log_controller.ex b/lib/logflare_web/controllers/log_controller.ex
+index 5f70abc04f..6dcb987b68 100644
+--- a/lib/logflare_web/controllers/log_controller.ex
++++ b/lib/logflare_web/controllers/log_controller.ex
+@@ -41,6 +41,9 @@ defmodule LogflareWeb.LogController do
+   plug(LogflareWeb.Plugs.BlockSystemSource)
+ 
+   @message "Logged!"
++  @source_unavailable_message "Source is unavailable. Send the batch again."
++  @source_unavailable_retry_after "5"
++  @source_not_found_message "Source not found."
+ 
+   operation(:create,
+     summary: "Create log event",
+@@ -249,6 +252,21 @@ defmodule LogflareWeb.LogController do
+     |> render("index.json", message: "Internal server error")
+   end
+ 
++  defp handle({:error, :source_not_found}, conn) do
++    conn
++    |> put_status(404)
++    |> put_view(LogflareWeb.LogView)
++    |> render("index.json", message: @source_not_found_message)
++  end
++
++  defp handle({:error, :source_unavailable}, conn) do
++    conn
++    |> put_status(503)
++    |> put_resp_header("retry-after", @source_unavailable_retry_after)
++    |> put_view(LogflareWeb.LogView)
++    |> render("index.json", message: @source_unavailable_message)
++  end
++
+   defp handle({:error, errors}, conn) do
+     conn
+     |> put_status(406)
+@@ -308,6 +326,16 @@ defmodule LogflareWeb.LogController do
+       reraise exception, __STACKTRACE__
+   end
+ 
++  defp protobuf_response({:error, :source_not_found}, conn, _success_response) do
++    send_proto_error(conn, 404, @source_not_found_message)
++  end
++
++  defp protobuf_response({:error, :source_unavailable}, conn, _success_response) do
++    conn
++    |> put_resp_header("retry-after", @source_unavailable_retry_after)
++    |> send_proto_error(503, @source_unavailable_message)
++  end
++
+   defp protobuf_response({:error, :spool_unavailable}, conn, _success_response) do
+     send_proto_error(conn, 500, "Internal server error")
+   end
+diff --git a/lib/telemetry.ex b/lib/telemetry.ex
+index fc3e5d6921..15ac6f19c3 100644
+--- a/lib/telemetry.ex
++++ b/lib/telemetry.ex
+@@ -478,6 +478,20 @@ defmodule Logflare.Telemetry do
+         measurement: :count,
+         description: "Sum of events dropped (timestamp more than 1h in the future)"
+       ),
++      sum("logflare.sources.source_router.dropped.count",
++        event_name: [:logflare, :sources, :source_router, :dropped],
++        measurement: :count,
++        tags: [:reason],
++        description:
++          "Count of routed event copies that a rule could not write, because the SourceSup of the target did not start. These are copies of user logs; the original event is written to its own source. Tagged `:source_unavailable` when the start failed or timed out, or `:source_not_found` when the target was deleted"
++      ),
++      sum("logflare.user_monitoring.system_logs.dropped.count",
++        event_name: [:logflare, :user_monitoring, :system_logs, :dropped],
++        measurement: :count,
++        tags: [:reason],
++        description:
++          "Count of async system log events that the log interceptor dropped. A system log event is an internal Logflare log line copied to a user's system.logs source; logs that users ingest never count here. Tagged `:source_not_started` when the system logs source was down, `:source_unavailable` when its start did not finish in time, or `:source_not_found` when it was deleted"
++      ),
+       sum("logflare.logs.ingest_logs.rejected",
+         event_name: [:logflare, :logs, :ingest_logs, :rejected],
+         measurement: :count,
+diff --git a/test/logflare/backends/spool/consumer_pipeline_test.exs b/test/logflare/backends/spool/consumer_pipeline_test.exs
+index 889d7c6382..77bf9b10df 100644
+--- a/test/logflare/backends/spool/consumer_pipeline_test.exs
++++ b/test/logflare/backends/spool/consumer_pipeline_test.exs
+@@ -290,6 +290,38 @@ defmodule Logflare.Backends.Spool.ConsumerPipelineTest do
+                       %{count: 1}, %{reason: :dispatch_error}}
+     end
+ 
++    test "fails a message for redelivery when the SourceSup of its source does not start", %{
++      source: source
++    } do
++      TestUtils.attach_forwarder([:logflare, :backends, :spool, :consumer, :skipped])
++      message = line_message(source.id, Ecto.UUID.generate())
++
++      stub(Logflare.Backends, :dispatch_from_spool, fn _params, _source, _handle ->
++        {:error, :source_unavailable}
++      end)
++
++      assert [returned] = ConsumerPipeline.handle_batch(:default, [message], %{}, %{})
++      assert returned.status == {:failed, :dispatch_error}
++
++      assert_receive {:telemetry_event, [:logflare, :backends, :spool, :consumer, :skipped],
++                      %{count: 1}, %{reason: :source_unavailable}}
++    end
++
++    test "skips a message without redelivery when its source was deleted", %{source: source} do
++      TestUtils.attach_forwarder([:logflare, :backends, :spool, :consumer, :skipped])
++      message = line_message(source.id, Ecto.UUID.generate())
++
++      stub(Logflare.Backends, :dispatch_from_spool, fn _params, _source, _handle ->
++        {:error, :source_not_found}
++      end)
++
++      assert [returned] = ConsumerPipeline.handle_batch(:default, [message], %{}, %{})
++      assert returned.status == :ok
++
++      assert_receive {:telemetry_event, [:logflare, :backends, :spool, :consumer, :skipped],
++                      %{count: 1}, %{reason: :unknown_source_id}}
++    end
++
+     test "does not fail a handle's message when only a different handle's dispatch for the same source fails" do
+       source = insert(:source, user: insert(:user))
+       failing_handle = "spool-handle-failing-#{System.unique_integer([:positive])}"
+diff --git a/test/logflare/backends/user_monitoring/system_source_starter_test.exs b/test/logflare/backends/user_monitoring/system_source_starter_test.exs
+new file mode 100644
+index 0000000000..ac592332ab
+--- /dev/null
++++ b/test/logflare/backends/user_monitoring/system_source_starter_test.exs
+@@ -0,0 +1,93 @@
++defmodule Logflare.Backends.UserMonitoring.SystemSourceStarterTest do
++  use Logflare.DataCase, async: false
++
++  alias Logflare.Backends
++  alias Logflare.Backends.UserMonitoring.SystemSourceStarter
++
++  setup :set_mimic_global
++
++  setup do
++    on_exit(fn ->
++      :sys.replace_state(SystemSourceStarter, fn _state -> SystemSourceStarter.empty_state() end)
++    end)
++
++    insert(:plan)
++    user = insert(:user)
++    source = insert(:source, user: user)
++    [source: source]
++  end
++
++  test "runs one start per source while a start is in flight", %{source: source} do
++    test_pid = self()
++    source_id = source.id
++
++    stub(Backends, :ensure_source_sup_started, fn received ->
++      send(test_pid, {:start, received, self()})
++
++      receive do
++        :release -> :ok
++      end
++    end)
++
++    for _ <- 1..100, do: SystemSourceStarter.request_start(source_id)
++
++    assert_receive {:start, ^source_id, task_pid}
++    refute_receive {:start, ^source_id, _pid}, 200
++
++    send(task_pid, :release)
++    TestUtils.retry_assert(fn -> assert in_flight() == %{} end)
++
++    SystemSourceStarter.request_start(source_id)
++    assert_receive {:start, ^source_id, next_task_pid}
++    send(next_task_pid, :release)
++    TestUtils.retry_assert(fn -> assert in_flight() == %{} end)
++  end
++
++  test "starts a source whose cache entry holds nil", %{source: source} do
++    {:ok, true} = Cachex.put(Logflare.Sources.Cache, {:get_by, [[id: source.id]]}, {:cached, nil})
++    on_exit(fn -> Backends.stop_source_sup(source) end)
++
++    SystemSourceStarter.request_start(source.id)
++
++    TestUtils.retry_assert(fn -> assert Backends.source_sup_started?(source) end)
++  end
++
++  test "times out a stalled source lookup and starts again on the next request", %{
++    source: source
++  } do
++    Application.put_env(:logflare, :source_sup_start_timeout, 50)
++    on_exit(fn -> Application.delete_env(:logflare, :source_sup_start_timeout) end)
++    stub(Logflare.Sources.Cache, :get_by_id_or_primary, fn _id -> Process.sleep(:infinity) end)
++
++    ExUnit.CaptureLog.capture_log(fn ->
++      SystemSourceStarter.request_start(source.id)
++      TestUtils.retry_assert(fn -> assert in_flight() == %{} end)
++    end)
++
++    Application.delete_env(:logflare, :source_sup_start_timeout)
++
++    stub(Logflare.Sources.Cache, :get_by_id_or_primary, fn id ->
++      call_original(Logflare.Sources.Cache, :get_by_id_or_primary, [id])
++    end)
++
++    on_exit(fn -> Backends.stop_source_sup(source) end)
++    SystemSourceStarter.request_start(source.id)
++
++    TestUtils.retry_assert(fn -> assert Backends.source_sup_started?(source) end)
++  end
++
++  test "survives a start that raises", %{source: source} do
++    starter = Process.whereis(SystemSourceStarter)
++    stub(Backends, :ensure_source_sup_started, fn _source -> raise "boom" end)
++
++    ExUnit.CaptureLog.capture_log(fn ->
++      SystemSourceStarter.request_start(source.id)
++      TestUtils.retry_assert(fn -> assert in_flight() == %{} end)
++    end)
++
++    assert Process.whereis(SystemSourceStarter) == starter
++    assert Process.alive?(starter)
++  end
++
++  defp in_flight, do: :sys.get_state(SystemSourceStarter).in_flight
++end
+diff --git a/test/logflare/backends/user_monitoring_test.exs b/test/logflare/backends/user_monitoring_test.exs
+index 98fe62082e..881c521519 100644
+--- a/test/logflare/backends/user_monitoring_test.exs
++++ b/test/logflare/backends/user_monitoring_test.exs
+@@ -148,6 +148,130 @@ defmodule Logflare.Backends.UserMonitoringTest do
+     end
+   end
+ 
++  describe "log interceptor and the system source SourceSup" do
++    setup :set_mimic_global
++
++    setup do
++      :ok =
++        :logger.add_primary_filter(
++          :user_log_intercetor,
++          {&UserMonitoring.log_interceptor/2, []}
++        )
++
++      on_exit(fn -> :logger.remove_primary_filter(:user_log_intercetor) end)
++
++      start_supervised!(AllLogsLogged)
++      insert(:plan)
++      user = insert(:user, system_monitoring: true)
++      Sources.create_user_system_sources(user.id)
++      system_source = Sources.get_by(user_id: user.id, system_source_type: :logs)
++      partitions = PartitionSupervisor.partitions(Backends.SourcesSup)
++      source = insert(:source, user: user, id: system_source.id + partitions * 1_000_000)
++
++      on_exit(fn ->
++        Backends.stop_source_sup(source)
++        Backends.stop_source_sup(system_source)
++      end)
++
++      [user: user, source: source, system_source: system_source]
++    end
++
++    test "drops the system log event while the SourceSup is down and requests a start", %{
++      user: user,
++      system_source: system_source
++    } do
++      attach_system_log_drops()
++      refute Backends.source_sup_started?(system_source)
++
++      capture_log(fn -> Logger.error("system source down", user_id: user.id) end)
++
++      system_source_id = system_source.id
++
++      assert_receive {:dropped, %{count: 1},
++                      %{source_id: ^system_source_id, reason: :source_not_started}}
++
++      TestUtils.retry_assert(fn -> assert Backends.source_sup_started?(system_source) end)
++      assert Backends.list_recent_logs_local(system_source) == []
++    end
++
++    test "drops the system log event when the ingest finds the SourceSup down after the check",
++         %{user: user, system_source: system_source} do
++      :ok = Backends.ensure_source_sup_started(system_source)
++      attach_system_log_drops()
++      stub(Backends, :start_for_ingest, fn _source -> {:error, :source_unavailable} end)
++
++      capture_log(fn -> Logger.error("source stopped after the check", user_id: user.id) end)
++
++      system_source_id = system_source.id
++
++      assert_receive {:dropped, %{count: 1},
++                      %{source_id: ^system_source_id, reason: :source_unavailable}}
++    end
++
++    test "ignores a log line that the ingest emits in the same process", %{
++      user: user,
++      system_source: system_source
++    } do
++      :ok = Backends.ensure_source_sup_started(system_source)
++      calls = :counters.new(1, [])
++      user_id = user.id
++
++      stub(Backends, :ingest_logs, fn _batch, _source, _backend, _allow_spooling ->
++        :counters.add(calls, 1, 1)
++
++        if :counters.get(calls, 1) < 10 do
++          Logger.error("spool dispatch failed inside the ingest", user_id: user_id)
++        end
++
++        {:error, :spool_unavailable}
++      end)
++
++      capture_log(fn -> Logger.error("first line", user_id: user_id) end)
++
++      assert :counters.get(calls, 1) == 1
++    end
++
++    test "a log during a SourceSup start on the system source's partition does not deadlock it",
++         %{user: user, source: source, system_source: system_source} do
++      source_id = source.id
++      user_id = user.id
++
++      stub(SourceSup, :init, fn
++        ^source_id = id ->
++          Logger.metadata(user_id: user_id)
++          Logger.error("log during SourceSup start")
++          call_original(SourceSup, :init, [id])
++
++        id ->
++          call_original(SourceSup, :init, [id])
++      end)
++
++      task = Task.async(fn -> Backends.ensure_source_sup_started(source) end)
++
++      capture_log(fn -> assert {:ok, :ok} = Task.yield(task, 5_000) end)
++      assert Backends.source_sup_started?(source)
++
++      TestUtils.retry_assert(fn -> assert Backends.source_sup_started?(system_source) end)
++    end
++  end
++
++  defp attach_system_log_drops do
++    test_pid = self()
++    ref = make_ref()
++    event = [:logflare, :user_monitoring, :system_logs, :dropped]
++
++    :telemetry.attach(
++      ref,
++      event,
++      fn ^event, measurements, metadata, _ ->
++        send(test_pid, {:dropped, measurements, metadata})
++      end,
++      nil
++    )
++
++    on_exit(fn -> :telemetry.detach(ref) end)
++  end
++
+   defp query_error_log_event?(%{
+          body: %{
+            "event_message" => "Backend query error",
+diff --git a/test/logflare/backends_test.exs b/test/logflare/backends_test.exs
+index efb726afa5..f0a1b978d1 100644
+--- a/test/logflare/backends_test.exs
++++ b/test/logflare/backends_test.exs
+@@ -19,6 +19,7 @@ defmodule Logflare.BackendsTest do
+   alias Logflare.Backends.Spool.Queue.PubSub, as: SpoolQueueMod
+   alias Logflare.Backends.Spool.Storage.GCS, as: SpoolStorageMod
+   alias Logflare.Backends.Spool.Health
++  alias Logflare.Backends.SourceRegistry
+   alias Logflare.Backends.SourceSup
+   alias Logflare.Backends.SourceSupWorker
+   alias Logflare.LogEvent
+@@ -908,6 +909,63 @@ defmodule Logflare.BackendsTest do
+     end
+   end
+ 
++  describe "SourceSup readiness" do
++    setup :set_mimic_global
++
++    setup do
++      insert(:plan)
++      user = insert(:user)
++      source = insert(:source, user_id: user.id)
++      on_exit(fn -> Backends.stop_source_sup(source) end)
++      {:ok, source: source}
++    end
++
++    test "a registered SourceSup is not started until its children are up", %{source: source} do
++      {first, sup_pid} = start_with_blocked_children(source)
++
++      assert [{^sup_pid, nil}] = Registry.lookup(SourceRegistry, {source.id, SourceSup})
++      refute Backends.source_sup_started?(source)
++
++      second = Task.async(fn -> Backends.ensure_source_sup_started(source) end)
++      refute Task.yield(second, 200)
++
++      send(sup_pid, :release)
++
++      assert :ok = Task.await(first)
++      assert :ok = Task.await(second)
++      assert Backends.source_sup_started?(source)
++    end
++
++    test "a backend attached during the start gets its child", %{source: source} do
++      backend = insert(:backend)
++      {first, sup_pid} = start_with_blocked_children(source)
++
++      attach = Task.async(fn -> Backends.update_source_backends(source, [backend]) end)
++      refute Task.yield(attach, 200)
++
++      send(sup_pid, :release)
++
++      assert :ok = Task.await(first)
++      assert {:ok, _source} = Task.await(attach)
++      assert SourceSup.backend_child_started?(backend.id, source.id)
++    end
++
++    test "a backend detached during the start loses its child", %{source: source} do
++      backend = insert(:backend)
++      {:ok, source} = Backends.update_source_backends(source, [backend])
++      {first, sup_pid} = start_with_blocked_children(source)
++
++      detach = Task.async(fn -> Backends.update_source_backends(source, []) end)
++      refute Task.yield(detach, 200)
++
++      send(sup_pid, :release)
++
++      assert :ok = Task.await(first)
++      assert {:ok, _source} = Task.await(detach)
++      refute SourceSup.backend_child_started?(backend.id, source.id)
++    end
++  end
++
+   describe "SourceSup management" do
+     setup do
+       insert(:plan)
+@@ -920,6 +978,188 @@ defmodule Logflare.BackendsTest do
+       assert :ok = Backends.ensure_source_sup_started(source)
+     end
+ 
++    test "child_spec/1 starts the SourceSup with the source id only", %{source: source} do
++      source_id = source.id
++
++      assert %{id: {SourceSup, ^source_id}, start: {SourceSup, :start_link, [^source_id]}} =
++               SourceSup.child_spec(source)
++    end
++
++    test "start_source_sup/1 returns not_found for a deleted source", %{source: source} do
++      Repo.delete!(source)
++      stub(SourceSup, :prefetch, fn _source -> :ok end)
++
++      assert {:error, :not_found} = Backends.start_source_sup(source)
++      refute Backends.source_sup_started?(source)
++    end
++
++    test "start_for_ingest/1 returns source_not_found for a deleted source", %{source: source} do
++      Repo.delete!(source)
++      stub(SourceSup, :prefetch, fn _source -> :ok end)
++
++      assert {:error, :source_not_found} = Backends.start_for_ingest(source)
++    end
++
++    test "start_for_ingest/1 returns source_unavailable when the start fails", %{source: source} do
++      stub_failing_child_spec()
++
++      capture_log(fn ->
++        assert {:error, :source_unavailable} = Backends.start_for_ingest(source)
++      end)
++    end
++
++    test "concurrent ensure_source_sup_started/1 calls start a stopped SourceSup once", %{
++      source: source
++    } do
++      test_pid = self()
++
++      stub(SourceSup, :child_spec, fn received_source ->
++        send(test_pid, :start_child)
++        call_original(SourceSup, :child_spec, [received_source])
++      end)
++
++      results =
++        1..1_000
++        |> Enum.map(fn _ -> Task.async(fn -> Backends.ensure_source_sup_started(source) end) end)
++        |> Task.await_many(30_000)
++
++      assert Enum.all?(results, &(&1 == :ok))
++      assert Backends.source_sup_started?(source)
++      assert_received :start_child
++      refute_received :start_child
++    end
++
++    test "ensure_source_sup_started/1 returns start_timeout when the partition does not answer",
++         %{source: source} do
++      Application.put_env(:logflare, :source_sup_start_timeout, 100)
++      on_exit(fn -> Application.delete_env(:logflare, :source_sup_start_timeout) end)
++
++      stub(SourceSup, :child_spec, fn received_source ->
++        %{
++          call_original(SourceSup, :child_spec, [received_source])
++          | start: {Process, :sleep, [300]}
++        }
++      end)
++
++      log =
++        capture_log(fn ->
++          assert {:error, :start_timeout} = Backends.ensure_source_sup_started(source)
++        end)
++
++      assert log =~ "SourceSup start timed out after 100ms"
++      refute Backends.source_sup_started?(source)
++    end
++
++    test "ensure_source_sup_started/1 returns and logs the error when the start fails", %{
++      source: source
++    } do
++      stub(SourceSup, :child_spec, fn received_source ->
++        %{
++          call_original(SourceSup, :child_spec, [received_source])
++          | start: {Function, :identity, [{:error, :boom}]}
++        }
++      end)
++
++      log =
++        capture_log(fn ->
++          assert {:error, :boom} = Backends.ensure_source_sup_started(source)
++        end)
++
++      assert log =~ "SourceSup start failed: :boom"
++      refute Backends.source_sup_started?(source)
++    end
++
++    test "ensure_source_sup_started/1 sends only the source id to the Cachex courier", %{
++      source: source,
++      user: user
++    } do
++      sink = insert(:source, user: user)
++      for _ <- 1..200, do: insert(:rule, source: source, sink: sink.token)
++      source = Repo.preload(source, :rules, force: true)
++      assert :erlang.external_size(source) > 100_000
++
++      courier =
++        Backends.SourceSupStarts
++        |> Supervisor.which_children()
++        |> Enum.find_value(fn
++          {Cachex.Services.Courier, pid, _type, _modules} -> pid
++          _child -> nil
++        end)
++
++      :erlang.trace(courier, true, [:receive])
++      assert :ok = Backends.ensure_source_sup_started(source)
++      :erlang.trace(courier, false, [:receive])
++
++      sizes = collect_dispatch_sizes(courier, [])
++      assert [_ | _] = sizes
++      assert Enum.max(sizes) < 10_000
++    end
++
++    test "ensure_source_sup_started/1 returns start_timeout when the source lookup does not return",
++         %{source: source} do
++      Application.put_env(:logflare, :source_sup_start_timeout, 100)
++      on_exit(fn -> Application.delete_env(:logflare, :source_sup_start_timeout) end)
++      stub(Sources.Cache, :get_by_id_or_primary, fn _id -> Process.sleep(:infinity) end)
++
++      log =
++        capture_log(fn ->
++          assert {:error, :start_timeout} = Backends.ensure_source_sup_started(source)
++        end)
++
++      assert log =~ "SourceSup start timed out after 100ms"
++      refute Backends.source_sup_started?(source)
++    end
++
++    test "start_source_sup/1 returns start_timeout when prefetch does not return", %{
++      source: source
++    } do
++      Application.put_env(:logflare, :source_sup_start_timeout, 100)
++      on_exit(fn -> Application.delete_env(:logflare, :source_sup_start_timeout) end)
++      stub(SourceSup, :prefetch, fn _source -> Process.sleep(:infinity) end)
++
++      capture_log(fn ->
++        assert {:error, :start_timeout} = Backends.start_source_sup(source)
++      end)
++
++      refute Backends.source_sup_started?(source)
++    end
++
++    test "ingest_logs/4 writes nothing and returns source_unavailable when the start fails", %{
++      source: source
++    } do
++      stub_failing_child_spec()
++      reject(IngestEventQueue, :add_to_table, 2)
++
++      assert {:error, :source_unavailable} = Backends.ingest_logs([%{"message" => "x"}], source)
++    end
++
++    test "dispatch_from_spool/3 writes nothing and returns source_unavailable when the start fails",
++         %{source: source} do
++      stub_failing_child_spec()
++      reject(IngestEventQueue, :add_to_table, 2)
++
++      assert {:error, :source_unavailable} =
++               Backends.dispatch_from_spool([%{"message" => "x"}], source)
++    end
++
++    test "start_source_sup/1 starts a source when the cache holds nil for it", %{source: source} do
++      {:ok, true} = Cachex.put(Sources.Cache, {:get_by, [[id: source.id]]}, {:cached, nil})
++      assert Sources.Cache.get_by_id(source.id) == nil
++
++      assert :ok = Backends.start_source_sup(source)
++      assert Backends.source_sup_started?(source)
++      assert %Source{} = Sources.Cache.get_by_id(source.id)
++    end
++
++    test "start_source_sup/1 leaves no EXIT message in a caller that traps exits", %{
++      source: source
++    } do
++      Process.flag(:trap_exit, true)
++
++      assert :ok = Backends.start_source_sup(source)
++      refute_receive {:EXIT, _pid, _reason}, 100
++    end
++
+     test "prefetch/1 warms the cache keys read during initial startup", %{source: source} do
+       source = Sources.get(source.id)
+       source_schema = insert(:source_schema, source: source)
+@@ -2739,6 +2979,43 @@ defmodule Logflare.BackendsTest do
+     end
+   end
+ 
++  defp collect_dispatch_sizes(courier, sizes) do
++    receive do
++      {:trace, ^courier, :receive, {:"$gen_call", _from, {:dispatch, _, _, _, _}} = message} ->
++        collect_dispatch_sizes(courier, [:erlang.external_size(message) | sizes])
++
++      {:trace, ^courier, :receive, _message} ->
++        collect_dispatch_sizes(courier, sizes)
++    after
++      0 -> sizes
++    end
++  end
++
++  defp start_with_blocked_children(source) do
++    test_pid = self()
++
++    stub(RateCounterServer, :start_link, fn args ->
++      send(test_pid, {:children_starting, self()})
++
++      receive do
++        :release -> call_original(RateCounterServer, :start_link, [args])
++      end
++    end)
++
++    task = Task.async(fn -> Backends.ensure_source_sup_started(source) end)
++    assert_receive {:children_starting, sup_pid}, 5_000
++    {task, sup_pid}
++  end
++
++  defp stub_failing_child_spec do
++    stub(SourceSup, :child_spec, fn received_source ->
++      %{
++        call_original(SourceSup, :child_spec, [received_source])
++        | start: {Function, :identity, [{:error, :boom}]}
++      }
++    end)
++  end
++
+   defp clickhouse_backend_attrs do
+     %{
+       type: :clickhouse,
+diff --git a/test/logflare/sources/source_router_test.exs b/test/logflare/sources/source_router_test.exs
+index d39f8cce02..42a53c6af5 100644
+--- a/test/logflare/sources/source_router_test.exs
++++ b/test/logflare/sources/source_router_test.exs
+@@ -784,4 +784,29 @@ defmodule Logflare.Sources.SourceRouterTest do
+       assert SourceRouter.route_to_sinks_and_ingest(le, source, SourceRouter.RulesTree) == le
+     end
+   end
++
++  describe "routing to a sink whose SourceSup does not start" do
++    test "emits a dropped event for the routed copy", %{user: user} do
++      TestUtils.attach_forwarder([:logflare, :sources, :source_router, :dropped])
++      sink = insert(:source, user: user)
++      rule = build(:rule, sink: sink.token, lql_string: "testing")
++      source = insert(:source, user: user, rules: [rule])
++      start_supervised!({SourceSup, source})
++
++      stub(SourceSup, :child_spec, fn received_source ->
++        %{
++          call_original(SourceSup, :child_spec, [received_source])
++          | start: {Function, :identity, [{:error, :boom}]}
++        }
++      end)
++
++      le = build(:log_event, source: source, message: "testing123")
++      SourceRouter.route_to_sinks_and_ingest(le, source, SourceRouter.RulesTree)
++
++      source_id = source.id
++
++      assert_receive {:telemetry_event, [:logflare, :sources, :source_router, :dropped],
++                      %{count: 1}, %{reason: :source_unavailable, source_id: ^source_id}}
++    end
++  end
+ end
+diff --git a/test/logflare/telemetry_test.exs b/test/logflare/telemetry_test.exs
+index 0debc4968c..bd7bedb77a 100644
+--- a/test/logflare/telemetry_test.exs
++++ b/test/logflare/telemetry_test.exs
+@@ -179,6 +179,22 @@ defmodule Logflare.TelemetryTest do
+       assert metric.tags == [:backend_id, :reason]
+     end
+ 
++    test "defines routed copy drops as a reason-tagged counter" do
++      metric = ch_metric([:logflare, :sources, :source_router, :dropped, :count])
++
++      assert metric.event_name == [:logflare, :sources, :source_router, :dropped]
++      assert metric.measurement == :count
++      assert metric.tags == [:reason]
++    end
++
++    test "defines system log drops as a reason-tagged counter" do
++      metric = ch_metric([:logflare, :user_monitoring, :system_logs, :dropped, :count])
++
++      assert metric.event_name == [:logflare, :user_monitoring, :system_logs, :dropped]
++      assert metric.measurement == :count
++      assert metric.tags == [:reason]
++    end
++
+     test "defines ClickHouse batch distribution and throughput metrics" do
+       metrics = clickhouse_batch_metrics()
+ 
+diff --git a/test/logflare_grpc/exception_log_filter_test.exs b/test/logflare_grpc/exception_log_filter_test.exs
+index a3d544a5d4..c2e8d8278a 100644
+--- a/test/logflare_grpc/exception_log_filter_test.exs
++++ b/test/logflare_grpc/exception_log_filter_test.exs
+@@ -5,20 +5,17 @@ defmodule LogflareGrpc.ExceptionLogFilterTest do
+   alias LogflareGrpc.ExceptionLogFilter
+ 
+   describe "emit_log?/1" do
+-    test "returns false for a permission_denied GRPC.RPCError rejection" do
+-      exception = ReportException.new([req: :ok], %GRPC.RPCError{status: :permission_denied})
++    for status <- [:not_found, :permission_denied, :unauthenticated, :unavailable] do
++      test "returns false for a #{status} GRPC.RPCError rejection" do
++        error = GRPC.RPCError.exception(status: unquote(status))
++        exception = ReportException.new([req: :ok], error)
+ 
+-      refute ExceptionLogFilter.emit_log?(exception)
+-    end
+-
+-    test "returns false for an unauthenticated GRPC.RPCError rejection" do
+-      exception = ReportException.new([req: :ok], %GRPC.RPCError{status: :unauthenticated})
+-
+-      refute ExceptionLogFilter.emit_log?(exception)
++        refute ExceptionLogFilter.emit_log?(exception)
++      end
+     end
+ 
+     test "returns true for a GRPC.RPCError with an unrecognized status" do
+-      exception = ReportException.new([req: :ok], %GRPC.RPCError{status: :internal})
++      exception = ReportException.new([req: :ok], GRPC.RPCError.exception(status: :internal))
+ 
+       assert ExceptionLogFilter.emit_log?(exception)
+     end
+diff --git a/test/logflare_grpc/logs/server_test.exs b/test/logflare_grpc/logs/server_test.exs
+index af8309e1f0..219ab2354b 100644
+--- a/test/logflare_grpc/logs/server_test.exs
++++ b/test/logflare_grpc/logs/server_test.exs
+@@ -41,6 +41,42 @@ defmodule LogflareGrpc.Logs.ServerTest do
+ 
+       assert {:ok, %ExportLogsServiceResponse{}} = emulate_request(channel, request)
+     end
++
++    test "returns NOT_FOUND when the source was deleted after the plug loaded it", %{
++      source: source,
++      user: user,
++      port: port
++    } do
++      Mimic.stub(Logflare.Backends, :start_for_ingest, fn _source ->
++        {:error, :source_not_found}
++      end)
++
++      access_token = insert(:access_token, resource_owner: user, scopes: "ingest")
++      headers = [{"x-api-key", access_token.token}, {"x-source", source.token}]
++      {:ok, channel} = GRPC.Stub.connect("localhost:#{port}", headers: headers)
++      not_found = GRPC.Status.not_found()
++
++      assert {:error, %GRPC.RPCError{status: ^not_found}} =
++               emulate_request(channel, TestUtilsGrpc.random_otel_logs_request())
++    end
++
++    test "returns UNAVAILABLE when the SourceSup does not start in time", %{
++      source: source,
++      user: user,
++      port: port
++    } do
++      Mimic.stub(Logflare.Backends, :start_for_ingest, fn _source ->
++        {:error, :source_unavailable}
++      end)
++
++      access_token = insert(:access_token, resource_owner: user, scopes: "ingest")
++      headers = [{"x-api-key", access_token.token}, {"x-source", source.token}]
++      {:ok, channel} = GRPC.Stub.connect("localhost:#{port}", headers: headers)
++      unavailable = GRPC.Status.unavailable()
++
++      assert {:error, %GRPC.RPCError{status: ^unavailable}} =
++               emulate_request(channel, TestUtilsGrpc.random_otel_logs_request())
++    end
+   end
+ 
+   defp emulate_request(channel, request) do
+diff --git a/test/logflare_web/channels/log_socket_test.exs b/test/logflare_web/channels/log_socket_test.exs
+index a49291001f..3b92497ae8 100644
+--- a/test/logflare_web/channels/log_socket_test.exs
++++ b/test/logflare_web/channels/log_socket_test.exs
+@@ -19,6 +19,8 @@ defmodule LogflareWeb.LogSocketTest do
+       {:ok, socket} = Phoenix.ChannelTest.connect(LogSocket, %{"access_token" => token.token})
+       {:ok, _, socket} = subscribe_and_join(socket, LogChannel, "logs:#{source.token}")
+ 
++      stub(Backends, :start_for_ingest, fn _source -> :ok end)
++
+       Backends
+       |> expect(:ingest_logs, fn batch, ingest_source, _backend, _allow_spooling ->
+         assert [%{"message" => "access-token-log"}] = batch
+@@ -33,6 +35,50 @@ defmodule LogflareWeb.LogSocketTest do
+       leave(socket)
+     end
+ 
++    test "replies with an error when the SourceSup does not start in time" do
++      user = insert(:user)
++      source = insert(:source, user: user)
++      token = insert(:access_token, resource_owner: user)
++
++      {:ok, socket} = Phoenix.ChannelTest.connect(LogSocket, %{"access_token" => token.token})
++      {:ok, _, socket} = subscribe_and_join(socket, LogChannel, "logs:#{source.token}")
++
++      stub(Backends, :start_for_ingest, fn _source -> {:error, :source_unavailable} end)
++      reject(Backends, :ingest_logs, 4)
++
++      Phoenix.ChannelTest.push(socket, "batch", %{"batch" => [%{"message" => "early-log"}]})
++
++      Phoenix.ChannelTest.assert_push(
++        "batch",
++        %{message: "Batch error", errors: ["Source is unavailable. Send the batch again."]},
++        1_000
++      )
++
++      leave(socket)
++    end
++
++    test "replies with an error when the source was deleted after the join" do
++      user = insert(:user)
++      source = insert(:source, user: user)
++      token = insert(:access_token, resource_owner: user)
++
++      {:ok, socket} = Phoenix.ChannelTest.connect(LogSocket, %{"access_token" => token.token})
++      {:ok, _, socket} = subscribe_and_join(socket, LogChannel, "logs:#{source.token}")
++
++      stub(Backends, :start_for_ingest, fn _source -> {:error, :source_not_found} end)
++      reject(Backends, :ingest_logs, 4)
++
++      Phoenix.ChannelTest.push(socket, "batch", %{"batch" => [%{"message" => "late-log"}]})
++
++      Phoenix.ChannelTest.assert_push(
++        "batch",
++        %{message: "Batch error", errors: ["Source not found."]},
++        1_000
++      )
++
++      leave(socket)
++    end
++
+     test "access token cannot connect with an unknown token" do
+       assert :error =
+                Phoenix.ChannelTest.connect(LogSocket, %{"access_token" => "not-a-real-token"})
+@@ -62,6 +108,8 @@ defmodule LogflareWeb.LogSocketTest do
+       {:ok, socket} = Phoenix.ChannelTest.connect(LogSocket, %{"api_key" => user.api_key})
+       {:ok, _, socket} = subscribe_and_join(socket, LogChannel, "logs:#{source.token}")
+ 
++      stub(Backends, :start_for_ingest, fn _source -> :ok end)
++
+       Backends
+       |> expect(:ingest_logs, fn batch, ingest_source, _backend, _allow_spooling ->
+         assert [%{"message" => "owned-log"}] = batch
+diff --git a/test/logflare_web/controllers/log_controller_test.exs b/test/logflare_web/controllers/log_controller_test.exs
+index d6c05c2b47..dabe9c76ac 100644
+--- a/test/logflare_web/controllers/log_controller_test.exs
++++ b/test/logflare_web/controllers/log_controller_test.exs
+@@ -252,6 +252,92 @@ defmodule LogflareWeb.LogControllerTest do
+       end
+     end
+ 
++    test "returns 503 with retry-after when the SourceSup does not start in time", %{
++      conn: conn,
++      source: source,
++      user: user
++    } do
++      Mimic.stub(Logflare.Backends, :start_for_ingest, fn _source ->
++        {:error, :source_unavailable}
++      end)
++
++      Mimic.reject(Logflare.Backends, :ingest_logs, 4)
++
++      conn =
++        conn
++        |> put_req_header("x-api-key", user.api_key)
++        |> post(Routes.log_path(conn, :create, source: source.token), @valid)
++
++      assert %{"message" => "Source is unavailable. Send the batch again."} =
++               json_response(conn, 503)
++
++      assert get_resp_header(conn, "retry-after") == ["5"]
++    end
++
++    test "otel_logs returns 503 with retry-after when the SourceSup does not start in time", %{
++      conn: conn,
++      source: source,
++      user: user
++    } do
++      Mimic.stub(Logflare.Backends, :start_for_ingest, fn _source ->
++        {:error, :source_unavailable}
++      end)
++
++      Mimic.reject(Logflare.Backends, :ingest_logs, 4)
++      body = TestUtilsGrpc.random_otel_logs_request() |> ExportLogsServiceRequest.encode()
++
++      conn =
++        conn
++        |> put_req_header("x-api-key", user.api_key)
++        |> put_req_header("x-source", Atom.to_string(source.token))
++        |> put_req_header("content-type", "application/x-protobuf")
++        |> post(Routes.log_path(conn, :otel_logs), body)
++
++      assert conn.status == 503
++      assert get_resp_header(conn, "retry-after") == ["5"]
++    end
++
++    test "returns 404 when the source was deleted after the plug loaded it", %{
++      conn: conn,
++      source: source,
++      user: user
++    } do
++      Mimic.stub(Logflare.Backends, :start_for_ingest, fn _source ->
++        {:error, :source_not_found}
++      end)
++
++      Mimic.reject(Logflare.Backends, :ingest_logs, 4)
++
++      conn =
++        conn
++        |> put_req_header("x-api-key", user.api_key)
++        |> post(Routes.log_path(conn, :create, source: source.token), @valid)
++
++      assert %{"message" => "Source not found."} = json_response(conn, 404)
++    end
++
++    test "otel_logs returns 404 when the source was deleted after the plug loaded it", %{
++      conn: conn,
++      source: source,
++      user: user
++    } do
++      Mimic.stub(Logflare.Backends, :start_for_ingest, fn _source ->
++        {:error, :source_not_found}
++      end)
++
++      Mimic.reject(Logflare.Backends, :ingest_logs, 4)
++      body = TestUtilsGrpc.random_otel_logs_request() |> ExportLogsServiceRequest.encode()
++
++      conn =
++        conn
++        |> put_req_header("x-api-key", user.api_key)
++        |> put_req_header("x-source", Atom.to_string(source.token))
++        |> put_req_header("content-type", "application/x-protobuf")
++        |> post(Routes.log_path(conn, :otel_logs), body)
++
++      assert conn.status == 404
++    end
++
+     test "invaild source token uuid checks", %{conn: conn, user: user} do
+       conn =
+         conn

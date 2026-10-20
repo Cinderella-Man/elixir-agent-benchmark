@@ -1,0 +1,251 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ba3b0c735e..9e5eb5cb39 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -37,6 +37,7 @@ Upgrading directly from 4.1.x no longer preserves entity registry customizations
+ - fix(auth): no longer follow redirects when refreshing the token, so the refresh token and the fleet token are never sent to another host (#5781 - @JakobLichterfeld)
+ - fix(auth): tell rejected tokens apart from every other refresh failure, so the sign-in page names the actual cause (#5781 - @JakobLichterfeld)
+ - fix(web): report a sign-in that exits instead of crashing the sign-in page (#5781 - @JakobLichterfeld)
++- fix(auth): keep credentials out of the log, even on the debug level (#5782 - @JakobLichterfeld)
+ 
+ #### Build, CI, internal
+ 
+diff --git a/elixir/lib/tesla_api.ex b/elixir/lib/tesla_api.ex
+index 2c67e2ae2a..26655297dd 100644
+--- a/elixir/lib/tesla_api.ex
++++ b/elixir/lib/tesla_api.ex
+@@ -1,8 +1,6 @@
+ defmodule TeslaApi do
+   @version Mix.Project.config()[:version]
+-  @redacted "[redacted]"
+   @sensitive_headers ~w(Authorization authorization)
+-  @sensitive_query_params ~w(access_token refresh_token token)
+ 
+   def client do
+     Tesla.client(
+@@ -32,7 +30,7 @@ defmodule TeslaApi do
+     [
+       request.method |> to_string() |> String.upcase(),
+       " ",
+-      redact_url(request.url),
++      TeslaApi.Error.redact_url(request.url),
+       " -> ",
+       response_status(response),
+       " (",
+@@ -48,33 +46,4 @@ defmodule TeslaApi do
+ 
+   defp response_status({:ok, %Tesla.Env{} = env}), do: to_string(env.status)
+   defp response_status({:error, reason}), do: "error: " <> inspect(reason)
+-
+-  defp redact_url(url) when is_binary(url) do
+-    uri = URI.parse(url)
+-
+-    case uri.query do
+-      nil ->
+-        url
+-
+-      query ->
+-        query =
+-          query
+-          |> URI.decode_query()
+-          |> Map.new(fn {key, value} ->
+-            if sensitive_query_param?(key), do: {key, @redacted}, else: {key, value}
+-          end)
+-          |> URI.encode_query()
+-
+-        URI.to_string(%URI{uri | query: query})
+-    end
+-  rescue
+-    _ -> url
+-  end
+-
+-  defp redact_url(url), do: url
+-
+-  defp sensitive_query_param?(key) when is_binary(key),
+-    do: key |> String.downcase() |> then(&(&1 in @sensitive_query_params))
+-
+-  defp sensitive_query_param?(_key), do: false
+ end
+diff --git a/elixir/lib/tesla_api/auth.ex b/elixir/lib/tesla_api/auth.ex
+index 207ccd9bcd..7f1646bc6d 100644
+--- a/elixir/lib/tesla_api/auth.ex
++++ b/elixir/lib/tesla_api/auth.ex
+@@ -18,7 +18,10 @@ defmodule TeslaApi.Auth do
+         {Tesla.Middleware.Headers, @default_headers},
+         Tesla.Middleware.JSON,
+         TeslaApi.Middleware.FleetAuth,
+-        {Tesla.Middleware.Logger, debug: true, level: &log_level/1}
++        # No request and response details, not even on the debug level: the
++        # request carries the refresh token, the response the new tokens.
++        {Tesla.Middleware.Logger,
++         debug: false, format: &TeslaApi.format_log/3, level: &log_level/1}
+       ],
+       {Tesla.Adapter.Finch, name: TeslaMate.HTTP, receive_timeout: 60_000}
+     )
+diff --git a/elixir/lib/tesla_api/error.ex b/elixir/lib/tesla_api/error.ex
+index f6c9cf0327..e65a33f4cd 100644
+--- a/elixir/lib/tesla_api/error.ex
++++ b/elixir/lib/tesla_api/error.ex
+@@ -67,29 +67,42 @@ defmodule TeslaApi.Error do
+ 
+   defp redact_headers(headers), do: headers
+ 
+-  defp redact_url(url) when is_binary(url) do
+-    uri = URI.parse(url)
+-
+-    case uri.query do
+-      nil ->
++  @doc """
++  Redacts the credentials a URL can carry: its userinfo and its sensitive
++  query parameters.
++  """
++  def redact_url(url) when is_binary(url) do
++    case URI.parse(url) do
++      %URI{userinfo: nil, query: nil} ->
+         url
+ 
+-      query ->
+-        query =
+-          query
+-          |> URI.decode_query()
+-          |> Map.new(fn {key, value} ->
+-            if sensitive_key?(key), do: {key, @redacted}, else: {key, value}
+-          end)
+-          |> URI.encode_query()
+-
+-        URI.to_string(%URI{uri | query: query})
++      uri ->
++        URI.to_string(%URI{
++          uri
++          | userinfo: redact_userinfo(uri.userinfo),
++            query: redact_query(uri.query)
++        })
+     end
+   rescue
+-    _ -> url
++    # Fails closed: a URL that cannot be redacted is not shown at all.
++    _ -> @redacted
+   end
+ 
+-  defp redact_url(url), do: url
++  def redact_url(url), do: url
++
++  defp redact_userinfo(nil), do: nil
++  defp redact_userinfo(_userinfo), do: @redacted
++
++  defp redact_query(nil), do: nil
++
++  defp redact_query(query) do
++    query
++    |> URI.decode_query()
++    |> Map.new(fn {key, value} ->
++      if sensitive_key?(key), do: {key, @redacted}, else: {key, value}
++    end)
++    |> URI.encode_query()
++  end
+ 
+   defp redact_pairs(values) when is_list(values) do
+     Enum.map(values, fn
+diff --git a/elixir/test/tesla_api/auth/refresh_test.exs b/elixir/test/tesla_api/auth/refresh_test.exs
+index 7e094b57dd..3004b1ddab 100644
+--- a/elixir/test/tesla_api/auth/refresh_test.exs
++++ b/elixir/test/tesla_api/auth/refresh_test.exs
+@@ -138,4 +138,54 @@ defmodule TeslaApi.Auth.RefreshTest do
+                refresh({:error, %Mint.TransportError{reason: :timeout}})
+     end
+   end
++
++  test "keeps the tokens out of the log, even on the debug level" do
++    level = Logger.level()
++    Logger.configure(level: :debug)
++    on_exit(fn -> Logger.configure(level: level) end)
++
++    body = %{"access_token" => "new-access", "refresh_token" => "new-refresh", "expires_in" => 1}
++
++    assert {{:ok, %Auth{}}, log} = refresh(status: 200, body: body)
++
++    assert log =~ "-> 200"
++
++    for token <- ["refresh-token", "new-access", "new-refresh"] do
++      refute log =~ token
++    end
++  end
++
++  test "keeps the userinfo of the auth host out of the log and the error" do
++    previous = System.get_env("TESLA_AUTH_HOST")
++    System.put_env("TESLA_AUTH_HOST", "https://user:secret@auth.example")
++
++    on_exit(fn ->
++      if previous,
++        do: System.put_env("TESLA_AUTH_HOST", previous),
++        else: System.delete_env("TESLA_AUTH_HOST")
++    end)
++
++    assert {{:error, %Error{env: env}}, log} = refresh(status: 503, body: "")
++
++    refute log =~ "secret"
++    assert log =~ "POST https://[redacted]@auth.example"
++    assert env.url =~ "https://[redacted]@auth.example"
++  end
++
++  # The logger sits next to the adapter, after the JSON middleware, so a body
++  # that fails to decode never reaches the log line.
++  test "keeps the tokens of a malformed token response out of the log and the error" do
++    level = Logger.level()
++    Logger.configure(level: :debug)
++    on_exit(fn -> Logger.configure(level: level) end)
++
++    body = ~s({"access_token":"secret-access","refresh_token":"secret-refresh")
++
++    assert {{:error, %Error{message: "invalid token response"} = error}, log} =
++             refresh(status: 200, headers: [{"content-type", "application/json"}], body: body)
++
++    assert log =~ "-> 200"
++    refute log =~ "secret"
++    refute inspect(error) =~ "secret"
++  end
+ end
+diff --git a/elixir/test/tesla_api/error_test.exs b/elixir/test/tesla_api/error_test.exs
+index 525c4e2be3..b2b9d2b5f2 100644
+--- a/elixir/test/tesla_api/error_test.exs
++++ b/elixir/test/tesla_api/error_test.exs
+@@ -24,6 +24,18 @@ defmodule TeslaApi.ErrorTest do
+     assert inspected =~ "[redacted]"
+   end
+ 
++  test "redacts the userinfo of the URL when inspected" do
++    error = %Error{
++      reason: :token_refresh,
++      env: %Tesla.Env{method: :post, url: "https://user:secret@auth.example/token"}
++    }
++
++    inspected = inspect(error, pretty: true)
++
++    refute inspected =~ "secret"
++    assert inspected =~ "https://[redacted]@auth.example/token"
++  end
++
+   test "redacts access tokens when directly constructed errors are inspected" do
+     secret = "secret-access-token"
+ 
+diff --git a/elixir/test/tesla_api_test.exs b/elixir/test/tesla_api_test.exs
+index 8b2e53a077..23e766c04d 100644
+--- a/elixir/test/tesla_api_test.exs
++++ b/elixir/test/tesla_api_test.exs
+@@ -20,6 +20,16 @@ defmodule TeslaApiTest do
+     assert log =~ "-> 408"
+   end
+ 
++  test "redacts the userinfo from request logs" do
++    log =
++      %Tesla.Env{method: :post, url: "https://user:secret@auth.example/token"}
++      |> TeslaApi.format_log({:ok, %Tesla.Env{status: 200}}, 18_345)
++      |> IO.iodata_to_binary()
++
++    refute log =~ "secret"
++    assert log =~ "POST https://[redacted]@auth.example/token -> 200"
++  end
++
+   test "filters capitalized authorization headers from debug logs" do
+     secret = "secret-access-token"
+ 

@@ -1,0 +1,2296 @@
+diff --git a/.dialyzer_ignore.exs b/.dialyzer_ignore.exs
+index e4790b424f..8a86cd8e76 100644
+--- a/.dialyzer_ignore.exs
++++ b/.dialyzer_ignore.exs
+@@ -43,7 +43,6 @@
+   {"lib/logflare_web/controllers/api/endpoint_controller.ex", :pattern_match},
+   {"lib/logflare_web/controllers/billing_controller.ex", :unused_fun},
+   {"lib/logflare_web/controllers/billing_controller.ex", :pattern_match_cov},
+-  {"lib/logflare_web/controllers/health_check_controller.ex", :pattern_match},
+   {"lib/logflare_web/controllers/source_controller.ex", :pattern_match},
+   {"lib/logflare_web/live/monaco_editor_component.ex", :pattern_match},
+   {"lib/logflare_web/live/query_live.ex", :no_return},
+diff --git a/AGENTS.md b/AGENTS.md
+index 553f9b6431..2834e39878 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -84,8 +84,10 @@ gate to go green - fix the code.
+   that have pre-existing findings. They are off so the gate is green on existing
+   code. Fixing a backlog check's findings and removing it from that list is a
+   welcome change on its own. Never add a check to the list to go green.
+-- `mix test.slop` runs `ex_dna --max-clones 29`, a duplication ratchet. A new
+-  clone fails CI. When you remove clones, lower the number. Never raise it.
++- `mix test.slop` runs `ex_dna --max-clones <Current clone number>`,
++  This tool counts duplicated code (clones), and the number should only go down,
++  never up. If you add a new clone, CI fails. If you remove clones,
++  lower the number. Never raise it.
+ - `mix test.structure` runs `reach.check --smells` against
+   `.reach.baseline.json` (194 accepted findings), so only **new** structural
+   smells fail. To accept a
+diff --git a/lib/logflare/auth/cache.ex b/lib/logflare/auth/cache.ex
+index b10b79e0a2..1aec407aca 100644
+--- a/lib/logflare/auth/cache.ex
++++ b/lib/logflare/auth/cache.ex
+@@ -4,31 +4,19 @@ defmodule Logflare.Auth.Cache do
+   Cachex `expiration`.
+   """
+ 
++  use Logflare.ContextCache
++
+   alias Logflare.Auth
++  alias Logflare.Cache.CachexOps
+   alias Logflare.OauthAccessTokens.OauthAccessToken
+   alias Logflare.User
+-  alias Logflare.Utils
+ 
+   def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
+-
+-    %{
+-      id: __MODULE__,
+-      start:
+-        {Cachex, :start_link,
+-         [
+-           __MODULE__,
+-           [
+-             hooks:
+-               [
+-                 if(stats, do: Utils.cache_stats()),
+-                 Utils.cache_limit(100_000)
+-               ]
+-               |> Enum.filter(& &1),
+-             expiration: Utils.cache_expiration_min(5, 2)
+-           ]
+-         ]}
+-    }
++    CachexOps.child_spec(__MODULE__,
++      limit: 100_000,
++      ttl: to_timeout(minute: 5),
++      purge_interval: to_timeout(minute: 2)
++    )
+   end
+ 
+   @spec verify_access_token(OauthAccessToken.t() | String.t()) ::
+diff --git a/lib/logflare/backends/cache.ex b/lib/logflare/backends/cache.ex
+index caaa98fbde..2e31effa8e 100644
+--- a/lib/logflare/backends/cache.ex
++++ b/lib/logflare/backends/cache.ex
+@@ -1,33 +1,13 @@
+ defmodule Logflare.Backends.Cache do
+   @moduledoc false
+ 
++  use Logflare.ContextCache
++
+   alias Logflare.Backends
+-  alias Logflare.Utils
+-  import Cachex.Spec
++  alias Logflare.Cache.CachexOps
+ 
+   def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
+-
+-    %{
+-      id: __MODULE__,
+-      start:
+-        {Cachex, :start_link,
+-         [
+-           __MODULE__,
+-           [
+-             warmers: [
+-               warmer(required: false, module: Backends.CacheWarmer, name: Backends.CacheWarmer)
+-             ],
+-             hooks:
+-               [
+-                 if(stats, do: Utils.cache_stats()),
+-                 Utils.cache_limit(100_000)
+-               ]
+-               |> Enum.filter(& &1),
+-             expiration: Utils.cache_expiration_min()
+-           ]
+-         ]}
+-    }
++    CachexOps.child_spec(__MODULE__, limit: 100_000, warmer: Backends.CacheWarmer)
+   end
+ 
+   def list_backends(arg), do: apply_repo_fun(__ENV__.function, [arg])
+diff --git a/lib/logflare/billing/cache.ex b/lib/logflare/billing/cache.ex
+index 31ac2889d7..41e119cfe4 100644
+--- a/lib/logflare/billing/cache.ex
++++ b/lib/logflare/billing/cache.ex
+@@ -1,29 +1,17 @@
+ defmodule Logflare.Billing.Cache do
+   @moduledoc false
+ 
++  use Logflare.ContextCache
++
+   alias Logflare.Billing
+-  alias Logflare.Utils
++  alias Logflare.Cache.CachexOps
+ 
+   def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
+-
+-    %{
+-      id: __MODULE__,
+-      start:
+-        {Cachex, :start_link,
+-         [
+-           __MODULE__,
+-           [
+-             hooks:
+-               [
+-                 if(stats, do: Utils.cache_stats()),
+-                 Utils.cache_limit(100_000)
+-               ]
+-               |> Enum.filter(& &1),
+-             expiration: Utils.cache_expiration_min(180, 10)
+-           ]
+-         ]}
+-    }
++    CachexOps.child_spec(__MODULE__,
++      limit: 100_000,
++      ttl: to_timeout(hour: 3),
++      purge_interval: to_timeout(minute: 10)
++    )
+   end
+ 
+   def get_billing_account_by(keyword) do
+diff --git a/lib/logflare/cache.ex b/lib/logflare/cache.ex
+new file mode 100644
+index 0000000000..0929bc0752
+--- /dev/null
++++ b/lib/logflare/cache.ex
+@@ -0,0 +1,52 @@
++defmodule Logflare.Cache do
++  @moduledoc """
++  Operational contract of an application cache, independent of its storage backend.
++
++  `use Logflare.Cache` injects default implementations of every callback, delegating to
++  `Logflare.Cache.CachexOps`. A cache on another backend overrides them, or passes
++  `impl: module` naming a `Logflare.Cache.Ops` implementation.
++  """
++
++  alias Logflare.Cache.CachexOps
++
++  @typedoc """
++  Counters since the last `c:reset/0`. Rates are percentages (0-100); `total_heap_size` is in bytes.
++  """
++  @type stats() :: %{
++          evictions: non_neg_integer(),
++          expirations: non_neg_integer(),
++          operations: non_neg_integer(),
++          hits: non_neg_integer(),
++          misses: non_neg_integer(),
++          hit_rate: number(),
++          miss_rate: number(),
++          total_heap_size: non_neg_integer()
++        }
++
++  @doc "Whether the cache on this node can serve requests."
++  @callback healthy?() :: boolean()
++
++  @callback stats() :: stats()
++
++  @doc "Clears all entries and statistics."
++  @callback reset() :: :ok
++
++  defmacro __using__(opts) do
++    impl = Keyword.get(opts, :impl, CachexOps)
++
++    quote do
++      @behaviour Logflare.Cache
++
++      @impl Logflare.Cache
++      def healthy?, do: unquote(impl).healthy?(__MODULE__)
++
++      @impl Logflare.Cache
++      def stats, do: unquote(impl).stats(__MODULE__)
++
++      @impl Logflare.Cache
++      def reset, do: unquote(impl).reset(__MODULE__)
++
++      defoverridable healthy?: 0, stats: 0, reset: 0
++    end
++  end
++end
+diff --git a/lib/logflare/cache/cachex_ops.ex b/lib/logflare/cache/cachex_ops.ex
+new file mode 100644
+index 0000000000..0cfe35025f
+--- /dev/null
++++ b/lib/logflare/cache/cachex_ops.ex
+@@ -0,0 +1,206 @@
++defmodule Logflare.Cache.CachexOps do
++  @moduledoc """
++  Cachex implementations of the `Logflare.Cache` and `Logflare.ContextCache` callbacks, and builders
++  for Cachex start options.
++
++  Context cache values are stored as `{:cached, value}`, because Cachex treats a stored `nil` as a miss.
++  """
++
++  @behaviour Logflare.Cache.Ops
++  @behaviour Logflare.ContextCache.Ops
++
++  import Cachex.Spec
++
++  alias Logflare.ContextCache.Gossip
++
++  @stat_keys [
++    :evictions,
++    :expirations,
++    :operations,
++    :hits,
++    :misses,
++    :hit_rate,
++    :miss_rate
++  ]
++
++  @type warmer() :: module() | {module(), interval: pos_integer()}
++  @type cache_opt() ::
++          {:limit, pos_integer() | nil}
++          | {:ttl, pos_integer()}
++          | {:purge_interval, pos_integer()}
++          | {:warmer, warmer() | nil}
++          | {:compressed, boolean()}
++
++  @doc """
++  Child spec for a Cachex cache registered as `name`, with the stats hook when `stats_enabled?/0`.
++
++  Options:
++    * `:limit` (required) - maximum number of entries, `nil` for no limit
++    * `:ttl` - default entry time-to-live, a timeout in ms, defaults to 20 minutes
++    * `:purge_interval` - timeout in ms between purges of expired entries, defaults to 5 minutes
++    * `:warmer` - a non-required warmer module, or `{module, interval: ms}`, registered under the module name
++    * `:compressed` - defaults to `false`
++  """
++  @spec child_spec(atom(), [cache_opt()]) :: Supervisor.child_spec()
++  def child_spec(name, opts) do
++    opts = Keyword.update!(cachex_opts(opts), :hooks, &(stats_hooks() ++ &1))
++    Supervisor.child_spec({Cachex, [name, opts]}, id: name)
++  end
++
++  @doc """
++  Cachex start options for `t:cache_opt/0`, without the stats hook.
++  """
++  @spec cachex_opts([cache_opt()]) :: keyword()
++  def cachex_opts(opts) do
++    [
++      hooks: limit_hooks(Keyword.fetch!(opts, :limit)),
++      expiration:
++        expiration(
++          default: Keyword.get(opts, :ttl, to_timeout(minute: 20)),
++          interval: Keyword.get(opts, :purge_interval, to_timeout(minute: 5)),
++          lazy: true
++        ),
++      warmers: warmers(opts[:warmer]),
++      compressed: Keyword.get(opts, :compressed, false)
++    ]
++  end
++
++  @spec stats_enabled?() :: boolean()
++  def stats_enabled?, do: Application.get_env(:logflare, :cache_stats, false)
++
++  @impl Logflare.Cache.Ops
++  @spec healthy?(Cachex.t()) :: boolean()
++  def healthy?(cache), do: match?({:ok, _}, Cachex.size(cache))
++
++  @doc """
++  Raises when the cache runs without the stats hook.
++  """
++  @impl Logflare.Cache.Ops
++  @spec stats(Cachex.t()) :: Logflare.Cache.stats()
++  def stats(cache) do
++    {:ok, stats} = Cachex.stats(cache)
++
++    {:total_heap_size, heap_words} =
++      cache
++      |> Process.whereis()
++      |> Process.info(:total_heap_size)
++
++    heap_bytes = heap_words * :erlang.system_info(:wordsize)
++
++    for key <- @stat_keys, into: %{total_heap_size: heap_bytes} do
++      {key, Map.get(stats, key, 0)}
++    end
++  end
++
++  @impl Logflare.Cache.Ops
++  @spec reset(Cachex.t()) :: :ok
++  def reset(cache) do
++    {:ok, true} = Cachex.reset(cache, hooks: [Cachex.Stats])
++    :ok
++  end
++
++  @doc """
++  With `[id: pkey]`, returns the keys of every entry whose cached value is a map with that `:id`, an
++  `{:ok, map}` with that `:id`, or a list containing such a map. Raises `ArgumentError` for any other
++  keyword.
++
++  It scans the cache with a match spec instead of keeping a reverse index of primary keys.
++  """
++  @impl Logflare.ContextCache.Ops
++  @spec keys_to_bust(Cachex.t(), keyword()) :: Enumerable.t()
++  def keys_to_bust(cache, id: pkey) do
++    filter =
++      {
++        # use orelse to prevent 2nd condition failing as value is not a map
++        :orelse,
++        {
++          :orelse,
++          # handle lists
++          {:is_list, {:element, 2, :value}},
++          # handle :ok tuples when struct with id is in 2nd element pos.
++          {:andalso, {:is_tuple, {:element, 2, :value}},
++           {:andalso, {:==, {:element, 1, {:element, 2, :value}}, :ok},
++            {:andalso, {:is_map, {:element, 2, {:element, 2, :value}}},
++             {:==, {:map_get, :id, {:element, 2, {:element, 2, :value}}}, pkey}}}}
++        },
++        # handle single maps
++        {:andalso, {:is_map, {:element, 2, :value}},
++         {:==, {:map_get, :id, {:element, 2, :value}}, pkey}}
++      }
++
++    query = Cachex.Query.build(where: filter, output: {:key, :value})
++
++    cache
++    |> Cachex.stream!(query)
++    |> Stream.filter(fn
++      {_k, {:cached, v}} when is_list(v) -> Enum.any?(v, &(&1.id == pkey))
++      {_k, _v} -> true
++    end)
++    |> Stream.map(fn {k, _v} -> k end)
++  end
++
++  def keys_to_bust(cache, kw) do
++    raise ArgumentError, "#{inspect(cache)} does not support busting by #{inspect(kw)}"
++  end
++
++  @doc """
++  Returns the cached value for `key`, calling `getter` and caching its result on a miss.
++
++  A miss is also multicast to peer nodes, see `Logflare.ContextCache.Gossip`. Accepts a Cachex
++  worker, so calls can be batched in `Cachex.execute/2`.
++  """
++  @impl Logflare.ContextCache.Ops
++  @spec fetch(Cachex.t(), term(), (-> term())) :: term()
++  def fetch(cache, key, getter) do
++    case Cachex.fetch(cache, key, fn _key -> {:commit, {:cached, getter.()}} end) do
++      {:commit, {:cached, value}} ->
++        Gossip.multicast(cache, key, value)
++        value
++
++      {:ok, {:cached, value}} ->
++        value
++    end
++  end
++
++  @impl Logflare.ContextCache.Ops
++  @spec update(Cachex.t(), term(), term()) :: :ok
++  def update(cache, key, value) do
++    {:ok, _updated?} = Cachex.update(cache, key, {:cached, value})
++    :ok
++  end
++
++  @doc """
++  Deletes `keys` and returns how many of them were present.
++  """
++  @impl Logflare.ContextCache.Ops
++  @spec delete_keys(Cachex.t(), Enumerable.t()) :: {:ok, non_neg_integer()}
++  def delete_keys(cache, keys) do
++    Cachex.execute(cache, fn worker ->
++      Enum.reduce(keys, 0, fn key, acc -> acc + take_count(worker, key) end)
++    end)
++  end
++
++  defp take_count(cache, key) do
++    case Cachex.take(cache, key) do
++      {:ok, nil} -> 0
++      {:ok, _value} -> 1
++    end
++  end
++
++  defp stats_hooks, do: if(stats_enabled?(), do: [hook(module: Cachex.Stats)], else: [])
++
++  defp limit_hooks(nil), do: []
++
++  defp limit_hooks(limit) when is_integer(limit) do
++    [hook(module: Cachex.Limit.Scheduled, args: {limit, [], []})]
++  end
++
++  defp warmers(nil), do: []
++
++  defp warmers({module, opts}) do
++    [interval: interval] = Keyword.validate!(opts, interval: nil)
++    [warmer(module: module, name: module, required: false, interval: interval)]
++  end
++
++  defp warmers(module), do: warmers({module, []})
++end
+diff --git a/lib/logflare/cache/ops.ex b/lib/logflare/cache/ops.ex
+new file mode 100644
+index 0000000000..11ea1ac22c
+--- /dev/null
++++ b/lib/logflare/cache/ops.ex
+@@ -0,0 +1,12 @@
++defmodule Logflare.Cache.Ops do
++  @moduledoc """
++  Implementation of the `Logflare.Cache` callbacks on one storage backend.
++
++  Selected with `use Logflare.Cache, impl: module`. Every function takes the cache module
++  the callback was called on.
++  """
++
++  @callback healthy?(cache :: module()) :: boolean()
++  @callback stats(cache :: module()) :: Logflare.Cache.stats()
++  @callback reset(cache :: module()) :: :ok
++end
+diff --git a/lib/logflare/config_cat/cache.ex b/lib/logflare/config_cat/cache.ex
+index 846d301214..ad5e643da5 100644
+--- a/lib/logflare/config_cat/cache.ex
++++ b/lib/logflare/config_cat/cache.ex
+@@ -4,28 +4,14 @@ defmodule Logflare.ConfigCatCache do
+   Used to avoid repeated ConfigCat calls on hot paths like LogEvent processing.
+   """
+ 
+-  alias Logflare.Utils
++  alias Logflare.Cache.CachexOps
+ 
+   def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
+-
+-    %{
+-      id: __MODULE__,
+-      start:
+-        {Cachex, :start_link,
+-         [
+-           __MODULE__,
+-           [
+-             hooks:
+-               [
+-                 if(stats, do: Utils.cache_stats()),
+-                 Utils.cache_limit(100_000)
+-               ]
+-               |> Enum.filter(& &1),
+-             expiration: Utils.cache_expiration_min(10, 1)
+-           ]
+-         ]}
+-    }
++    CachexOps.child_spec(__MODULE__,
++      limit: 100_000,
++      ttl: to_timeout(minute: 10),
++      purge_interval: to_timeout(minute: 1)
++    )
+   end
+ 
+   @spec get(term()) :: {:ok, term()} | {:error, term()}
+diff --git a/lib/logflare/context_cache.ex b/lib/logflare/context_cache.ex
+index 172ed6835d..8422d58d6b 100644
+--- a/lib/logflare/context_cache.ex
++++ b/lib/logflare/context_cache.ex
+@@ -6,51 +6,75 @@ defmodule Logflare.ContextCache do
+   e.g. `Logflare.Users.Cache` functions go through `apply_fun/3` and results of those
+   functions are returned to the caller and cached in the respective cache.
+ 
+-  ## Cache Implementation
++  ## Implementation
+ 
+-  The cache implementation directly queries the relevant context cache to be busted and performs
+-  primary key checking within the matchspec. This approach queries across a narrower set of records,
+-  providing better performance compared to a reverse index approach.
++  `use Logflare.ContextCache` makes the module a `Logflare.Cache` and injects overridable defaults
++  for `c:fetch/2`, `c:update/2` and `c:bust_by/1`. They delegate to a `Logflare.ContextCache.Ops`
++  module, `Logflare.Cache.CachexOps` unless `impl: module` is given.
+ 
+-  If customization of busting is needed, cache module may implement `c:bust_by/1` callback expecting
+-  a keyword list instead of primary key for entry.
++  ## Busting
+ 
+-  ## List Busting
+-
+-  The cache supports busting records within lists. If a struct in a non-empty list contains
+-  the :id field, the record will get busted when that ID is encountered in the write-ahead log.
++  `bust_keys/1` busts entries by primary key or by a keyword of fields. Caches that need busting
++  keys other than `id:` override `c:keys_to_bust/1`.
+ 
+   ## Memoization
+ 
+   This module can also be used to cache heavy functions or db calls hidden behind a 3rd party
+-  library. See `Logflare.Auth.Cache` for an example. In this example, the `expiration` set in that
+-  Cachex child_spec is handling the cache expiration.
++  library. See `Logflare.Auth.Cache` for an example, where the cache's own expiration is the only
++  invalidation.
++  """
+ 
+-  In the case functions don't return a response with a primary key, or something else we can
+-  bust the cache on, it will get reverse indexed with `select_key/1` as `:unknown`.
++  alias Logflare.Cache.CachexOps
+ 
+-  ## Gossip
++  @doc """
++  Returns the keys of the entries to bust for a keyword of values.
++  """
++  @callback keys_to_bust(keyword()) :: Enumerable.t()
+ 
+-  Cache misses are optionally multicast to peer nodes via `:erpc` to warm the cluster.
+-  To prevent race conditions, WAL invalidations write short-lived tombstones that
+-  filter out stale incoming messages.
++  @doc """
++  Deletes `keys`, returning the number of entries deleted.
+   """
++  @callback delete_keys(Enumerable.t()) :: {:ok, non_neg_integer()}
+ 
+-  alias Logflare.ContextCache.Gossip
++  @doc """
++  Returns the cached value for `key`, calling `getter` and caching its result on a miss.
++  """
++  @callback fetch(key :: term(), getter :: (-> term())) :: term()
+ 
+   @doc """
+-  Optional callback implementing custom cache key busting by a keyword of values
++  Replaces the value cached for `key`. Does nothing when `key` is not cached.
+   """
+-  @callback bust_by(keyword()) :: {:ok, non_neg_integer()} | {:error, term()}
++  @callback update(key :: term(), value :: term()) :: :ok
++
++  defmacro __using__(opts) do
++    impl = Keyword.get(opts, :impl, CachexOps)
++
++    quote do
++      use Logflare.Cache, unquote(opts)
++
++      @behaviour Logflare.ContextCache
++
++      @impl Logflare.ContextCache
++      def keys_to_bust(kw), do: unquote(impl).keys_to_bust(__MODULE__, kw)
++
++      @impl Logflare.ContextCache
++      def delete_keys(keys), do: unquote(impl).delete_keys(__MODULE__, keys)
++
++      @impl Logflare.ContextCache
++      def fetch(key, getter), do: unquote(impl).fetch(__MODULE__, key, getter)
++
++      @impl Logflare.ContextCache
++      def update(key, value), do: unquote(impl).update(__MODULE__, key, value)
++
++      defoverridable keys_to_bust: 1, delete_keys: 1, fetch: 2, update: 2
++    end
++  end
+ 
+   @spec apply_fun(module(), tuple() | atom(), list()) :: any()
+   def apply_fun(context, {fun, _arity}, args), do: apply_fun(context, fun, args)
+ 
+   def apply_fun(context, fun, args) when is_atom(fun) do
+-    cache = cache_name(context)
+-    cache_key = {fun, args}
+-
+-    fetch(cache, cache_key, fn ->
++    cache_name(context).fetch({fun, args}, fn ->
+       Logflare.Repo.apply_with_replica(context, fun, args)
+     end)
+   end
+@@ -58,11 +82,9 @@ defmodule Logflare.ContextCache do
+   @doc """
+   Updates cache entry to the given value
+   """
++  @spec update(module(), atom(), list(), term()) :: :ok
+   def update(context, fun, args, value) when is_atom(fun) do
+-    cache = cache_name(context)
+-    cache_key = {fun, args}
+-
+-    Cachex.update(cache, cache_key, {:cached, value})
++    cache_name(context).update({fun, args}, value)
+   end
+ 
+   @doc """
+@@ -70,104 +92,30 @@ defmodule Logflare.ContextCache do
+ 
+   It is intended for following a WAL for cache busting. When a new record comes in from the WAL,
+   the CacheBuster process calls this function with either the primary keys extracted from those records
+-  or a keyword list with fields useful for busting.
+-
+-  For primary key, the function then:
+-
+-  1. Queries the relevant context cache using a matchspec to find entries to bust
+-  2. Handles both single records and lists of records containing matching IDs
+-  3. Deletes matching cache entries
+-
+-  For keywords, it expects the cache to handle busting by implementing `c:bust_by/1`
++  or a keyword list with fields useful for busting. Both are passed to the context cache's
++  `c:keys_to_bust/1`, a primary key as `[id: pkey]`, and the returned keys to `c:delete_keys/1`.
+   """
+   @spec bust_keys(list()) :: {:ok, non_neg_integer()}
+   def bust_keys(values) when is_list(values) do
+     busted =
+-      for {context, primary_key} <- values, reduce: 0 do
++      for {context, pkey_or_kw} <- values, reduce: 0 do
+         acc ->
+-          {:ok, n} = bust_key({context, primary_key})
++          {:ok, n} = bust_key(context, pkey_or_kw)
+           acc + n
+       end
+ 
+     {:ok, busted}
+   end
+ 
+-  defp bust_key({context, kw}) when is_list(kw) do
+-    context_cache = cache_name(context)
+-    context_cache.bust_by(kw)
++  defp bust_key(context, kw) when is_list(kw) do
++    cache = cache_name(context)
++    cache.delete_keys(cache.keys_to_bust(kw))
+   end
+ 
+-  defp bust_key({context, pkey}) do
+-    context_cache = cache_name(context)
+-
+-    filter =
+-      {
+-        # use orelse to prevent 2nd condition failing as value is not a map
+-        :orelse,
+-        {
+-          :orelse,
+-          # handle lists
+-          {:is_list, {:element, 2, :value}},
+-          # handle :ok tuples when struct with id is in 2nd element pos.
+-          {:andalso, {:is_tuple, {:element, 2, :value}},
+-           {:andalso, {:==, {:element, 1, {:element, 2, :value}}, :ok},
+-            {:andalso, {:is_map, {:element, 2, {:element, 2, :value}}},
+-             {:==, {:map_get, :id, {:element, 2, {:element, 2, :value}}}, pkey}}}}
+-        },
+-        # handle single maps
+-        {:andalso, {:is_map, {:element, 2, :value}},
+-         {:==, {:map_get, :id, {:element, 2, :value}}, pkey}}
+-      }
+-
+-    query =
+-      Cachex.Query.build(where: filter, output: {:key, :value})
+-
+-    context_cache
+-    |> Cachex.stream!(query)
+-    |> delete_matching_entries(context_cache, pkey)
+-  end
++  defp bust_key(context, pkey), do: bust_key(context, id: pkey)
+ 
+   @spec cache_name(atom()) :: atom()
+   def cache_name(context) do
+     Module.concat(context, Cache)
+   end
+-
+-  @doc """
+-  Low level API for fetching from cache. Allows wrapping calls with
+-  `Cachex.execute/2` and accessing arbitrary key or calling any getter function.
+-  """
+-  @spec fetch(Cachex.t(), {atom(), list()}, fun()) :: term()
+-  def fetch(cache, cache_key, getter_fn) do
+-    case Cachex.fetch(cache, cache_key, fn _cache_key ->
+-           # Use a `:cached` tuple here otherwise when an fn returns nil Cachex will miss
+-           # the cache because it thinks ETS returned nil
+-           {:commit, {:cached, getter_fn.()}}
+-         end) do
+-      {:commit, {:cached, value}} ->
+-        Gossip.multicast(cache, cache_key, value)
+-        value
+-
+-      {:ok, {:cached, value}} ->
+-        value
+-    end
+-  end
+-
+-  defp delete_matching_entries(entries, context_cache, pkey) do
+-    to_delete =
+-      entries
+-      |> Stream.filter(fn
+-        {_k, {:cached, v}} when is_list(v) ->
+-          Enum.any?(v, &(&1.id == pkey))
+-
+-        {_k, _v} ->
+-          true
+-      end)
+-
+-    Cachex.execute(context_cache, fn worker ->
+-      Enum.reduce(to_delete, 0, fn {k, _v}, acc ->
+-        Cachex.del(worker, k)
+-        acc + 1
+-      end)
+-    end)
+-  end
+ end
+diff --git a/lib/logflare/context_cache/ops.ex b/lib/logflare/context_cache/ops.ex
+new file mode 100644
+index 0000000000..c95ba82ddb
+--- /dev/null
++++ b/lib/logflare/context_cache/ops.ex
+@@ -0,0 +1,13 @@
++defmodule Logflare.ContextCache.Ops do
++  @moduledoc """
++  Implementation of the `Logflare.ContextCache` callbacks on one storage backend.
++
++  Selected with `use Logflare.ContextCache, impl: module`, which also requires the module to
++  implement `Logflare.Cache.Ops`. Every function takes the cache module the callback was called on.
++  """
++
++  @callback keys_to_bust(cache :: module(), keyword()) :: Enumerable.t()
++  @callback delete_keys(cache :: module(), Enumerable.t()) :: {:ok, non_neg_integer()}
++  @callback fetch(cache :: module(), key :: term(), getter :: (-> term())) :: term()
++  @callback update(cache :: module(), key :: term(), value :: term()) :: :ok
++end
+diff --git a/lib/logflare/context_cache/tombstones/cache.ex b/lib/logflare/context_cache/tombstones/cache.ex
+index 2be676f9ad..34b489cf0c 100644
+--- a/lib/logflare/context_cache/tombstones/cache.ex
++++ b/lib/logflare/context_cache/tombstones/cache.ex
+@@ -1,28 +1,18 @@
+ defmodule Logflare.ContextCache.Tombstones.Cache do
+   @moduledoc false
+-  require Cachex.Spec
+ 
+-  @name __MODULE__
+-
+-  def child_spec(_options) do
+-    expiration =
+-      Cachex.Spec.expiration(
+-        interval: to_timeout(second: 30),
+-        default: to_timeout(minute: 1),
+-        lazy: true
+-      )
++  use Logflare.Cache
+ 
+-    hooks =
+-      if Application.get_env(:logflare, :cache_stats, false) do
+-        [Cachex.Spec.hook(module: Cachex.Stats)]
+-      end
++  alias Logflare.Cache.CachexOps
+ 
+-    options = [
+-      expiration: expiration,
+-      hooks: List.wrap(hooks)
+-    ]
++  @name __MODULE__
+ 
+-    Supervisor.child_spec({Cachex, [@name, options]}, id: @name)
++  def child_spec(_options) do
++    CachexOps.child_spec(@name,
++      limit: nil,
++      ttl: to_timeout(minute: 1),
++      purge_interval: to_timeout(second: 30)
++    )
+   end
+ 
+   def put_tombstone(cache, tombstone) do
+diff --git a/lib/logflare/endpoints/cache.ex b/lib/logflare/endpoints/cache.ex
+index 4a653589f4..d9975d58a9 100644
+--- a/lib/logflare/endpoints/cache.ex
++++ b/lib/logflare/endpoints/cache.ex
+@@ -3,29 +3,17 @@ defmodule Logflare.Endpoints.Cache do
+   Cachex for Endpoints context.
+   """
+ 
++  use Logflare.ContextCache
++
++  alias Logflare.Cache.CachexOps
+   alias Logflare.Endpoints
+-  alias Logflare.Utils
+ 
+   def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
+-
+-    %{
+-      id: __MODULE__,
+-      start:
+-        {Cachex, :start_link,
+-         [
+-           __MODULE__,
+-           [
+-             hooks:
+-               [
+-                 if(stats, do: Utils.cache_stats()),
+-                 Utils.cache_limit(100_000)
+-               ]
+-               |> Enum.reject(&is_nil/1),
+-             expiration: Utils.cache_expiration_min(2, 1)
+-           ]
+-         ]}
+-    }
++    CachexOps.child_spec(__MODULE__,
++      limit: 100_000,
++      ttl: to_timeout(minute: 2),
++      purge_interval: to_timeout(minute: 1)
++    )
+   end
+ 
+   def get_endpoint_query(kw), do: apply_repo_fun(:get_endpoint_query, [kw])
+diff --git a/lib/logflare/key_values/cache.ex b/lib/logflare/key_values/cache.ex
+index 3a55a9b0d3..060c9cbc35 100644
+--- a/lib/logflare/key_values/cache.ex
++++ b/lib/logflare/key_values/cache.ex
+@@ -1,46 +1,21 @@
+ defmodule Logflare.KeyValues.Cache do
+   @moduledoc false
+ 
++  use Logflare.ContextCache
++
++  alias Logflare.Cache.CachexOps
+   alias Logflare.ContextCache
+   alias Logflare.KeyValues
+   alias Logflare.Repo
+-  alias Logflare.Utils
+-
+-  import Cachex.Spec
+-
+-  @behaviour ContextCache
+ 
+   def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
+-
+-    %{
+-      id: __MODULE__,
+-      start: {
+-        Cachex,
+-        :start_link,
+-        [
+-          __MODULE__,
+-          [
+-            compressed: true,
+-            warmers: [
+-              warmer(
+-                required: false,
+-                module: KeyValues.CacheWarmer,
+-                name: KeyValues.CacheWarmer,
+-                interval: :timer.hours(1)
+-              )
+-            ],
+-            hooks:
+-              [
+-                if(stats, do: Utils.cache_stats()),
+-                Utils.cache_limit(10_000_000)
+-              ]
+-              |> Enum.filter(& &1),
+-            expiration: Utils.cache_expiration_min(1440, 60)
+-          ]
+-        ]
+-      }
+-    }
++    CachexOps.child_spec(__MODULE__,
++      limit: 10_000_000,
++      ttl: to_timeout(day: 1),
++      purge_interval: to_timeout(hour: 1),
++      compressed: true,
++      warmer: {KeyValues.CacheWarmer, interval: :timer.hours(1)}
++    )
+   end
+ 
+   @spec count(integer()) :: non_neg_integer()
+@@ -86,17 +61,7 @@ defmodule Logflare.KeyValues.Cache do
+   end
+ 
+   @impl ContextCache
+-  def bust_by(kw) do
+-    entries = bust_entries(kw)
+-
+-    Cachex.execute(__MODULE__, fn worker ->
+-      Enum.reduce(entries, 0, fn k, acc ->
+-        acc + delete_and_count(worker, k)
+-      end)
+-    end)
+-  end
+-
+-  defp bust_entries(kw) do
++  def keys_to_bust(kw) do
+     user_id = Keyword.get(kw, :user_id)
+     key = Keyword.get(kw, :key)
+ 
+@@ -118,11 +83,4 @@ defmodule Logflare.KeyValues.Cache do
+       _ -> false
+     end)
+   end
+-
+-  defp delete_and_count(cache, key) do
+-    case Cachex.take(cache, key) do
+-      {:ok, nil} -> 0
+-      {:ok, _value} -> 1
+-    end
+-  end
+ end
+diff --git a/lib/logflare/logs/log_events_cache.ex b/lib/logflare/logs/log_events_cache.ex
+index 2eba752e90..ebc8dea61f 100644
+--- a/lib/logflare/logs/log_events_cache.ex
++++ b/lib/logflare/logs/log_events_cache.ex
+@@ -1,36 +1,22 @@
+ defmodule Logflare.Logs.LogEvents.Cache do
+   @moduledoc false
+-  alias Logflare.Logs.LogEvents
++
++  use Logflare.ContextCache
++
++  alias Logflare.Cache.CachexOps
+   alias Logflare.ContextCache
+   alias Logflare.LogEvent, as: LE
+-  alias Logflare.Utils
++  alias Logflare.Logs.LogEvents
+ 
+   @cache __MODULE__
+ 
+   def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
+-
+-    %{
+-      id: __MODULE__,
+-      name: __MODULE__,
+-      start: {
+-        Cachex,
+-        :start_link,
+-        [
+-          @cache,
+-          [
+-            hooks:
+-              [
+-                if(stats, do: Utils.cache_stats()),
+-                Utils.cache_limit(15_000)
+-              ]
+-              |> Enum.filter(& &1),
+-            expiration: Utils.cache_expiration_min(10),
+-            compressed: true
+-          ]
+-        ]
+-      }
+-    }
++    CachexOps.child_spec(@cache,
++      limit: 15_000,
++      ttl: to_timeout(minute: 10),
++      purge_interval: to_timeout(minute: 5),
++      compressed: true
++    )
+   end
+ 
+   @fetch_event_by_id {:fetch_event_by_id, 2}
+diff --git a/lib/logflare/logs/rejected_log_events.ex b/lib/logflare/logs/rejected_log_events.ex
+index 484036227d..343100ddfd 100644
+--- a/lib/logflare/logs/rejected_log_events.ex
++++ b/lib/logflare/logs/rejected_log_events.ex
+@@ -22,33 +22,21 @@ defmodule Logflare.Logs.RejectedLogEvents do
+   ```
+   """
+ 
++  use Logflare.Cache
++
++  alias Logflare.Cache.CachexOps
+   alias Logflare.Sources.Source
+   alias Logflare.LogEvent, as: LE
+-  alias Logflare.Utils
+   alias Logflare.Sources
+ 
+   @cache __MODULE__
+ 
+   def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
+-
+-    %{
+-      id: @cache,
+-      start:
+-        {Cachex, :start_link,
+-         [
+-           @cache,
+-           [
+-             expiration: Utils.cache_expiration_min(60),
+-             hooks:
+-               [
+-                 if(stats, do: Utils.cache_stats()),
+-                 Utils.cache_limit(10_000)
+-               ]
+-               |> Enum.filter(& &1)
+-           ]
+-         ]}
+-    }
++    CachexOps.child_spec(@cache,
++      limit: 10_000,
++      ttl: to_timeout(hour: 1),
++      purge_interval: to_timeout(minute: 5)
++    )
+   end
+ 
+   @spec get_by_source(Source.t()) :: list(LE.t())
+diff --git a/lib/logflare/partners/cache.ex b/lib/logflare/partners/cache.ex
+index cb99da62db..b677412eb9 100644
+--- a/lib/logflare/partners/cache.ex
++++ b/lib/logflare/partners/cache.ex
+@@ -3,30 +3,12 @@ defmodule Logflare.Partners.Cache do
+   Cache for Partners
+   """
+ 
+-  alias Logflare.Partners
+-  alias Logflare.Utils
++  use Logflare.ContextCache
+ 
+-  def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
++  alias Logflare.Cache.CachexOps
++  alias Logflare.Partners
+ 
+-    %{
+-      id: __MODULE__,
+-      start:
+-        {Cachex, :start_link,
+-         [
+-           __MODULE__,
+-           [
+-             hooks:
+-               [
+-                 if(stats, do: Utils.cache_stats()),
+-                 Utils.cache_limit(100_000)
+-               ]
+-               |> Enum.filter(& &1),
+-             expiration: Utils.cache_expiration_min()
+-           ]
+-         ]}
+-    }
+-  end
++  def child_spec(_), do: CachexOps.child_spec(__MODULE__, limit: 100_000)
+ 
+   def get_partner(id), do: apply_repo_fun(__ENV__.function, [id])
+   def get_user_by_uuid(partner, token), do: apply_repo_fun(__ENV__.function, [partner, token])
+diff --git a/lib/logflare/pubsub_rates/cache.ex b/lib/logflare/pubsub_rates/cache.ex
+index af94238361..0bc767f83e 100644
+--- a/lib/logflare/pubsub_rates/cache.ex
++++ b/lib/logflare/pubsub_rates/cache.ex
+@@ -1,35 +1,24 @@
+ defmodule Logflare.PubSubRates.Cache do
+   @moduledoc false
++
++  use Logflare.Cache
++
+   require Logger
+ 
++  alias Logflare.Cache.CachexOps
+   alias Logflare.Sources.Source
+   alias Logflare.Cluster
+   alias Logflare.Users.Cache, as: UsersCache
+-  alias Logflare.Utils
+ 
+   @cache __MODULE__
+   @default_bucket_width 60
+ 
+   def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
+-
+-    %{
+-      id: __MODULE__,
+-      start:
+-        {Cachex, :start_link,
+-         [
+-           @cache,
+-           [
+-             hooks:
+-               [
+-                 if(stats, do: Utils.cache_stats()),
+-                 Utils.cache_limit(100_000)
+-               ]
+-               |> Enum.filter(& &1),
+-             expiration: Utils.cache_expiration_min(5)
+-           ]
+-         ]}
+-    }
++    CachexOps.child_spec(@cache,
++      limit: 100_000,
++      ttl: to_timeout(minute: 5),
++      purge_interval: to_timeout(minute: 5)
++    )
+   end
+ 
+   def clear do
+diff --git a/lib/logflare/rules/cache.ex b/lib/logflare/rules/cache.ex
+index 47b365f555..be26634144 100644
+--- a/lib/logflare/rules/cache.ex
++++ b/lib/logflare/rules/cache.ex
+@@ -1,41 +1,22 @@
+ defmodule Logflare.Rules.Cache do
+   @moduledoc false
+ 
++  use Logflare.ContextCache
++
+   alias Logflare.Backends.Backend
++  alias Logflare.Cache.CachexOps
+   alias Logflare.ContextCache
+   alias Logflare.Repo
+   alias Logflare.Rules
+   alias Logflare.Sources.Source
+-  alias Logflare.Utils
+-  import Cachex.Spec
+-
+-  @behaviour ContextCache
+ 
+   def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
+-
+-    %{
+-      id: __MODULE__,
+-      start: {
+-        Cachex,
+-        :start_link,
+-        [
+-          __MODULE__,
+-          [
+-            warmers: [
+-              warmer(required: false, module: Rules.CacheWarmer, name: Rules.CacheWarmer)
+-            ],
+-            hooks:
+-              [
+-                if(stats, do: Utils.cache_stats()),
+-                Utils.cache_limit(100_000)
+-              ]
+-              |> Enum.filter(& &1),
+-            expiration: Utils.cache_expiration_min(60, 5)
+-          ]
+-        ]
+-      }
+-    }
++    CachexOps.child_spec(__MODULE__,
++      limit: 100_000,
++      ttl: to_timeout(hour: 1),
++      purge_interval: to_timeout(minute: 5),
++      warmer: Rules.CacheWarmer
++    )
+   end
+ 
+   @spec list_rules(Source.t() | Backend.t()) :: [Rules.Rule.t()]
+@@ -56,40 +37,25 @@ defmodule Logflare.Rules.Cache do
+   def rules_tree_by_source_id(id), do: apply_repo_fun(__ENV__.function, [id])
+ 
+   @impl ContextCache
+-  def bust_by(kw) do
+-    entries =
+-      kw
+-      |> Enum.flat_map(fn
+-        {:id, id} ->
+-          [{:get_rule, [id]}]
++  def keys_to_bust(kw) do
++    Enum.flat_map(kw, fn
++      {:id, id} ->
++        [{:get_rule, [id]}]
+ 
+-        {:source_id, source_id} ->
+-          [{:list_by_source_id, [source_id]}, {:rules_tree_by_source_id, [source_id]}]
++      {:source_id, source_id} ->
++        [{:list_by_source_id, [source_id]}, {:rules_tree_by_source_id, [source_id]}]
+ 
+-        {:backend_id, backend_id} ->
+-          [{:list_by_backend_id, [backend_id]}]
+-      end)
+-
+-    Cachex.execute(Rules.Cache, fn worker ->
+-      Enum.reduce(entries, 0, fn k, acc ->
+-        acc + delete_and_count(worker, k)
+-      end)
++      {:backend_id, backend_id} ->
++        [{:list_by_backend_id, [backend_id]}]
+     end)
+   end
+ 
+   defp fetch_rule(cache, id) do
+-    ContextCache.fetch(cache, {:get_rule, [id]}, fn ->
++    CachexOps.fetch(cache, {:get_rule, [id]}, fn ->
+       Repo.with_replica(fn -> Rules.get_rule(id) end)
+     end)
+   end
+ 
+-  defp delete_and_count(cache, key) do
+-    case Cachex.take(cache, key) do
+-      {:ok, nil} -> 0
+-      {:ok, _value} -> 1
+-    end
+-  end
+-
+   defp apply_repo_fun(fun, args) do
+     Logflare.ContextCache.apply_fun(Rules, fun, args)
+   end
+diff --git a/lib/logflare/saved_searches/cache.ex b/lib/logflare/saved_searches/cache.ex
+index 0922ed1c48..66af3fa53d 100644
+--- a/lib/logflare/saved_searches/cache.ex
++++ b/lib/logflare/saved_searches/cache.ex
+@@ -1,57 +1,22 @@
+ defmodule Logflare.SavedSearches.Cache do
+   @moduledoc false
+ 
+-  @behaviour Logflare.ContextCache
++  use Logflare.ContextCache
+ 
++  alias Logflare.Cache.CachexOps
+   alias Logflare.SavedSearches
+-  alias Logflare.Utils
+ 
+-  def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
+-
+-    %{
+-      id: __MODULE__,
+-      start:
+-        {Cachex, :start_link,
+-         [
+-           __MODULE__,
+-           [
+-             hooks:
+-               [
+-                 if(stats, do: Utils.cache_stats()),
+-                 Utils.cache_limit(10_000)
+-               ]
+-               |> Enum.filter(& &1),
+-             expiration: Utils.cache_expiration_min()
+-           ]
+-         ]}
+-    }
+-  end
++  def child_spec(_), do: CachexOps.child_spec(__MODULE__, limit: 10_000)
+ 
+   def list_saved_searches_by_source(source_id), do: apply_repo_fun(__ENV__.function, [source_id])
+ 
+   @impl Logflare.ContextCache
+-  def bust_by(kw) do
+-    entries =
+-      kw
+-      |> Enum.map(fn
+-        {:source_id, source_id} -> {:list_saved_searches_by_source, [source_id]}
+-      end)
+-
+-    Cachex.execute(__MODULE__, fn cache ->
+-      Enum.reduce(entries, 0, fn key, acc ->
+-        acc + delete_and_count(cache, key)
+-      end)
++  def keys_to_bust(kw) do
++    Enum.map(kw, fn
++      {:source_id, source_id} -> {:list_saved_searches_by_source, [source_id]}
+     end)
+   end
+ 
+-  defp delete_and_count(cache, key) do
+-    case Cachex.take(cache, key) do
+-      {:ok, nil} -> 0
+-      {:ok, _value} -> 1
+-    end
+-  end
+-
+   defp apply_repo_fun(arg1, arg2) do
+     Logflare.ContextCache.apply_fun(SavedSearches, arg1, arg2)
+   end
+diff --git a/lib/logflare/source_schemas/cache.ex b/lib/logflare/source_schemas/cache.ex
+index 589d9c70f4..eba0f749f0 100644
+--- a/lib/logflare/source_schemas/cache.ex
++++ b/lib/logflare/source_schemas/cache.ex
+@@ -1,38 +1,18 @@
+ defmodule Logflare.SourceSchemas.Cache do
+   @moduledoc false
+-  alias Logflare.SourceSchemas
+-  alias Logflare.Utils
+ 
+-  import Cachex.Spec
++  use Logflare.ContextCache
+ 
+-  def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
++  alias Logflare.Cache.CachexOps
++  alias Logflare.SourceSchemas
+ 
+-    %{
+-      id: __MODULE__,
+-      start:
+-        {Cachex, :start_link,
+-         [
+-           __MODULE__,
+-           [
+-             warmers: [
+-               warmer(
+-                 required: false,
+-                 module: SourceSchemas.CacheWarmer,
+-                 name: SourceSchemas.CacheWarmer
+-               )
+-             ],
+-             hooks:
+-               [
+-                 if(stats, do: Utils.cache_stats()),
+-                 Utils.cache_limit(100_000)
+-               ]
+-               |> Enum.filter(& &1),
+-             # shorter expiration for schemas
+-             expiration: Utils.cache_expiration_min(10, 2)
+-           ]
+-         ]}
+-    }
++  def child_spec(_) do
++    CachexOps.child_spec(__MODULE__,
++      limit: 100_000,
++      ttl: to_timeout(minute: 10),
++      purge_interval: to_timeout(minute: 2),
++      warmer: SourceSchemas.CacheWarmer
++    )
+   end
+ 
+   def get_source_schema_by(kv), do: apply_fun(__ENV__.function, [kv])
+diff --git a/lib/logflare/sources/cache.ex b/lib/logflare/sources/cache.ex
+index e7f2007089..2ef957b5c7 100644
+--- a/lib/logflare/sources/cache.ex
++++ b/lib/logflare/sources/cache.ex
+@@ -1,35 +1,19 @@
+ defmodule Logflare.Sources.Cache do
+   @moduledoc false
+ 
++  use Logflare.ContextCache
++
++  alias Logflare.Cache.CachexOps
+   alias Logflare.Sources
+   alias Logflare.Sources.Source
+-  alias Logflare.Utils
+-
+-  import Cachex.Spec
+ 
+   def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
+-
+-    %{
+-      id: __MODULE__,
+-      start:
+-        {Cachex, :start_link,
+-         [
+-           __MODULE__,
+-           [
+-             warmers: [
+-               warmer(required: false, module: Sources.CacheWarmer, name: Sources.CacheWarmer)
+-             ],
+-             hooks:
+-               [
+-                 if(stats, do: Utils.cache_stats()),
+-                 Utils.cache_limit(100_000)
+-               ]
+-               |> Enum.filter(& &1),
+-             expiration: Utils.cache_expiration_min(60, 5)
+-           ]
+-         ]}
+-    }
++    CachexOps.child_spec(__MODULE__,
++      limit: 100_000,
++      ttl: to_timeout(hour: 1),
++      purge_interval: to_timeout(minute: 5),
++      warmer: Sources.CacheWarmer
++    )
+   end
+ 
+   def get_by_for_ingest(kv) do
+diff --git a/lib/logflare/system_cache.ex b/lib/logflare/system_cache.ex
+index 61daf8476a..311df1a43b 100644
+--- a/lib/logflare/system_cache.ex
++++ b/lib/logflare/system_cache.ex
+@@ -1,50 +1,26 @@
+ defmodule Logflare.SystemCache do
+   @moduledoc false
+ 
+-  import Cachex.Spec
++  use Logflare.Cache
+ 
+   require Logger
+ 
+-  alias Logflare.Utils
++  alias Logflare.Cache.CachexOps
+ 
+   @cache __MODULE__
+ 
+   def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
+-    env = Application.get_env(:logflare, :env)
+-
+-    warmers =
+-      if env == :test do
+-        []
+-      else
+-        [
+-          warmer(
+-            required: false,
+-            module: __MODULE__.Warmer,
+-            name: __MODULE__.Warmer,
+-            interval: :timer.seconds(3)
+-          )
+-        ]
++    warmer =
++      if Application.get_env(:logflare, :env) != :test do
++        {__MODULE__.Warmer, interval: :timer.seconds(3)}
+       end
+ 
+-    %{
+-      id: __MODULE__,
+-      start:
+-        {Cachex, :start_link,
+-         [
+-           @cache,
+-           [
+-             warmers: warmers,
+-             hooks:
+-               [
+-                 if(stats, do: Utils.cache_stats()),
+-                 Utils.cache_limit(100)
+-               ]
+-               |> Enum.filter(& &1),
+-             expiration: Utils.cache_expiration_sec(5, 5)
+-           ]
+-         ]}
+-    }
++    CachexOps.child_spec(@cache,
++      limit: 100,
++      ttl: to_timeout(second: 5),
++      purge_interval: to_timeout(second: 5),
++      warmer: warmer
++    )
+   end
+ 
+   @spec memory_utilization() :: float()
+diff --git a/lib/logflare/team_users/cache.ex b/lib/logflare/team_users/cache.ex
+index 9baee55215..7e3fea5096 100644
+--- a/lib/logflare/team_users/cache.ex
++++ b/lib/logflare/team_users/cache.ex
+@@ -3,30 +3,12 @@ defmodule Logflare.TeamUsers.Cache do
+   Cache for TeamUsers.
+   """
+ 
+-  alias Logflare.TeamUsers
+-  alias Logflare.Utils
++  use Logflare.ContextCache
+ 
+-  def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
++  alias Logflare.Cache.CachexOps
++  alias Logflare.TeamUsers
+ 
+-    %{
+-      id: __MODULE__,
+-      start:
+-        {Cachex, :start_link,
+-         [
+-           __MODULE__,
+-           [
+-             hooks:
+-               [
+-                 if(stats, do: Utils.cache_stats()),
+-                 Utils.cache_limit(100_000)
+-               ]
+-               |> Enum.filter(& &1),
+-             expiration: Utils.cache_expiration_min()
+-           ]
+-         ]}
+-    }
+-  end
++  def child_spec(_), do: CachexOps.child_spec(__MODULE__, limit: 100_000)
+ 
+   def get_team_user(id), do: apply_repo_fun({:get_team_user, 1}, [id])
+   def get_team_user!(id), do: apply_repo_fun(:get_team_user!, [id])
+diff --git a/lib/logflare/users/cache.ex b/lib/logflare/users/cache.ex
+index a5231705e1..f14d047893 100644
+--- a/lib/logflare/users/cache.ex
++++ b/lib/logflare/users/cache.ex
+@@ -3,33 +3,18 @@ defmodule Logflare.Users.Cache do
+   Cache for users.
+   """
+ 
++  use Logflare.ContextCache
++
++  alias Logflare.Cache.CachexOps
+   alias Logflare.Users
+-  alias Logflare.Utils
+-  import Cachex.Spec
+ 
+   def child_spec(_) do
+-    stats = Application.get_env(:logflare, :cache_stats, false)
+-
+-    %{
+-      id: __MODULE__,
+-      start:
+-        {Cachex, :start_link,
+-         [
+-           __MODULE__,
+-           [
+-             warmers: [
+-               warmer(required: false, module: Users.CacheWarmer, name: Users.CacheWarmer)
+-             ],
+-             hooks:
+-               [
+-                 if(stats, do: Utils.cache_stats()),
+-                 Utils.cache_limit(100_000)
+-               ]
+-               |> Enum.filter(& &1),
+-             expiration: Utils.cache_expiration_min(180, 10)
+-           ]
+-         ]}
+-    }
++    CachexOps.child_spec(__MODULE__,
++      limit: 100_000,
++      ttl: to_timeout(hour: 3),
++      purge_interval: to_timeout(minute: 10),
++      warmer: Users.CacheWarmer
++    )
+   end
+ 
+   def update(user),
+diff --git a/lib/logflare/utils.ex b/lib/logflare/utils.ex
+index 664f1b6749..3f0ff5ad76 100644
+--- a/lib/logflare/utils.ex
++++ b/lib/logflare/utils.ex
+@@ -8,7 +8,6 @@ defmodule Logflare.Utils do
+   alias Logflare.Backends.Backend
+   alias Logflare.OauthAccessTokens.OauthAccessToken
+   alias Logflare.OauthAccessTokens.PartnerOauthAccessToken
+-  import Cachex.Spec
+   import Logflare.Utils.Guards, only: [is_atom_value: 1]
+ 
+   @sensitive_header_names ["authorization", "x-api-key", "Authorization", "X-API-Key"]
+@@ -67,49 +66,6 @@ defmodule Logflare.Utils do
+   @original_to_string String.Chars.impl_for(%Tesla.Env{})
+   def tesla_env_to_string, do: @original_to_string
+ 
+-  def cache_stats do
+-    hook(module: Cachex.Stats)
+-  end
+-
+-  def cache_limit(n) when is_integer(n) do
+-    hook(
+-      module: Cachex.Limit.Scheduled,
+-      args: {
+-        # setting cache max size
+-        n,
+-        # options for `Cachex.prune/3`
+-        [],
+-        # options for `Cachex.Limit.Scheduled`
+-        []
+-      }
+-    )
+-  end
+-
+-  @doc """
+-  Builds a long Cachex expiration spec
+-  Defaults to 20 min with 5 min cleanup intervals
+-  """
+-  @spec cache_expiration_min(non_neg_integer(), non_neg_integer()) :: Cachex.Spec.expiration()
+-  def cache_expiration_min(default \\ 20, interval \\ 5) do
+-    cache_expiration_sec(default * 60, interval * 60)
+-  end
+-
+-  @doc """
+-  Builds a short Cachex expiration spec
+-  Defaults to 60 sec with 20 sec cleanup intervals
+-  """
+-  @spec cache_expiration_sec(non_neg_integer(), non_neg_integer()) :: Cachex.Spec.expiration()
+-  def cache_expiration_sec(default \\ 60, interval \\ 20) do
+-    expiration(
+-      # default record expiration of 20 mins
+-      default: :timer.seconds(default),
+-      # how often cleanup should occur, 5 mins
+-      interval: :timer.seconds(interval),
+-      # whether to enable lazy checking
+-      lazy: true
+-    )
+-  end
+-
+   @doc """
+   Stringifies an atom map to a string map.
+ 
+diff --git a/lib/logflare_web/controllers/health_check_controller.ex b/lib/logflare_web/controllers/health_check_controller.ex
+index 7ea5f126ca..fc27a21b73 100644
+--- a/lib/logflare_web/controllers/health_check_controller.ex
++++ b/lib/logflare_web/controllers/health_check_controller.ex
+@@ -106,11 +106,7 @@ defmodule LogflareWeb.HealthCheckController do
+               Logflare.Logs.LogEvents.Cache
+             ],
+         into: %{} do
+-      # call is O(1)
+-      case Cachex.size(cache) do
+-        {:ok, _} -> {cache, :ok}
+-        {:error, :no_cache} -> {cache, :no_cache}
+-      end
++      {cache, if(cache.healthy?(), do: :ok, else: :unhealthy)}
+     end
+   end
+ end
+diff --git a/lib/telemetry.ex b/lib/telemetry.ex
+index fc3e5d6921..b64c3ac7b9 100644
+--- a/lib/telemetry.ex
++++ b/lib/telemetry.ex
+@@ -9,6 +9,7 @@ defmodule Logflare.Telemetry do
+ 
+   alias Logflare.Backends.Adaptor.ClickHouseAdaptor
+   alias Logflare.Backends.Adaptor.ClickHouseAdaptor.QueryConnectionSup
++  alias Logflare.Cache.CachexOps
+ 
+   def start_link(arg), do: Supervisor.start_link(__MODULE__, arg, name: __MODULE__)
+ 
+@@ -174,14 +175,12 @@ defmodule Logflare.Telemetry do
+   # isn't the case in dev/test, so there'd otherwise be no way to exercise it.
+   @doc false
+   def metrics do
+-    cache_stats? = Application.get_env(:logflare, :cache_stats, false)
++    cache_stats? = CachexOps.stats_enabled?()
+ 
+     cache_metrics =
+       if cache_stats? do
+         Enum.flat_map(@caches, fn {_cache, metric} ->
+           [
+-            last_value("cachex.#{metric}.purge"),
+-            last_value("cachex.#{metric}.stats"),
+             last_value("cachex.#{metric}.evictions"),
+             last_value("cachex.#{metric}.expirations"),
+             last_value("cachex.#{metric}.operations"),
+@@ -753,7 +752,7 @@ defmodule Logflare.Telemetry do
+   end
+ 
+   defp periodic_measurements do
+-    cache_stats? = Application.get_env(:logflare, :cache_stats, false)
++    cache_stats? = CachexOps.stats_enabled?()
+ 
+     cachex_metrics =
+       if cache_stats? do
+@@ -864,27 +863,7 @@ defmodule Logflare.Telemetry do
+ 
+   def cachex_metrics do
+     Enum.each(@caches, fn {cache, metric} ->
+-      {:ok, stats} = Cachex.stats(cache)
+-
+-      {:total_heap_size, total_heap_size} =
+-        cache
+-        |> Process.whereis()
+-        |> Process.info(:total_heap_size)
+-
+-      metrics = %{
+-        purge: Map.get(stats, :purge, 0),
+-        stats: Map.get(stats, :stats, 0),
+-        evictions: Map.get(stats, :evictions, 0),
+-        expirations: Map.get(stats, :expirations, 0),
+-        operations: Map.get(stats, :operations, 0),
+-        hits: Map.get(stats, :hits, 0),
+-        misses: Map.get(stats, :misses, 0),
+-        hit_rate: Map.get(stats, :hit_rate, 0),
+-        miss_rate: Map.get(stats, :miss_rate, 0),
+-        total_heap_size: total_heap_size
+-      }
+-
+-      :telemetry.execute([:cachex, metric], metrics)
++      :telemetry.execute([:cachex, metric], cache.stats())
+     end)
+   end
+ 
+diff --git a/mix.exs b/mix.exs
+index 8073d08a8b..c5b92a719b 100644
+--- a/mix.exs
++++ b/mix.exs
+@@ -283,7 +283,7 @@ defmodule Logflare.Mixfile do
+       "test.compile": ["compile --warnings-as-errors"],
+       "test.format": ["format --check-formatted"],
+       "test.security": ["sobelow --threshold high --ignore Config.HTTPS"],
+-      "test.slop": ["ex_dna --max-clones 26"],
++      "test.slop": ["ex_dna --max-clones 25"],
+       "test.structure": [
+         "reach.check --smells --strict --baseline .reach.baseline.json"
+       ],
+diff --git a/test/logflare/cache/cachex_ops_test.exs b/test/logflare/cache/cachex_ops_test.exs
+new file mode 100644
+index 0000000000..4fd6d29e51
+--- /dev/null
++++ b/test/logflare/cache/cachex_ops_test.exs
+@@ -0,0 +1,208 @@
++defmodule Logflare.Cache.CachexOpsTest do
++  use ExUnit.Case, async: false
++
++  import Cachex.Spec
++
++  alias Logflare.Cache.CachexOps
++
++  @cache __MODULE__.Cache
++
++  describe "child_spec/2" do
++    for {stats_enabled?, expected} <- [{true, :ok}, {false, :error}] do
++      test "cache stats config set to #{stats_enabled?}" do
++        original = Application.get_env(:logflare, :cache_stats)
++        on_exit(fn -> Application.put_env(:logflare, :cache_stats, original) end)
++        Application.put_env(:logflare, :cache_stats, unquote(stats_enabled?))
++
++        start_cache(limit: 10)
++        Cachex.put(@cache, :key, :value)
++
++        assert {unquote(expected), _} = Cachex.stats(@cache)
++        assert :ok = CachexOps.reset(@cache)
++        assert {:ok, 0} = Cachex.size(@cache)
++      end
++    end
++  end
++
++  describe "cachex_opts/1" do
++    for {name, opts, expected} <- [
++          {"only a nil limit", [limit: nil],
++           [
++             hooks: [],
++             expiration: expiration(default: :timer.minutes(20), interval: :timer.minutes(5)),
++             warmers: [],
++             compressed: false
++           ]},
++          {"an integer limit", [limit: 10],
++           [hooks: [hook(module: Cachex.Limit.Scheduled, args: {10, [], []})]]},
++          {"a warmer module", [limit: nil, warmer: __MODULE__.Warmer],
++           [
++             warmers: [
++               warmer(module: __MODULE__.Warmer, name: __MODULE__.Warmer, required: false)
++             ]
++           ]},
++          {"a warmer with interval", [limit: nil, warmer: {__MODULE__.Warmer, interval: 1_000}],
++           [
++             warmers: [
++               warmer(
++                 module: __MODULE__.Warmer,
++                 name: __MODULE__.Warmer,
++                 required: false,
++                 interval: 1_000
++               )
++             ]
++           ]},
++          {"ttl and purge interval", [limit: nil, ttl: 10_000, purge_interval: 2_000],
++           [expiration: expiration(default: 10_000, interval: 2_000, lazy: true)]},
++          {"compression", [limit: nil, compressed: true], [compressed: true]}
++        ] do
++      test name do
++        opts = CachexOps.cachex_opts(unquote(Macro.escape(opts)))
++
++        for {key, value} <- unquote(Macro.escape(expected)) do
++          assert Keyword.fetch!(opts, key) == value
++        end
++      end
++    end
++
++    test "missing limit" do
++      assert_raise KeyError, fn -> CachexOps.cachex_opts(compressed: true) end
++    end
++  end
++
++  describe "healthy?/1" do
++    test "started cache" do
++      start_cache(limit: 10)
++      assert CachexOps.healthy?(@cache)
++    end
++
++    test "cache that is not started" do
++      refute CachexOps.healthy?(@cache)
++    end
++  end
++
++  describe "stats/1" do
++    test "cache after reads and writes" do
++      start_cache(limit: 10)
++      Cachex.put(@cache, :key, :value)
++      Cachex.get(@cache, :key)
++      Cachex.get(@cache, :missing)
++
++      assert %{hits: 1, misses: 1, total_heap_size: heap} = stats = CachexOps.stats(@cache)
++      assert heap > 0
++
++      assert stats |> Map.keys() |> Enum.sort() == [
++               :evictions,
++               :expirations,
++               :hit_rate,
++               :hits,
++               :miss_rate,
++               :misses,
++               :operations,
++               :total_heap_size
++             ]
++    end
++  end
++
++  describe "reset/1" do
++    test "cache with entries and stats" do
++      start_cache(limit: 10)
++      Cachex.put(@cache, :key, :value)
++      Cachex.get(@cache, :key)
++
++      assert :ok = CachexOps.reset(@cache)
++
++      assert {:ok, nil} = Cachex.get(@cache, :key)
++      assert %{hits: 0} = CachexOps.stats(@cache)
++    end
++  end
++
++  describe "delete_keys/2" do
++    setup do
++      start_cache(limit: nil)
++      Cachex.put_many(@cache, a: 1, b: 2)
++      :ok
++    end
++
++    for {name, keys, expected_count} <- [
++          {"existing keys", [:a, :b], 2},
++          {"missing keys", [:x, :y], 0},
++          {"existing and missing keys", [:a, :x], 1},
++          {"no keys", [], 0}
++        ] do
++      test name do
++        keys = unquote(keys)
++
++        assert {:ok, unquote(expected_count)} = CachexOps.delete_keys(@cache, keys)
++
++        for key <- keys do
++          assert {:ok, false} = Cachex.exists?(@cache, key)
++        end
++      end
++    end
++  end
++
++  describe "keys_to_bust/2" do
++    setup do
++      start_cache(limit: nil)
++      :ok
++    end
++
++    for {name, value, expected_keys} <- [
++          {"map with the id", %{id: 1}, [:key]},
++          {":ok tuple with a map with the id", {:ok, %{id: 1}}, [:key]},
++          {":ok 3-tuple with a map with the id", {:ok, %{id: 1}, :extra}, [:key]},
++          {"list containing a map with the id", [%{id: 2}, %{id: 1}], [:key]},
++          {"map with another id", %{id: 2}, []},
++          {"list without the id", [%{id: 2}], []},
++          {"nil", nil, []}
++        ] do
++      test "cached #{name}" do
++        Cachex.put(@cache, :key, {:cached, unquote(Macro.escape(value))})
++
++        assert Enum.to_list(CachexOps.keys_to_bust(@cache, id: 1)) == unquote(expected_keys)
++      end
++    end
++
++    test "keyword other than id" do
++      assert_raise ArgumentError, fn -> CachexOps.keys_to_bust(@cache, source_id: 1) end
++    end
++  end
++
++  describe "fetch/3" do
++    setup do
++      start_cache(limit: nil)
++      :ok
++    end
++
++    for value <- [:value, nil] do
++      test "missing key with a getter returning #{inspect(value)}" do
++        value = unquote(value)
++
++        assert CachexOps.fetch(@cache, :key, fn -> value end) == value
++        assert CachexOps.fetch(@cache, :key, fn -> flunk("getter called on a hit") end) == value
++      end
++    end
++  end
++
++  describe "update/3" do
++    setup do
++      start_cache(limit: nil)
++      :ok
++    end
++
++    test "cached key" do
++      CachexOps.fetch(@cache, :key, fn -> :old end)
++
++      assert :ok = CachexOps.update(@cache, :key, :new)
++      assert :new = CachexOps.fetch(@cache, :key, fn -> flunk("getter called on a hit") end)
++    end
++
++    test "missing key" do
++      assert :ok = CachexOps.update(@cache, :key, :new)
++      assert {:ok, false} = Cachex.exists?(@cache, :key)
++    end
++  end
++
++  defp start_cache(opts), do: start_supervised!(CachexOps.child_spec(@cache, opts))
++end
+diff --git a/test/logflare/cache_test.exs b/test/logflare/cache_test.exs
+new file mode 100644
+index 0000000000..4e68aeb88a
+--- /dev/null
++++ b/test/logflare/cache_test.exs
+@@ -0,0 +1,33 @@
++defmodule Logflare.CacheTest do
++  use ExUnit.Case, async: true
++
++  defmodule RecordingImpl do
++    @behaviour Logflare.Cache.Ops
++
++    @impl true
++    def healthy?(cache), do: record({:healthy?, cache}, true)
++    @impl true
++    def stats(cache), do: record({:stats, cache}, %{})
++    @impl true
++    def reset(cache), do: record({:reset, cache}, :ok)
++
++    defp record(call, result) do
++      send(self(), call)
++      result
++    end
++  end
++
++  defmodule CustomImplCache do
++    use Logflare.Cache, impl: RecordingImpl
++  end
++
++  test "cache with a custom impl module" do
++    assert CustomImplCache.healthy?()
++    assert %{} = CustomImplCache.stats()
++    assert :ok = CustomImplCache.reset()
++
++    assert_received {:healthy?, CustomImplCache}
++    assert_received {:stats, CustomImplCache}
++    assert_received {:reset, CustomImplCache}
++  end
++end
+diff --git a/test/logflare/context_cache_test.exs b/test/logflare/context_cache_test.exs
+index d753a5263a..0ba2e61216 100644
+--- a/test/logflare/context_cache_test.exs
++++ b/test/logflare/context_cache_test.exs
+@@ -4,53 +4,61 @@ defmodule Logflare.ContextCacheTest do
+   alias Ecto.Adapters.SQL
+   alias Logflare.ContextCache
+   alias Logflare.ContextCache.TransactionBroadcaster
+-  alias Logflare.Sources
+-  alias Logflare.Sources.Source
+-  alias Logflare.Backends
+-  alias Logflare.Backends.Backend
+-  alias Logflare.Auth
+ 
+-  describe "ContextCache" do
+-    setup do
+-      insert(:plan, name: "Free")
+-      user = insert(:user)
+-      source = insert(:source, user: user)
+-      %{source: source, user: user}
+-    end
++  defmodule RecordingOps do
++    @behaviour Logflare.Cache.Ops
++    @behaviour Logflare.ContextCache.Ops
+ 
+-    test "bust_keys/1, does nothing for empty list" do
+-      assert {:ok, 0} = ContextCache.bust_keys([])
+-    end
++    @impl Logflare.Cache.Ops
++    def healthy?(cache), do: record({:healthy?, cache}, true)
++    @impl Logflare.Cache.Ops
++    def stats(cache), do: record({:stats, cache}, %{})
++    @impl Logflare.Cache.Ops
++    def reset(cache), do: record({:reset, cache}, :ok)
+ 
+-    test "apply_fun/3,  bust_keys/1 by :id field of value", %{source: source} do
+-      Sources.Cache.get_by(token: source.token)
+-      cache_key = {:get_by, [[token: source.token]]}
+-      assert {:cached, %Source{}} = Cachex.get!(Sources.Cache, cache_key)
++    @impl Logflare.ContextCache.Ops
++    def keys_to_bust(cache, kw), do: record({:keys_to_bust, cache, kw}, [:key])
++    @impl Logflare.ContextCache.Ops
++    def delete_keys(cache, keys), do: record({:delete_keys, cache, keys}, {:ok, 1})
++    @impl Logflare.ContextCache.Ops
++    def fetch(cache, key, _getter), do: record({:fetch, cache, key}, :fetched)
++    @impl Logflare.ContextCache.Ops
++    def update(cache, key, value), do: record({:update, cache, key, value}, :ok)
+ 
+-      assert {:ok, 1} = ContextCache.bust_keys([{Sources, source.id}])
+-      assert is_nil(Cachex.get!(Sources.Cache, cache_key))
++    defp record(call, result) do
++      send(self(), call)
++      result
+     end
++  end
+ 
+-    test "apply_fun/3,  bust_keys/1 by :id field of value for :ok tuple", %{user: user} do
+-      {:ok, key} = Auth.create_access_token(user)
+-      assert {:ok, _token, _user} = Auth.Cache.verify_access_token(key.token)
+-      cache_key = {:verify_access_token, [key.token]}
+-      assert {:cached, {:ok, %_{}, _user}} = Cachex.get!(Auth.Cache, cache_key)
++  defmodule CustomImpl.Cache do
++    use Logflare.ContextCache, impl: RecordingOps
++  end
++
++  test "bust_keys/1 with an empty list" do
++    assert {:ok, 0} = ContextCache.bust_keys([])
++  end
+ 
+-      assert {:ok, 1} = ContextCache.bust_keys([{Auth, key.id}])
+-      assert is_nil(Cachex.get!(Auth.Cache, cache_key))
++  describe "context cache with a custom impl module" do
++    test "apply_fun/3" do
++      assert :fetched = ContextCache.apply_fun(CustomImpl, :get, [1])
++      assert_received {:fetch, CustomImpl.Cache, {:get, [1]}}
+     end
+ 
+-    test "apply_fun/3, bust_keys/1 if primary key is in list of returned structs", %{
+-      source: source
+-    } do
+-      backend = insert(:backend, sources: [source])
+-      Backends.Cache.list_backends(source_id: source.id)
+-      cache_key = {:list_backends, [[source_id: source.id]]}
+-      assert {:cached, [%Backend{}]} = Cachex.get!(Backends.Cache, cache_key)
++    test "update/4" do
++      assert :ok = ContextCache.update(CustomImpl, :get, [1], :value)
++      assert_received {:update, CustomImpl.Cache, {:get, [1]}, :value}
++    end
+ 
+-      assert {:ok, 1} = ContextCache.bust_keys([{Backends, backend.id}])
+-      assert is_nil(Cachex.get!(Backends.Cache, cache_key))
++    for {name, bust, expected_kw} <- [
++          {"primary key", 5, [id: 5]},
++          {"keyword", [source_id: 5], [source_id: 5]}
++        ] do
++      test "bust_keys/1 with a #{name}" do
++        assert {:ok, 1} = ContextCache.bust_keys([{CustomImpl, unquote(bust)}])
++        assert_received {:keys_to_bust, CustomImpl.Cache, unquote(expected_kw)}
++        assert_received {:delete_keys, CustomImpl.Cache, [:key]}
++      end
+     end
+   end
+ 
+diff --git a/test/logflare/key_values/cache_test.exs b/test/logflare/key_values/cache_test.exs
+index 0e67d2ad40..97dd292cb8 100644
+--- a/test/logflare/key_values/cache_test.exs
++++ b/test/logflare/key_values/cache_test.exs
+@@ -2,6 +2,7 @@ defmodule Logflare.KeyValues.CacheTest do
+   @moduledoc false
+   use Logflare.DataCase, async: false
+ 
++  alias Logflare.ContextCache
+   alias Logflare.KeyValues
+ 
+   setup do
+@@ -48,7 +49,7 @@ defmodule Logflare.KeyValues.CacheTest do
+     assert nil == KeyValues.Cache.lookup(user.id, "nonexistent")
+   end
+ 
+-  test "bust_by/1 clears cached lookup and all accessor variants", %{user: user} do
++  test "busting a cached lookup and its accessor variants", %{user: user} do
+     kv = insert(:key_value, user: user, key: "proj1", value: %{"org" => %{"id" => "abc"}})
+ 
+     assert "abc" = KeyValues.Cache.lookup(user.id, "proj1", "org.id")
+@@ -56,14 +57,14 @@ defmodule Logflare.KeyValues.CacheTest do
+ 
+     new_value = %{"org" => %{"id" => "xyz"}}
+     kv |> Ecto.Changeset.change(value: new_value) |> Repo.update!()
+-    assert {:ok, _} = KeyValues.Cache.bust_by(user_id: user.id, key: "proj1")
++    assert {:ok, _} = ContextCache.bust_keys([{KeyValues, user_id: user.id, key: "proj1"}])
+ 
+     assert "xyz" = KeyValues.Cache.lookup(user.id, "proj1", "org.id")
+     assert ^new_value = KeyValues.Cache.lookup(user.id, "proj1")
+   end
+ 
+-  test "bust_by/1 returns 0 when key not cached", %{user: user} do
+-    assert {:ok, 0} = KeyValues.Cache.bust_by(user_id: user.id, key: "nonexistent")
++  test "busting a key that is not cached", %{user: user} do
++    assert {:ok, 0} = ContextCache.bust_keys([{KeyValues, user_id: user.id, key: "nonexistent"}])
+   end
+ 
+   describe "count/1" do
+@@ -76,14 +77,14 @@ defmodule Logflare.KeyValues.CacheTest do
+       assert KeyValues.Cache.count(user.id) == 2
+     end
+ 
+-    test "bust_by/1 clears cached count", %{user: user} do
++    test "busting a cached count", %{user: user} do
+       insert(:key_value, user: user, key: "k1")
+ 
+       # populate cache
+       assert 1 = KeyValues.Cache.count(user.id)
+ 
+       # bust clears it
+-      KeyValues.Cache.bust_by(user_id: user.id, key: "k1")
++      ContextCache.bust_keys([{KeyValues, user_id: user.id, key: "k1"}])
+ 
+       cache_key = {:count, user.id}
+       assert is_nil(Cachex.get!(KeyValues.Cache, cache_key))
+diff --git a/test/logflare/rules/rule_cache_test.exs b/test/logflare/rules/rule_cache_test.exs
+index 8b234fcf2d..a36686c4cb 100644
+--- a/test/logflare/rules/rule_cache_test.exs
++++ b/test/logflare/rules/rule_cache_test.exs
+@@ -2,6 +2,7 @@ defmodule Logflare.Rules.CacheTest do
+   alias Logflare.Rules.Rule
+   use Logflare.DataCase
+ 
++  alias Logflare.ContextCache
+   alias Logflare.Rules
+ 
+   @subject Rules.Cache
+@@ -88,7 +89,7 @@ defmodule Logflare.Rules.CacheTest do
+       assert _ = @subject.rules_tree_by_source_id(source.id)
+       assert %{misses: 2, writes: 2} = Cachex.stats!(@subject)
+ 
+-      assert {:ok, 2} = @subject.bust_by(source_id: source.id)
++      assert {:ok, 2} = ContextCache.bust_keys([{Rules, source_id: source.id}])
+       assert [_r1, _r2] = @subject.list_rules(source)
+       assert %{misses: 3, writes: 3} = Cachex.stats!(@subject)
+ 
+@@ -100,7 +101,7 @@ defmodule Logflare.Rules.CacheTest do
+       assert [_r1, _r2] = @subject.list_rules(backend)
+       assert %{misses: 1, writes: 1} = Cachex.stats!(@subject)
+ 
+-      assert {:ok, 1} = @subject.bust_by(backend_id: backend.id)
++      assert {:ok, 1} = ContextCache.bust_keys([{Rules, backend_id: backend.id}])
+       assert [_r1, _r2] = @subject.list_rules(backend)
+       assert %{misses: 2, writes: 2} = Cachex.stats!(@subject)
+     end
+@@ -109,12 +110,12 @@ defmodule Logflare.Rules.CacheTest do
+       assert _r1 = @subject.get_rule(rid1)
+       assert %{misses: 1, writes: 1} = Cachex.stats!(@subject)
+ 
+-      assert {:ok, 1} = @subject.bust_by(id: rid1)
++      assert {:ok, 1} = ContextCache.bust_keys([{Rules, rid1}])
+       assert _r1 = @subject.get_rule(rid1)
+       assert %{misses: 2, writes: 2} = Cachex.stats!(@subject)
+ 
+       # Bust missing key
+-      assert {:ok, 0} = @subject.bust_by(id: rid2)
++      assert {:ok, 0} = ContextCache.bust_keys([{Rules, rid2}])
+     end
+ 
+     test "cache warming" do
+diff --git a/test/logflare/system_cache_test.exs b/test/logflare/system_cache_test.exs
+index 69078c97ab..251941ef08 100644
+--- a/test/logflare/system_cache_test.exs
++++ b/test/logflare/system_cache_test.exs
+@@ -44,8 +44,7 @@ defmodule Logflare.SystemCacheTest do
+     Application.put_env(:logflare, :env, :prod)
+     on_exit(fn -> Application.put_env(:logflare, :env, previous_env) end)
+ 
+-    assert %{start: {Cachex, :start_link, [SystemCache, options]}} = SystemCache.child_spec(nil)
+-    assert [warmer_spec] = Keyword.fetch!(options, :warmers)
++    assert [warmer_spec] = Keyword.fetch!(cachex_options(), :warmers)
+     refute warmer(warmer_spec, :required)
+   end
+ 
+@@ -55,7 +54,7 @@ defmodule Logflare.SystemCacheTest do
+     on_exit(fn -> Application.put_env(:logflare, :env, previous_env) end)
+     set_mimic_global()
+ 
+-    assert %{start: {Cachex, :start_link, [SystemCache, options]}} = SystemCache.child_spec(nil)
++    options = cachex_options()
+     assert [warmer_spec] = Keyword.fetch!(options, :warmers)
+ 
+     cache_name = Module.concat(__MODULE__, IntegrationCache)
+@@ -92,4 +91,9 @@ defmodule Logflare.SystemCacheTest do
+     assert log =~ "SystemCache warmer failed"
+     assert log =~ "monitor_unavailable"
+   end
++
++  defp cachex_options do
++    %{start: {Cachex, :start_link, [[_name, options]]}} = SystemCache.child_spec(nil)
++    options
++  end
+ end
+diff --git a/test/logflare/telemetry_test.exs b/test/logflare/telemetry_test.exs
+index 0debc4968c..3cb8326de8 100644
+--- a/test/logflare/telemetry_test.exs
++++ b/test/logflare/telemetry_test.exs
+@@ -891,8 +891,6 @@ defmodule Logflare.TelemetryTest do
+                  :miss_rate,
+                  :misses,
+                  :operations,
+-                 :purge,
+-                 :stats,
+                  :total_heap_size
+                ]
+ 
+diff --git a/test/logflare_web/controllers/health_check_controller_test.exs b/test/logflare_web/controllers/health_check_controller_test.exs
+index d533150992..9606235594 100644
+--- a/test/logflare_web/controllers/health_check_controller_test.exs
++++ b/test/logflare_web/controllers/health_check_controller_test.exs
+@@ -39,6 +39,21 @@ defmodule LogflareWeb.HealthCheckControllerTest do
+            } = json_response(conn, 200)
+   end
+ 
++  test "cache reporting unhealthy", %{conn: conn} do
++    start_supervised!(Source.Supervisor)
++    stub(Logflare.Partners.Cache, :healthy?, fn -> false end)
++
++    conn = get(conn, "/health")
++
++    assert %{
++             "status" => "coming_up",
++             "caches" => %{
++               "Elixir.Logflare.Partners.Cache" => "unhealthy",
++               "Elixir.Logflare.Auth.Cache" => "ok"
++             }
++           } = json_response(conn, 503)
++  end
++
+   test "readiness check", %{conn: conn} do
+     start_supervised!(Source.Supervisor)
+     :timer.sleep(1000)
+diff --git a/test/logflare_web/live/search_live/logs_search_lv_test.exs b/test/logflare_web/live/search_live/logs_search_lv_test.exs
+index 48bf8578d4..f96e5c6946 100644
+--- a/test/logflare_web/live/search_live/logs_search_lv_test.exs
++++ b/test/logflare_web/live/search_live/logs_search_lv_test.exs
+@@ -527,7 +527,11 @@ defmodule LogflareWeb.Source.SearchLVTest do
+ 
+       saved_search = insert(:saved_search, %{source: source})
+ 
+-      _ = Logflare.SavedSearches.Cache.bust_by(source_id: saved_search.source_id)
++      _ =
++        Logflare.ContextCache.bust_keys([
++          {Logflare.SavedSearches, source_id: saved_search.source_id}
++        ])
++
+       {:ok, view, _html} = live_with_redirect(conn, ~p"/sources/#{source.id}/search")
+ 
+       assert view
+@@ -822,7 +826,7 @@ defmodule LogflareWeb.Source.SearchLVTest do
+           schema_flat_map: schema_flat_map
+         })
+ 
+-      _ = Logflare.SavedSearches.Cache.bust_by(source_id: source.id)
++      _ = Logflare.ContextCache.bust_keys([{Logflare.SavedSearches, source_id: source.id}])
+       Cachex.clear(Logflare.SourceSchemas.Cache)
+ 
+       {:ok, view, _html} = live_with_redirect(conn, Routes.live_path(conn, SearchLV, source.id))
+diff --git a/test/profiling/context_cache_bust_by_kw_bench.exs b/test/profiling/context_cache_bust_by_kw_bench.exs
+index e7446b44d9..794e4cfeb4 100644
+--- a/test/profiling/context_cache_bust_by_kw_bench.exs
++++ b/test/profiling/context_cache_bust_by_kw_bench.exs
+@@ -1,3 +1,4 @@
++alias Logflare.Cache.CachexOps
+ alias Logflare.ContextCache
+ alias Logflare.Rules
+ 
+@@ -18,9 +19,9 @@ end
+ 
+ Benchee.run(
+   %{
++    # Rules.Cache overrides keys_to_bust/1, so call the default match-spec scan directly
+     "bust_keys by primary key" => fn [{_source, rule} | _] ->
+-      pkey = rule.id
+-      ContextCache.bust_keys([{Rules, pkey}])
++      CachexOps.delete_keys(cache, CachexOps.keys_to_bust(cache, id: rule.id))
+     end,
+     "bust_keys by relation key" => fn [{source, _rule} | _] ->
+       ContextCache.bust_keys([{Rules, source_id: source.id}])
+diff --git a/test/support/conn_case.ex b/test/support/conn_case.ex
+index e7640168a7..16c4ac15be 100644
+--- a/test/support/conn_case.ex
++++ b/test/support/conn_case.ex
+@@ -79,7 +79,7 @@ defmodule LogflareWeb.ConnCase do
+         end)
+ 
+         caches = Logflare.ContextCache.Supervisor.list_caches()
+-        Enum.each(caches, &Cachex.reset(&1, hooks: [Cachex.Stats]))
++        Enum.each(caches, & &1.reset())
+ 
+         on_exit(fn ->
+           IngestEventQueue.delete_all_mappings()
+diff --git a/test/support/data_case.ex b/test/support/data_case.ex
+index 53db5a9ae6..4d86aa2e84 100644
+--- a/test/support/data_case.ex
++++ b/test/support/data_case.ex
+@@ -45,7 +45,7 @@ defmodule Logflare.DataCase do
+         end)
+ 
+         caches = Logflare.ContextCache.Supervisor.list_caches()
+-        Enum.each(caches, &Cachex.reset(&1, hooks: [Cachex.Stats]))
++        Enum.each(caches, & &1.reset())
+ 
+         on_exit(fn ->
+           # Deterministic, not timer-based: IngestEventQueue's generation-store
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index 3b2545b16e..0f897fa99f 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -74,6 +74,7 @@ Mimic.copy(Logflare.Lql)
+ Mimic.copy(Logflare.Mailer)
+ Mimic.copy(Logflare.NaturalLanguageLql.AnthropicClient)
+ Mimic.copy(Logflare.Networking.GrpcPool)
++Mimic.copy(Logflare.Partners.Cache)
+ Mimic.copy(Logflare.Rules)
+ Mimic.copy(Logflare.SingleTenant)
+ Mimic.copy(Logflare.Sources)

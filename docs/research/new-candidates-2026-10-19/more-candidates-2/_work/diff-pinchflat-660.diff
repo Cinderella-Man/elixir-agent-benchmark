@@ -1,0 +1,148 @@
+diff --git a/lib/pinchflat/settings/setting.ex b/lib/pinchflat/settings/setting.ex
+index c366ff024..f2a6b0ad9 100644
+--- a/lib/pinchflat/settings/setting.ex
++++ b/lib/pinchflat/settings/setting.ex
+@@ -16,7 +16,8 @@ defmodule Pinchflat.Settings.Setting do
+     :audio_codec_preference,
+     :youtube_api_key,
+     :extractor_sleep_interval_seconds,
+-    :download_throughput_limit
++    :download_throughput_limit,
++    :restrict_filenames
+   ]
+ 
+   @required_fields [
+@@ -38,6 +39,7 @@ defmodule Pinchflat.Settings.Setting do
+     field :extractor_sleep_interval_seconds, :integer, default: 0
+     # This is a string because it accepts values like "100K" or "4.2M"
+     field :download_throughput_limit, :string
++    field :restrict_filenames, :boolean, default: false
+ 
+     field :video_codec_preference, :string
+     field :audio_codec_preference, :string
+diff --git a/lib/pinchflat/yt_dlp/command_runner.ex b/lib/pinchflat/yt_dlp/command_runner.ex
+index 80c4c98c6..f574d30be 100644
+--- a/lib/pinchflat/yt_dlp/command_runner.ex
++++ b/lib/pinchflat/yt_dlp/command_runner.ex
+@@ -35,7 +35,7 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+ 
+     output_filepath = generate_output_filepath(addl_opts)
+     print_to_file_opts = [{:print_to_file, output_template}, output_filepath]
+-    user_configured_opts = cookie_file_options(addl_opts) ++ rate_limit_opts(addl_opts)
++    user_configured_opts = cookie_file_options(addl_opts) ++ rate_limit_options(addl_opts) ++ misc_options()
+     # These must stay in exactly this order, hence why I'm giving it its own variable.
+     all_opts = command_opts ++ print_to_file_opts ++ user_configured_opts ++ global_options()
+     formatted_command_opts = [url] ++ CliUtils.parse_options(all_opts)
+@@ -116,7 +116,22 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+     end
+   end
+ 
+-  defp rate_limit_opts(addl_opts) do
++  defp add_cookie_file do
++    base_dir = Application.get_env(:pinchflat, :extras_directory)
++    filename_options_map = %{cookies: "cookies.txt"}
++
++    Enum.reduce(filename_options_map, [], fn {opt_name, filename}, acc ->
++      filepath = Path.join(base_dir, filename)
++
++      if FSUtils.exists_and_nonempty?(filepath) do
++        [{opt_name, filepath} | acc]
++      else
++        acc
++      end
++    end)
++  end
++
++  defp rate_limit_options(addl_opts) do
+     throughput_limit = Settings.get!(:download_throughput_limit)
+     sleep_interval_opts = sleep_interval_opts(addl_opts)
+     throughput_option = if throughput_limit, do: [limit_rate: throughput_limit], else: []
+@@ -138,19 +153,8 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+     end
+   end
+ 
+-  defp add_cookie_file do
+-    base_dir = Application.get_env(:pinchflat, :extras_directory)
+-    filename_options_map = %{cookies: "cookies.txt"}
+-
+-    Enum.reduce(filename_options_map, [], fn {opt_name, filename}, acc ->
+-      filepath = Path.join(base_dir, filename)
+-
+-      if FSUtils.exists_and_nonempty?(filepath) do
+-        [{opt_name, filepath} | acc]
+-      else
+-        acc
+-      end
+-    end)
++  defp misc_options do
++    if Settings.get!(:restrict_filenames), do: [:restrict_filenames], else: []
+   end
+ 
+   defp backend_executable do
+diff --git a/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex b/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
+index 9fb55cc7f..c59031f11 100644
+--- a/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
++++ b/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
+@@ -54,7 +54,14 @@
+         field={f[:download_throughput_limit]}
+         placeholder="4.2M"
+         label="Download Throughput"
+-        help="Sets the max throughput when downloading media. Examples: '50K' or '4.2M'. Leave blank to disable"
++        help="Sets the max bytes-per-second throughput when downloading media. Examples: '50K' or '4.2M'. Leave blank to disable"
++      />
++
++      <.input
++        field={f[:restrict_filenames]}
++        type="toggle"
++        label="Restrict Filenames"
++        help="Restrict filenames to only ASCII characters and avoid ampersands/spaces in filenames"
+       />
+     </section>
+   </section>
+diff --git a/priv/repo/erd.png b/priv/repo/erd.png
+index 207379363..4f069544c 100644
+Binary files a/priv/repo/erd.png and b/priv/repo/erd.png differ
+diff --git a/priv/repo/migrations/20250317213740_add_restrict_filenames_to_settings.exs b/priv/repo/migrations/20250317213740_add_restrict_filenames_to_settings.exs
+new file mode 100644
+index 000000000..6a6591d08
+--- /dev/null
++++ b/priv/repo/migrations/20250317213740_add_restrict_filenames_to_settings.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddRestrictFilenamesToSettings do
++  use Ecto.Migration
++
++  def change do
++    alter table(:settings) do
++      add :restrict_filenames, :boolean, default: false
++    end
++  end
++end
+diff --git a/test/pinchflat/yt_dlp/command_runner_test.exs b/test/pinchflat/yt_dlp/command_runner_test.exs
+index ddbc77fec..51653e341 100644
+--- a/test/pinchflat/yt_dlp/command_runner_test.exs
++++ b/test/pinchflat/yt_dlp/command_runner_test.exs
+@@ -162,6 +162,24 @@ defmodule Pinchflat.YtDlp.CommandRunnerTest do
+     end
+   end
+ 
++  describe "run/4 when testing misc options" do
++    test "includes --restrict-filenames when enabled" do
++      Settings.set(restrict_filenames: true)
++
++      assert {:ok, output} = Runner.run(@media_url, :foo, [], "")
++
++      assert String.contains?(output, "--restrict-filenames")
++    end
++
++    test "doesn't include --restrict-filenames when disabled" do
++      Settings.set(restrict_filenames: false)
++
++      assert {:ok, output} = Runner.run(@media_url, :foo, [], "")
++
++      refute String.contains?(output, "--restrict-filenames")
++    end
++  end
++
+   describe "version/0" do
+     test "adds the version arg" do
+       assert {:ok, output} = Runner.version()

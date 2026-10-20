@@ -55,6 +55,67 @@ defmodule Eab.ModelIdentityTest do
     assert Eab.ModelIdentity.details(%{"model" => "gpt-6-astra"})["quantization"] == nil
   end
 
+  test "connection shows skipped memory collection until the exact endpoint hostname is configured" do
+    old_memory = Application.get_env(:eab, :memory_monitor)
+    old_http = Application.get_env(:eab, :http_request)
+
+    on_exit(fn ->
+      for {key, value} <- [memory_monitor: old_memory, http_request: old_http] do
+        if is_nil(value),
+          do: Application.delete_env(:eab, key),
+          else: Application.put_env(:eab, key, value)
+      end
+    end)
+
+    for backend <- ["llama_cpp", "strata"] do
+      Application.put_env(:eab, :http_request, fn opts ->
+        body =
+          case URI.parse(opts[:url]).path do
+            "/health" ->
+              %{"status" => "ok"}
+
+            "/v1/models" ->
+              %{"data" => [%{"id" => "fixture"}]}
+
+            "/props" ->
+              %{
+                "model_alias" => "fixture",
+                "model_path" => "/models/fixture-Q4_K_M.gguf",
+                "build_info" =>
+                  if(backend == "strata", do: "Strata fixture", else: "llama fixture"),
+                "default_generation_settings" => %{"n_ctx" => 262_144}
+              }
+          end
+
+        {:ok, %{status: 200, body: body}}
+      end)
+
+      Application.put_env(:eab, :memory_monitor, hosts: ["rig"], target: "rig")
+      {:ok, view, _} = live(build_conn(), "/")
+      connection = %{"connection" => %{"url" => "http://rig.example.ts.net:8410", "key" => ""}}
+      render_submit(view, "connect", connection)
+      render_async(view)
+      assert has_element?(view, "#memory-collection-status", "RAM/VRAM will not be recorded")
+      assert has_element?(view, "#memory-collection-status", "rig.example.ts.net")
+      assert has_element?(view, "#memory-collection-status", "EAB_MEMORY_HOSTS")
+
+      Application.put_env(:eab, :memory_monitor,
+        hosts: ["rig", "rig.example.ts.net"],
+        target: "rig"
+      )
+
+      render_submit(view, "connect", connection)
+      render_async(view)
+      assert has_element?(view, "#memory-collection-status", "RAM/VRAM collection is configured")
+
+      Application.delete_env(:eab, :memory_monitor)
+      render_submit(view, "connect", connection)
+      render_async(view)
+      assert has_element?(view, "#memory-collection-status", "RAM/VRAM will not be recorded")
+      assert has_element?(view, "#memory-collection-status", "EAB_MEMORY_SSH_TARGET")
+    end
+  end
+
   test "saved runs show the artifact name and quantization rather than their routing alias" do
     id = "identity-display-test"
 

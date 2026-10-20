@@ -1,0 +1,228 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 02efc1b46..68f432e91 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,8 @@
+ 
+   - Introduce global process lock for Loader Workers, preventing multiple workers from
+     attempting to compile the same module simultaneously
++  - Page Warming - Beacon will now eagerly load a small number of pages (default 10) at boot time for SEO 
++  - `Beacon.Config` option `:page_warming` can change the number of pages to warm, specify which pages, or disable warming per site
+ 
+ ## 0.2.2 (2024-11-17)
+ 
+diff --git a/lib/beacon/boot.ex b/lib/beacon/boot.ex
+index 4a8083853..15973cb81 100644
+--- a/lib/beacon/boot.ex
++++ b/lib/beacon/boot.ex
+@@ -20,7 +20,7 @@ defmodule Beacon.Boot do
+     :ignore
+   end
+ 
+-  def init(%{site: site, mode: :live}) when is_atom(site) do
++  def init(%{site: site, mode: :live} = config) when is_atom(site) do
+     Logger.info("Beacon.Boot booting site #{site}")
+     task_supervisor = Beacon.Registry.via({site, TaskSupervisor})
+ 
+@@ -34,17 +34,40 @@ defmodule Beacon.Boot do
+ 
+     %{mode: :live} = Beacon.Config.update_value(site, :mode, :live)
+ 
+-    assets = [
++    tasks = [
+       Task.Supervisor.async(task_supervisor, fn -> Beacon.Loader.load_runtime_js(site) end),
+       Task.Supervisor.async(task_supervisor, fn -> Beacon.Loader.load_runtime_css(site) end)
++      | warm_pages_async(task_supervisor, config)
+     ]
+ 
+     # TODO: revisit this timeout after we upgrade to Tailwind v4
+-    Task.await_many(assets, :timer.minutes(5))
++    Task.await_many(tasks, :timer.minutes(5))
+ 
+     # TODO: add telemetry to measure booting time
+     Logger.info("Beacon.Boot finished booting site #{site}")
+ 
+     :ignore
+   end
++
++  defp warm_pages_async(task_supervisor, config) do
++    pages =
++      case config.page_warming do
++        {:shortest_paths, count} ->
++          Logger.info("Beacon.Boot warming pages - #{count} shortest paths")
++          Beacon.Content.list_published_pages(config.site, sort: {:length, :path}, limit: count)
++
++        {:specify_paths, paths} ->
++          Logger.info("Beacon.Boot warming pages - specified paths")
++          Beacon.Content.list_published_pages_for_paths(config.site, paths)
++
++        :none ->
++          Logger.info("Beacon.Boot page warming disabled")
++          []
++      end
++
++    Enum.map(pages, fn page ->
++      Logger.info("Beacon.Boot warming page #{page.id} #{page.path}")
++      Task.Supervisor.async(task_supervisor, fn -> Beacon.Loader.load_page_module(config.site, page.id) end)
++    end)
++  end
+ end
+diff --git a/lib/beacon/config.ex b/lib/beacon/config.ex
+index 8ffd8454f..58c43d04b 100644
+--- a/lib/beacon/config.ex
++++ b/lib/beacon/config.ex
+@@ -194,6 +194,11 @@ defmodule Beacon.Config do
+   """
+   @type default_meta_tags :: [%{binary() => binary()}]
+ 
++  @typedoc """
++  The strategy for pre-loading page modules at boot time.
++  """
++  @type page_warming :: {:shortest_paths, integer()} | {:specify_paths, [String.t()]} | :none
++
+   @type t :: %__MODULE__{
+           site: Beacon.Types.Site.t(),
+           endpoint: endpoint(),
+@@ -211,7 +216,8 @@ defmodule Beacon.Config do
+           lifecycle: lifecycle(),
+           extra_page_fields: extra_page_fields(),
+           extra_asset_fields: extra_asset_fields(),
+-          default_meta_tags: default_meta_tags()
++          default_meta_tags: default_meta_tags(),
++          page_warming: page_warming()
+         }
+ 
+   @default_load_template [
+@@ -257,7 +263,8 @@ defmodule Beacon.Config do
+             ],
+             extra_page_fields: [],
+             extra_asset_fields: [],
+-            default_meta_tags: []
++            default_meta_tags: [],
++            page_warming: {:shortest_paths, 10}
+ 
+   @type option ::
+           {:site, Beacon.Types.Site.t()}
+@@ -277,6 +284,7 @@ defmodule Beacon.Config do
+           | {:extra_page_fields, extra_page_fields()}
+           | {:extra_asset_fields, extra_asset_fields()}
+           | {:default_meta_tags, default_meta_tags()}
++          | {:page_warming, page_warming()}
+ 
+   @doc """
+   Build a new `%Beacon.Config{}` instance to hold the entire configuration for each site.
+@@ -324,6 +332,8 @@ defmodule Beacon.Config do
+ 
+     * `:default_meta_tags` - `t:default_meta_tags/0` (optional). Defaults to `%{}`.
+ 
++    * `:page_warming` - `t:page_warming/0` (optional). Defaults to `{:shortest_paths, 10}`.
++
+   ## Example
+ 
+       iex> Beacon.Config.new(
+@@ -352,7 +362,8 @@ defmodule Beacon.Config do
+           after_publish_page: [
+             notify_admin: fn page -> {:cont, MyApp.Admin.send_email(page)} end
+           ]
+-        ]
++        ],
++        page_warming: {:specify_paths, ["/", "/home", "/blog"]}
+       )
+       %Beacon.Config{
+         site: :my_site,
+@@ -400,7 +411,8 @@ defmodule Beacon.Config do
+         ],
+         extra_page_fields: [],
+         extra_asset_fields: [],
+-        default_meta_tags: []
++        default_meta_tags: [],
++        page_warming: {:specify_paths, ["/", "/home", "/blog"]}
+       }
+ 
+   """
+@@ -442,6 +454,8 @@ defmodule Beacon.Config do
+     default_meta_tags = Keyword.get(opts, :default_meta_tags, [])
+     extra_asset_fields = Keyword.get(opts, :extra_asset_fields, [{"image/*", [Beacon.MediaLibrary.AssetFields.AltText]}])
+ 
++    page_warming = Keyword.get(opts, :page_warming, {:shortest_paths, 10})
++
+     opts =
+       opts
+       |> Keyword.put(:tailwind_config, ensure_tailwind_config(opts[:tailwind_config]))
+@@ -452,6 +466,7 @@ defmodule Beacon.Config do
+       |> Keyword.put(:assets, assets)
+       |> Keyword.put(:default_meta_tags, default_meta_tags)
+       |> Keyword.put(:extra_asset_fields, extra_asset_fields)
++      |> Keyword.put(:page_warming, page_warming)
+ 
+     struct!(__MODULE__, opts)
+   end
+diff --git a/lib/beacon/content.ex b/lib/beacon/content.ex
+index 475f17604..6d1f2035e 100644
+--- a/lib/beacon/content.ex
++++ b/lib/beacon/content.ex
+@@ -980,6 +980,20 @@ defmodule Beacon.Content do
+     |> Enum.map(&extract_page_snapshot/1)
+   end
+ 
++  @doc """
++  Similar to `list_published_pages/2`, but does not accept any options.  Instead, provide a list
++  of paths, and this function will return any published pages which match one of those paths.
++  """
++  @doc type: :pages
++  @spec list_published_pages_for_paths(Site.t(), [String.t()]) :: [Page.t()]
++  def list_published_pages_for_paths(site, paths) do
++    site
++    |> query_list_published_pages_base()
++    |> then(fn query -> from(q in query, where: q.path in ^paths) end)
++    |> repo(site).all()
++    |> Enum.map(&extract_page_snapshot/1)
++  end
++
+   defp query_list_published_pages_base(site) do
+     events =
+       from event in PageEvent,
+@@ -1026,6 +1040,7 @@ defmodule Beacon.Content do
+ 
+   defp query_list_published_pages_search(query, _search), do: query
+ 
++  defp query_list_published_pages_sort(query, {:length, key}), do: from(q in query, order_by: [{:asc, fragment("length(?)", field(q, ^key))}])
+   defp query_list_published_pages_sort(query, sort), do: from(q in query, order_by: [asc: ^sort])
+ 
+   @doc """
+diff --git a/test/beacon/content_test.exs b/test/beacon/content_test.exs
+index 390ee12c0..6be403d9a 100644
+--- a/test/beacon/content_test.exs
++++ b/test/beacon/content_test.exs
+@@ -291,6 +291,31 @@ defmodule Beacon.ContentTest do
+       assert [%Page{path: "/with-tags"}] = Content.list_published_pages(:my_site, search: %{extra: %{"tags" => "tag1"}})
+     end
+ 
++    test "list_published_pages sort by path length" do
++      beacon_published_page_fixture(path: "/")
++      beacon_published_page_fixture(path: "/foo")
++      beacon_published_page_fixture(path: "/a")
++
++      assert [
++               %Page{path: "/"},
++               %Page{path: "/a"},
++               %Page{path: "/foo"}
++             ] = Content.list_published_pages(:my_site, sort: {:length, :path})
++    end
++
++    test "list_published_pages_for_paths/2" do
++      beacon_published_page_fixture(path: "/foo")
++      beacon_published_page_fixture(path: "/bar")
++      beacon_published_page_fixture(path: "/baz")
++      beacon_published_page_fixture(path: "/bong")
++      beacon_page_fixture(path: "/unpublished")
++
++      assert [
++               %Page{path: "/bar"},
++               %Page{path: "/baz"}
++             ] = Content.list_published_pages_for_paths(:my_site, ["/bar", "/baz", "/unpublished"])
++    end
++
+     test "list_page_events" do
+       page = beacon_page_fixture()
+       Content.publish_page(page)

@@ -47,7 +47,7 @@ defmodule Eab.ResultsTest do
   end
 
   defp current do
-    inventory = Results.read!("config/benchmark.json")
+    inventory = Eab.Inventory.definition()
 
     Map.merge(run(), %{
       "cases" => inventory["cases"],
@@ -186,6 +186,29 @@ defmodule Eab.ResultsTest do
     assert_raise ArgumentError, ~r/physical GPUs/, fn ->
       Results.export!(put_in(source, ["memory", "sessions"], [session, other]))
     end
+
+    # Servers may omit weight size even though the collector can stat the model files.
+    source = put_in(source, ["model", "metadata"], %{})
+    assert Results.export!(source)["model"]["size_bytes"] == nil
+
+    weights = %{
+      "size_bytes" => 1234,
+      "files" => [%{"name" => identity["model_artifact"], "size_bytes" => 1234}]
+    }
+
+    source =
+      put_in(source, ["memory", "sessions", Access.at(0), "identity", "weight_files"], weights)
+
+    result = Results.export!(source)
+    assert result["model"]["size_bytes"] == 1234
+    assert result["model"]["size_source"] == "artifact_files"
+    refute Map.has_key?(result["resources"], "weight_files")
+    assert Results.export!(source, size_bytes: 5678)["model"]["size_bytes"] == 5678
+    assert Results.export!(source, size_bytes: 5678)["model"]["size_source"] == "owner_supplied"
+
+    reported = put_in(source, ["model", "metadata"], %{"model" => %{"size" => 9876}})
+    assert Results.export!(reported)["model"]["size_bytes"] == 9876
+    assert Results.export!(reported)["model"]["size_source"] == "reported"
   end
 
   test "incomplete, partial, mismatched and duplicated runs cannot be published" do
@@ -255,9 +278,10 @@ defmodule Eab.ResultsTest do
       end)
 
     result = Results.export!(source, inventory: inventory)
-    assert length(result["cases"]) == 9 and Enum.all?(result["cases"], & &1["passed"])
+    assert Enum.map(result["cases"], & &1["id"]) == inventory["cases"]
+    assert Enum.all?(result["cases"], & &1["passed"])
     refute Jason.encode!(result) =~ "retired-"
-    assert length(source["cases"]) == 11
+    assert source["cases"] == inventory["cases"] ++ ~w(retired-a retired-b)
 
     bad =
       put_in(
@@ -300,7 +324,8 @@ defmodule Eab.ResultsTest do
 
   test "build validates duplicates and fixtures, escapes script data, and supports an empty page",
        %{dir: dir} do
-    record = Results.export!(current(), model_label: "<img src=x onerror=alert(1)>")
+    source = current()
+    record = Results.export!(source, model_label: "<img src=x onerror=alert(1)>")
     Results.write!(Path.join(dir, "first.json"), record)
     Results.write!(Path.join(dir, "second.json"), record)
     assert_raise ArgumentError, ~r/Duplicate/, fn -> Results.load!(dir) end
@@ -308,7 +333,9 @@ defmodule Eab.ResultsTest do
     output = Path.join(dir, "dist")
     Results.build!(Results.load!(dir), output)
     [built] = Results.read!(Path.join(output, "results.json"))["results"]
-    assert built["passed"] == 9 and built["total"] == 9
+    assert built["passed"] == length(source["cases"])
+    assert built["total"] == length(source["cases"])
+    assert Enum.map(built["cases"], & &1["id"]) == source["cases"]
     refute File.read!(Path.join(output, "results.js")) =~ "<img"
 
     assert Enum.sort(File.ls!(output)) ==
@@ -341,7 +368,9 @@ defmodule Eab.ResultsTest do
     assert Results.publish!(source, opts) == :already_added
     [built] = Results.read!(Path.join(page, "dist/results.json"))["results"]
     assert built["note"] == "Reviewed note"
-    assert built["passed"] == 9 and built["total"] == 9
+    assert built["passed"] == length(source["cases"])
+    assert built["total"] == length(source["cases"])
+    assert Enum.map(built["cases"], & &1["id"]) == source["cases"]
     refute Jason.encode!(built) =~ "private-host"
     refute Jason.encode!(built) =~ "private-account"
     refute Jason.encode!(built) =~ "private-trace"

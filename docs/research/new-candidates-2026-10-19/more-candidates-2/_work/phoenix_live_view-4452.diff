@@ -1,0 +1,65 @@
+diff --git a/assets/js/phoenix_live_view/entry_uploader.js b/assets/js/phoenix_live_view/entry_uploader.js
+index aeb04edd71..4693691f7b 100644
+--- a/assets/js/phoenix_live_view/entry_uploader.js
++++ b/assets/js/phoenix_live_view/entry_uploader.js
+@@ -83,6 +83,7 @@ export default class EntryUploader {
+           );
+         }
+       })
+-      .receive("error", ({ reason }) => this.error(reason));
++      .receive("error", ({ reason }) => this.error(reason))
++      .receive("timeout", () => this.error("timeout"));
+   }
+ }
+diff --git a/assets/test/entry_uploader_test.ts b/assets/test/entry_uploader_test.ts
+index 406e293d39..8e655d9c7c 100644
+--- a/assets/test/entry_uploader_test.ts
++++ b/assets/test/entry_uploader_test.ts
+@@ -74,6 +74,47 @@ describe("EntryUploader", () => {
+     expect(entry.error).not.toHaveBeenCalled();
+   });
+ 
++  test("fails an upload when a chunk push times out", () => {
++    let receives = new Map<string, () => void>();
++    let push = {
++      receive(kind, cb) {
++        receives.set(kind, cb);
++        return this;
++      },
++    };
++    let form = {};
++    let fakeChannel = {
++      isJoined: () => true,
++      push: jest.fn(() => push),
++      leave: jest.fn(),
++    };
++    let entry = {
++      ref: "0",
++      fileEl: { form },
++      view: { cancelSubmit: jest.fn() },
++      metadata: () => ({}),
++      error: jest.fn(),
++      progress: jest.fn(),
++    };
++    let config = { chunk_size: 1024, chunk_timeout: 5000 };
++    let uploader = new EntryUploader(entry, config, {
++      channel: () => fakeChannel,
++    });
++
++    uploader.pushChunk(new ArrayBuffer(1));
++    expect(fakeChannel.push).toHaveBeenCalledWith(
++      "chunk",
++      expect.any(ArrayBuffer),
++      config.chunk_timeout,
++    );
++    receives.get("timeout")!();
++
++    expect(entry.view.cancelSubmit).toHaveBeenCalledWith(form);
++    expect(fakeChannel.leave).toHaveBeenCalledTimes(1);
++    expect(entry.error).toHaveBeenCalledWith("timeout");
++    expect(entry.progress).not.toHaveBeenCalled();
++  });
++
+   test.each([
+     ["error", "NotReadableError"],
+     ["abort", "aborted"],

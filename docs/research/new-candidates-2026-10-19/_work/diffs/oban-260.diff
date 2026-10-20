@@ -1,0 +1,73 @@
+diff --git a/lib/oban.ex b/lib/oban.ex
+index 24998b9c..e8e05476 100644
+--- a/lib/oban.ex
++++ b/lib/oban.ex
+@@ -203,7 +203,7 @@ defmodule Oban do
+ 
+       Ecto.Multi.new()
+       |> Oban.insert("job-1", MyApp.Worker.new(%{id: 1}))
+-      |> Oban.insert("job-2", MyApp.Worker.new(%{id: 2}))
++      |> Oban.insert("job-2", fn _ -> MyApp.Worker.new(%{id: 2}) end)
+       |> MyApp.Repo.transaction()
+   """
+   @doc since: "0.7.0"
+@@ -211,15 +211,24 @@ defmodule Oban do
+           name :: atom(),
+           multi :: Multi.t(),
+           multi_name :: Multi.name(),
+-          changeset :: Changeset.t(Job.t())
++          changeset_or_fun :: Changeset.t(Job.t()) | fun()
+         ) :: Multi.t()
+-  def insert(name \\ __MODULE__, %Multi{} = multi, multi_name, %Changeset{} = changeset)
++  def insert(name \\ __MODULE__, multi, multi_name, changeset_or_fun)
++
++  def insert(name, %Multi{} = multi, multi_name, %Changeset{} = changeset)
+       when is_atom(name) do
+     name
+     |> config()
+     |> Query.fetch_or_insert_job(multi, multi_name, changeset)
+   end
+ 
++  def insert(name, %Multi{} = multi, multi_name, fun)
++      when is_atom(name) and is_function(fun, 1) do
++    name
++    |> config()
++    |> Query.fetch_or_insert_job(multi, multi_name, fun)
++  end
++
+   @doc """
+   Similar to `insert/2`, but raises an `Ecto.InvalidChangesetError` if the job can't be inserted.
+ 
+diff --git a/lib/oban/query.ex b/lib/oban/query.ex
+index 7c637cac..8e78a34a 100644
+--- a/lib/oban/query.ex
++++ b/lib/oban/query.ex
+@@ -47,7 +47,14 @@ defmodule Oban.Query do
+     with {:ok, result} <- repo.transaction(fun, log: log), do: result
+   end
+ 
+-  @spec fetch_or_insert_job(Config.t(), Multi.t(), Multi.name(), Changeset.t()) :: Multi.t()
++  @spec fetch_or_insert_job(Config.t(), Multi.t(), Multi.name(), fun() | Changeset.t()) ::
++          Multi.t()
++  def fetch_or_insert_job(config, multi, name, fun) when is_function(fun, 1) do
++    Multi.run(multi, name, fn repo, changes ->
++      insert_unique(%{config | repo: repo}, fun.(changes))
++    end)
++  end
++
+   def fetch_or_insert_job(config, multi, name, changeset) do
+     Multi.run(multi, name, fn repo, _changes ->
+       insert_unique(%{config | repo: repo}, changeset)
+diff --git a/test/integration/inserting_test.exs b/test/integration/inserting_test.exs
+index b836fb8c..2d8f481a 100644
+--- a/test/integration/inserting_test.exs
++++ b/test/integration/inserting_test.exs
+@@ -9,7 +9,7 @@ defmodule Oban.Integration.InsertingTest do
+     assert {:ok, results} =
+              Multi.new()
+              |> Oban.insert(:job_1, Worker.new(%{ref: 1}))
+-             |> Oban.insert("job-2", Worker.new(%{ref: 2}))
++             |> Oban.insert("job-2", fn _ -> Worker.new(%{ref: 2}) end)
+              |> Oban.insert({:job, 3}, Worker.new(%{ref: 3}))
+              |> Repo.transaction()
+ 

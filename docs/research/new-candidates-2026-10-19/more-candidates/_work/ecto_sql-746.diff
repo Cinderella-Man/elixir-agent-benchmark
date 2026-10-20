@@ -1,0 +1,170 @@
+diff --git a/lib/mix/tasks/ecto.query.ex b/lib/mix/tasks/ecto.query.ex
+index b294997b..1e5983b4 100644
+--- a/lib/mix/tasks/ecto.query.ex
++++ b/lib/mix/tasks/ecto.query.ex
+@@ -6,9 +6,10 @@ defmodule Mix.Tasks.Ecto.Query do
+   @shortdoc "Runs a query against the repository"
+ 
+   @switches [
++    explain: :boolean,
+     limit: :integer,
+     repo: [:string, :keep],
+-    sql: :boolean,
++    to_sql: :boolean,
+     no_compile: :boolean,
+     no_deps_check: :boolean
+   ]
+@@ -24,19 +25,21 @@ defmodule Mix.Tasks.Ecto.Query do
+   If a local `.iex.exs` file exists, only aliases from the file are made
+   available to the query.
+ 
+-  The query runs inside a read-only transaction.
++  Unless `--to-sql` or `--explain` is given, the query runs inside a read-only transaction.
+ 
+   ## Examples
+ 
+       $ mix ecto.query "from p in Post, where: p.published"
+       $ mix ecto.query -r Custom.Repo "from p in Post, limit: 10"
+-      $ mix ecto.query --sql "from p in Post, where: p.published"
++      $ mix ecto.query --to-sql "from p in Post, where: p.published"
++      $ mix ecto.query --explain "from p in Post, where: p.published"
+ 
+   ## Command line options
+ 
+     * `-r`, `--repo` - the repo to query
+     * `--limit` - limits the number of printed entries. Defaults to 100.
+-    * `--sql` - prints the generated SQL and parameters instead of running the query
++    * `--to-sql` - prints the generated SQL and parameters instead of running the query
++    * `--explain` - prints the query plan instead of running the query
+ 
+   """
+ 
+@@ -67,26 +70,37 @@ defmodule Mix.Tasks.Ecto.Query do
+       end
+ 
+     limit = Keyword.get(opts, :limit, @default_limit)
++    explain? = Keyword.get(opts, :explain, false)
++    to_sql? = Keyword.get(opts, :to_sql, false)
+ 
+     if limit < 0 do
+       Mix.raise("ecto.query expects --limit to be greater than or equal to zero")
+     end
+ 
++    if explain? and to_sql? do
++      Mix.raise("ecto.query expects only one of --explain or --to-sql to be given")
++    end
++
+     Mix.Task.run("app.start", args)
+     ensure_repo(repo, args)
+ 
+     query = eval_query(query)
+ 
+     result =
+-      if opts[:sql] do
+-        {:ok, format_sql(repo, query)}
+-      else
+-        read_only_transaction(repo, fn ->
+-          query
+-          |> repo.all()
+-          |> Enum.take(limit)
+-          |> inspect_entries()
+-        end)
++      cond do
++        explain? ->
++          {:ok, repo.explain(:all, query)}
++
++        to_sql? ->
++          {:ok, format_sql(repo, query)}
++
++        true ->
++          read_only_transaction(repo, fn ->
++            query
++            |> repo.all()
++            |> Enum.take(limit)
++            |> inspect_entries()
++          end)
+       end
+ 
+     result
+diff --git a/test/mix/tasks/ecto.query_test.exs b/test/mix/tasks/ecto.query_test.exs
+index 7ca1e671..66266e3e 100644
+--- a/test/mix/tasks/ecto.query_test.exs
++++ b/test/mix/tasks/ecto.query_test.exs
+@@ -176,7 +176,7 @@ defmodule Mix.Tasks.Ecto.QueryTest do
+     assert Inspect.Opts.default_inspect_fun() == previous_fun
+   end
+ 
+-  test "prints SQL and params with --sql" do
++  test "prints SQL and params with --to-sql" do
+     Process.put(
+       :test_repo_to_sql,
+       {"SELECT p0.\"id\" FROM \"posts\" AS p0 WHERE (p0.\"id\" = $1)", [1]}
+@@ -188,7 +188,7 @@ defmodule Mix.Tasks.Ecto.QueryTest do
+       run([
+         "-r",
+         to_string(__MODULE__.PostgresRepo),
+-        "--sql",
++        "--to-sql",
+         "from(p in Post, where: p.id == ^1)"
+       ])
+ 
+@@ -202,6 +202,17 @@ defmodule Mix.Tasks.Ecto.QueryTest do
+     end)
+   end
+ 
++  test "prints explain plan with --explain" do
++    Process.put(:test_repo_explain, "Seq Scan on posts p0")
++
++    run(["-r", to_string(__MODULE__.PostgresRepo), "--explain", inspect(Post)])
++
++    assert_received {:explain, :all, %Ecto.Query{}, []}
++    refute_received {:all, _query}
++    refute_received {:read_only_transaction, __MODULE__.PostgresRepo, _fun, _opts}
++    assert_received {:mix_shell, :info, ["Seq Scan on posts p0"]}
++  end
++
+   test "runs MySQL queries in a read-only transaction" do
+     Process.put(:test_repo_all_results, [[1, "first", "hunter2"]])
+ 
+@@ -216,7 +227,7 @@ defmodule Mix.Tasks.Ecto.QueryTest do
+   test "prints MySQL SQL without starting a transaction" do
+     Process.put(:test_repo_to_sql, {"SELECT p0.`id` FROM `posts` AS p0", []})
+ 
+-    run(["-r", to_string(__MODULE__.MyXQLRepo), "--sql", inspect(Post)])
++    run(["-r", to_string(__MODULE__.MyXQLRepo), "--to-sql", inspect(Post)])
+ 
+     refute_received {:myxql_read_only_transaction, __MODULE__.MyXQLRepo, _fun, _opts}
+     assert_received {:myxql_to_sql, :all, %Ecto.Query{}, []}
+@@ -269,6 +280,20 @@ defmodule Mix.Tasks.Ecto.QueryTest do
+                  end
+   end
+ 
++  test "raises when explain and to_sql are given together" do
++    assert_raise Mix.Error,
++                 "ecto.query expects only one of --explain or --to-sql to be given",
++                 fn ->
++                   run([
++                     "-r",
++                     to_string(__MODULE__.PostgresRepo),
++                     "--explain",
++                     "--to-sql",
++                     inspect(Post)
++                   ])
++                 end
++  end
++
+   test "raises when the adapter does not support read-only transactions" do
+     assert_raise ArgumentError, ~r/read-only transactions are not supported/, fn ->
+       run(["-r", to_string(__MODULE__.NoReadOnlyRepo), inspect(Post)])
+@@ -323,6 +348,11 @@ defmodule Mix.Tasks.Ecto.QueryTest do
+       send(self(), {:to_sql, operation, queryable, opts})
+       Process.get(:test_repo_to_sql, {"SELECT s0.\"id\" FROM \"posts\" AS s0", []})
+     end
++
++    def explain(operation, queryable, opts \\ []) do
++      send(self(), {:explain, operation, queryable, opts})
++      Process.get(:test_repo_explain, "Seq Scan on posts p0")
++    end
+   end
+ 
+   defmodule PostgresAdapter do

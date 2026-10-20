@@ -1,0 +1,549 @@
+diff --git a/assets/js/phoenix_live_view/entry_uploader.js b/assets/js/phoenix_live_view/entry_uploader.js
+index 4693691f7b..6cc82f9411 100644
+--- a/assets/js/phoenix_live_view/entry_uploader.js
++++ b/assets/js/phoenix_live_view/entry_uploader.js
+@@ -25,9 +25,9 @@ export default class EntryUploader {
+     this.chunkTimer != null && clearTimeout(this.chunkTimer);
+     if (reason === "writer_error") {
+       // The server already recorded the exact writer failure and retained the
+-      // entry. Keep the uploader pending until the failed entry is cancelled
+-      // and removed from the DOM, without sending a second, generic client
+-      // error progress event.
++      // entry. Complete the failed entry to release the form, without sending
++      // a second, generic client error progress event.
++      this.entry.fail(reason, false);
+       return;
+     }
+     this.entry.error(reason);
+diff --git a/assets/js/phoenix_live_view/upload_entry.js b/assets/js/phoenix_live_view/upload_entry.js
+index f6c537315d..10a5c5b78d 100644
+--- a/assets/js/phoenix_live_view/upload_entry.js
++++ b/assets/js/phoenix_live_view/upload_entry.js
+@@ -42,6 +42,7 @@ export default class UploadEntry {
+     this.meta = null;
+     this._isCancelled = false;
+     this._isDone = false;
++    this._isErrored = false;
+     this._progress = 0;
+     this._lastProgressSent = -1;
+     this._onCancel = function () {};
+@@ -93,11 +94,11 @@ export default class UploadEntry {
+   }
+ 
+   error(reason = "failed") {
+-    this.fileEl.removeEventListener(PHX_LIVE_FILE_UPDATED, this._onElUpdated);
+-    this.view.pushFileProgress(this.fileEl, this.ref, { error: reason });
+-    if (!this.isAutoUpload()) {
+-      LiveUploader.clearFiles(this.fileEl);
+-    }
++    this.fail(reason, true);
++  }
++
++  isErrored() {
++    return this._isErrored;
+   }
+ 
+   isAutoUpload() {
+@@ -114,8 +115,31 @@ export default class UploadEntry {
+ 
+   //private
+ 
++  // notifyServer is false when the server already recorded the failure,
++  // for example for upload writer errors
++  fail(reason, notifyServer) {
++    if (this._isErrored) {
++      return;
++    }
++    this._isErrored = true;
++    this._isDone = true;
++    this.fileEl.removeEventListener(PHX_LIVE_FILE_UPDATED, this._onElUpdated);
++    try {
++      if (notifyServer) {
++        this.view.pushFileProgress(this.fileEl, this.ref, { error: reason });
++      }
++      if (!this.isAutoUpload()) {
++        LiveUploader.clearFiles(this.fileEl);
++      }
++    } finally {
++      this._onDone();
++    }
++  }
++
+   onDone(callback) {
+     this._onDone = () => {
++      // A late progress reply or cancellation must not complete an entry twice.
++      this._onDone = function () {};
+       this.fileEl.removeEventListener(PHX_LIVE_FILE_UPDATED, this._onElUpdated);
+       callback();
+     };
+diff --git a/assets/js/phoenix_live_view/view.ts b/assets/js/phoenix_live_view/view.ts
+index 330aa18bad..0cf03b2c07 100644
+--- a/assets/js/phoenix_live_view/view.ts
++++ b/assets/js/phoenix_live_view/view.ts
+@@ -2345,14 +2345,21 @@ export default class View {
+     const joinCountAtUpload = this.joinCount;
+     const inputEls = LiveUploader.activeFileInputs(formEl);
+     let numFileInputsInProgress = inputEls.length;
++    let uploadFailed = false;
+ 
+     // get each file input
+     inputEls.forEach((inputEl) => {
+       const uploader = new LiveUploader(inputEl, this, () => {
+         this.activeUploaders.delete(uploader);
++        uploadFailed ||= uploader.entries().some((entry) => entry.isErrored());
+         numFileInputsInProgress--;
+         if (numFileInputsInProgress === 0) {
+-          onComplete();
++          if (uploadFailed) {
++            this.cancelSubmit(formEl, phxEvent);
++            this.undoRefs(ref, phxEvent);
++          } else {
++            onComplete();
++          }
+         }
+       });
+       this.activeUploaders.add(uploader);
+diff --git a/assets/test/entry_uploader_test.ts b/assets/test/entry_uploader_test.ts
+index 8e655d9c7c..9f600d71c4 100644
+--- a/assets/test/entry_uploader_test.ts
++++ b/assets/test/entry_uploader_test.ts
+@@ -36,7 +36,7 @@ describe("EntryUploader", () => {
+     expect(entry.error).toHaveBeenCalledWith("join crashed");
+   });
+ 
+-  test("writer errors remain pending without sending a generic entry error", () => {
++  test("writer errors fail the entry without sending a generic entry error", () => {
+     let errorCb;
+     let channelErrorCb;
+     let form = {};
+@@ -59,6 +59,7 @@ describe("EntryUploader", () => {
+       metadata: () => ({}),
+       cancel: jest.fn(),
+       error: jest.fn(),
++      fail: jest.fn(),
+     };
+     let config = { chunk_size: 1024, chunk_timeout: 5000 };
+ 
+@@ -72,6 +73,8 @@ describe("EntryUploader", () => {
+     expect(fakeChannel.leave).toHaveBeenCalledTimes(1);
+     expect(entry.cancel).not.toHaveBeenCalled();
+     expect(entry.error).not.toHaveBeenCalled();
++    expect(entry.fail).toHaveBeenCalledTimes(1);
++    expect(entry.fail).toHaveBeenCalledWith("writer_error", false);
+   });
+ 
+   test("fails an upload when a chunk push times out", () => {
+diff --git a/assets/test/upload_entry_test.ts b/assets/test/upload_entry_test.ts
+new file mode 100644
+index 0000000000..59166b14ed
+--- /dev/null
++++ b/assets/test/upload_entry_test.ts
+@@ -0,0 +1,57 @@
++import UploadEntry from "phoenix_live_view/upload_entry";
++import LiveUploader from "phoenix_live_view/live_uploader";
++import { PHX_LIVE_FILE_UPDATED } from "phoenix_live_view/constants";
++
++describe("UploadEntry", () => {
++  test.each([false, true])(
++    "an error completes once without waiting for progress (auto upload: %s)",
++    (autoUpload) => {
++      const input = document.createElement("input");
++      input.type = "file";
++      const file = new File(["contents"], "file.txt");
++      LiveUploader.trackFiles(input, [file]);
++      const replies: (() => void)[] = [];
++      const view = {
++        pushFileProgress: jest.fn((_input, _ref, _progress, onReply) => {
++          if (onReply) replies.push(onReply);
++        }),
++      };
++      const entry = new UploadEntry(input, file, view, autoUpload);
++      const onDone = jest.fn();
++      entry.onDone(onDone);
++      entry.progress(100);
++      entry.error("failed");
++      entry.error("failed again");
++      entry.cancel();
++      replies[0]();
++      input.dispatchEvent(new CustomEvent(PHX_LIVE_FILE_UPDATED));
++
++      expect(entry.isDone()).toBe(true);
++      expect(entry.isErrored()).toBe(true);
++      expect(onDone).toHaveBeenCalledTimes(1);
++      expect(view.pushFileProgress).toHaveBeenCalledTimes(2);
++      expect(view.pushFileProgress).toHaveBeenLastCalledWith(input, entry.ref, {
++        error: "failed",
++      });
++    },
++  );
++
++  test("a failure already known to the server completes without pushing progress", () => {
++    const input = document.createElement("input");
++    input.type = "file";
++    const file = new File(["contents"], "file.txt");
++    LiveUploader.trackFiles(input, [file]);
++    const view = { pushFileProgress: jest.fn() };
++    const entry = new UploadEntry(input, file, view, false);
++    const onDone = jest.fn();
++    entry.onDone(onDone);
++    entry.fail("writer_error", false);
++    entry.error("failed");
++
++    expect(entry.isDone()).toBe(true);
++    expect(entry.isErrored()).toBe(true);
++    expect(onDone).toHaveBeenCalledTimes(1);
++    expect(view.pushFileProgress).not.toHaveBeenCalled();
++    expect(LiveUploader.activeFiles(input)).toEqual([]);
++  });
++});
+diff --git a/assets/test/view_test.ts b/assets/test/view_test.ts
+index a97227764c..04dd9988d4 100644
+--- a/assets/test/view_test.ts
++++ b/assets/test/view_test.ts
+@@ -2,6 +2,8 @@ import { Socket } from "phoenix";
+ import { createHook } from "phoenix_live_view/index";
+ import LiveSocket from "phoenix_live_view/live_socket";
+ import DOM from "phoenix_live_view/dom";
++import LiveUploader from "phoenix_live_view/live_uploader";
++import UploadEntry from "phoenix_live_view/upload_entry";
+ import View from "phoenix_live_view/view";
+ import ViewHook, { HooksOptions } from "phoenix_live_view/view_hook";
+ 
+@@ -1982,6 +1984,87 @@ describe("View Hooks", function () {
+     ]);
+   });
+ 
++  test.each([
++    [false, 1],
++    [true, 1],
++    [false, 2],
++    [true, 2],
++  ])(
++    "upload errors release form refs without submitting (auto upload: %s, inputs: %s)",
++    async (autoUpload, numInputs) => {
++      const entries: UploadEntry[] = [];
++      liveSocket = new LiveSocket("/live", Socket, {
++        uploaders: { Test: (uploads) => entries.push(...uploads) },
++      });
++      const el = liveViewDOM(`
++        <form id="upload-form" phx-submit="save">
++          ${Array.from(
++            { length: Number(numInputs) },
++            (_, i) => `
++            <input id="upload-${i}" type="file" name="files-${i}" multiple
++              data-phx-upload-ref="upload-ref-${i}" data-phx-active-refs=""
++              data-phx-preflighted-refs="" data-phx-done-refs=""
++              ${autoUpload ? 'data-phx-auto-upload=""' : ""}>
++          `,
++          ).join("")}
++          <button id="submit" type="submit">Save</button>
++        </form>
++      `);
++      const view = simulateJoinedView(el, liveSocket);
++      const form = view.el.querySelector("form")!;
++      const button = form.querySelector("button")!;
++      const files = [
++        new File(["first"], "first.txt"),
++        new File(["second"], "second.txt"),
++      ];
++      form.querySelectorAll("input").forEach((input, i) => {
++        LiveUploader.trackFiles(input, numInputs === 1 ? files : [files[i]]);
++        input.setAttribute(
++          "data-phx-active-refs",
++          LiveUploader.activeFiles(input)
++            .map((file) => LiveUploader.genFileRef(file))
++            .join(","),
++        );
++      });
++      const push = jest
++        .spyOn(view, "pushWithReply")
++        .mockImplementation((_ref, event, payload) => {
++          expect(event).toBe("allow_upload");
++          return Promise.resolve({
++            type: "ok",
++            resp: {
++              entries: Object.fromEntries(
++                payload.entries.map((entry) => [
++                  entry.ref,
++                  { uploader: "Test" },
++                ]),
++              ),
++            },
++          } as any);
++        });
++      // No server progress reply is needed to release a failed upload.
++      jest.spyOn(view, "pushFileProgress").mockImplementation(() => {});
++      const onReply = jest.fn();
++      view.pushFormSubmit(form, form, "save", button, {}, onReply);
++      await Promise.resolve();
++      expect(form.classList.contains("phx-submit-loading")).toBe(true);
++      expect(button.disabled).toBe(true);
++      expect(entries).toHaveLength(2);
++
++      entries[0].error("timeout");
++      entries[0].error("closed");
++      entries[0].cancel();
++      expect(view["activeUploaders"].size).toBe(1);
++      entries[1].cancel();
++
++      expect(view["activeUploaders"].size).toBe(0);
++      expect(form.classList.contains("phx-submit-loading")).toBe(false);
++      expect(button.disabled).toBe(false);
++      expect(push).toHaveBeenCalledTimes(Number(numInputs));
++      expect(onReply).not.toHaveBeenCalled();
++    },
++  );
++
+   test("dispatches uploads", async () => {
+     const hooks = { Recorder: {} };
+     const liveSocket = new LiveSocket("/live", Socket, { hooks });
+diff --git a/test/e2e/support/issues/issue_4465.ex b/test/e2e/support/issues/issue_4465.ex
+new file mode 100644
+index 0000000000..7ff68f7829
+--- /dev/null
++++ b/test/e2e/support/issues/issue_4465.ex
+@@ -0,0 +1,112 @@
++defmodule Phoenix.LiveViewTest.E2E.Issue4465Live do
++  use Phoenix.LiveView
++
++  # https://github.com/phoenixframework/phoenix_live_view/pull/4465
++  #
++  # Query params:
++  #   * uploader=external|channel (default channel)
++  #   * auto=true|false (default false)
++  #
++  # Files whose content is "error" fail in the writer and external entries
++  # named "bad*" call entry.error() in the client uploader.
++
++  defmodule Writer do
++    @behaviour Phoenix.LiveView.UploadWriter
++
++    @impl true
++    def init(name), do: {:ok, name}
++
++    @impl true
++    def meta(name), do: %{name: name}
++
++    @impl true
++    def write_chunk("error", name), do: {:error, :boom, name}
++    def write_chunk(_chunk, name), do: {:ok, name}
++
++    @impl true
++    def close(name, _reason), do: {:ok, name}
++  end
++
++  @impl true
++  def mount(params, _session, socket) do
++    assigns = %{}
++
++    pre_script = ~H"""
++    <script>
++      window.uploaders = {
++        Issue4465(entries) {
++          entries.forEach((entry) => {
++            setTimeout(() => {
++              if (entry.file.name.startsWith("bad")) {
++                entry.error("boom");
++              } else {
++                entry.progress(100);
++              }
++            }, 300);
++          });
++        },
++      };
++    </script>
++    """
++
++    opts = [
++      accept: :any,
++      max_entries: 2,
++      chunk_size: 5,
++      auto_upload: params["auto"] == "true"
++    ]
++
++    opts =
++      case params["uploader"] do
++        "external" ->
++          Keyword.put(opts, :external, fn _entry, socket ->
++            {:ok, %{uploader: "Issue4465"}, socket}
++          end)
++
++        _ ->
++          Keyword.put(opts, :writer, fn _name, entry, _socket -> {Writer, entry.client_name} end)
++      end
++
++    {:ok,
++     socket
++     |> assign(submitted: nil, pre_script: pre_script)
++     |> allow_upload(:files, opts)}
++  end
++
++  @impl true
++  def handle_event("validate", _params, socket), do: {:noreply, socket}
++
++  def handle_event("cancel", %{"ref" => ref}, socket) do
++    {:noreply, cancel_upload(socket, :files, ref)}
++  end
++
++  def handle_event("submit", _params, socket) do
++    {completed, _in_progress} = uploaded_entries(socket, :files)
++    {:noreply, assign(socket, submitted: Enum.map(completed, & &1.client_name))}
++  end
++
++  @impl true
++  def render(assigns) do
++    ~H"""
++    <form id="upload-form" phx-change="validate" phx-submit="submit">
++      <.live_file_input upload={@uploads.files} />
++      <button type="submit">Submit</button>
++    </form>
++
++    <p id="submitted">submitted: {inspect(@submitted)}</p>
++    <p id="pid">{inspect(self())}</p>
++
++    <article
++      :for={entry <- @uploads.files.entries}
++      class="upload-entry"
++      data-name={entry.client_name}
++    >
++      <span>{entry.client_name}: {entry.progress}%</span>
++      <button type="button" phx-click="cancel" phx-value-ref={entry.ref}>Cancel</button>
++      <p :for={error <- upload_errors(@uploads.files, entry)} class="upload-error">
++        {inspect(error)}
++      </p>
++    </article>
++    """
++  end
++end
+diff --git a/test/e2e/test_helper.exs b/test/e2e/test_helper.exs
+index 71b3f94e2b..5b6ca75ccf 100644
+--- a/test/e2e/test_helper.exs
++++ b/test/e2e/test_helper.exs
+@@ -36,6 +36,7 @@ defmodule Phoenix.LiveViewTest.E2E.Layout do
+     <meta name="csrf-token" content={Plug.CSRFProtection.get_csrf_token()} />
+     <script>
+       window.hooks = {};
++      window.uploaders = {};
+     </script>
+     <script src="/assets/phoenix/phoenix.min.js">
+     </script>
+@@ -77,7 +78,7 @@ defmodule Phoenix.LiveViewTest.E2E.Layout do
+       let liveSocket = new LiveSocket("/live", window.Phoenix.Socket, {
+         params: { _csrf_token: csrfToken },
+         hooks: { ...Hooks, ...window.hooks, ...colocatedHooks },
+-        uploaders: Uploaders,
++        uploaders: { ...Uploaders, ...window.uploaders },
+         cascadePhxRemoveOnNavigation:
+           new URLSearchParams(window.location.search).get(
+             "cascadePhxRemoveOnNavigation",
+@@ -256,6 +257,7 @@ defmodule Phoenix.LiveViewTest.E2E.Router do
+       live "/4368", Issue4368Live
+       live "/4442", Issue4442Live
+       live "/4444", Issue4444Live
++      live "/4465", Issue4465Live
+     end
+   end
+ 
+diff --git a/test/e2e/tests/issues/4465.spec.js b/test/e2e/tests/issues/4465.spec.js
+new file mode 100644
+index 0000000000..3f3c687dcf
+--- /dev/null
++++ b/test/e2e/tests/issues/4465.spec.js
+@@ -0,0 +1,97 @@
++import { test, expect } from "../../test-fixtures";
++import { syncLV } from "../../utils";
++
++// https://github.com/phoenixframework/phoenix_live_view/pull/4465
++
++const file = (name, contents) => ({
++  name,
++  mimeType: "text/plain",
++  buffer: Buffer.from(contents),
++});
++
++const setup = async (page, query) => {
++  await page.goto(`/issues/4465?${query}`);
++  await syncLV(page);
++  const form = page.locator("#upload-form");
++  return {
++    // used to ensure that the form is not only released because the LiveView remounted
++    pid: await page.locator("#pid").textContent(),
++    form,
++    input: form.locator("input[type='file']"),
++    submit: form.getByRole("button", { name: "Submit" }),
++  };
++};
++
++const expectUnlocked = async ({ form, input, submit }) => {
++  await expect(form).not.toHaveClass(/phx-submit-loading/);
++  await expect(submit).toBeEnabled();
++  await expect(submit).not.toHaveAttribute("data-phx-ref-lock");
++  await expect(input).toBeEnabled();
++  await expect(input).not.toHaveAttribute("data-phx-ref-lock");
++};
++
++const cancelAndResubmit = async (page, { input, submit, pid }) => {
++  await page
++    .locator('.upload-entry[data-name="bad.txt"]')
++    .getByRole("button", { name: "Cancel" })
++    .click();
++  await syncLV(page);
++  await input.setInputFiles([file("good2.txt", "0000000000")]);
++  await submit.click();
++  await expect(page.locator("#submitted")).toContainText("good2.txt");
++  await expect(page.locator("#pid")).toHaveText(pid);
++};
++
++test.describe("external uploader calling entry.error()", () => {
++  for (const files of [
++    [file("bad.txt", "0000000000")],
++    [file("good.txt", "0000000000"), file("bad.txt", "0000000000")],
++  ]) {
++    test(`releases the submit lock (${files.map((f) => f.name).join(", ")})`, async ({
++      page,
++    }) => {
++      const ctx = await setup(page, "uploader=external");
++      await ctx.input.setInputFiles(files);
++      await ctx.submit.click();
++      // locked while the external uploader is running
++      await expect(ctx.form).toHaveClass(/phx-submit-loading/);
++      await expect(ctx.submit).toBeDisabled();
++
++      await expectUnlocked(ctx);
++      await expect(page.locator("#submitted")).toHaveText("submitted: nil");
++      await expect(
++        page.locator('.upload-entry[data-name="bad.txt"] .upload-error'),
++      ).toHaveText(":external_client_failure");
++
++      await cancelAndResubmit(page, ctx);
++    });
++  }
++
++  test("auto upload: a submit scheduled during upload is released", async ({
++    page,
++  }) => {
++    const ctx = await setup(page, "uploader=external&auto=true");
++    await ctx.input.setInputFiles([file("bad.txt", "0000000000")]);
++    await ctx.submit.click();
++
++    await expectUnlocked(ctx);
++    await expect(page.locator("#submitted")).toHaveText("submitted: nil");
++    await expect(page.locator("#pid")).toHaveText(ctx.pid);
++  });
++});
++
++test("channel uploader: writer error releases the submit lock", async ({
++  page,
++}) => {
++  const ctx = await setup(page, "uploader=channel");
++  await ctx.input.setInputFiles([file("bad.txt", "error")]);
++  await ctx.submit.click();
++
++  await expectUnlocked(ctx);
++  await expect(
++    page.locator('.upload-entry[data-name="bad.txt"] .upload-error'),
++  ).toHaveText("{:writer_failure, :boom}");
++  await expect(page.locator("#submitted")).toHaveText("submitted: nil");
++
++  await cancelAndResubmit(page, ctx);
++});

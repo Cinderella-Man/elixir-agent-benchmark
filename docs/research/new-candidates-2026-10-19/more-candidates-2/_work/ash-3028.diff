@@ -1,0 +1,232 @@
+diff --git a/lib/ash/actions/update/bulk.ex b/lib/ash/actions/update/bulk.ex
+index 4e61f477f..5bb966a5a 100644
+--- a/lib/ash/actions/update/bulk.ex
++++ b/lib/ash/actions/update/bulk.ex
+@@ -3452,18 +3452,7 @@ defmodule Ash.Actions.Update.Bulk do
+                     results
+ 
+                   callback_results ->
+-                    callback_results
+-                    |> Enum.zip(results)
+-                    |> Enum.map(fn
+-                      {{:ok, result}, {:ok, _old_result, changeset}} ->
+-                        {:ok, result, changeset}
+-
+-                      {{:error, error}, {:ok, _old_result, changeset}} ->
+-                        {:error, error, changeset}
+-
+-                      {notification, _} ->
+-                        notification
+-                    end)
++                    pair_after_batch_results(callback_results, results)
+                 end
+               else
+                 results
+@@ -3500,19 +3489,8 @@ defmodule Ash.Actions.Update.Bulk do
+                     :ok ->
+                       [{:ok, record, changeset}]
+ 
+-                    results ->
+-                      results
+-                      |> Enum.zip(changesets)
+-                      |> Enum.map(fn
+-                        {{:ok, result}, changeset} ->
+-                          {:ok, result, changeset}
+-
+-                        {{:error, error}, changeset} ->
+-                          {:error, error, changeset}
+-
+-                        {notification, _changeset} ->
+-                          notification
+-                      end)
++                    callback_results ->
++                      pair_after_batch_results(callback_results, [{:ok, record, changeset}])
+                   end
+                 else
+                   [{:ok, record, changeset}]
+@@ -3567,18 +3545,7 @@ defmodule Ash.Actions.Update.Bulk do
+                       matches
+ 
+                     callback_results ->
+-                      callback_results
+-                      |> Enum.zip(matches)
+-                      |> Enum.map(fn
+-                        {{:ok, result}, {:ok, _old_result, changeset}} ->
+-                          {:ok, result, changeset}
+-
+-                        {{:error, error}, {:ok, _old_result, changeset}} ->
+-                          {:error, error, changeset}
+-
+-                        {notification, _} ->
+-                          notification
+-                      end)
++                      pair_after_batch_results(callback_results, matches)
+                   end
+                 else
+                   matches
+@@ -3625,19 +3592,8 @@ defmodule Ash.Actions.Update.Bulk do
+                       :ok ->
+                         [{:ok, record, changeset}]
+ 
+-                      results ->
+-                        results
+-                        |> Enum.zip(changesets)
+-                        |> Enum.map(fn
+-                          {{:ok, result}, changeset} ->
+-                            {:ok, result, changeset}
+-
+-                          {{:error, error}, changeset} ->
+-                            {:error, error, changeset}
+-
+-                          {notification, _changeset} ->
+-                            notification
+-                        end)
++                      callback_results ->
++                        pair_after_batch_results(callback_results, [{:ok, record, changeset}])
+                     end
+                   else
+                     [{:ok, record, changeset}]
+@@ -3659,12 +3615,32 @@ defmodule Ash.Actions.Update.Bulk do
+ 
+   defp put_result_phase(other, _phase), do: other
+ 
++  # Pairs `after_batch/3`'s output with the results it was given. Notifications
++  # are taken out first, so they neither shift the pairing nor fall off its end.
++  defp pair_after_batch_results(callback_results, results) do
++    {notifications, callback_results} =
++      Enum.split_with(callback_results, &match?(%Ash.Notifier.Notification{}, &1))
++
++    callback_results
++    |> Enum.zip(results)
++    |> Enum.map(fn
++      {{:ok, result}, {:ok, _old_result, changeset}} ->
++        {:ok, result, changeset}
++
++      {{:error, error}, {:ok, _old_result, changeset}} ->
++        {:error, error, changeset}
++    end)
++    |> Enum.concat(notifications)
++  end
++
+   defp handle_after_batch_results(results, _matches, ref, resource, opts) do
+     results
+     |> Enum.flat_map(fn
+-      {%Ash.Notifier.Notification{} = notification, _} ->
++      %Ash.Notifier.Notification{} = notification ->
+         Ash.Actions.Helpers.Bulk.store_notification(ref, notification, opts)
+ 
++        []
++
+       {:ok, result, changeset} ->
+         [{:ok, result, changeset}]
+ 
+diff --git a/test/actions/bulk/after_batch_notifications_test.exs b/test/actions/bulk/after_batch_notifications_test.exs
+new file mode 100644
+index 000000000..21eac9680
+--- /dev/null
++++ b/test/actions/bulk/after_batch_notifications_test.exs
+@@ -0,0 +1,104 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Test.Actions.Bulk.AfterBatchNotificationsTest do
++  @moduledoc false
++  use ExUnit.Case, async: true
++
++  defmodule Notifier do
++    @moduledoc false
++    use Ash.Notifier
++
++    @impl true
++    def notify(%{metadata: %{batch: titles}}), do: send(self(), {:batch, Enum.sort(titles)})
++    def notify(_notification), do: :ok
++  end
++
++  defmodule NotifyOncePerBatch do
++    @moduledoc false
++    use Ash.Resource.Change
++
++    @impl true
++    def batch_change(changesets, _opts, _context), do: changesets
++
++    @impl true
++    def after_batch([{changeset, _} | _] = changesets_and_results, _opts, _context) do
++      results = Enum.map(changesets_and_results, fn {_changeset, result} -> {:ok, result} end)
++
++      notification = %Ash.Notifier.Notification{
++        resource: changeset.resource,
++        action: changeset.action,
++        metadata: %{batch: Enum.map(changesets_and_results, fn {_, result} -> result.title end)},
++        for: [Notifier]
++      }
++
++      results ++ [notification]
++    end
++  end
++
++  defmodule Post do
++    @moduledoc false
++    use Ash.Resource,
++      domain: Ash.Test.Domain,
++      data_layer: Ash.DataLayer.Ets,
++      notifiers: [Notifier]
++
++    ets do
++      private? true
++    end
++
++    attributes do
++      uuid_primary_key :id
++      attribute :title, :string, public?: true
++    end
++
++    actions do
++      defaults [:read, :destroy]
++
++      create :create do
++        primary? true
++        accept [:title]
++      end
++
++      update :update do
++        require_atomic? false
++        accept [:title]
++        change NotifyOncePerBatch
++      end
++
++      update :update_where do
++        require_atomic? false
++        accept [:title]
++        change NotifyOncePerBatch, where: [attribute_equals(:title, "b")]
++      end
++    end
++  end
++
++  defp create_posts(titles) do
++    Ash.bulk_create!(Enum.map(titles, &%{title: &1}), Post, :create, return_records?: true).records
++  end
++
++  test "a notification returned after a batch's results is sent, and the results are kept" do
++    posts = create_posts(["a", "b", "c"])
++
++    assert %{status: :success, records: records} =
++             Ash.bulk_update(posts, :update, %{},
++               strategy: :stream,
++               notify?: true,
++               return_records?: true
++             )
++
++    assert length(records) == 3
++    assert_received {:batch, ["a", "b", "c"]}
++  end
++
++  test "a notification from a change scoped by `where` is sent for the records it applied to" do
++    posts = create_posts(["a", "b"])
++
++    assert %{status: :success} =
++             Ash.bulk_update(posts, :update_where, %{}, strategy: :stream, notify?: true)
++
++    assert_received {:batch, ["b"]}
++  end
++end

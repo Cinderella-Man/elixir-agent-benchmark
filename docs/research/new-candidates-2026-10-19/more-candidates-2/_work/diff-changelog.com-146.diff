@@ -1,0 +1,679 @@
+diff --git a/lib/changelog/meta/title.ex b/lib/changelog/meta/title.ex
+index 71f3d2b68f..4a08171f0e 100644
+--- a/lib/changelog/meta/title.ex
++++ b/lib/changelog/meta/title.ex
+@@ -1,5 +1,5 @@
+ defmodule Changelog.Meta.Title do
+-  alias Changelog.{AuthView, EpisodeView, PageView, PersonView, PodcastView, PostView}
++  alias Changelog.{AuthView, EpisodeView, PageView, PersonView, PodcastView, PostView, SearchView}
+ 
+   @suffix "Changelog"
+ 
+@@ -13,6 +13,9 @@ defmodule Changelog.Meta.Title do
+ 
+   defp get(%{view_module: AuthView}), do: "Sign In"
+ 
++  defp get(%{view_module: SearchView, view_template: "search.html", query: query}), do: query
++  defp get(%{view_module: SearchView, view_template: "search.html"}), do: "Search"
++
+   defp get(%{view_module: EpisodeView, view_template: "show.html", podcast: podcast, episode: episode}) do
+     "#{podcast.name} #{EpisodeView.numbered_title(episode, "#")}"
+   end
+diff --git a/priv/repo/migrations/20161216091618_setup_full_text_search.exs b/priv/repo/migrations/20161216091618_setup_full_text_search.exs
+new file mode 100644
+index 0000000000..4cd054a864
+--- /dev/null
++++ b/priv/repo/migrations/20161216091618_setup_full_text_search.exs
+@@ -0,0 +1,85 @@
++defmodule Changelog.Repo.Migrations.SetupFullTextSearch do
++  use Ecto.Migration
++
++  def up do
++    # For episodes and posts we create a search vector index that contains the searchable columns.
++    # The indexes gets updated by triggers that fire on insertion or change.
++    # The indexes contain the particular fields in weighed form.
++    #
++    # For further details see these two posts and the postgres docs:
++    # http://www.brightball.com/articles/postgresql-functions-with-elixir-ecto
++    # https://hashrocket.com/blog/posts/exploring-postgres-gin-index
++    # https://www.postgresql.org/docs/9.6/static/textsearch-intro.html
++
++    alter table(:episodes) do
++      add :search_vector, :tsvector
++    end
++
++    alter table(:posts) do
++      add :search_vector, :tsvector
++    end
++
++    execute "CREATE extension if not exists pg_trgm;"
++
++    execute "CREATE INDEX episodes_search_index ON episodes USING GIN(search_vector);"
++    execute "CREATE INDEX posts_search_index ON posts USING GIN(search_vector);"
++
++    # Create trigger functions that weigh the fields and populate the index.
++    # https://www.postgresql.org/docs/9.6/static/functions-textsearch.html
++    execute "CREATE OR REPLACE FUNCTION episode_search_trigger() RETURNS trigger AS $$
++      begin
++          new.search_vector :=
++            setweight(to_tsvector('pg_catalog.english', coalesce(new.title,'')), 'A') ||
++            setweight(to_tsvector('pg_catalog.english', coalesce(new.summary,'')), 'A') ||
++            setweight(to_tsvector('pg_catalog.english', coalesce(new.notes,'')), 'B');
++        return new;
++      end
++    $$ LANGUAGE plpgsql"
++
++    execute "CREATE OR REPLACE FUNCTION post_search_trigger() RETURNS trigger AS $$
++      begin
++          new.search_vector :=
++            setweight(to_tsvector('pg_catalog.english', coalesce(new.title,'')), 'A') ||
++            setweight(to_tsvector('pg_catalog.english', coalesce(new.tldr,'')), 'A') ||
++            setweight(to_tsvector('pg_catalog.english', coalesce(new.body,'')), 'B');
++        return new;
++      end
++    $$ LANGUAGE plpgsql"
++
++    # Create triggers to update the search vectors on insertion or change
++    # https://www.postgresql.org/docs/9.6/static/sql-createtrigger.html
++    execute "CREATE TRIGGER episode_search_update
++      BEFORE INSERT OR UPDATE OF title, summary, notes
++      ON episodes
++      FOR EACH ROW
++      EXECUTE PROCEDURE episode_search_trigger();"
++
++    execute "CREATE TRIGGER post_search_update
++      BEFORE INSERT OR UPDATE OF title, tldr, body
++      ON posts
++      FOR EACH ROW
++      EXECUTE PROCEDURE post_search_trigger();"
++
++    # Populate the search vectors initially
++    execute "UPDATE episodes SET title=title;"
++    execute "UPDATE posts SET title=title;"
++  end
++
++  def down do
++    execute "DROP INDEX episodes_search_index;"
++    execute "DROP INDEX posts_search_index;"
++    execute "DROP TRIGGER episode_search_update ON episodes;"
++    execute "DROP TRIGGER post_search_update ON posts;"
++    execute "DROP FUNCTION episode_search_trigger();"
++    execute "DROP FUNCTION post_search_trigger();"
++
++    alter table(:episodes) do
++      remove :search_vector
++    end
++
++    alter table(:posts) do
++      remove :search_vector
++    end
++  end
++
++end
+diff --git a/priv/repo/seeds.exs b/priv/repo/seeds.exs
+index a12fd9ef12..416e134457 100644
+--- a/priv/repo/seeds.exs
++++ b/priv/repo/seeds.exs
+@@ -11,16 +11,20 @@
+ # and so on) as they will fail if something goes wrong.
+ 
+ alias Changelog.Repo
+-alias Changelog.{Episode, EpisodeGuest, EpisodeHost, EpisodeSponsor, Person, Podcast, PodcastHost, Sponsor}
++alias Changelog.{Channel, Episode, EpisodeChannel, EpisodeGuest, EpisodeHost, EpisodeSponsor, Person, Podcast, PodcastHost, Post, PostChannel, Sponsor}
+ 
+ # Clean slate
+ 
++Repo.delete_all EpisodeChannel
++Repo.delete_all PostChannel
++Repo.delete_all Channel
+ Repo.delete_all EpisodeSponsor
+ Repo.delete_all EpisodeGuest
+ Repo.delete_all EpisodeHost
+ Repo.delete_all Episode
+ Repo.delete_all PodcastHost
+ Repo.delete_all Podcast
++Repo.delete_all Post
+ Repo.delete_all Person
+ Repo.delete_all Sponsor
+ 
+@@ -155,6 +159,20 @@ andrewgodwin = Repo.insert! %Person{
+   website: "http://www.aeracode.org/"
+ }
+ 
++# Channels
++
++practice = Repo.insert! %Channel{
++  name: "Practice",
++  slug: "practice",
++  description: "Description for the practice channel"
++}
++
++updates = Repo.insert! %Channel{
++  name: "Updates",
++  slug: "updates",
++  description: "Description for the updates channel"
++}
++
+ # Podcasts
+ 
+ changelog = Repo.insert! %Podcast{
+@@ -553,3 +571,93 @@ Repo.insert! %Episode{
+     }
+   ]
+ }
++
++# Posts
++
++Repo.insert! %Post{
++  title: "Introducing Changelog 2.0",
++  slug: "introducing-changelog-2-0",
++  published: true,
++  published_at: Timex.to_datetime({{2016, 10, 11}, {11, 25, 00}}, :local),
++  author: adamstac,
++  tldr: "**I'm excited to finally be able to introduce you to Changelog 2.0! This might seem like a simple visual update, but trust me when I tell you this is literally the biggest launch we’ve ever done.**
++
++tl;dr — We launched a new brand and CMS to power the future of our digital media company.",
++  body: "## The New Logo
++
++There is so much in a logo. It carries the weight of all you do. It goes before you to set the tone for how you will be perceived. It represents you when you can't be directly involved. It's what people attach their feelings to. It's the sticker on a laptop representing an affinity or belief.
++
++For 7 years, we have been primarily known as \"The Changelog podcast\" and our album art is that sticker on a listener's laptop — so we couldn't just carelessly make changes to our logo. We needed to seek out the right help and guidance through the process.
++
++Nearly one year ago we began the process of rebranding The Changelog. But before we get to that, more than two years ago we purchased `changelog.com` for $1,000 in hope of one day taking the [advice of JT](https://www.youtube.com/watch?v=k06fsS9Vjn4) to drop the \"The.\" It’s cleaner.
++
++We are now simply, Changelog.",
++  post_channels: [
++    %PostChannel{
++      position: 1,
++      channel: updates
++    }
++  ]
++}
++
++Repo.insert! %Post{
++  title: "Changelog.com is Open Source",
++  slug: "changelog-is-open-source",
++  published: true,
++  published_at: Timex.to_datetime({{2016, 10, 25}, {16, 45, 30}}, :local),
++  author: jerodsanto,
++  tldr: "This morning we open sourced the code that powers the new Changelog.com!",
++  body: "As we promised in [our relaunch announcement](/posts/introducing-changelog-2-0), this morning we open sourced the code that powers the new Changelog.com!
++
++Don't want the full rundown? Go star [the source code on GitHub](https://github.com/thechangelog/changelog.com).",
++  post_channels: [
++    %PostChannel{
++      position: 1,
++      channel: updates
++    }
++  ]
++}
++
++Repo.insert! %Post{
++  title: "Slow Down to Go Faster",
++  slug: "slow-down-to-go-faster",
++  published: true,
++  published_at: Timex.to_datetime({{2016, 11, 25}, {10, 30, 00}}, :local),
++  author: jerodsanto,
++  tldr: "What many people fail to realize — and what I’ll emphasize in this post — is that the compromises we often make when optimizing for development speed can actually slow us down.",
++  body: "***Editor's Note:*** I originally wrote this for Fuel Your Coding back in October of 2010. Unfortunately, that site is now defunct, so I'm republishing the article here for posterity's sake1. I considered updating it for modern times, but I think it holds up well enough as is. Enjoy.
++- - -
++Today’s software development culture promotes [rapid development methodologies](http://en.wikipedia.org/wiki/Rapid_application_development), [minimum viable products](http://en.wikipedia.org/wiki/Minimum_viable_product), releasing early & often, and the axiom that [\"real artists ship\"](http://www.folklore.org/StoryView.py?story=Real_Artists_Ship.txt). What common thread weaves its way through all of these things?
++
++**SPEED.**
++
++If you haven’t felt the pressure to squeeze one more feature in before the release date, to fix an interface bug “RIGHT NOW!”, to get your product launched before your competition, or to shave a week off of your development schedule then you haven’t been developing software for all that long.
++
++What many people fail to realize — and what I’ll emphasize in this post — is that the compromises we often make when optimizing for development speed can actually slow us down. More succinctly:
++
++<mark>If you want to move faster, you have to slow down.</mark>
++
++Allow me to demonstrate this concept in a few key areas of software development.",
++  post_channels: [
++    %PostChannel{
++      position: 1,
++      channel: practice
++    }
++  ]
++}
++
++Repo.insert! %Post{
++  title: "This is a draft",
++  slug: "this-is-a-draft",
++  published: false,
++  published_at: Timex.now,
++  author: adamstac,
++  tldr: "Not published yet, But it will be awesome. All the new tech people are raging about!",
++  body: "This is content that will be published soon. For now it is just sitting, waiting, wishing – in the database.",
++  post_channels: [
++    %PostChannel{
++      position: 1,
++      channel: practice
++    }
++  ]
++}
+diff --git a/test/controllers/search_controller_test.exs b/test/controllers/search_controller_test.exs
+new file mode 100644
+index 0000000000..c9b75a0513
+--- /dev/null
++++ b/test/controllers/search_controller_test.exs
+@@ -0,0 +1,64 @@
++defmodule Changelog.SearchControllerTest do
++  use Changelog.ConnCase
++
++  describe "without query" do
++    test "getting the search" do
++      conn = get(build_conn, search_path(build_conn, :search))
++
++      assert conn.status == 200
++    end
++  end
++
++  describe "with query" do
++    test "getting the search with one result" do
++      podcast = insert(:podcast)
++      episode1 = insert(:published_episode, podcast: podcast, slug: "1", title: "Phoenix")
++      episode2 = insert(:published_episode, podcast: podcast, slug: "2", title: "Rails")
++
++      conn = get(build_conn, search_path(build_conn, :search, q: "phoenix"))
++
++      assert conn.status == 200
++      assert conn.resp_body =~ "1 episode"
++      assert conn.resp_body =~ episode1.title
++      refute conn.resp_body =~ episode2.title
++    end
++
++    test "getting the search with multiple results" do
++      podcast = insert(:podcast)
++      episode1 = insert(:published_episode, podcast: podcast, slug: "1", title: "Phoenix")
++      episode2 = insert(:published_episode, podcast: podcast, slug: "2", title: "Rails")
++      post1 = insert(:published_post, title: "Phoenix")
++      post2 = insert(:published_post, title: "Rails")
++
++      conn = get(build_conn, search_path(build_conn, :search, q: "phoenix"))
++
++      assert conn.status == 200
++      assert conn.resp_body =~ "2 results"
++      assert conn.resp_body =~ "1 episode"
++      assert conn.resp_body =~ "1 post"
++      assert conn.resp_body =~ episode1.title
++      refute conn.resp_body =~ episode2.title
++      assert conn.resp_body =~ post1.title
++      refute conn.resp_body =~ post2.title
++    end
++
++    test "getting the search paginated" do
++      podcast = insert(:podcast)
++      Enum.map(1..11, fn(x) -> insert(:published_episode, podcast: podcast, title: "Elixir #{x}") end)
++
++      conn = get(build_conn, search_path(build_conn, :search, q: "elixir", type: "episodes", page: 2))
++
++      assert conn.status == 200
++      assert conn.resp_body =~ "11 episodes"
++      assert conn.resp_body =~ "Elixir 1"
++      refute conn.resp_body =~ "Elixir 2"
++    end
++
++    test "getting the search without results" do
++      conn = get(build_conn, search_path(build_conn, :search, q: "phoenix"))
++
++      assert conn.status == 200
++      assert conn.resp_body =~ "There are no results"
++    end
++  end
++end
+diff --git a/test/models/episode_test.exs b/test/models/episode_test.exs
+index 17fc8cd76e..0d49d4e86e 100644
+--- a/test/models/episode_test.exs
++++ b/test/models/episode_test.exs
+@@ -67,4 +67,41 @@ defmodule Changelog.EpisodeTest do
+       assert episode.reach_count == 4+45
+     end
+   end
++
++  describe "search" do
++    setup do
++      {:ok, phoenix: insert(:published_episode, slug: "phoenix-episode", title: "Phoenix", summary: "A web framework for Elixir", notes: "Chris McCord"),
++            rails: insert(:published_episode, slug: "rails-episode", title: "Rails", summary: "A web framework for Ruby", notes: "DHH") }
++    end
++
++    test "finds episode by matching title" do
++      episode_titles =
++        Episode
++        |> Episode.search("Rails")
++        |> Repo.all
++        |> Enum.map(&(&1.title))
++
++      assert episode_titles == ["Rails"]
++    end
++
++    test "finds episode by matching summary" do
++      episode_titles =
++        Episode
++        |> Episode.search("Elixir")
++        |> Repo.all
++        |> Enum.map(&(&1.title))
++
++      assert episode_titles == ["Phoenix"]
++    end
++
++    test "finds episode by matching notes" do
++      episode_titles =
++        Episode
++        |> Episode.search("McCord")
++        |> Repo.all
++        |> Enum.map(&(&1.title))
++
++      assert episode_titles == ["Phoenix"]
++    end
++  end
+ end
+diff --git a/test/models/post_test.exs b/test/models/post_test.exs
+index 022d000991..0448c28512 100644
+--- a/test/models/post_test.exs
++++ b/test/models/post_test.exs
+@@ -15,4 +15,41 @@ defmodule Changelog.PostTest do
+     changeset = Post.changeset(%Post{}, @invalid_attrs)
+     refute changeset.valid?
+   end
++
++  describe "search" do
++    setup do
++      {:ok, phoenix: insert(:published_post, slug: "phoenix-post", title: "Phoenix", tldr: "A web framework for Elixir", body: "Chris McCord"),
++            rails: insert(:published_post, slug: "rails-post", title: "Rails", tldr: "A web framework for Ruby", body: "DHH") }
++    end
++
++    test "finds post by matching title" do
++      post_titles =
++        Post
++        |> Post.search("Phoenix")
++        |> Repo.all
++        |> Enum.map(&(&1.title))
++
++      assert post_titles == ["Phoenix"]
++    end
++
++    test "finds post by matching tldr" do
++      post_titles =
++        Post
++        |> Post.search("Ruby")
++        |> Repo.all
++        |> Enum.map(&(&1.title))
++
++      assert post_titles == ["Rails"]
++    end
++
++    test "finds post by matching body" do
++      post_titles =
++        Post
++        |> Post.search("DHH")
++        |> Repo.all
++        |> Enum.map(&(&1.title))
++
++      assert post_titles == ["Rails"]
++    end
++  end
+ end
+diff --git a/web/controllers/search_controller.ex b/web/controllers/search_controller.ex
+new file mode 100644
+index 0000000000..2a06c39b93
+--- /dev/null
++++ b/web/controllers/search_controller.ex
+@@ -0,0 +1,60 @@
++defmodule Changelog.SearchController do
++  use Changelog.Web, :controller
++
++  alias Changelog.{Episode, Post, SearchResults}
++
++  require Logger
++
++  def search(conn, params) do
++    results = case params do
++      %{"q" => query, "type" => type, "page" => page} -> fetch_results(query, type, page)
++      %{"q" => query} -> fetch_results(query)
++      _else -> nil
++    end
++
++    render(conn, "search.html", results: results, query: params["q"], type: params["type"])
++  end
++
++  defp fetch_results(query) do
++    episodes = find_episodes(query)
++    posts = find_posts(query)
++
++    results(episodes, posts)
++  end
++
++  defp fetch_results(query, type, page) do
++    episodes = if type == "episodes", do: find_episodes(query, page), else: %{total_entries: 0}
++    posts = if type == "posts", do: find_posts(query, page), else: %{total_entries: 0}
++
++    results(episodes, posts)
++  end
++
++  defp results(episodes, posts) do
++    %SearchResults{
++      count_total: episodes.total_entries + posts.total_entries,
++      count_episodes: episodes.total_entries,
++      count_posts: posts.total_entries,
++      episodes: episodes,
++      posts: posts
++    }
++  end
++
++  defp find_episodes(query, page \\ 1, page_size \\ 10) do
++    Episode
++    |> Episode.published
++    |> Episode.search(query)
++    |> Episode.newest_first
++    |> preload(:podcast)
++    |> preload(:guests)
++    |> Repo.paginate(page: page, page_size: page_size)
++  end
++
++  defp find_posts(query, page \\ 1, page_size \\ 10) do
++    Post
++    |> Post.published
++    |> Post.search(query)
++    |> Post.newest_first
++    |> preload(:author)
++    |> Repo.paginate(page: page, page_size: page_size)
++  end
++end
+diff --git a/web/models/episode.ex b/web/models/episode.ex
+index 0e7f843b54..a11beff807 100644
+--- a/web/models/episode.ex
++++ b/web/models/episode.ex
+@@ -98,6 +98,11 @@ defmodule Changelog.Episode do
+     from e in query, limit: ^count
+   end
+ 
++  def search(query, search_term) do
++    from e in query,
++      where: fragment("search_vector @@ to_tsquery('english', ?)", ^search_term)
++  end
++
+   def is_public(episode, as_of \\ Timex.now) do
+     episode.published && episode.published_at <= as_of
+   end
+diff --git a/web/models/post.ex b/web/models/post.ex
+index fa7ce85971..358d0e33ef 100644
+--- a/web/models/post.ex
++++ b/web/models/post.ex
+@@ -62,6 +62,11 @@ defmodule Changelog.Post do
+     from e in query, limit: ^count
+   end
+ 
++  def search(query, search_term) do
++    from e in query,
++      where: fragment("search_vector @@ to_tsquery('english', ?)", ^search_term)
++  end
++
+   def is_public(post, as_of \\ Timex.now) do
+     post.published && post.published_at <= as_of
+   end
+diff --git a/web/models/search_results.ex b/web/models/search_results.ex
+new file mode 100644
+index 0000000000..dae08bb390
+--- /dev/null
++++ b/web/models/search_results.ex
+@@ -0,0 +1,3 @@
++defmodule Changelog.SearchResults do
++  defstruct count_total: 0, count_episodes: 0, count_posts: 0, episodes: [], posts: []
++end
+diff --git a/web/router.ex b/web/router.ex
+index 04e3944b83..a20a9b7b1c 100644
+--- a/web/router.ex
++++ b/web/router.ex
+@@ -60,6 +60,8 @@ defmodule Changelog.Router do
+ 
+     get "/slack/gotime", SlackController, :gotime
+ 
++    get "/search", SearchController, :search
++
+     # static pages
+     get "/", PageController, :home
+     get "/about", PageController, :about
+diff --git a/web/static/app/layout/_layout.sass b/web/static/app/layout/_layout.sass
+index 5ed7198904..497c8989a3 100644
+--- a/web/static/app/layout/_layout.sass
++++ b/web/static/app/layout/_layout.sass
+@@ -1,6 +1,7 @@
+ @import footer
+ @import podcasts
+ @import posts
++@import search
+ 
+ // Sticky Footer
+ body
+diff --git a/web/static/app/layout/_search.sass b/web/static/app/layout/_search.sass
+new file mode 100644
+index 0000000000..6dc5052b8b
+--- /dev/null
++++ b/web/static/app/layout/_search.sass
+@@ -0,0 +1,12 @@
++#search
++    padding: $padding-large 1rem
++
++    @media (min-width: $desktop)
++        padding: $padding-extra-large 0
++
++    .search-results
++      margin-top: 2rem
++
++      & + .search-results
++        border-top: 4px solid $border-color
++        padding-top: 2rem
+diff --git a/web/static/app/modules/_modules.sass b/web/static/app/modules/_modules.sass
+index bdb714bf70..733571ff55 100644
+--- a/web/static/app/modules/_modules.sass
++++ b/web/static/app/modules/_modules.sass
+@@ -41,3 +41,4 @@
+ @import toolbar
+ @import tooltip
+ @import tweetable
++@import search-box
+diff --git a/web/static/app/modules/_pagination.sass b/web/static/app/modules/_pagination.sass
+index 3289e3a9df..1dce90bdda 100644
+--- a/web/static/app/modules/_pagination.sass
++++ b/web/static/app/modules/_pagination.sass
+@@ -1,6 +1,8 @@
+ .pagination
+     margin: 2rem 0 4rem
+     text-align: center
++
++    .item,
+     &_item
+         @extend %display-font
+         color: $body-copy-color
+@@ -18,5 +20,6 @@
+                 background-color: $green
+                 color: $white
+ 
++        &.active,
+         &--current
+             border-color: transparent
+diff --git a/web/static/app/modules/_search-box.sass b/web/static/app/modules/_search-box.sass
+new file mode 100644
+index 0000000000..2d02cb8368
+--- /dev/null
++++ b/web/static/app/modules/_search-box.sass
+@@ -0,0 +1,2 @@
++.search-box
++    display: flex
+diff --git a/web/templates/layout/_nav.html.eex b/web/templates/layout/_nav.html.eex
+index 2cedfd31c1..7628e02415 100644
+--- a/web/templates/layout/_nav.html.eex
++++ b/web/templates/layout/_nav.html.eex
+@@ -64,6 +64,7 @@
+           <h3 class="navigation-tray-side-nav_heading">More Info</h3>
+           <%= link "Subscribe", to: page_path(@conn, :subscribe) %>
+           <%= link "Sponsorship", to: page_path(@conn, :sponsorship) %>
++          <%= link "Search", to: search_path(@conn, :search) %>
+           <%= link "Community", to: page_path(@conn, :community) %>
+           <%= link "About", to: page_path(@conn, :about) %>
+           <%= link "Contact", to: page_path(@conn, :contact) %>
+diff --git a/web/templates/search/search.html.eex b/web/templates/search/search.html.eex
+new file mode 100644
+index 0000000000..1ccef82beb
+--- /dev/null
++++ b/web/templates/search/search.html.eex
+@@ -0,0 +1,46 @@
++<section id="search">
++  <div class="container container--has-padding container--skinny">
++    <div class="content_body">
++      <form action="<%= search_path(@conn, :search) %>" method="get" class="form">
++        <div class="form_element_wrap">
++          <label for="name">Search for …</label>
++          <div class="form_element search-box">
++            <input name="q" type="text" value="<%= @query %>" />
++            <input type="submit" value="Search">
++          </div>
++        </div>
++      </form>
++    </div>
++
++    <%= if @results do %>
++      <%= if @results.count_total > 0 do %>
++        <%= if @results.count_episodes > 0 && @results.count_posts > 0 do %>
++          <h2><%= pluralize(@results.count_total, "result", "results") %> for "<%= @query %>"</h2>
++        <% end %>
++
++        <%= if @results.count_episodes > 0 do %>
++          <section class="search-results">
++            <h3><%= pluralize(@results.count_episodes, "episode", "episodes") %></h3>
++            <%= for episode <- @results.episodes do %>
++              <%= render(PodcastView, "_episode_summary.html", conn: @conn, episode: episode) %>
++            <% end %>
++            <%= pagination_links(@conn, @results.episodes, type: "episodes", action: :search, q: @query, path: &search_path/3) %>
++          </section>
++        <% end %>
++
++        <%= if @results.count_posts > 0 do %>
++          <section class="search-results">
++            <h3><%= pluralize(@results.count_posts, "post", "posts") %></h3>
++            <%= for post <- @results.posts do %>
++              <%= render(PostView, "_post_summary.html", conn: @conn, post: post) %>
++            <% end %>
++            <%= pagination_links(@conn, @results.posts, type: "posts", action: :search, q: @query, path: &search_path/3) %>
++          </section>
++        <% end %>
++
++      <% else %>
++        <h2>There are no results for "<%= @query %>"</h2>
++      <% end %>
++    <% end %>
++  </div>
++</section>
+diff --git a/web/views/search_view.ex b/web/views/search_view.ex
+new file mode 100644
+index 0000000000..fddca615d8
+--- /dev/null
++++ b/web/views/search_view.ex
+@@ -0,0 +1,7 @@
++defmodule Changelog.SearchView do
++  use Changelog.Web, :view
++
++  alias Changelog.{PodcastView, PostView}
++
++  import Scrivener.HTML
++end

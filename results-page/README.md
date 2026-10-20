@@ -6,7 +6,7 @@ The page contains a title, maximum model-size slider and one shared chart, with 
 
 The previous benchmark runs and published results were cleared on 2026-10-18 for fresh measurements. The nine benchmark cases remain configured. With no published records, the page shows “No benchmark results yet” and hides the slider and chart guidance.
 
-Fresh runs on ratx570 collect model-service RAM and VRAM throughout the run. Their exported summaries include sampled peaks, the highest simultaneous RAM + VRAM total, per-GPU allocations, configured context, runtime and collection coverage. Model weight size remains a separate field.
+Fresh runs on configured ratx570 endpoint hostnames collect model-service RAM and VRAM throughout the run. Their exported summaries include sampled peaks, the highest simultaneous RAM + VRAM total, per-GPU allocations, configured context, runtime and collection coverage. Model weight size remains a separate field. The dashboard shows collection configuration before starting a run; the chart explicitly labels local results without saved memory observations.
 
 The slider still filters model weight-file size in decimal GB when results exist. Changing it to “Max VRAM+RAM used” is deferred until fresh runs provide the required memory data. Observed VRAM/RAM does not yet determine eligibility for this filter. A numeric limit hides unknown-size/API models; All restores them.
 
@@ -48,7 +48,7 @@ mix eab.results add /path/to/run.json \
   --evidence-url 'https://example.com/public-run-evidence'
 ```
 
-All flags are optional. Model name, quantization and size use saved artifact metadata when available, including legacy runs whose routing aliases differ from their artifact names. `--quantization` and `--size-gb` mark owner-supplied values; absent metadata stays unknown. `--note` adds context shown in the details. The command uses the same publisher as the dashboard button. Adding an existing run rebuilds the preview and preserves its public JSON, including manual edits; edit that JSON deliberately to correct a label or note.
+All flags are optional. Model name, quantization and size use saved artifact metadata when available, including legacy runs whose routing aliases differ from their artifact names. If the server omits size, a configured collector can supply the installed GGUF file sizes, including all numbered shards; exports label this source `artifact_files`. `--quantization` and `--size-gb` mark owner-supplied values; absent metadata stays unknown. `--note` adds context shown in the details. The command uses the same publisher as the dashboard button. Adding an existing run rebuilds the preview and preserves its public JSON, including manual edits; edit that JSON deliberately to correct a label or note.
 
 To use the command line with a run stored in Docker, copy the original run file out to an ignored local directory first:
 

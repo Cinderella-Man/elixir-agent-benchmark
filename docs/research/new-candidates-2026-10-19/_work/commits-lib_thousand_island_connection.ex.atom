@@ -1,0 +1,551 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/" xml:lang="en-US">
+  <id>tag:github.com,2008:/mtrudel/thousand_island/commits/main/lib/thousand_island/connection.ex</id>
+  <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commits/main/lib/thousand_island/connection.ex"/>
+  <link type="application/atom+xml" rel="self" href="https://github.com/mtrudel/thousand_island/commits/main/lib/thousand_island/connection.ex.atom"/>
+  <title>Recent Commits to thousand_island:main</title>
+  <updated>2026-08-31T20:22:24Z</updated>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/62385e80f43d2197ac55b4092cc8ca44be7491d6</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/62385e80f43d2197ac55b4092cc8ca44be7491d6"/>
+    <title>
+        Fix: Handle socket ownership-transfer errors during connection start …
+    </title>
+    <updated>2026-08-31T20:22:24Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/94031664?s=30&amp;v=4"/>
+    <author>
+      <name>mpettibone</name>
+      <uri>https://github.com/mpettibone</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Fix: Handle socket ownership-transfer errors during connection start (#220)
+
+Note: I asked Claude to specifically look for spec non-conformance. It found below. Claude helped write the desc, test case and identification of the PR.
+
+## Summary
+
+- Check the result of the transport&amp;#39;s `controlling_process/2` callback before activating a newly spawned handler.
+- On ownership-transfer failure, close the accepted socket, terminate the idle handler child, and return a typed `{:controlling_process, reason}` error.
+- Keep the acceptor alive for this per-connection setup failure and emit the existing `:spawn_error` telemetry event with the error attached.
+- Add a deterministic regression test backed by a custom transport proving cleanup occurs and the handler never receives the ready message, plus a server-level test that injects the failure through a live acceptor.
+
+## Non-conformance
+
+Thousand Island discards the return value from `controlling_process/2` and sends `:thousand_island_ready` unconditionally. Both OTP transports document that ownership transfer can return `{:error, reason}`. Continuing after that result violates the ownership contract: the spawned handler is not the controlling process, yet it is told to begin using the socket, while the acceptor still owns the accepted socket.
+
+Authoritative documentation:
+
+- [`gen_tcp:controlling_process/2`](https://www.erlang.org/doc/apps/kernel/gen_tcp.html#controlling_process-2) defines the socket-owner transfer and its error returns.
+- [`ssl:controlling_process/2`](https://www.erlang.org/doc/apps/ssl/ssl.html#controlling_process-2) requires the caller to be the current controlling process and documents `{:error, reason}`.
+
+## Test plan
+
+Verified on Elixir 1.18.4 / Erlang OTP 27.3.4 against current `main`:
+
+- `mix test test/thousand_island/connection_test.exs test/thousand_island/acceptor_test.exs` passes.
+- `mix test test/thousand_island/server_test.exs` passes.
+- `mix format --check-formatted`, `mix credo --strict`, and `mix dialyzer` pass.
+- The new tests fail on unpatched `main` and pass with this change.
+
+The unit regression uses a custom transport implementing `ThousandIsland.Transport`. It deterministically returns `{:error, :badarg}` from `controlling_process/2` and records each operation, verifying that the socket is closed, the handler terminates with `:shutdown`, no ready message is sent, the child is removed from the dynamic supervisor, and the typed error is returned.
+
+The server-level regression injects the same failure through a live acceptor. It verifies the accepted socket closes, `:spawn_error` telemetry contains `{:controlling_process, :badarg}`, the acceptor process survives, and the next client is accepted and echoed normally.
+
+## Compatibility / risks
+
+- Successful ownership transfers are unchanged.
+- A failed transfer now cleans up immediately and is treated as a recoverable per-connection spawn error instead of activating a handler that cannot own the socket.
+- The cleanup waits for the handler&amp;#39;s configured supervisor shutdown behavior. This occurs only on the ownership-transfer error path and ensures the spawned child is not leaked.
+- Existing custom transports are unaffected if they obey the documented `:ok | {:error, reason}` callback contract.&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/a48bb5e0dfd23c0b99a7b730569b93c06a4292ee</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/a48bb5e0dfd23c0b99a7b730569b93c06a4292ee"/>
+    <title>
+        Refactor: Separate connection start retries from socket handoff (#216)
+    </title>
+    <updated>2026-08-25T21:35:52Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/94031664?s=30&amp;v=4"/>
+    <author>
+      <name>mpettibone</name>
+      <uri>https://github.com/mpettibone</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Refactor: Separate connection start retries from socket handoff (#216)
+
+- Move `:max_children` retry behavior into `start_child_with_retry/4`.
+- Keep socket ownership transfer, connection startup, telemetry, and terminal cleanup in `start/5`.
+- Reduce the connection-start implementation by 20 lines.
+
+## Why
+
+The old recursive helper carried the socket, server config, handler config, telemetry span, and
+start timestamp through every retry even though retries only concern admission to the dynamic
+supervisor. Separating those concerns makes the success and cleanup paths visible in one place and
+gives the retry loop only the four values it uses.
+
+## Behavior and performance
+
+Behavior is unchanged:
+
+- A retry count of `n` still allows `n + 1` start attempts.
+- The same wait is used between `:max_children` responses.
+- Intermediate retries do not close the accepted socket.
+- The final `:max_children` response still closes the socket and returns
+  `{:error, :too_many_connections}`.
+- Other child-start results, socket handoff, telemetry, and cleanup are unchanged.
+
+The successful path has the same private helper call and one supervisor start operation as before.
+The retry path performs the same sleeps and supervisor calls.
+
+## Verification
+
+Verified against thousand_island `main` at `8f04692` with Erlang/OTP 27.3 and Elixir 1.18.4:
+
+- `mix format --check-formatted`
+- `MIX_ENV=test mix compile --warnings-as-errors`
+- Full suite: 118 tests pass (the suite&amp;#39;s two IPv6 bare-option tests need an IPv6-capable host)
+- `mix credo --strict` passes; the combined five-PR tree also passes `mix dialyzer` with no issues&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/8c3199730cbf85faff75bf69996873d50fd1e68b</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/8c3199730cbf85faff75bf69996873d50fd1e68b"/>
+    <title>
+        Survive handler start failure: close the socket and keep accepting (#…
+    </title>
+    <updated>2026-08-21T00:26:05Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/94031664?s=30&amp;v=4"/>
+    <author>
+      <name>mpettibone</name>
+      <uri>https://github.com/mpettibone</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Survive handler start failure: close the socket and keep accepting (#209)
+
+* Survive handler start failure: close the socket and keep accepting
+
+## The problem
+
+After a successful `accept`, the acceptor calls `ThousandIsland.Connection.start/5`, which asks the connection `DynamicSupervisor` to start the handler process. If that start fails for any reason other than `:max_children`, `Connection.start` falls through its final clause:
+
+```elixir
+other -&amp;gt;
+  other
+```
+
+and returns the raw value to the acceptor. For `{:error, reason}` (a handler whose `init/1` returned `{:stop, reason}`, say) the acceptor&amp;#39;s catch all raises &amp;quot;Unexpected error in accept: ...&amp;quot;. For `:ignore` (a handler whose `init/1` opted out) nothing in the `with` else block matches at all, and the acceptor dies with a `WithClauseError` instead. Either way the acceptor crashes on a per connection condition, and repeated occurrences escalate through the supervision tree exactly as described in the descriptor exhaustion PR: 4 crashes in 5 seconds kill the `AcceptorSupervisor` and its live connections.
+
+There is also a socket ownership loose end on this path: the accepted socket is never explicitly closed. Today that is masked, because the socket dies with the crashing acceptor process. But it means the crash is load bearing for cleanup, and any fix that keeps the acceptor alive must add the close, which this PR does.
+
+Verified on unmodified main: with a handler whose `init/1` returns `{:stop, reason}`, a single connection crashes the acceptor, and six connections in a row replace the acceptor pid and kill its supervisor.
+
+## Why it matters
+
+A handler can fail to start for ordinary reasons: it registers itself in a `Registry` during `init` and hits a conflict, it acquires a limited resource that is momentarily exhausted, or it returns `{:stop, reason}` or `:ignore` under some condition. None of these should take down the acceptor that accepted the connection, and none of them should leave the client hanging. The failure is per connection and should be handled per connection.
+
+## Prior art
+
+This is Ranch parity. When a connection process fails to start, Ranch logs the error, closes the socket, and keeps going. From `ranch_conns_sup.erl`:
+
+```erlang
+Ret -&amp;gt;
+    To ! self(),
+    ranch:log(error,
+        &amp;quot;Ranch listener ~p connection process start failure; &amp;quot;
+        &amp;quot;~p:start_link/3 returned: ~0p~n&amp;quot;,
+        [Ref, Protocol, Ret], Logger),
+    Transport:close(Socket),
+```
+
+The supervisor and acceptor stay up. A handler that cannot start is a connection level problem, not an acceptor level fault.
+
+## Design
+
+Two small, matched changes:
+
+- `ThousandIsland.Connection.start/5` now handles the non-`:max_children` failure returns explicitly: it closes the raw socket (which it still owns at that point) and returns a structured `{:error, {:spawn_error, reason}}`. `{:error, reason}` from the supervisor unwraps to the inner reason; `:ignore` or any nonstandard `start_link` return is passed through as is. The spec is tightened to the two outcomes that can actually occur, `:ok` or an error tuple.
+- `ThousandIsland.Acceptor` gains a clause matching `{:error, {:spawn_error, reason}}` which emits the existing `:spawn_error` telemetry event and continues the accept loop.
+
+Reusing the existing `:spawn_error` event is deliberate: from an operator&amp;#39;s point of view, &amp;quot;could not start a handler for this connection&amp;quot; is the same category whether the cause is the connection limit or a failed handler start, and consumers already handle the event. To keep the two cases distinguishable, the handler start failure now carries the failure reason in the event&amp;#39;s `error` measurement (the connection limit case is unchanged and carries none), and the event documentation says so.
+
+Closing the socket in `Connection.start` rather than in the acceptor keeps ownership logic in one place: it is where the socket is handed off on success, so it is also the right place to clean up on failure. This matches the `:max_children` branch a few lines up, which already closes there.
+
+## Regression tests
+
+Three tests in `test/thousand_island/spawn_failure_test.exs`, driven by a handler whose `init/1` fails in a mode chosen via `handler_options` (`{:stop, reason}` or `:ignore`):
+
+- For each failure mode: six connections in a row (past the acceptor&amp;#39;s restart budget, were it crashing) against a single acceptor. Asserts every client socket is actively closed (`recv` returns `{:error, :closed}` rather than hanging), and that the very same acceptor pid is still in place afterward, so the acceptor never crashed at all, let alone escalated. On unmodified main these fail deterministically.
+- A spawn failure emits the `:spawn_error` event with the init failure reason in its `error` measurement.
+
+## Verification
+
+- All three tests fail on unmodified main across seeds and pass on the branch.
+- Full suite on the branch: no new failures beyond the sandbox&amp;#39;s usual reuseport and IPv6 environment set.
+- `mix format --check-formatted`, `mix credo --strict`, and `mix dialyzer` are all clean on the branch.
+
+## Performance and compatibility
+
+No hot path impact: the new logic runs only when a handler fails to start. The `Connection.start` spec is narrowed to match what the function actually returns; the module is `@moduledoc false`, so there is no public API change. The `:spawn_error` event gains an optional documented measurement; its existing shape for the connection limit case is unchanged.
+
+## Note
+
+The explicit close also means a client whose connection was accepted but could not be handled sees a prompt close instead of a dead air socket. As with the companion acceptor PRs, this can be reviewed alone or folded into a combined &amp;quot;harden the acceptor&amp;quot; change.
+
+* Update and rename spawn_failure_test.exs to acceptor_test.exs&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/9470db5e08b2e70a0b17b155a617e62794569c1b</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/9470db5e08b2e70a0b17b155a617e62794569c1b"/>
+    <title>
+        Socket performance: reduce allocations on connection lifecycle (#182)
+    </title>
+    <updated>2025-12-11T22:42:37Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/27267603?s=30&amp;v=4"/>
+    <author>
+      <name>NelsonVides</name>
+      <uri>https://github.com/NelsonVides</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Socket performance: reduce allocations on connection lifecycle (#182)
+
+* Socket performance: reduce allocations on connection lifecycle
+
+Optimize connection handling to minimize memory allocations and message
+passing overhead during connection accept and close operations.
+
+Changes:
+
+1. Optimised socket stats collection in do_socket_close/2
+ - Replaced Keyword.take/2 + Enum.into/2 with a single map comprehension
+ - Reduces from 2 iterations and 2 allocations to 1 pass with direct map
+   construction
+ - Called on every connection close
+
+2. Minimised ServerConfig message passing on connection accept
+   (`:thousand_island_ready` message)
+ - Changed from sending entire ServerConfig struct (potentially very
+   big) to a plain map of 3 values, only the needed ones
+ - Reduces message copying overhead
+ - Called on every connection accept
+
+* Optimise further after review suggestions
+
+* Precalculate the connection config only once in the acceptor start&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/48f37587064e8f6a531349653a66b0a855d1e094</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/48f37587064e8f6a531349653a66b0a855d1e094"/>
+    <title>
+        Add support for not logging loudly on returned error tuples (#92)
+    </title>
+    <updated>2023-10-23T20:30:56Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Add support for not logging loudly on returned error tuples (#92)
+
+* Move premature close case to where it can actually catch
+
+* Typo (unrelated)
+
+* Add support for `silent_terminate_on_error` option for quieter runs&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/1c960ca480ac4ecbee030e9dc247ef8d0931aaf1</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/1c960ca480ac4ecbee030e9dc247ef8d0931aaf1"/>
+    <title>
+        Redesign Telemetry so its implementation details won&#39;t leak outside (…
+    </title>
+    <updated>2023-06-14T13:34:23Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/29058?s=30&amp;v=4"/>
+    <author>
+      <name>asakura</name>
+      <uri>https://github.com/asakura</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Redesign Telemetry so its implementation details won&amp;#39;t leak outside (#65)
+
+* Redesign Telemetry so its implementation details won&amp;#39;t leak outside
+
+* Partially revert &amp;quot;Redesign Telemetry so its implementation details won&amp;#39;t leak outside&amp;quot;
+
+This reverts commit 77717c8afdc8034131d80bb7efe3950904b67dfd.
+
+* Tidy up specs in Telemetry&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/99288bb9f2b85f8c79367a122246d2ef4c1908da</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/99288bb9f2b85f8c79367a122246d2ef4c1908da"/>
+    <title>
+        Adds missing specs and enables additional checks in Dialyzer (#61)
+    </title>
+    <updated>2023-05-25T13:16:44Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/29058?s=30&amp;v=4"/>
+    <author>
+      <name>asakura</name>
+      <uri>https://github.com/asakura</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Adds missing specs and enables additional checks in Dialyzer (#61)&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/afe6e70a12cb990209b41276d4f9f4871a4b1f81</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/afe6e70a12cb990209b41276d4f9f4871a4b1f81"/>
+    <title>
+        Add `num_connections` support and associated configuration (#54)
+    </title>
+    <updated>2023-04-07T16:59:43Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Add `num_connections` support and associated configuration (#54)
+
+* Add `num_connections` config option &amp;amp; pass it to acceptor supervisors
+
+* Handle supervisor errors at connection startup
+
+* Also move connection span construction into handler process
+
+* Add telemetry support for spawn errors
+
+* Add configurable retry parameters
+
+* Add test coverage
+
+* Refactor into with block&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/76047472d4421a234b9309efba03af3ea7514b61</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/76047472d4421a234b9309efba03af3ea7514b61"/>
+    <title>
+        Refine shutdown timing and semantics
+    </title>
+    <updated>2023-03-14T18:28:33Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Refine shutdown timing and semantics&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/9b6b3a31d47b7f35b3d12dfff9d3b997b33b3edc</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/9b6b3a31d47b7f35b3d12dfff9d3b997b33b3edc"/>
+    <title>
+        Update internal config plumbing
+    </title>
+    <updated>2023-03-14T18:28:33Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Update internal config plumbing
+
+* Set read_timeout default to 60_000ms
+* Set num_acceptors default to 100
+* Add missing docs for read_timeout&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/3e52851e4048f3d4f6a6e615ae2dc688acd165a4</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/3e52851e4048f3d4f6a6e615ae2dc688acd165a4"/>
+    <title>
+        Implement new telemetry events &amp; tests (#27)
+    </title>
+    <updated>2023-02-04T21:42:58Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Implement new telemetry events &amp;amp; tests (#27)&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/5678277907699ac30315b23739085a1c1776e4db</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/5678277907699ac30315b23739085a1c1776e4db"/>
+    <title>
+        Refactor app structure (#29)
+    </title>
+    <updated>2022-12-01T00:47:32Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Refactor app structure (#29)&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/7bfb834273605281f98185acce70efa5a2f46b7b</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/7bfb834273605281f98185acce70efa5a2f46b7b"/>
+    <title>
+        Add `read_timeout` (#16)
+    </title>
+    <updated>2022-05-13T18:48:00Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/792046?s=30&amp;v=4"/>
+    <author>
+      <name>moogle19</name>
+      <uri>https://github.com/moogle19</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Add `read_timeout` (#16)
+
+* Add `read_timeout` to Socket
+
+* Fix typo and add recv timeout in assert
+
+* Add test for synchronous read
+
+* Add test to validate timeout priority
+
+* Add more specific typespec for transport_options
+
+* Fix ServerConfig typespec
+
+* Use correct type for timeout
+
+* Fix typespec for Socket
+
+* Fix Socket.recv typespec
+
+* Remove :inet.inet_backend from typespec
+
+* Update typespec based on feedback&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/f38c0673e0e94c6ab55ca6772284fba76eeec987</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/f38c0673e0e94c6ab55ca6772284fba76eeec987"/>
+    <title>
+        Add callback to pass GenServer options to handlers (#9)
+    </title>
+    <updated>2022-02-14T17:17:55Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/1076999?s=30&amp;v=4"/>
+    <author>
+      <name>lucacorti</name>
+      <uri>https://github.com/lucacorti</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Add callback to pass GenServer options to handlers (#9)
+
+* Add callback to pass Genserver options to handlers&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/2ca2709913c293ba35b3dc616ebc6cae2acad534</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/2ca2709913c293ba35b3dc616ebc6cae2acad534"/>
+    <title>
+        Improve handler related telemetry
+    </title>
+    <updated>2021-04-29T00:57:37Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Improve handler related telemetry&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/5b246b5054671cf2b9a822d7d388bd90c0c77510</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/5b246b5054671cf2b9a822d7d388bd90c0c77510"/>
+    <title>
+        Fix CI Issues
+    </title>
+    <updated>2021-04-24T01:50:36Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Fix CI Issues&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/2664eba3052b9344a3e9e9c04b2efb84e29a5a47</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/2664eba3052b9344a3e9e9c04b2efb84e29a5a47"/>
+    <title>
+        Implement async-capable Handler behaviour
+    </title>
+    <updated>2021-04-23T20:23:41Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Implement async-capable Handler behaviour&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/8ee5badf3f57981de73a9b0c456a236646ed4369</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/8ee5badf3f57981de73a9b0c456a236646ed4369"/>
+    <title>
+        Add option to suppress error re-raising, suppress in test env
+    </title>
+    <updated>2020-11-24T17:50:36Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Add option to suppress error re-raising, suppress in test env&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/dce09927bb5bccc5761557b2e2fda37cc439db73</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/dce09927bb5bccc5761557b2e2fda37cc439db73"/>
+    <title>
+        Allow transport modules to source their own stats
+    </title>
+    <updated>2020-11-24T17:50:36Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Allow transport modules to source their own stats&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/6a5b0e924bd0be41e9b9a60b799077c925721605</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/6a5b0e924bd0be41e9b9a60b799077c925721605"/>
+    <title>
+        Reraise connection exceptions for improved visibility
+    </title>
+    <updated>2020-11-05T16:37:12Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Reraise connection exceptions for improved visibility&lt;/pre&gt;
+    </content>
+  </entry>
+</feed>

@@ -1,0 +1,66 @@
+diff --git a/lib/absinthe/middleware/async.ex b/lib/absinthe/middleware/async.ex
+index f5003ce17f..b56c95d57c 100644
+--- a/lib/absinthe/middleware/async.ex
++++ b/lib/absinthe/middleware/async.ex
+@@ -50,8 +50,14 @@ defmodule Absinthe.Middleware.Async do
+   # This function inserts additional middleware into the remaining middleware
+   # stack for this field. On the next resolution pass, we need to `Task.await` the
+   # task so we have actual data. Thus, we prepend this module to the middleware stack.
+-  def call(%{state: :unresolved} = res, {fun, opts}) when is_function(fun),
+-    do: call(res, {Task.async(fun), opts})
++  def call(%{state: :unresolved} = res, {fun, opts}) when is_function(fun) do
++    task =
++      Task.async(fn ->
++        :telemetry.span([:absinthe, :middleware, :async, :task], %{}, fn -> {fun.(), %{}} end)
++      end)
++
++    call(res, {task, opts})
++  end
+ 
+   def call(%{state: :unresolved} = res, {task, opts}) do
+     task_data = {task, opts}
+diff --git a/test/absinthe/middleware/async_test.exs b/test/absinthe/middleware/async_test.exs
+index 7c4e88eefd..49e39a196e 100644
+--- a/test/absinthe/middleware/async_test.exs
++++ b/test/absinthe/middleware/async_test.exs
+@@ -75,12 +75,39 @@ defmodule Absinthe.Middleware.AsyncTest do
+     assert {:ok, %{data: %{"asyncBareThing" => "bare task"}}} == Absinthe.run(doc, Schema)
+   end
+ 
+-  test "can resolve a field using the normal test helper" do
++  test "can resolve a field using the normal test helper and emit telemetry event", %{test: test} do
+     doc = """
+     {asyncThing}
+     """
+ 
++    pid = self()
++
++    :ok =
++      :telemetry.attach_many(
++        "#{test}",
++        [
++          [:absinthe, :middleware, :async, :task, :start],
++          [:absinthe, :middleware, :async, :task, :stop]
++        ],
++        fn name, measurements, metadata, _config ->
++          send(pid, {:telemetry_event, name, measurements, metadata})
++        end,
++        _config = %{}
++      )
++
+     assert {:ok, %{data: %{"asyncThing" => "we async now"}}} == Absinthe.run(doc, Schema)
++
++    assert_receive {:telemetry_event, [:absinthe, :middleware, :async, :task, :start],
++                    %{system_time: _}, %{}}
++
++    assert_receive {:telemetry_event, [:absinthe, :middleware, :async, :task, :stop],
++                    %{duration: _}, %{}}
++
++    assert_receive {:telemetry_event, [:absinthe, :middleware, :async, :task, :start],
++                    %{system_time: _}, %{}}
++
++    assert_receive {:telemetry_event, [:absinthe, :middleware, :async, :task, :stop],
++                    %{duration: _}, %{}}
+   end
+ 
+   test "can resolve a field using a cooler but probably confusing to some people helper" do

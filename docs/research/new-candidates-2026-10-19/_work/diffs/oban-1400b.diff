@@ -1,0 +1,300 @@
+diff --git a/lib/oban/job.ex b/lib/oban/job.ex
+index 1dcf4b2e..19e82867 100644
+--- a/lib/oban/job.ex
++++ b/lib/oban/job.ex
+@@ -11,29 +11,21 @@ defmodule Oban.Job do
+   use Ecto.Schema
+ 
+   import Ecto.Changeset
++  import Oban.Period, only: [is_valid_period: 1]
+ 
+   alias Ecto.Changeset
++  alias Oban.Period
+   alias Oban.Validation
+ 
+   @type args :: map()
+   @type errors :: [%{at: DateTime.t(), attempt: pos_integer(), error: binary()}]
+   @type tags :: [binary()]
+ 
+-  @type time_unit ::
+-          :second
+-          | :seconds
+-          | :minute
+-          | :minutes
+-          | :hour
+-          | :hours
+-          | :day
+-          | :days
+-          | :week
+-          | :weeks
++  @type time_unit :: Period.time_unit()
+ 
+   @type unique_field :: :args | :meta | :queue | :worker
+ 
+-  @type unique_period :: pos_integer() | {pos_integer(), time_unit()} | :infinity
++  @type unique_period :: Period.t() | :infinity
+ 
+   @type unique_state_group :: :all | :incomplete | :scheduled | :successful
+ 
+@@ -481,20 +473,8 @@ defmodule Oban.Job do
+   end
+ 
+   @doc false
+-  @spec cast_period(unique_period()) :: pos_integer()
+-  def cast_period({value, unit}) do
+-    unit = to_string(unit)
+-
+-    cond do
+-      unit in ~w(second seconds) -> value
+-      unit in ~w(minute minutes) -> value * 60
+-      unit in ~w(hour hours) -> value * 60 * 60
+-      unit in ~w(day days) -> value * 24 * 60 * 60
+-      unit in ~w(week weeks) -> value * 24 * 60 * 60 * 7
+-      true -> unit
+-    end
+-  end
+-
++  @spec cast_period(unique_period()) :: pos_integer() | :infinity
++  def cast_period(period) when is_valid_period(period), do: Period.to_seconds(period)
+   def cast_period(period), do: period
+ 
+   @doc false
+diff --git a/lib/oban/period.ex b/lib/oban/period.ex
+new file mode 100644
+index 00000000..cd9b970f
+--- /dev/null
++++ b/lib/oban/period.ex
+@@ -0,0 +1,46 @@
++defmodule Oban.Period do
++  @moduledoc false
++
++  @type time_unit ::
++          :second
++          | :seconds
++          | :minute
++          | :minutes
++          | :hour
++          | :hours
++          | :day
++          | :days
++          | :week
++          | :weeks
++
++  @type t :: pos_integer() | {pos_integer(), time_unit()}
++
++  @time_units ~w(
++    second
++    seconds
++    minute
++    minutes
++    hour
++    hours
++    day
++    days
++    week
++    weeks
++  )a
++
++  defguard is_seconds(seconds) when is_integer(seconds) and seconds >= 0
++
++  defguard is_valid_period(period)
++           when is_seconds(period) or
++                  (is_tuple(period) and tuple_size(period) == 2 and
++                     is_integer(elem(period, 0)) and elem(period, 0) >= 0 and
++                     elem(period, 1) in @time_units)
++
++  @spec to_seconds(t()) :: pos_integer()
++  def to_seconds({value, unit}) when unit in ~w(second seconds)a, do: value
++  def to_seconds({value, unit}) when unit in ~w(minute minutes)a, do: value * 60
++  def to_seconds({value, unit}) when unit in ~w(hour hours)a, do: value * 60 * 60
++  def to_seconds({value, unit}) when unit in ~w(day days)a, do: value * 24 * 60 * 60
++  def to_seconds({value, unit}) when unit in ~w(week weeks)a, do: value * 24 * 60 * 60 * 7
++  def to_seconds(seconds) when is_seconds(seconds), do: seconds
++end
+diff --git a/lib/oban/queue/executor.ex b/lib/oban/queue/executor.ex
+index 0108b19c..76800341 100644
+--- a/lib/oban/queue/executor.ex
++++ b/lib/oban/queue/executor.ex
+@@ -1,7 +1,9 @@
+ defmodule Oban.Queue.Executor do
+   @moduledoc false
+ 
+-  alias Oban.{Backoff, Config, CrashError, Engine, Job}
++  import Oban.Period, only: [is_valid_period: 1]
++
++  alias Oban.{Backoff, Config, CrashError, Engine, Job, Period}
+   alias Oban.{PerformError, TimeoutError, Worker}
+ 
+   require Logger
+@@ -159,8 +161,8 @@ defmodule Oban.Queue.Executor do
+       {:error, _reason} = result ->
+         %{exec | result: result, state: :failure, error: perform_error(worker, result)}
+ 
+-      {:snooze, seconds} = result when is_integer(seconds) and seconds >= 0 ->
+-        %{exec | result: result, state: :snoozed, snooze: seconds}
++      {:snooze, period} = result when is_valid_period(period) ->
++        %{exec | result: result, state: :snoozed, snooze: Period.to_seconds(period)}
+ 
+       returned ->
+         log_warning(exec, returned)
+@@ -346,7 +348,7 @@ defmodule Oban.Queue.Executor do
+         - `{:error, reason}`,
+         - `{:cancel, reason}`
+         - `{:discard, reason}`
+-        - `{:snooze, seconds}`
++        - `{:snooze, period}`
+ 
+         Instead received:
+ 
+diff --git a/lib/oban/worker.ex b/lib/oban/worker.ex
+index f51d6ef3..2fe790f8 100644
+--- a/lib/oban/worker.ex
++++ b/lib/oban/worker.ex
+@@ -100,8 +100,9 @@ defmodule Oban.Worker do
+     already, the job is marked as `retryable` and scheduled to run again. Otherwise, the job is
+     marked as `discarded` and won't be retried.
+ 
+-  * `{:snooze, seconds}` — mark the job as `snoozed` and schedule it to run again `seconds` in the
+-    future. See [Snoozing](#module-snoozing-jobs) for more details.
++  * `{:snooze, period}` — mark the job as `snoozed` and schedule it to run again after the specified
++    period. The period can be a number of seconds or a tuple like `{5, :minutes}`.
++    See [Snoozing](#module-snoozing-jobs) for more details.
+ 
+   In addition to explicit return values, any _unhandled exception_, _exit_ or _throw_ will fail
+   the job and schedule a retry under the same conditions as in the `{:error, error}` case.
+@@ -260,14 +261,41 @@ defmodule Oban.Worker do
+ 
+   ## Snoozing Jobs
+ 
+-  When returning `{:snooze, snooze_time}` in `c:perform/1`, the job is postponed for at least
+-  `snooze_time` seconds. Snoozing is done by incrementing the job's `max_attempts` field and
+-  scheduling execution for `snooze_time` seconds in the future.
++  When returning `{:snooze, period}` in `c:perform/1`, the job is postponed for at least
++  the specified period. The period can be specified as:
++
++  * An integer representing seconds: `{:snooze, 60}` - snooze for 60 seconds
++  * A tuple with a value and time unit: `{:snooze, {5, :minutes}}` - snooze for 5 minutes
++
++  Supported time units are: `:second`, `:seconds`, `:minute`, `:minutes`, `:hour`, `:hours`,
++  `:day`, `:days`, `:week`, `:weeks`.
++
++  Snoozing is done by incrementing the job's `max_attempts` field and scheduling execution for
++  the specified period in the future.
+ 
+   Executing bumps a job's `attempt` count. Despite snooze incrementing the `max_attempts` to
+   preserve total retries, the change to `attempt` will affect the default backoff retry
+   algorithm.
+ 
++  ### Examples
++
++  ```elixir
++    # Snooze for 60 seconds
++    def perform(job) do
++      if ready?(job), do: :ok, else: {:snooze, 60}
++    end
++
++    # Snooze for 5 minutes
++    def perform(job) do
++      if ready?(job), do: :ok, else: {:snooze, {5, :minutes}}
++    end
++
++    # Snooze for 1 hour
++    def perform(job) do
++      if rate_limited?(job), do: {:snooze, {1, :hour}}, else: :ok
++    end
++    ```
++
+   > #### 🌟 Snoozes and Attempts {: .info}
+   >
+   > Oban Pro's [Smart Engine](https://oban.pro/docs/pro/Oban.Pro.Engines.Smart.html) rolls back
+@@ -331,7 +359,7 @@ defmodule Oban.Worker do
+ 
+   import Kernel, except: [to_string: 1]
+ 
+-  alias Oban.{Backoff, Job, Validation}
++  alias Oban.{Backoff, Job, Period, Validation}
+ 
+   @type t :: module()
+ 
+@@ -343,7 +371,8 @@ defmodule Oban.Worker do
+   - `{:cancel, reason}` - the job is marked as `cancelled` for the provided reason and no longer retried.
+   - `{:error, reason}` - the job is marked as `retryable` for the provided reason, or `discarded`
+     if it has  exhausted all attempts.
+-  - `{:snooze, seconds}` - mark the job as `scheduled` to run again `seconds` in the future.
++  - `{:snooze, period}` - mark the job as `scheduled` to run again after the specified period.
++    The period can be an integer (seconds) or a tuple like `{5, :minutes}`.
+ 
+   > #### Deprecated {: .warning}
+   >
+@@ -357,7 +386,7 @@ defmodule Oban.Worker do
+           | {:discard, reason :: term()}
+           | {:ok, ignored :: term()}
+           | {:error, reason :: term()}
+-          | {:snooze, seconds :: non_neg_integer()}
++          | {:snooze, period :: Period.t()}
+ 
+   @doc """
+   Build a job changeset for this worker with optional overrides.
+diff --git a/test/oban/queue/executor_test.exs b/test/oban/queue/executor_test.exs
+index 40febbbd..1834ecff 100644
+--- a/test/oban/queue/executor_test.exs
++++ b/test/oban/queue/executor_test.exs
+@@ -1,6 +1,8 @@
+ defmodule Oban.Queue.ExecutorTest do
+   use Oban.Case, async: true
+ 
++  import ExUnit.CaptureLog
++
+   alias Oban.{CrashError, PerformError, TimeoutError}
+   alias Oban.Queue.Executor
+ 
+@@ -12,6 +14,10 @@ defmodule Oban.Queue.ExecutorTest do
+     def perform(%{args: %{"mode" => "result"}}), do: {:ok, :result}
+     def perform(%{args: %{"mode" => "snooze_zero"}}), do: {:snooze, 0}
+     def perform(%{args: %{"mode" => "snooze"}}), do: {:snooze, 1}
++    def perform(%{args: %{"mode" => "snooze_minutes"}}), do: {:snooze, {5, :minutes}}
++    def perform(%{args: %{"mode" => "snooze_hours"}}), do: {:snooze, {1, :hour}}
++    def perform(%{args: %{"mode" => "snooze_days"}}), do: {:snooze, {2, :days}}
++    def perform(%{args: %{"mode" => "snooze_invalid_unit"}}), do: {:snooze, {5, :invalid}}
+     def perform(%{args: %{"mode" => "raise"}}), do: raise(ArgumentError)
+     def perform(%{args: %{"mode" => "catch"}}), do: throw({:error, :no_reason})
+     def perform(%{args: %{"mode" => "error"}}), do: {:error, "no reason"}
+@@ -37,6 +43,22 @@ defmodule Oban.Queue.ExecutorTest do
+       assert %{state: :snoozed, snooze: 1} = call_with_mode("snooze")
+     end
+ 
++    test "reporting :snooze status with time unit tuples" do
++      assert %{state: :snoozed, snooze: 300} = call_with_mode("snooze_minutes")
++      assert %{state: :snoozed, snooze: 3600} = call_with_mode("snooze_hours")
++      assert %{state: :snoozed, snooze: 172_800} = call_with_mode("snooze_days")
++    end
++
++    test "handling invalid snooze time units gracefully" do
++      # Invalid unit should be treated as success with warning
++      logged =
++        capture_log(fn ->
++          assert %{state: :success} = call_with_mode("snooze_invalid_unit")
++        end)
++
++      assert logged =~ "The job will be considered a success."
++    end
++
+     test "reporting :discard status" do
+       assert %{state: :discard} = call_with_mode("discard")
+     end
+diff --git a/test/support/worker.ex b/test/support/worker.ex
+index a22c39f7..9c8ea671 100644
+--- a/test/support/worker.ex
++++ b/test/support/worker.ex
+@@ -59,6 +59,11 @@ defmodule Oban.Integration.Worker do
+ 
+         {:snooze, 60}
+ 
++      "SNOOZE_MINUTES" ->
++        send(pid, {:snooze, ref})
++
++        {:snooze, {1, :minute}}
++
+       "TASK_ERROR" ->
+         send(pid, {:async, ref})
+ 

@@ -1,0 +1,136 @@
+diff --git a/lib/bandit/http1/socket.ex b/lib/bandit/http1/socket.ex
+index f3fd31c5..a2e313d1 100644
+--- a/lib/bandit/http1/socket.ex
++++ b/lib/bandit/http1/socket.ex
+@@ -62,7 +62,7 @@ defmodule Bandit.HTTP1.Socket do
+       {method, request_target, socket} = do_read_request_line!(socket)
+       {headers, socket} = do_read_headers!(socket)
+       content_length = get_content_length!(headers)
+-      body_encoding = get_transfer_encoding!(headers)
++      body_encoding = headers |> get_transfer_encoding!() |> validate_transfer_encoding!()
+       request_connection_header = safe_downcase(Bandit.Headers.get_header(headers, "connection"))
+       socket = %{socket | request_connection_header: request_connection_header}
+ 
+@@ -209,6 +209,31 @@ defmodule Bandit.HTTP1.Socket do
+       end
+     end
+ 
++    # RFC9112§6.3 requires a 400 response when a request's final transfer coding
++    # is not chunked. Reject it while reading the headers so the request cannot be
++    # dispatched to Plug before its framing has been validated.
++    defp validate_transfer_encoding!(nil), do: nil
++
++    defp validate_transfer_encoding!(encoding) do
++      codings = Plug.Conn.Utils.list(encoding)
++
++      cond do
++        codings == ["chunked"] ->
++          "chunked"
++
++        Enum.count(codings, &(&1 == "chunked")) > 1 ->
++          request_error!("Transfer-encoding cannot apply chunked more than once (RFC9112§6.1)")
++
++        List.last(codings) != "chunked" ->
++          request_error!(
++            "Final transfer coding in a request must be chunked (RFC9112§6.3 rule 4)"
++          )
++
++        true ->
++          request_error!("Unsupported transfer-encoding", :not_implemented)
++      end
++    end
++
+     def read_data(
+           %@for{read_state: :headers_read, unread_content_length: unread_content_length} = socket,
+           opts
+diff --git a/test/bandit/http1/protocol_test.exs b/test/bandit/http1/protocol_test.exs
+index 8a8ca889..c61c12df 100644
+--- a/test/bandit/http1/protocol_test.exs
++++ b/test/bandit/http1/protocol_test.exs
+@@ -1473,6 +1473,58 @@ defmodule HTTP1ProtocolTest do
+   end
+ 
+   describe "transfer-encoding edge cases (RFC9112§6.1, §7.1.1)" do
++    test "rejects a non-chunked final transfer coding before invoking Plug", context do
++      test_pid = self()
++
++      context =
++        context
++        |> http_server(
++          plug: fn conn, _opts ->
++            send(test_pid, :plug_called)
++            send_resp(conn, 200, "unexpected")
++          end
++        )
++        |> Enum.into(context)
++
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      SimpleHTTP1Client.send(client, "POST", "/", [
++        "host: localhost",
++        "transfer-encoding: gzip"
++      ])
++
++      assert {:ok, "400 Bad Request", _headers, ""} = SimpleHTTP1Client.recv_reply(client)
++      refute_receive :plug_called, 100
++      assert SimpleHTTP1Client.connection_closed_for_reading?(client)
++    end
++
++    test "rejects an unsupported transfer coding before invoking Plug", context do
++      test_pid = self()
++
++      context =
++        context
++        |> http_server(
++          plug: fn conn, _opts ->
++            send(test_pid, :plug_called)
++            send_resp(conn, 200, "unexpected")
++          end
++        )
++        |> Enum.into(context)
++
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      SimpleHTTP1Client.send(client, "POST", "/", [
++        "host: localhost",
++        "transfer-encoding: gzip, chunked"
++      ])
++
++      assert {:ok, "501 Not Implemented", _headers, ""} =
++               SimpleHTTP1Client.recv_reply(client)
++
++      refute_receive :plug_called, 100
++      assert SimpleHTTP1Client.connection_closed_for_reading?(client)
++    end
++
+     @tag :capture_log
+     test "rejects a request with transfer-encoding applied twice", context do
+       client = SimpleHTTP1Client.tcp_client(context)
+@@ -1498,7 +1550,7 @@ defmodule HTTP1ProtocolTest do
+ 
+       Transport.send(client, "3\r\nabc\r\n0\r\n\r\n")
+       assert {:ok, status, _headers, _body} = SimpleHTTP1Client.recv_reply(client)
+-      assert status in ["400 Bad Request", "501 Not Implemented"]
++      assert status == "400 Bad Request"
+     end
+ 
+     test "ignores unrecognized chunk extensions", context do
+@@ -1514,6 +1566,18 @@ defmodule HTTP1ProtocolTest do
+       assert SimpleHTTP1Client.recv_reply(client) ~> {:ok, "200 OK", list(), "OK"}
+     end
+ 
++    test "accepts optional whitespace after a single chunked transfer coding", context do
++      client = SimpleHTTP1Client.tcp_client(context)
++
++      SimpleHTTP1Client.send(client, "POST", "/expect_case_insensitive_chunked_body", [
++        "host: localhost",
++        "transfer-encoding: chunked  \t"
++      ])
++
++      Transport.send(client, "3\r\n123\r\n0\r\n\r\n")
++      assert SimpleHTTP1Client.recv_reply(client) ~> {:ok, "200 OK", list(), "OK"}
++    end
++
+     @tag :capture_log
+     test "treats a transfer-encoding request from an HTTP/1.0 client as faulty framing",
+          context do

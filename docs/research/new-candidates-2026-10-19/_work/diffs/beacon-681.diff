@@ -1,0 +1,308 @@
+diff --git a/dev.exs b/dev.exs
+index 654cea4ed..679178837 100644
+--- a/dev.exs
++++ b/dev.exs
+@@ -77,6 +77,7 @@ defmodule DemoWeb.Router do
+     plug :fetch_live_flash
+     plug :protect_from_forgery
+     plug :put_secure_browser_headers
++    plug Beacon.Plug
+   end
+ 
+   scope "/", DemoWeb do
+diff --git a/lib/beacon/loader/page.ex b/lib/beacon/loader/page.ex
+index 48c29571c..5b4eeb4b7 100644
+--- a/lib/beacon/loader/page.ex
++++ b/lib/beacon/loader/page.ex
+@@ -197,7 +197,7 @@ defmodule Beacon.Loader.Page do
+           def render(var!(assigns)) when is_map(var!(assigns)) do
+             var!(assigns)
+             |> templates()
+-            |> Beacon.Template.choose_template()
++            |> Beacon.Template.choose_template(var!(assigns).beacon.private[:variant_roll])
+           end
+ 
+           def templates(var!(assigns)) when is_map(var!(assigns)) do
+diff --git a/lib/beacon/plug.ex b/lib/beacon/plug.ex
+new file mode 100644
+index 000000000..f0c59c5ac
+--- /dev/null
++++ b/lib/beacon/plug.ex
+@@ -0,0 +1,25 @@
++defmodule Beacon.Plug do
++  @moduledoc """
++  Used to ensure consistency for Beacon Page rendering.
++
++  This is especially important when using Page Variants.
++
++  ## Usage
++
++  Add the plug to your Router's `:browser` pipeline:
++
++  ```
++  pipeline :browser do
++    ...
++    plug Beacon.Plug
++  end
++  ```
++  """
++  @behaviour Plug
++
++  @impl Plug
++  def init(_opts), do: []
++
++  @impl Plug
++  def call(conn, _opts), do: Plug.Conn.put_session(conn, :beacon_variant_roll, Enum.random(1..100))
++end
+diff --git a/lib/beacon/template.ex b/lib/beacon/template.ex
+index 5f183349f..ea7e58ffa 100644
+--- a/lib/beacon/template.ex
++++ b/lib/beacon/template.ex
+@@ -1,32 +1,3 @@
+-defmodule Beacon.Template.LoadMetadata do
+-  @moduledoc """
+-  Metadata passed to page loading lifecycle.
+-  """
+-
+-  defstruct [:site, :path]
+-
+-  @type t :: %__MODULE__{
+-          site: Beacon.Types.Site.t(),
+-          path: String.t()
+-        }
+-end
+-
+-defmodule Beacon.Template.RenderMetadata do
+-  @moduledoc """
+-  Metadata passed to page rendering lifecycle.
+-  """
+-
+-  defstruct [:site, :path, :page_module, :assigns, :env]
+-
+-  @type t :: %__MODULE__{
+-          site: Beacon.Types.Site.t(),
+-          path: String.t(),
+-          page_module: module(),
+-          assigns: Phoenix.LiveView.Socket.assigns(),
+-          env: Macro.Env.t()
+-        }
+-end
+-
+ defmodule Beacon.Template do
+   @moduledoc """
+   Template for layouts, pages, and any other resource that display HTML/HEEx.
+@@ -36,9 +7,10 @@ defmodule Beacon.Template do
+ 
+   Template engines that do not support dynamic content can make use of the `:static` field to store its contents.
+   """
+-
+   alias Beacon.Web.BeaconAssigns
+ 
++  require Logger
++
+   @typedoc """
+   The AST representation of a `t:Phoenix.LiveView.Rendered.t/0` struct.
+   """
+@@ -46,6 +18,7 @@ defmodule Beacon.Template do
+ 
+   @type t :: Phoenix.LiveView.Rendered.t() | ast()
+ 
++  # Used for backwards-compatibility with Atom feeds
+   @doc false
+   def render_path(site, path_info, query_params \\ %{}) when is_atom(site) and is_list(path_info) and is_map(query_params) do
+     case Beacon.RouterServer.lookup_page(site, path_info) do
+@@ -55,7 +28,7 @@ defmodule Beacon.Template do
+       page ->
+         page_module = Beacon.Loader.fetch_page_module(page.site, page.id)
+         live_data = Beacon.Web.DataSource.live_data(site, path_info)
+-        beacon_assigns = BeaconAssigns.new(site, page, live_data, path_info, query_params)
++        beacon_assigns = BeaconAssigns.new(site, page, live_data, path_info, query_params, :beacon)
+         assigns = Map.put(live_data, :beacon, beacon_assigns)
+         env = Beacon.Web.PageLive.make_env(site)
+ 
+@@ -69,11 +42,10 @@ defmodule Beacon.Template do
+   end
+ 
+   @doc false
+-  def choose_template([primary]), do: primary
+-  def choose_template([primary | variants]), do: choose_template(variants, Enum.random(1..100), primary)
++  def choose_template([primary | variants], roll), do: choose_template(variants, roll, primary)
+ 
+-  @doc false
+-  def choose_template([], _, primary), do: primary
+-  def choose_template([{weight, template} | _], n, _) when weight >= n, do: template
+-  def choose_template([{weight, _} | variants], n, primary), do: choose_template(variants, n - weight, primary)
++  defp choose_template([], _, primary), do: primary
++  defp choose_template(_, nil, primary), do: primary
++  defp choose_template([{weight, template} | _], n, _) when weight >= n, do: template
++  defp choose_template([{weight, _} | variants], n, primary), do: choose_template(variants, n - weight, primary)
+ end
+diff --git a/lib/beacon/template/load_metadata.ex b/lib/beacon/template/load_metadata.ex
+new file mode 100644
+index 000000000..3bbfe1f8d
+--- /dev/null
++++ b/lib/beacon/template/load_metadata.ex
+@@ -0,0 +1,12 @@
++defmodule Beacon.Template.LoadMetadata do
++  @moduledoc """
++  Metadata passed to page loading lifecycle.
++  """
++
++  defstruct [:site, :path]
++
++  @type t :: %__MODULE__{
++          site: Beacon.Types.Site.t(),
++          path: String.t()
++        }
++end
+diff --git a/lib/beacon/template/render_metadata.ex b/lib/beacon/template/render_metadata.ex
+new file mode 100644
+index 000000000..8b02890f7
+--- /dev/null
++++ b/lib/beacon/template/render_metadata.ex
+@@ -0,0 +1,15 @@
++defmodule Beacon.Template.RenderMetadata do
++  @moduledoc """
++  Metadata passed to page rendering lifecycle.
++  """
++
++  defstruct [:site, :path, :page_module, :assigns, :env]
++
++  @type t :: %__MODULE__{
++          site: Beacon.Types.Site.t(),
++          path: String.t(),
++          page_module: module(),
++          assigns: Phoenix.LiveView.Socket.assigns(),
++          env: Macro.Env.t()
++        }
++end
+diff --git a/lib/beacon/web/beacon_assigns.ex b/lib/beacon/web/beacon_assigns.ex
+index ed2682a2e..dfad25d9c 100644
+--- a/lib/beacon/web/beacon_assigns.ex
++++ b/lib/beacon/web/beacon_assigns.ex
+@@ -42,7 +42,8 @@ defmodule Beacon.Web.BeaconAssigns do
+               info_handlers_module: nil,
+               event_handlers_module: nil,
+               live_data_keys: [],
+-              live_path: []
++              live_path: [],
++              variant_roll: nil
+             }
+ 
+   @doc false
+@@ -52,15 +53,23 @@ defmodule Beacon.Web.BeaconAssigns do
+   end
+ 
+   @doc false
+-  def new(site, %Beacon.Content.Page{} = page) do
++  def new(site, %Beacon.Content.Page{} = page, variant_roll) do
+     components_module = Beacon.Loader.Components.module_name(site)
+     page_module = Beacon.Loader.Page.module_name(site, page.id)
+-    %__MODULE__{site: site, private: %{components_module: components_module, page_module: page_module}}
++
++    %__MODULE__{
++      site: site,
++      private: %{
++        components_module: components_module,
++        page_module: page_module,
++        variant_roll: variant_roll
++      }
++    }
+   end
+ 
+   @doc false
+-  def new(site, %Beacon.Content.Page{} = page, live_data, path_info, query_params, source \\ :beacon)
+-      when is_atom(site) and is_map(live_data) and is_list(path_info) and is_map(query_params) do
++  def new(site, %Beacon.Content.Page{} = page, live_data, path_info, query_params, source, variant_roll \\ nil)
++      when is_atom(site) and is_map(live_data) and is_list(path_info) and is_map(query_params) and source in [:beacon, :admin] do
+     %{site: ^site} = page
+     page_module = Beacon.Loader.Page.module_name(site, page.id)
+     live_data = Beacon.Web.DataSource.live_data(site, path_info, Map.drop(query_params, ["path"]))
+@@ -81,7 +90,8 @@ defmodule Beacon.Web.BeaconAssigns do
+         info_handlers_module: info_handlers_module,
+         event_handlers_module: event_handlers_module,
+         live_data_keys: Map.keys(live_data),
+-        live_path: path_info
++        live_path: path_info,
++        variant_roll: variant_roll
+       }
+     }
+   end
+diff --git a/lib/beacon/web/live/page_live.ex b/lib/beacon/web/live/page_live.ex
+index 212a7f46f..de0466b34 100644
+--- a/lib/beacon/web/live/page_live.ex
++++ b/lib/beacon/web/live/page_live.ex
+@@ -23,8 +23,23 @@ defmodule Beacon.Web.PageLive do
+       :ok = Beacon.PubSub.subscribe_to_page(site, path)
+     end
+ 
++    variant_roll =
++      case session["beacon_variant_roll"] do
++        nil ->
++          Logger.warning("""
++          Beacon.Plug is missing from the Router pipeline.
++
++          Page Variants will not be used.
++          """)
++
++          nil
++
++        roll ->
++          roll
++      end
++
+     page = RouterServer.lookup_page!(site, path)
+-    socket = Component.assign(socket, beacon: BeaconAssigns.new(site, page))
++    socket = Component.assign(socket, beacon: BeaconAssigns.new(site, page, variant_roll))
+ 
+     {:ok, socket, layout: {Beacon.Web.Layouts, :dynamic}}
+   end
+@@ -124,7 +139,7 @@ defmodule Beacon.Web.PageLive do
+ 
+         page = RouterServer.lookup_page!(site, path_info)
+         live_data = Beacon.Web.DataSource.live_data(site, path_info, Map.drop(params, ["path"]))
+-        beacon_assigns = BeaconAssigns.new(site, page, live_data, path_info, params)
++        beacon_assigns = BeaconAssigns.new(site, page, live_data, path_info, params, :beacon, socket.assigns.beacon.private.variant_roll)
+ 
+         socket =
+           socket
+diff --git a/test/beacon_web/beacon_assigns_test.exs b/test/beacon_web/beacon_assigns_test.exs
+index de230ced2..c62664f94 100644
+--- a/test/beacon_web/beacon_assigns_test.exs
++++ b/test/beacon_web/beacon_assigns_test.exs
+@@ -32,7 +32,7 @@ defmodule Beacon.Web.BeaconAssignsTest do
+   test "build with published page resolves page title", %{site: site} do
+     page = beacon_published_page_fixture(path: "/blog", title: "blog index")
+ 
+-    assigns = BeaconAssigns.new(site, page, %{}, ["blog"], %{})
++    assigns = BeaconAssigns.new(site, page, %{}, ["blog"], %{}, :beacon)
+ 
+     assert %BeaconAssigns{
+              site: @site,
+@@ -46,7 +46,7 @@ defmodule Beacon.Web.BeaconAssignsTest do
+   test "build with path info and query params", %{site: site} do
+     page = beacon_published_page_fixture(path: "/blog")
+ 
+-    assigns = BeaconAssigns.new(site, page, %{}, ["blog"], %{source: "search"})
++    assigns = BeaconAssigns.new(site, page, %{}, ["blog"], %{source: "search"}, :beacon)
+ 
+     assert %BeaconAssigns{
+              site: @site,
+@@ -60,7 +60,7 @@ defmodule Beacon.Web.BeaconAssignsTest do
+   test "build with path params", %{site: site} do
+     page = beacon_published_page_fixture(path: "/blog/:post")
+ 
+-    assigns = BeaconAssigns.new(site, page, %{}, ["blog", "hello"], %{})
++    assigns = BeaconAssigns.new(site, page, %{}, ["blog", "hello"], %{}, :beacon)
+ 
+     assert %BeaconAssigns{
+              site: @site,
+@@ -74,7 +74,7 @@ defmodule Beacon.Web.BeaconAssignsTest do
+     live_data = beacon_live_data_fixture(path: "/blog")
+     beacon_live_data_assign_fixture(live_data: live_data, format: :text, key: "customer_id", value: "123")
+ 
+-    assigns = BeaconAssigns.new(site, page, live_data, ["blog"], %{})
++    assigns = BeaconAssigns.new(site, page, live_data, ["blog"], %{}, :beacon)
+ 
+     assert %BeaconAssigns{
+              site: @site,

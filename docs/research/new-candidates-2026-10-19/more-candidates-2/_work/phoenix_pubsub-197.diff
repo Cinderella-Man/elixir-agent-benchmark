@@ -1,0 +1,363 @@
+diff --git a/lib/phoenix/pubsub.ex b/lib/phoenix/pubsub.ex
+index d84e3cb2..8cbed738 100644
+--- a/lib/phoenix/pubsub.ex
++++ b/lib/phoenix/pubsub.ex
+@@ -34,7 +34,7 @@ defmodule Phoenix.PubSub do
+       It supports a `:pool_size` option to be given alongside
+       the name, defaults to `1`. Note the `:pool_size` must
+       be the same throughout the cluster, therefore don't
+-      configure the pool size based on `System.schedulers_online/1`, 
++      configure the pool size based on `System.schedulers_online/0`,
+       especially if you are using machines with different specs.
+ 
+     * `Phoenix.PubSub.Redis` - uses Redis to exchange data between
+@@ -59,6 +59,83 @@ defmodule Phoenix.PubSub do
+   custom `value` to provide "fastlaning", allowing messages broadcast
+   to thousands or even millions of users to be encoded once and written
+   directly to sockets instead of being encoded per channel.
++
++  ## Safe pool size migration (when using `Phoenix.PubSub.PG2` adapter)
++
++  When you need to change the pool size in a running cluster,
++  you can use the `broadcast_pool_size` option to ensure no
++  messages are lost during deployment. This is particularly
++  important when increasing the pool size.
++
++  Here's how to safely increase the pool size from 1 to 2:
++
++  1. Initial state - Current configuration with `pool_size: 1`:
++  ```
++  {Phoenix.PubSub, name: :my_pubsub, pool_size: 1}
++  ```
++
++  ```mermaid
++  graph TD
++      subgraph "Initial State"
++          subgraph "Node 1"
++              A1[Shard 1<br/>Broadcast & Receive]
++          end
++          subgraph "Node 2"
++              B1[Shard 1<br/>Broadcast & Receive]
++          end
++          A1 <--> B1
++      end
++  ```
++
++  2. First deployment - Set the new pool size but keep broadcasting on the old size:
++  ```
++  {Phoenix.PubSub, name: :my_pubsub, pool_size: 2, broadcast_pool_size: 1}
++  ```
++
++  ```mermaid
++  graph TD
++      subgraph "First Deployment"
++          subgraph "Node 1"
++              A1[Shard 1<br/>Broadcast & Receive]
++              A2[Shard 2<br/>Broadcast & Receive]
++          end
++          subgraph "Node 2"
++              B1[Shard 1<br/>Broadcast & Receive]
++              B2[Shard 2<br/>Receive Only]
++          end
++          A1 <--> B1
++          A2 --> B2
++      end
++  ```
++
++  3. Final deployment - All nodes running with new pool size:
++  ```
++  {Phoenix.PubSub, name: :my_pubsub, pool_size: 2}
++  ```
++
++  ```mermaid
++  graph TD
++      subgraph "Final State"
++          subgraph "Node 1"
++              A1[Shard 1<br/>Broadcast & Receive]
++              A2[Shard 2<br/>Broadcast & Receive]
++          end
++          subgraph "Node 2"
++              B1[Shard 1<br/>Broadcast & Receive]
++              B2[Shard 2<br/>Broadcast & Receive]
++          end
++          A1 <--> B1
++          A2 <--> B2
++      end
++  ```
++
++  This two-step process ensures that:
++  - All nodes can receive messages from both old and new pool sizes
++  - No messages are lost during the transition
++  - The cluster remains fully functional throughout the deployment
++
++  To decrease the pool size, follow the same process in reverse order.
++
+   """
+ 
+   @type node_name :: atom | binary
+@@ -87,6 +164,9 @@ defmodule Phoenix.PubSub do
+     * `:adapter` - the adapter to use (defaults to `Phoenix.PubSub.PG2`)
+     * `:pool_size` - number of pubsub partitions to launch
+       (defaults to one partition for every 4 cores)
++    * `:broadcast_pool_size` - number of pubsub partitions used for broadcasting messages
++      (defaults to `:pool_size`). This option is used during pool size migrations to ensure
++      no messages are lost. See the "Safe Pool Size Migration" section in the module documentation.
+ 
+   """
+   @spec child_spec(keyword) :: Supervisor.child_spec()
+diff --git a/lib/phoenix/pubsub/pg2.ex b/lib/phoenix/pubsub/pg2.ex
+index 330e79d6..823ae5e5 100644
+--- a/lib/phoenix/pubsub/pg2.ex
++++ b/lib/phoenix/pubsub/pg2.ex
+@@ -61,30 +61,42 @@ defmodule Phoenix.PubSub.PG2 do
+   def start_link(opts) do
+     name = Keyword.fetch!(opts, :name)
+     pool_size = Keyword.get(opts, :pool_size, 1)
+-    adapter_name = Keyword.fetch!(opts, :adapter_name)
+-    Supervisor.start_link(__MODULE__, {name, adapter_name, pool_size}, name: :"#{adapter_name}_supervisor")
++    broadcast_pool_size = Keyword.get(opts, :broadcast_pool_size, pool_size)
++
++    if pool_size < broadcast_pool_size do
++      {:error, "the :pool_size option must be greater than or equal to the :broadcast_pool_size option"}
++    else
++      adapter_name = Keyword.fetch!(opts, :adapter_name)
++      Supervisor.start_link(__MODULE__, {name, adapter_name, pool_size, broadcast_pool_size}, name: :"#{adapter_name}_supervisor")
++    end
+   end
+ 
+   @impl true
+-  def init({name, adapter_name, pool_size}) do
+-    [_ | groups] =
+-      for number <- 1..pool_size do
+-        :"#{adapter_name}_#{number}"
+-      end
++  def init({name, adapter_name, pool_size, broadcast_pool_size}) do
+ 
+-    # Use `adapter_name` for the first in the pool for backwards compatibility
+-    # with v2.0 when the pool_size is 1.
+-    groups = [adapter_name | groups]
++    listener_groups = groups(adapter_name, pool_size)
++    broadcast_groups = groups(adapter_name, broadcast_pool_size)
+ 
+-    :persistent_term.put(adapter_name, List.to_tuple(groups))
++    :persistent_term.put(adapter_name, List.to_tuple(broadcast_groups))
+ 
+     children =
+-      for group <- groups do
++      for group <- listener_groups do
+         Supervisor.child_spec({Phoenix.PubSub.PG2Worker, {name, group}}, id: group)
+       end
+ 
+     Supervisor.init(children, strategy: :one_for_one)
+   end
++
++  defp groups(adapter_name, pool_size) do
++    [_ | groups] =
++      for number <- 1..pool_size do
++        :"#{adapter_name}_#{number}"
++      end
++
++    # Use `adapter_name` for the first in the pool for backwards compatibility
++    # with v2.0 when the pool_size is 1.
++    [adapter_name | groups]
++  end
+ end
+ 
+ defmodule Phoenix.PubSub.PG2Worker do
+diff --git a/mix.exs b/mix.exs
+index 7f581917..b1718e8b 100644
+--- a/mix.exs
++++ b/mix.exs
+@@ -47,7 +47,42 @@ defmodule Phoenix.PubSub.Mixfile do
+     [
+       main: "Phoenix.PubSub",
+       source_ref: "v#{@version}",
+-      source_url: "https://github.com/phoenixframework/phoenix_pubsub"
++      source_url: "https://github.com/phoenixframework/phoenix_pubsub",
++
++      before_closing_body_tag: %{
++        html: """
++        <script defer src="https://cdn.jsdelivr.net/npm/mermaid@11.6.0/dist/mermaid.min.js"></script>
++        <script>
++          let initialized = false;
++
++          window.addEventListener("exdoc:loaded", () => {
++            if (!initialized) {
++              mermaid.initialize({
++                startOnLoad: false,
++                theme: document.body.className.includes("dark") ? "dark" : "default"
++              });
++              initialized = true;
++            }
++
++            let id = 0;
++            for (const codeEl of document.querySelectorAll("pre code.mermaid")) {
++              const preEl = codeEl.parentElement;
++              const graphDefinition = codeEl.textContent;
++              const graphEl = document.createElement("div");
++              const graphId = "mermaid-graph-" + id++;
++
++              mermaid.render(graphId, graphDefinition).then(({svg, bindFunctions}) => {
++                graphEl.innerHTML = svg;
++                bindFunctions?.(graphEl);
++                preEl.insertAdjacentElement("afterend", graphEl);
++                preEl.remove();
++              });
++            }
++          });
++        </script>
++        """,
++        epub: ""
++      }
+     ]
+   end
+ end
+diff --git a/test/phoenix/distributed_pubsub_test.exs b/test/phoenix/distributed_pubsub_test.exs
+index 4ed2ff2b..6fdbe19a 100644
+--- a/test/phoenix/distributed_pubsub_test.exs
++++ b/test/phoenix/distributed_pubsub_test.exs
+@@ -5,6 +5,8 @@ defmodule Phoenix.PubSub.DistributedTest do
+ 
+   @node1 :"node1@127.0.0.1"
+   @node2 :"node2@127.0.0.1"
++  @node3 :"node3@127.0.0.1"
++  @node4 :"node4@127.0.0.1"
+ 
+   setup config do
+     {:ok, %{pubsub: Phoenix.PubSubTest, topic: Atom.to_string(config.test)}}
+@@ -17,7 +19,7 @@ defmodule Phoenix.PubSub.DistributedTest do
+     :ok = PubSub.broadcast(config.pubsub, config.topic, :ping)
+     assert_receive {@node1, :ping}
+     assert_receive {@node2, :ping}
+-    
++
+     :ok = PubSub.broadcast(config.pubsub, config.topic, :ping)
+     assert_receive {@node1, :ping}
+     assert_receive {@node2, :ping}
+@@ -46,4 +48,27 @@ defmodule Phoenix.PubSub.DistributedTest do
+     :ok = PubSub.direct_broadcast!(@node2, config.pubsub, config.topic, :ping)
+     refute_received {@node1, :ping}
+   end
++
++  test "broadcast is received by other node that has pool_size > broadcast_pool_size", config do
++    spy_on_pubsub(@node1, config.pubsub, self(), config.topic)
++    # node3 has pool_size = 4, broadcast_pool_size = 1
++    spy_on_pubsub(@node3, config.pubsub, self(), config.topic)
++    :ok = PubSub.broadcast(config.pubsub, config.topic, :ping)
++    assert_receive {@node3, :ping}
++  end
++
++  test "broadcast is received by other node that was broadcast from node that has broadcast_pool_size < pool_size", config do
++    # node4 has pool_size = 1, message is sent from node3 that has pool_size = 4, broadcast_pool_size = 1
++    spy_on_pubsub(@node1, config.pubsub, self(), config.topic)
++    spy_on_pubsub(@node2, config.pubsub, self(), config.topic)
++    spy_on_pubsub(@node3, config.pubsub, self(), config.topic)
++    spy_on_pubsub(@node4, config.pubsub, self(), config.topic)
++
++    broadcast_from_node(@node3, config.pubsub, config.topic, :ping)
++
++    assert_receive {@node1, :ping}
++    assert_receive {@node2, :ping}
++    assert_receive {@node3, :ping}
++    assert_receive {@node4, :ping}
++  end
+ end
+diff --git a/test/phoenix/pubsub_test.exs b/test/phoenix/pubsub_test.exs
+index 0f74c531..ff2e1323 100644
+--- a/test/phoenix/pubsub_test.exs
++++ b/test/phoenix/pubsub_test.exs
+@@ -8,5 +8,18 @@ defmodule Phoenix.PubSub.UnitTest do
+       assert Exception.message(exception) ==
+                "the :name option is required when starting Phoenix.PubSub"
+     end
++
++    test "pool_size can't be smaller than broadcast_pool_size" do
++      opts = [name: name(), pool_size: 1, broadcast_pool_size: 2]
++
++      {:error, {{:shutdown, {:failed_to_start_child, Phoenix.PubSub.PG2, message}}, _}} =
++        start_supervised({Phoenix.PubSub, opts})
++
++      assert ^message = "the :pool_size option must be greater than or equal to the :broadcast_pool_size option"
++    end
++
++    defp name do
++      :"#{__MODULE__}_#{:crypto.strong_rand_bytes(8) |> Base.encode16()}"
++    end
+   end
+ end
+diff --git a/test/support/cluster.ex b/test/support/cluster.ex
+index ffc3e9ff..85892854 100644
+--- a/test/support/cluster.ex
++++ b/test/support/cluster.ex
+@@ -18,14 +18,17 @@ defmodule Phoenix.PubSub.Cluster do
+     |> Enum.map(&Task.await(&1, 30_000))
+   end
+ 
+-  defp spawn_node(node_host) do
++  defp spawn_node({node_host, opts}) do
+     {:ok, node} = :slave.start(to_charlist("127.0.0.1"), node_name(node_host), inet_loader_args())
+     add_code_paths(node)
+     transfer_configuration(node)
+     ensure_applications_started(node)
+-    start_pubsub(node)
++    start_pubsub(node, opts)
+     {:ok, node}
+   end
++  defp spawn_node(node_host) do
++    spawn_node({node_host, []})
++  end
+ 
+   defp rpc(node, module, function, args) do
+     :rpc.block_call(node, module, function, args)
+@@ -60,9 +63,10 @@ defmodule Phoenix.PubSub.Cluster do
+     end
+   end
+ 
+-  defp start_pubsub(node) do
++  defp start_pubsub(node, opts) do
++    opts = [name: Phoenix.PubSubTest, pool_size: 4] |> Keyword.merge(opts)
+     args = [
+-      [{Phoenix.PubSub, name: Phoenix.PubSubTest, pool_size: 1}],
++      [{Phoenix.PubSub, opts}],
+       [strategy: :one_for_one]
+     ]
+ 
+diff --git a/test/support/node_case.ex b/test/support/node_case.ex
+index fe54b874..b8d96cbd 100644
+--- a/test/support/node_case.ex
++++ b/test/support/node_case.ex
+@@ -187,4 +187,10 @@ defmodule Phoenix.PubSub.NodeCase do
+       @timeout -> {pid, {:error, :timeout}}
+     end
+   end
++
++  def broadcast_from_node(node, pubsub, topic, message) do
++    call_node(node, fn ->
++      Phoenix.PubSub.broadcast(pubsub, topic, message)
++    end)
++  end
+ end
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index 3a5b14c1..2430bd24 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -3,12 +3,17 @@ Application.put_env(:phoenix_pubsub, :test_adapter, {Phoenix.PubSub.PG2, []})
+ exclude = Keyword.get(ExUnit.configuration(), :exclude, [])
+ 
+ Supervisor.start_link(
+-  [{Phoenix.PubSub, name: Phoenix.PubSubTest, pool_size: 1}],
++  [{Phoenix.PubSub, name: Phoenix.PubSubTest, pool_size: 4}],
+   strategy: :one_for_one
+ )
+ 
+ unless :clustered in exclude do
+-  Phoenix.PubSub.Cluster.spawn([:"node1@127.0.0.1", :"node2@127.0.0.1"])
++  Phoenix.PubSub.Cluster.spawn([
++    :"node1@127.0.0.1",
++    :"node2@127.0.0.1",
++    {:"node3@127.0.0.1", pool_size: 4, broadcast_pool_size: 1},
++    {:"node4@127.0.0.1", pool_size: 1}
++  ])
+ end
+ 
+ ExUnit.start()

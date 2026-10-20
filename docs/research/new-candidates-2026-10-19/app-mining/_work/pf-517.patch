@@ -1,0 +1,775 @@
+From a365685b3e5e5be4aefc264e092d3cafd60379c1 Mon Sep 17 00:00:00 2001
+From: Kieran Eglin <kieran.eglin@gmail.com>
+Date: Tue, 17 Dec 2024 11:10:22 -0800
+Subject: [PATCH 1/2] Updated get_downloadable_status to pass yt cookies
+
+---
+ lib/pinchflat/downloading/media_downloader.ex | 6 ++++--
+ lib/pinchflat/yt_dlp/media.ex                 | 7 +++++--
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/lib/pinchflat/downloading/media_downloader.ex b/lib/pinchflat/downloading/media_downloader.ex
+index 5425932ef..0c4c0160a 100644
+--- a/lib/pinchflat/downloading/media_downloader.ex
++++ b/lib/pinchflat/downloading/media_downloader.ex
+@@ -113,9 +113,11 @@ defmodule Pinchflat.Downloading.MediaDownloader do
+ 
+   defp download_with_options(url, item_with_preloads, output_filepath, override_opts) do
+     {:ok, options} = DownloadOptionBuilder.build(item_with_preloads, override_opts)
+-    runner_opts = [output_filepath: output_filepath, use_cookies: item_with_preloads.source.use_cookies]
++    use_cookies = item_with_preloads.source.use_cookies
++    runner_opts = [output_filepath: output_filepath, use_cookies: use_cookies]
+ 
+-    case YtDlpMedia.get_downloadable_status(url) do
++    # TODO: test
++    case YtDlpMedia.get_downloadable_status(url, use_cookies: use_cookies) do
+       {:ok, :downloadable} -> YtDlpMedia.download(url, options, runner_opts)
+       {:ok, :ignorable} -> {:error, :unsuitable_for_download}
+       err -> err
+diff --git a/lib/pinchflat/yt_dlp/media.ex b/lib/pinchflat/yt_dlp/media.ex
+index 4f68a3580..d936041c9 100644
+--- a/lib/pinchflat/yt_dlp/media.ex
++++ b/lib/pinchflat/yt_dlp/media.ex
+@@ -55,8 +55,11 @@ defmodule Pinchflat.YtDlp.Media do
+ 
+   Returns {:ok, :downloadable | :ignorable} | {:error, any}
+   """
+-  def get_downloadable_status(url) do
+-    case backend_runner().run(url, :get_downloadable_status, [:simulate, :skip_download], "%(.{live_status})j") do
++  def get_downloadable_status(url, addl_opts \\ []) do
++    action = :get_downloadable_status
++    command_opts = [:simulate, :skip_download]
++
++    case backend_runner().run(url, action, command_opts, "%(.{live_status})j", addl_opts) do
+       {:ok, output} ->
+         output
+         |> Phoenix.json_library().decode!()
+
+From 43b250694dc34a1b7de8499f6a94118033e47c99 Mon Sep 17 00:00:00 2001
+From: Kieran Eglin <kieran.eglin@gmail.com>
+Date: Tue, 17 Dec 2024 11:10:50 -0800
+Subject: [PATCH 2/2] Updated tests
+
+---
+ lib/pinchflat/downloading/media_downloader.ex |   1 -
+ .../media_download_worker_test.exs            | 154 +++++++-------
+ .../downloading/media_downloader_test.exs     | 188 +++++++++++-------
+ test/pinchflat/yt_dlp/media_test.exs          |  24 ++-
+ 4 files changed, 214 insertions(+), 153 deletions(-)
+
+diff --git a/lib/pinchflat/downloading/media_downloader.ex b/lib/pinchflat/downloading/media_downloader.ex
+index 0c4c0160a..1103abcc9 100644
+--- a/lib/pinchflat/downloading/media_downloader.ex
++++ b/lib/pinchflat/downloading/media_downloader.ex
+@@ -116,7 +116,6 @@ defmodule Pinchflat.Downloading.MediaDownloader do
+     use_cookies = item_with_preloads.source.use_cookies
+     runner_opts = [output_filepath: output_filepath, use_cookies: use_cookies]
+ 
+-    # TODO: test
+     case YtDlpMedia.get_downloadable_status(url, use_cookies: use_cookies) do
+       {:ok, :downloadable} -> YtDlpMedia.download(url, options, runner_opts)
+       {:ok, :ignorable} -> {:error, :unsuitable_for_download}
+diff --git a/test/pinchflat/downloading/media_download_worker_test.exs b/test/pinchflat/downloading/media_download_worker_test.exs
+index 27a0d8812..6932fcbcf 100644
+--- a/test/pinchflat/downloading/media_download_worker_test.exs
++++ b/test/pinchflat/downloading/media_download_worker_test.exs
+@@ -10,11 +10,11 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+ 
+   setup do
+     stub(YtDlpRunnerMock, :run, fn
++      _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
+       _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""}
+-      _url, :download, _opts, _ot, _addl -> {:ok, ""}
++      _url, :download, _opts, _ot, _addl -> {:ok, render_metadata(:media_metadata)}
+     end)
+ 
+-    stub(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot -> {:ok, "{}"} end)
+     stub(UserScriptRunnerMock, :run, fn _event_type, _data -> {:ok, "", 0} end)
+     stub(HTTPClientMock, :get, fn _url, _headers, _opts -> {:ok, ""} end)
+ 
+@@ -57,13 +57,17 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+   end
+ 
+   describe "perform/1" do
+-    test "it saves attributes to the media_item", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, _opts, _ot, _addl ->
+-        {:ok, render_metadata(:media_metadata)}
++    setup do
++      stub(YtDlpRunnerMock, :run, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:ok, render_metadata(:media_metadata)}
++        _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""}
+       end)
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""} end)
++      :ok
++    end
+ 
++    test "it saves attributes to the media_item", %{media_item: media_item} do
+       assert media_item.media_filepath == nil
+       perform_job(MediaDownloadWorker, %{id: media_item.id})
+       media_item = Repo.reload(media_item)
+@@ -72,12 +76,6 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+     end
+ 
+     test "it saves the metadata to the media_item", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, _opts, _ot, _addl ->
+-        {:ok, render_metadata(:media_metadata)}
+-      end)
+-
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""} end)
+-
+       assert media_item.metadata == nil
+       perform_job(MediaDownloadWorker, %{id: media_item.id})
+       assert Repo.reload(media_item).metadata != nil
+@@ -91,7 +89,10 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+     end
+ 
+     test "it sets the job to retryable if the download fails", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, fn _url, :download, _opts, _ot, _addl -> {:error, "error"} end)
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, "error"}
++      end)
+ 
+       Oban.Testing.with_testing_mode(:inline, fn ->
+         {:ok, job} = Oban.insert(MediaDownloadWorker.new(%{id: media_item.id}))
+@@ -101,8 +102,9 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+     end
+ 
+     test "sets the job to retryable if the download failed and was retried", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, fn _url, :download, _opts, _ot, _addl ->
+-        {:error, "Unable to communicate with SponsorBlock", 1}
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, "Unable to communicate with SponsorBlock", 1}
+       end)
+ 
+       Oban.Testing.with_testing_mode(:inline, fn ->
+@@ -113,8 +115,9 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+     end
+ 
+     test "does not set the job to retryable if retrying wouldn't fix the issue", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, fn _url, :download, _opts, _ot, _addl ->
+-        {:error, "Something something Video unavailable something something", 1}
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, "Something something Video unavailable something something", 1}
+       end)
+ 
+       Oban.Testing.with_testing_mode(:inline, fn ->
+@@ -125,7 +128,10 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+     end
+ 
+     test "it ensures error are returned in a 2-item tuple", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, fn _url, :download, _opts, _ot, _addl -> {:error, "error", 1} end)
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, "error", 1}
++      end)
+ 
+       assert {:error, :download_failed} = perform_job(MediaDownloadWorker, %{id: media_item.id})
+     end
+@@ -147,14 +153,19 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+     end
+ 
+     test "it saves the file's size to the database", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, _opts, _ot, _addl ->
+-        metadata = render_parsed_metadata(:media_metadata)
+-        FilesystemUtils.write_p!(metadata["filepath"], "test")
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, "{}"}
+ 
+-        {:ok, Phoenix.json_library().encode!(metadata)}
+-      end)
++        _url, :download, _opts, _ot, _addl ->
++          metadata = render_parsed_metadata(:media_metadata)
++          FilesystemUtils.write_p!(metadata["filepath"], "test")
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""} end)
++          {:ok, Phoenix.json_library().encode!(metadata)}
++
++        _url, :download_thumbnail, _opts, _ot, _addl ->
++          {:ok, ""}
++      end)
+ 
+       perform_job(MediaDownloadWorker, %{id: media_item.id})
+       media_item = Repo.reload(media_item)
+@@ -163,12 +174,6 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+     end
+ 
+     test "does not set redownloaded_at by default", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, _opts, _ot, _addl ->
+-        {:ok, render_metadata(:media_metadata)}
+-      end)
+-
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""} end)
+-
+       perform_job(MediaDownloadWorker, %{id: media_item.id})
+       media_item = Repo.reload(media_item)
+ 
+@@ -180,14 +185,19 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+     end
+ 
+     test "sets the no_force_overwrites runner option", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, opts, _ot, _addl ->
+-        assert :no_force_overwrites in opts
+-        refute :force_overwrites in opts
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, "{}"}
+ 
+-        {:ok, render_metadata(:media_metadata)}
+-      end)
++        _url, :download, opts, _ot, _addl ->
++          assert :no_force_overwrites in opts
++          refute :force_overwrites in opts
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""} end)
++          {:ok, render_metadata(:media_metadata)}
++
++        _url, :download_thumbnail, _opts, _ot, _addl ->
++          {:ok, ""}
++      end)
+ 
+       perform_job(MediaDownloadWorker, %{id: media_item.id})
+     end
+@@ -195,7 +205,7 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+ 
+   describe "perform/1 when testing non-downloadable media" do
+     test "does not retry the job if the media is currently not downloadable", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot ->
++      stub(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot, _addl ->
+         {:ok, Phoenix.json_library().encode!(%{"live_status" => "is_live"})}
+       end)
+ 
+@@ -209,8 +219,6 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+ 
+   describe "perform/1 when testing forced downloads" do
+     test "ignores 'prevent_download' if forced", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, fn _url, :download, _opts, _ot, _addl -> :ok end)
+-
+       Sources.update_source(media_item.source, %{download_media: false})
+       Media.update_media_item(media_item, %{prevent_download: true})
+ 
+@@ -218,14 +226,19 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+     end
+ 
+     test "sets force_overwrites runner option", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, opts, _ot, _addl ->
+-        assert :force_overwrites in opts
+-        refute :no_force_overwrites in opts
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, "{}"}
+ 
+-        {:ok, render_metadata(:media_metadata)}
+-      end)
++        _url, :download, opts, _ot, _addl ->
++          assert :force_overwrites in opts
++          refute :no_force_overwrites in opts
++
++          {:ok, render_metadata(:media_metadata)}
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""} end)
++        _url, :download_thumbnail, _opts, _ot, _addl ->
++          {:ok, ""}
++      end)
+ 
+       perform_job(MediaDownloadWorker, %{id: media_item.id, force: true})
+     end
+@@ -233,12 +246,6 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+ 
+   describe "perform/1 when testing re-downloads" do
+     test "sets redownloaded_at on the media_item", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, _opts, _ot, _addl ->
+-        {:ok, render_metadata(:media_metadata)}
+-      end)
+-
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""} end)
+-
+       perform_job(MediaDownloadWorker, %{id: media_item.id, quality_upgrade?: true})
+       media_item = Repo.reload(media_item)
+ 
+@@ -246,28 +253,38 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+     end
+ 
+     test "sets force_overwrites runner option", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, opts, _ot, _addl ->
+-        assert :force_overwrites in opts
+-        refute :no_force_overwrites in opts
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, "{}"}
+ 
+-        {:ok, render_metadata(:media_metadata)}
+-      end)
++        _url, :download, opts, _ot, _addl ->
++          assert :force_overwrites in opts
++          refute :no_force_overwrites in opts
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""} end)
++          {:ok, render_metadata(:media_metadata)}
++
++        _url, :download_thumbnail, _opts, _ot, _addl ->
++          {:ok, ""}
++      end)
+ 
+       perform_job(MediaDownloadWorker, %{id: media_item.id, force: true})
+     end
+ 
+     test "deletes old files if the media item has been updated" do
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, _opts, _ot, _addl ->
+-        tmp_media_item = media_item_with_attachments()
+-        metadata = render_parsed_metadata(:media_metadata)
+-        metadata = Map.put(metadata, "filepath", tmp_media_item.media_filepath)
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, "{}"}
+ 
+-        {:ok, Phoenix.json_library().encode!(metadata)}
+-      end)
++        _url, :download, _opts, _ot, _addl ->
++          tmp_media_item = media_item_with_attachments()
++          metadata = render_parsed_metadata(:media_metadata)
++          metadata = Map.put(metadata, "filepath", tmp_media_item.media_filepath)
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""} end)
++          {:ok, Phoenix.json_library().encode!(metadata)}
++
++        _url, :download_thumbnail, _opts, _ot, _addl ->
++          {:ok, ""}
++      end)
+ 
+       old_media_item = media_item_with_attachments()
+       perform_job(MediaDownloadWorker, %{id: old_media_item.id, force: true})
+@@ -280,15 +297,6 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+   end
+ 
+   describe "perform/1 when testing user script callbacks" do
+-    setup do
+-      stub(YtDlpRunnerMock, :run, fn
+-        _url, :download, _opts, _ot, _addl -> {:ok, render_metadata(:media_metadata)}
+-        _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""}
+-      end)
+-
+-      :ok
+-    end
+-
+     test "calls the media_pre_download user script runner", %{media_item: media_item} do
+       expect(UserScriptRunnerMock, :run, fn :media_pre_download, data ->
+         assert data.id == media_item.id
+diff --git a/test/pinchflat/downloading/media_downloader_test.exs b/test/pinchflat/downloading/media_downloader_test.exs
+index db291a130..8a60f9379 100644
+--- a/test/pinchflat/downloading/media_downloader_test.exs
++++ b/test/pinchflat/downloading/media_downloader_test.exs
+@@ -16,34 +16,38 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+       )
+ 
+     stub(HTTPClientMock, :get, fn _url, _headers, _opts -> {:ok, ""} end)
+-    stub(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot -> {:ok, "{}"} end)
+ 
+     {:ok, %{media_item: media_item}}
+   end
+ 
+   describe "download_for_media_item/3" do
+     test "calls the backend runner", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, 1, fn url, :download, _opts, ot, addl ->
+-        assert url == media_item.original_url
+-        assert ot == "after_move:%()j"
+-        assert [{:output_filepath, filepath} | _] = addl
+-        assert is_binary(filepath)
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, "{}"}
+ 
+-        {:ok, render_metadata(:media_metadata)}
+-      end)
++        _url, :download_thumbnail, _opts, _ot, _addl ->
++          {:ok, ""}
++
++        url, :download, _opts, ot, addl ->
++          assert url == media_item.original_url
++          assert ot == "after_move:%()j"
++          assert [{:output_filepath, filepath} | _] = addl
++          assert is_binary(filepath)
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl_args -> {:ok, ""} end)
++          {:ok, render_metadata(:media_metadata)}
++      end)
+ 
+       assert {:ok, _} = MediaDownloader.download_for_media_item(media_item)
+     end
+ 
+     test "saves the metadata filepath to the database", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, _opts, _ot, _addl ->
+-        {:ok, render_metadata(:media_metadata)}
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""}
++        _url, :download, _opts, _ot, _addl -> {:ok, render_metadata(:media_metadata)}
+       end)
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl_args -> {:ok, ""} end)
+-
+       assert is_nil(media_item.metadata)
+       assert {:ok, updated_media_item} = MediaDownloader.download_for_media_item(media_item)
+ 
+@@ -52,7 +56,7 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+     end
+ 
+     test "errors for non-downloadable media are passed through", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot ->
++      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot, _addl ->
+         {:ok, Phoenix.json_library().encode!(%{"live_status" => "is_live"})}
+       end)
+ 
+@@ -60,16 +64,18 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+     end
+ 
+     test "non-recoverable errors are passed through", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, fn _url, :download, _opts, _ot, _addl ->
+-        {:error, :some_error, 1}
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, :some_error, 1}
+       end)
+ 
+       assert {:error, :some_error} = MediaDownloader.download_for_media_item(media_item)
+     end
+ 
+     test "unknown errors are passed through", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, fn _url, :download, _opts, _ot, _addl ->
+-        {:error, :some_error}
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
++        _url, :download, _opts, _ot, _addl -> {:error, :some_error}
+       end)
+ 
+       assert {:error, message} = MediaDownloader.download_for_media_item(media_item)
+@@ -79,22 +85,24 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+ 
+   describe "download_for_media_item/3 when testing non-downloadable media" do
+     test "calls the download runner if the media is currently downloadable", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot ->
+-        {:ok, Phoenix.json_library().encode!(%{"live_status" => "was_live"})}
+-      end)
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, Phoenix.json_library().encode!(%{"live_status" => "was_live"})}
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, _opts, _ot, _addl ->
+-        {:ok, render_metadata(:media_metadata)}
+-      end)
++        _url, :download, _opts, _ot, _addl ->
++          {:ok, render_metadata(:media_metadata)}
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl_args -> {:ok, ""} end)
++        _url, :download_thumbnail, _opts, _ot, _addl ->
++          {:ok, ""}
++      end)
+ 
+       assert {:ok, _} = MediaDownloader.download_for_media_item(media_item)
+     end
+ 
+     test "does not call the download runner if the media is not downloadable", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot ->
+-        {:ok, Phoenix.json_library().encode!(%{"live_status" => "is_live"})}
++      expect(YtDlpRunnerMock, :run, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, Phoenix.json_library().encode!(%{"live_status" => "is_live"})}
+       end)
+ 
+       expect(YtDlpRunnerMock, :run, 0, fn _url, :download, _opts, _ot, _addl -> {:ok, ""} end)
+@@ -103,7 +111,7 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+     end
+ 
+     test "returns unexpected errors from the download status determination method", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot -> {:error, :what_tha} end)
++      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot, _addl -> {:error, :what_tha} end)
+ 
+       assert {:error, "Unknown error: {:error, :what_tha}"} = MediaDownloader.download_for_media_item(media_item)
+     end
+@@ -111,14 +119,19 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+ 
+   describe "download_for_media_item/3 when testing override options" do
+     test "includes override opts if specified", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, opts, _ot, _addl ->
+-        refute :force_overwrites in opts
+-        assert :no_force_overwrites in opts
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, "{}"}
+ 
+-        {:ok, render_metadata(:media_metadata)}
+-      end)
++        _url, :download, opts, _ot, _addl ->
++          refute :force_overwrites in opts
++          assert :no_force_overwrites in opts
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""} end)
++          {:ok, render_metadata(:media_metadata)}
++
++        _url, :download_thumbnail, _opts, _ot, _addl ->
++          {:ok, ""}
++      end)
+ 
+       override_opts = [overwrite_behaviour: :no_force_overwrites]
+ 
+@@ -128,12 +141,18 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+ 
+   describe "download_for_media_item/3 when testing cookie usage" do
+     test "sets use_cookies if the source uses cookies" do
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, _opts, _ot, addl ->
+-        assert {:use_cookies, true} in addl
+-        {:ok, render_metadata(:media_metadata)}
+-      end)
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, addl ->
++          assert {:use_cookies, true} in addl
++          {:ok, "{}"}
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl_args -> {:ok, ""} end)
++        _url, :download, _opts, _ot, addl ->
++          assert {:use_cookies, true} in addl
++          {:ok, render_metadata(:media_metadata)}
++
++        _url, :download_thumbnail, _opts, _ot, _addl ->
++          {:ok, ""}
++      end)
+ 
+       source = source_fixture(%{use_cookies: true})
+       media_item = media_item_fixture(%{source_id: source.id})
+@@ -142,12 +161,17 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+     end
+ 
+     test "does not set use_cookies if the source does not use cookies" do
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, _opts, _ot, addl ->
+-        assert {:use_cookies, false} in addl
+-        {:ok, render_metadata(:media_metadata)}
+-      end)
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, "{}"}
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl_args -> {:ok, ""} end)
++        _url, :download, _opts, _ot, addl ->
++          assert {:use_cookies, false} in addl
++          {:ok, render_metadata(:media_metadata)}
++
++        _url, :download_thumbnail, _opts, _ot, _addl ->
++          {:ok, ""}
++      end)
+ 
+       source = source_fixture(%{use_cookies: false})
+       media_item = media_item_fixture(%{source_id: source.id})
+@@ -160,8 +184,12 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+     test "returns a recovered tuple on recoverable errors", %{media_item: media_item} do
+       message = "Unable to communicate with SponsorBlock"
+ 
+-      expect(YtDlpRunnerMock, :run, fn _url, :download, _opts, _ot, _addl ->
+-        {:error, message, 1}
++      expect(YtDlpRunnerMock, :run, 2, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, "{}"}
++
++        _url, :download, _opts, _ot, _addl ->
++          {:error, message, 1}
+       end)
+ 
+       assert {:recovered, ^message} = MediaDownloader.download_for_media_item(media_item)
+@@ -170,14 +198,19 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+     test "attempts to update the media item on recoverable errors", %{media_item: media_item} do
+       message = "Unable to communicate with SponsorBlock"
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, _opts, _ot, addl ->
+-        [{:output_filepath, filepath} | _] = addl
+-        File.write(filepath, render_metadata(:media_metadata))
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :download, _opts, _ot, addl ->
++          [{:output_filepath, filepath} | _] = addl
++          File.write(filepath, render_metadata(:media_metadata))
+ 
+-        {:error, message, 1}
+-      end)
++          {:error, message, 1}
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl_args -> {:ok, ""} end)
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, "{}"}
++
++        _url, :download_thumbnail, _opts, _ot, _addl ->
++          {:ok, ""}
++      end)
+ 
+       assert {:recovered, ^message} = MediaDownloader.download_for_media_item(media_item)
+       media_item = Repo.reload(media_item)
+@@ -191,6 +224,7 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+     setup do
+       stub(YtDlpRunnerMock, :run, fn
+         _url, :download, _opts, _ot, _addl -> {:ok, render_metadata(:media_metadata)}
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
+         _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""}
+       end)
+ 
+@@ -238,23 +272,28 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+     end
+ 
+     test "extracts the thumbnail_filepath", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, _opts, _ot, _addl ->
+-        metadata = render_parsed_metadata(:media_metadata)
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, "{}"}
+ 
+-        thumbnail_filepath =
+-          metadata["thumbnails"]
+-          |> Enum.reverse()
+-          |> Enum.find_value(fn attrs -> attrs["filepath"] end)
+-          |> String.split(~r{\.}, include_captures: true)
+-          |> List.insert_at(-3, "-thumb")
+-          |> Enum.join()
++        _url, :download, _opts, _ot, _addl ->
++          metadata = render_parsed_metadata(:media_metadata)
+ 
+-        :ok = File.cp(thumbnail_filepath_fixture(), thumbnail_filepath)
++          thumbnail_filepath =
++            metadata["thumbnails"]
++            |> Enum.reverse()
++            |> Enum.find_value(fn attrs -> attrs["filepath"] end)
++            |> String.split(~r{\.}, include_captures: true)
++            |> List.insert_at(-3, "-thumb")
++            |> Enum.join()
+ 
+-        {:ok, Phoenix.json_library().encode!(metadata)}
+-      end)
++          :ok = File.cp(thumbnail_filepath_fixture(), thumbnail_filepath)
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl_args -> {:ok, ""} end)
++          {:ok, Phoenix.json_library().encode!(metadata)}
++
++        _url, :download_thumbnail, _opts, _ot, _addl ->
++          {:ok, ""}
++      end)
+ 
+       assert media_item.thumbnail_filepath == nil
+       assert {:ok, updated_media_item} = MediaDownloader.download_for_media_item(media_item)
+@@ -264,16 +303,20 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+     end
+ 
+     test "extracts the metadata_filepath", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download, _opts, _ot, _addl ->
+-        metadata = render_parsed_metadata(:media_metadata)
++      expect(YtDlpRunnerMock, :run, 3, fn
++        _url, :get_downloadable_status, _opts, _ot, _addl ->
++          {:ok, "{}"}
+ 
+-        infojson_filepath = metadata["infojson_filename"]
+-        :ok = File.cp(infojson_filepath_fixture(), infojson_filepath)
++        _url, :download, _opts, _ot, _addl ->
++          metadata = render_parsed_metadata(:media_metadata)
++          infojson_filepath = metadata["infojson_filename"]
++          :ok = File.cp(infojson_filepath_fixture(), infojson_filepath)
+ 
+-        {:ok, Phoenix.json_library().encode!(metadata)}
+-      end)
++          {:ok, Phoenix.json_library().encode!(metadata)}
+ 
+-      expect(YtDlpRunnerMock, :run, 1, fn _url, :download_thumbnail, _opts, _ot, _addl_args -> {:ok, ""} end)
++        _url, :download_thumbnail, _opts, _ot, _addl ->
++          {:ok, ""}
++      end)
+ 
+       assert media_item.metadata_filepath == nil
+       assert {:ok, updated_media_item} = MediaDownloader.download_for_media_item(media_item)
+@@ -287,6 +330,7 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+     setup do
+       stub(YtDlpRunnerMock, :run, fn
+         _url, :download, _opts, _ot, _addl -> {:ok, render_metadata(:media_metadata)}
++        _url, :get_downloadable_status, _opts, _ot, _addl -> {:ok, "{}"}
+         _url, :download_thumbnail, _opts, _ot, _addl -> {:ok, ""}
+       end)
+ 
+diff --git a/test/pinchflat/yt_dlp/media_test.exs b/test/pinchflat/yt_dlp/media_test.exs
+index 865dc1a21..70dc26e0a 100644
+--- a/test/pinchflat/yt_dlp/media_test.exs
++++ b/test/pinchflat/yt_dlp/media_test.exs
+@@ -60,7 +60,7 @@ defmodule Pinchflat.YtDlp.MediaTest do
+ 
+   describe "get_downloadable_status/1" do
+     test "returns :downloadable if the media was never live" do
+-      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot ->
++      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot, _addl ->
+         {:ok, Phoenix.json_library().encode!(%{"live_status" => "not_live"})}
+       end)
+ 
+@@ -68,7 +68,7 @@ defmodule Pinchflat.YtDlp.MediaTest do
+     end
+ 
+     test "returns :downloadable if the media was live and has been processed" do
+-      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot ->
++      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot, _addl ->
+         {:ok, Phoenix.json_library().encode!(%{"live_status" => "was_live"})}
+       end)
+ 
+@@ -76,7 +76,7 @@ defmodule Pinchflat.YtDlp.MediaTest do
+     end
+ 
+     test "returns :downloadable if the media's live_status is nil" do
+-      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot ->
++      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot, _addl ->
+         {:ok, Phoenix.json_library().encode!(%{"live_status" => nil})}
+       end)
+ 
+@@ -84,7 +84,7 @@ defmodule Pinchflat.YtDlp.MediaTest do
+     end
+ 
+     test "returns :ignorable if the media is currently live" do
+-      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot ->
++      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot, _addl ->
+         {:ok, Phoenix.json_library().encode!(%{"live_status" => "is_live"})}
+       end)
+ 
+@@ -92,7 +92,7 @@ defmodule Pinchflat.YtDlp.MediaTest do
+     end
+ 
+     test "returns :ignorable if the media is scheduled to be live" do
+-      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot ->
++      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot, _addl ->
+         {:ok, Phoenix.json_library().encode!(%{"live_status" => "is_upcoming"})}
+       end)
+ 
+@@ -100,7 +100,7 @@ defmodule Pinchflat.YtDlp.MediaTest do
+     end
+ 
+     test "returns :ignorable if the media was live but hasn't been processed" do
+-      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot ->
++      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot, _addl ->
+         {:ok, Phoenix.json_library().encode!(%{"live_status" => "post_live"})}
+       end)
+ 
+@@ -108,12 +108,22 @@ defmodule Pinchflat.YtDlp.MediaTest do
+     end
+ 
+     test "returns an error if the downloadable status can't be determined" do
+-      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot ->
++      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot, _addl ->
+         {:ok, Phoenix.json_library().encode!(%{"live_status" => "what_tha"})}
+       end)
+ 
+       assert {:error, "Unknown live status: what_tha"} = Media.get_downloadable_status(@media_url)
+     end
++
++    test "optionally accepts additional args" do
++      expect(YtDlpRunnerMock, :run, fn _url, :get_downloadable_status, _opts, _ot, addl ->
++        assert [addl_arg: true] = addl
++
++        {:ok, Phoenix.json_library().encode!(%{"live_status" => "not_live"})}
++      end)
++
++      assert {:ok, :downloadable} = Media.get_downloadable_status(@media_url, addl_arg: true)
++    end
+   end
+ 
+   describe "download_thumbnail/2" do

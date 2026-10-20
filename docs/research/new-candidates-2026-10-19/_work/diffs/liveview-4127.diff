@@ -1,0 +1,1367 @@
+diff --git a/lib/phoenix_component/macro_component.ex b/lib/phoenix_component/macro_component.ex
+index 29aecd6753..a7cf70ec59 100644
+--- a/lib/phoenix_component/macro_component.ex
++++ b/lib/phoenix_component/macro_component.ex
+@@ -120,6 +120,29 @@ defmodule Phoenix.Component.MacroComponent do
+   #   LiveView's end to end tests: a macro component that performs
+   #   [syntax highlighting at compile time](https://github.com/phoenixframework/phoenix_live_view/blob/38851d943f3280c5982d75679291dccb8c442534/test/e2e/support/colocated_live.ex#L4-L35)
+   #   using the [Makeup](https://hexdocs.pm/makeup/Makeup.html) library.
++  #
++  #   ## Directives
++  #
++  #   Macro components may return directives from `transform/2` which can be used to influence
++  #   other elements in the template outside of the macro component at compile-time. For example:
++  #
++  #   ```elixir
++  #   defmodule MyAppWeb.TagRootSampleComponent do
++  #     @behaviour Phoenix.Component.MacroComponent
++  #
++  #     @impl true
++  #     def transform(_ast, _meta) do
++  #       {:ok, "", %{}, [root_tag_attribute: {"phx-sample-one", "test"}, root_tag_attribute: {"phx-sample-two", true}]}
++  #     end
++  #   end
++  #   ```
++  #
++  #   The following directives are currently supported:
++  #
++  #   * `:root_tag_attribute` - A `{name, value}` tuple to apply as an attribute to all root tags during template compilation.
++  #     Requires that a global `:root_tag_attribute` is configured for the application. The attribute name must be a string and the attribute value must be a string or `true`.
++  #     May be provided multiple times to apply multiple attributes.
++  #
+ 
+   @type tag :: binary()
+   @type attribute :: {binary(), Macro.t()}
+@@ -128,9 +151,13 @@ defmodule Phoenix.Component.MacroComponent do
+   @type tag_meta :: %{closing: :self | :void}
+   @type heex_ast :: {tag(), attributes(), children(), tag_meta()} | binary()
+   @type transform_meta :: %{env: Macro.Env.t()}
++  @type directive :: {:root_tag_attribute, {name :: String.t(), value :: String.t() | true}}
++  @type directives :: [directive]
+ 
+   @callback transform(heex_ast :: heex_ast(), meta :: transform_meta()) ::
+-              {:ok, heex_ast()} | {:ok, heex_ast(), data :: term()}
++              {:ok, heex_ast()}
++              | {:ok, heex_ast(), data :: term()}
++              | {:ok, heex_ast(), data :: term(), directives :: directives()}
+ 
+   @doc """
+   Returns the stored data from macro components that returned `{:ok, ast, data}`.
+diff --git a/lib/phoenix_live_view/html_formatter.ex b/lib/phoenix_live_view/html_formatter.ex
+index c7eb34d1cf..7e3178a569 100644
+--- a/lib/phoenix_live_view/html_formatter.ex
++++ b/lib/phoenix_live_view/html_formatter.ex
+@@ -312,8 +312,8 @@ defmodule Phoenix.LiveView.HTMLFormatter do
+           process_buffer: &process_buffer/1
+         )
+         |> case do
+-          {:ok, nodes} ->
+-            nodes
++          {:ok, result} ->
++            result.nodes
+             |> transform_tree(source, newlines)
+             |> HTMLAlgebra.build(opts)
+             |> Inspect.Algebra.format(line_length)
+diff --git a/lib/phoenix_live_view/tag_engine/compiler.ex b/lib/phoenix_live_view/tag_engine/compiler.ex
+index 3c01706a6d..1b59b24afd 100644
+--- a/lib/phoenix_live_view/tag_engine/compiler.ex
++++ b/lib/phoenix_live_view/tag_engine/compiler.ex
+@@ -1,6 +1,7 @@
+ defmodule Phoenix.LiveView.TagEngine.Compiler do
+   @moduledoc false
+ 
++  alias Phoenix.LiveView.TagEngine.Parser
+   alias Phoenix.LiveView.TagEngine.Tokenizer.ParseError
+ 
+   @doc """
+@@ -15,7 +16,7 @@ defmodule Phoenix.LiveView.TagEngine.Compiler do
+   text and expression parts and properly invoking the engine
+   with the correct code for features like components and slots.
+   """
+-  def compile(nodes, opts) do
++  def compile(%Parser{nodes: nodes, directives: directives}, opts) do
+     {engine, opts} = Keyword.pop(opts, :engine, Phoenix.LiveView.Engine)
+     tag_handler = Keyword.fetch!(opts, :tag_handler)
+ 
+@@ -26,8 +27,11 @@ defmodule Phoenix.LiveView.TagEngine.Compiler do
+       caller: Keyword.fetch!(opts, :caller),
+       source: Keyword.fetch!(opts, :source),
+       tag_handler: tag_handler,
+-      # slots is the only key that is updated when traversing nodes
+-      slots: []
++      root_tag_attribute: Application.get_env(:phoenix_live_view, :root_tag_attribute),
++      root_tag_attributes: Keyword.get_values(directives, :root_tag_attribute),
++      # The following keys are updated when traversing nodes
++      slots: [],
++      local_root?: true
+     }
+ 
+     # Live components require a single, static root tag.
+@@ -328,7 +332,7 @@ defmodule Phoenix.LiveView.TagEngine.Compiler do
+ 
+     with_special_attrs(attrs, meta, substate, state, fn attrs, meta, substate, state ->
+       substate = handle_tag_and_attrs(name, attrs, ">", to_location(meta), substate, state)
+-      {_child_state, substate} = handle_node(children, substate, state)
++      {_child_state, substate} = handle_node(children, substate, %{state | local_root?: false})
+       substate = state.engine.handle_text(substate, [to_location(close_meta)], "</#{name}>")
+       {state, substate}
+     end)
+@@ -353,7 +357,7 @@ defmodule Phoenix.LiveView.TagEngine.Compiler do
+         meta,
+         close_meta,
+         substate,
+-        state
++        %{state | local_root?: true}
+       )
+ 
+     ast =
+@@ -383,7 +387,10 @@ defmodule Phoenix.LiveView.TagEngine.Compiler do
+ 
+     with_special_attrs(attrs, meta, substate, state, fn attrs, meta, substate, state ->
+       {assigns, attr_info, slot_info} =
+-        build_component_assigns(ref, attrs, children, meta, close_meta, substate, state)
++        build_component_assigns(ref, attrs, children, meta, close_meta, substate, %{
++          state
++          | local_root?: true
++        })
+ 
+       store_component_call({mod, fun}, attr_info, slot_info, line, state)
+       call_meta = [line: line, column: column]
+@@ -420,7 +427,10 @@ defmodule Phoenix.LiveView.TagEngine.Compiler do
+     with_special_attrs(attrs, meta, substate, state, fn attrs, meta, substate, state ->
+       # Process children in a new nesting
+       {assigns, attr_info, slot_info} =
+-        build_component_assigns(ref, attrs, children, meta, close_meta, substate, state)
++        build_component_assigns(ref, attrs, children, meta, close_meta, substate, %{
++          state
++          | local_root?: true
++        })
+ 
+       store_component_call({mod, fun}, attr_info, slot_info, line, state)
+       call_meta = [line: line, column: column + mod_size]
+@@ -479,17 +489,41 @@ defmodule Phoenix.LiveView.TagEngine.Compiler do
+ 
+   defp handle_tag_and_attrs(name, attrs, suffix, meta, substate, state) do
+     text =
+-      if debug_attributes?(state.caller) do
+-        "<#{name} data-phx-loc=\"#{meta[:line]}\""
+-      else
+-        "<#{name}"
+-      end
++      "<#{name}"
++      |> maybe_add_phx_loc(state, meta)
++      |> maybe_add_root_tag_attributes(state, meta)
+ 
+     substate = state.engine.handle_text(substate, meta, text)
+     substate = handle_tag_attrs(meta, attrs, substate, state)
+     state.engine.handle_text(substate, meta, suffix)
+   end
+ 
++  defp maybe_add_phx_loc(text, %{caller: caller}, meta) do
++    if debug_attributes?(caller) do
++      "#{text} data-phx-loc=\"#{meta[:line]}\""
++    else
++      text
++    end
++  end
++
++  defp maybe_add_root_tag_attributes(text, %{local_root?: true} = state, _meta) do
++    case state do
++      %{root_tag_attribute: root_tag_attribute} when is_binary(root_tag_attribute) ->
++        attrs =
++          [{root_tag_attribute, true} | state.root_tag_attributes]
++          |> Phoenix.HTML.attributes_escape()
++          |> Phoenix.HTML.safe_to_string()
++
++        # Phoenix.HTML.attributes_escape/1 adds a leading space automatically
++        "#{text}#{attrs}"
++
++      %{root_tag_attribute: _} ->
++        text
++    end
++  end
++
++  defp maybe_add_root_tag_attributes(text, _state, _meta), do: text
++
+   defp handle_tag_attrs(meta, attrs, substate, state) do
+     Enum.reduce(attrs, substate, fn
+       {:root, {:expr, _, _} = expr, _attr_meta}, substate ->
+diff --git a/lib/phoenix_live_view/tag_engine/parser.ex b/lib/phoenix_live_view/tag_engine/parser.ex
+index b36f960adb..3c1b85d24d 100644
+--- a/lib/phoenix_live_view/tag_engine/parser.ex
++++ b/lib/phoenix_live_view/tag_engine/parser.ex
+@@ -1,6 +1,27 @@
+ defmodule Phoenix.LiveView.TagEngine.Parser do
+   @moduledoc false
+ 
++  defstruct [:nodes, :directives]
++
++  @type t :: %__MODULE__{
++          nodes: list(tag_node()),
++          directives: Phoenix.Component.MacroComponent.directives()
++        }
++
++  @type tag_node() :: text() | comment() | block() | self_close() | expression()
++  @type text() :: {:text, binary(), meta()}
++  @type comment() :: {:eex_comment, binary(), meta()}
++  @type block() :: {:block, atom(), binary(), list(attr()), list(tag_node()), meta(), meta()}
++  @type self_close() :: {:self_close, atom(), binary(), list(attr()), meta()}
++  @type expression() ::
++          {:body_expr, binary(), meta()}
++          | {:eex, binary(), meta()}
++          | {:eex_block, binary(), list(eex_clause()), meta()}
++  @type eex_clause() :: {list(tag_node()), binary(), meta()}
++  @type attr :: {:root | binary(), attr_value(), meta()}
++  @type attr_value :: {:expr, binary(), meta()} | {:string, binary(), meta()}
++  @type meta() :: map()
++
+   alias Phoenix.LiveView.TagEngine.Tokenizer
+   alias Phoenix.Component.MacroComponent
+ 
+@@ -30,7 +51,8 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+       caller: caller,
+       skip_macro_components: skip_macro_components,
+       prune_text_after_slots: prune_text_after_slots,
+-      process_buffer: process_buffer
++      process_buffer: process_buffer,
++      directives: []
+     })
+   catch
+     {:syntax_error, line, column, message} ->
+@@ -233,8 +255,8 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+   #    ], %{line: 0, column: 0, opt: '='}}
+   # ]
+   # ```
+-  defp to_tree([], buffer, [], _state) do
+-    {:ok, Enum.reverse(buffer)}
++  defp to_tree([], buffer, [], state) do
++    {:ok, %__MODULE__{nodes: Enum.reverse(buffer), directives: state.directives}}
+   end
+ 
+   defp to_tree(
+@@ -269,7 +291,7 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+        when parent_type in [:local_component, :remote_component] do
+     meta = meta |> Map.put(:special, extract_special_attrs(attrs)) |> maybe_macro_component(attrs)
+ 
+-    {tokens, buffer} =
++    {tokens, buffer, state} =
+       maybe_process_macro_component(
+         {:self_close, :slot, name, attrs, meta},
+         tokens,
+@@ -331,7 +353,7 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+        when is_tag_open(type) do
+     meta = meta |> Map.put(:special, extract_special_attrs(attrs)) |> maybe_macro_component(attrs)
+ 
+-    {tokens, buffer} =
++    {tokens, buffer, state} =
+       maybe_process_macro_component({:self_close, type, name, attrs, meta}, tokens, buffer, state)
+ 
+     to_tree(tokens, buffer, stack, state)
+@@ -353,7 +375,7 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+        ) do
+     block = Enum.reverse(reversed_buffer)
+ 
+-    {tokens, buffer} =
++    {tokens, buffer, state} =
+       maybe_process_macro_component(
+         {:block, type, name, attrs, block, open_meta, close_meta},
+         tokens,
+@@ -522,9 +544,19 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+ 
+   defp maybe_process_macro_component(tree_node, tokens, buffer, state)
+        when is_macro_component(tree_node) and not skip_macro_components(state) do
+-    # Remove :type from attrs for the macro component AST
++    caller = state.caller
++
++    if is_nil(caller) do
++      raise ArgumentError, "macro components require a caller environment"
++    end
++
++    Macro.Env.required?(caller, Phoenix.Component) ||
++      raise ArgumentError,
++            "macro components are only supported in modules that `use Phoenix.Component`"
++
+     tree_node =
+       case tree_node do
++        # Remove :type from attrs for the macro component AST
+         {:self_close, :tag, name, attrs, meta} ->
+           {:self_close, :tag, name, List.keydelete(attrs, ":type", 0), meta}
+ 
+@@ -545,21 +577,31 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+           )
+       end
+ 
+-    case process_macro_component(tree_node, state) do
+-      {:text, "", _} ->
+-        {strip_text(tokens), buffer}
++    meta = get_meta(tree_node)
++    module_string = meta.macro_component
++    module = validate_module!(module_string, meta, state)
+ 
+-      new_node ->
+-        {strip_text(tokens), [new_node | buffer]}
++    case process_macro_component(tree_node, module, state) do
++      {_new_node, directives} when directives != [] and buffer != [] ->
++        throw_syntax_error!(
++          "macro component #{inspect(module)} specified directives and therefore must appear at the very beginning of the template",
++          get_meta(tree_node)
++        )
++
++      {{:text, "", _}, directives} ->
++        {strip_text(tokens), buffer, %{state | directives: directives}}
++
++      {new_node, directives} ->
++        {strip_text(tokens), [new_node | buffer], %{state | directives: directives}}
+     end
+   end
+ 
+-  defp maybe_process_macro_component(tree_node, tokens, buffer, _state) do
+-    {tokens, [tree_node | buffer]}
++  defp maybe_process_macro_component(tree_node, tokens, buffer, state) do
++    {tokens, [tree_node | buffer], state}
+   end
+ 
+   # Process a macro component: call transform and convert result back to tree nodes
+-  defp process_macro_component(tree_node, state) do
++  defp process_macro_component(tree_node, module, state) do
+     # Macro components work by converting the tree nodes into a macro AST
+     # (see Phoenix.Component.MacroComponent) and then calling the transform
+     # function on the macro component module, which can return a transformed
+@@ -567,36 +609,29 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+     #
+     # The AST is limited in functionality and we convert it back to the regular
+     # node format afterwards.
+-    caller = state.caller
+-
+-    if is_nil(caller) do
+-      raise ArgumentError, "macro components require a caller environment"
+-    end
+-
+-    Macro.Env.required?(caller, Phoenix.Component) ||
+-      raise ArgumentError,
+-            "macro components are only supported in modules that `use Phoenix.Component`"
+-
+     meta = get_meta(tree_node)
+-    module_string = meta.macro_component
+-    module = validate_module!(module_string, meta, state)
+ 
+-    # Build the macro component AST
+-    case MacroComponent.build_ast(tree_node, caller) do
++    case MacroComponent.build_ast(tree_node, state.caller) do
+       {:ok, macro_ast} ->
+         try do
+           # Call the transform function
+-          case module.transform(macro_ast, %{env: caller}) do
++          case module.transform(macro_ast, %{env: state.caller}) do
+             {:ok, new_ast} ->
+-              MacroComponent.ast_to_tree(new_ast, meta)
++              {MacroComponent.ast_to_tree(new_ast, meta), []}
+ 
+             {:ok, new_ast, data} ->
+-              Module.put_attribute(caller.module, :__macro_components__, {module, data})
+-              MacroComponent.ast_to_tree(new_ast, meta)
++              Module.put_attribute(state.caller.module, :__macro_components__, {module, data})
++              {MacroComponent.ast_to_tree(new_ast, meta), []}
++
++            {:ok, new_ast, data, directives} ->
++              Module.put_attribute(state.caller.module, :__macro_components__, {module, data})
++
++              {MacroComponent.ast_to_tree(new_ast, meta),
++               validate_directives!(module, directives, meta)}
+ 
+             other ->
+               throw_syntax_error!(
+-                "a macro component must return {:ok, ast} or {:ok, ast, data}, got: #{inspect(other)}",
++                "a macro component must return {:ok, ast}, {:ok, ast, data}, or {:ok, ast, data, directives}, got: #{inspect(other)}",
+                 meta
+               )
+           end
+@@ -641,6 +676,39 @@ defmodule Phoenix.LiveView.TagEngine.Parser do
+     module
+   end
+ 
++  defp validate_directives!(module, directives, meta) do
++    Enum.each(directives, fn {key, value} ->
++      validate_directive!(module, key, value, meta)
++    end)
++
++    directives
++  end
++
++  defp validate_directive!(_module, :root_tag_attribute, nil, _), do: :ok
++
++  defp validate_directive!(_module, :root_tag_attribute, {name, value}, _meta)
++       when is_binary(name) and (is_binary(value) or value == true) do
++    :ok
++  end
++
++  defp validate_directive!(module, :root_tag_attribute, other, meta) do
++    throw_syntax_error!(
++      """
++      expected {name, value} for :root_tag_attribute directive from macro component #{inspect(module)}, got: #{inspect(other)}
++
++      name must be a compile-time string, and value must be a compile-time string or true
++      """,
++      meta
++    )
++  end
++
++  defp validate_directive!(module, directive, value, meta) do
++    throw_syntax_error!(
++      "unknown directive #{inspect({directive, value})} provided by macro component #{inspect(module)}",
++      meta
++    )
++  end
++
+   defp throw_syntax_error!(message, meta) do
+     throw({:syntax_error, meta.line, meta.column, message})
+   end
+diff --git a/test/phoenix_component/macro_component_integration_test.exs b/test/phoenix_component/macro_component_integration_test.exs
+index 1f27eb4d04..3752bd43d5 100644
+--- a/test/phoenix_component/macro_component_integration_test.exs
++++ b/test/phoenix_component/macro_component_integration_test.exs
+@@ -1,5 +1,7 @@
+ defmodule Phoenix.Component.MacroComponentIntegrationTest do
+-  use ExUnit.Case, async: true
++  # async: false due to manipulating the Application env
++  # for :root_tag_attribute
++  use ExUnit.Case, async: false
+ 
+   use Phoenix.Component
+ 
+@@ -20,6 +22,37 @@ defmodule Phoenix.Component.MacroComponentIntegrationTest do
+     end
+   end
+ 
++  defmodule DirectiveMacroComponent do
++    @behaviour Phoenix.Component.MacroComponent
++
++    @impl true
++    def transform(_ast, _meta) do
++      {:ok, "", %{},
++       [
++         root_tag_attribute: {"phx-sample-one", "test"},
++         root_tag_attribute: {"phx-sample-two", "test"}
++       ]}
++    end
++  end
++
++  defmodule BadRootTagAttrDirectiveMacroComponent do
++    @behaviour Phoenix.Component.MacroComponent
++
++    @impl true
++    def transform(_ast, _meta) do
++      {:ok, "", %{}, [root_tag_attribute: false]}
++    end
++  end
++
++  defmodule UnknownDirectiveMacroComponent do
++    @behaviour Phoenix.Component.MacroComponent
++
++    @impl true
++    def transform(_ast, _meta) do
++      {:ok, "", %{}, [unknown: true]}
++    end
++  end
++
+   test "receives ast" do
+     defmodule TestComponentAst do
+       use Phoenix.Component
+@@ -353,6 +386,282 @@ defmodule Phoenix.Component.MacroComponentIntegrationTest do
+            """).root
+   end
+ 
++  describe "directives" do
++    test "raises if an unknown directive is provided" do
++      message =
++        ~r/unknown directive {:unknown, true} provided by macro component #{inspect(__MODULE__)}\.UnknownDirectiveMacroComponent/
++
++      assert_raise ParseError,
++                   message,
++                   fn ->
++                     defmodule TestUnknownDirective do
++                       use Phoenix.Component
++
++                       def render(assigns) do
++                         ~H"""
++                         <div :type={UnknownDirectiveMacroComponent}></div>
++                         """
++                       end
++                     end
++                   end
++    end
++  end
++
++  describe "directives - root_tag_attribute" do
++    setup do
++      # Need to set a :root_tag_attribute as the only directive supported
++      # by macro components currently is [root_tag_attribute: {name, value}] which
++      # requires a :root_tag_attribute to be configured
++      Application.put_env(:phoenix_live_view, :root_tag_attribute, "phx-r")
++      on_exit(fn -> Application.delete_env(:phoenix_live_view, :root_tag_attribute) end)
++    end
++
++    test "happy path" do
++      defmodule TestComponentRootTagAttr do
++        use Phoenix.Component
++
++        def render(assigns) do
++          ~H"""
++          <div :type={DirectiveMacroComponent}></div>
++          <div id="hello">
++            <span class="inside">
++              <.my_link><p>I am in an inner block<b>non-root</b></p></.my_link>
++            </span>
++            <.my_component>
++              <span>Inner block</span>
++              <p>More inner block</p>
++              <:other_slot>
++                <div>Hey</div>
++              </:other_slot>
++            </.my_component>
++          </div>
++          """
++        end
++
++        defp my_link(assigns) do
++          ~H"""
++          <a href="#">{render_slot(@inner_block)}</a>
++          """
++        end
++
++        defp my_component(assigns) do
++          ~H"""
++          {render_slot(@inner_block)}
++          {render_slot(@other_slot)}
++
++          <p>Part of the component</p>
++          """
++        end
++      end
++
++      assert render_component(&TestComponentRootTagAttr.render/1)
++             |> TreeDOM.normalize_to_tree(sort_attributes: true) ==
++               ~X"""
++               <div phx-sample-one="test" phx-sample-two="test" phx-r id="hello">
++                 <span class="inside">
++                   <a href="#" phx-r><p phx-sample-one="test" phx-sample-two="test" phx-r>I am in an inner block<b>non-root</b></p></a>
++                 </span>
++
++                 <span phx-sample-one="test" phx-sample-two="test" phx-r>Inner block</span>
++                 <p phx-sample-one="test" phx-sample-two="test" phx-r>More inner block</p>
++                 <div phx-sample-one="test" phx-sample-two="test" phx-r>Hey</div>
++
++                 <p phx-r>Part of the component</p>
++               </div>
++               """
++    end
++
++    test "raises if :root_tag_attribute directive is provided with an invalid value" do
++      message = ~r"""
++      expected {name, value} for :root_tag_attribute directive from macro component #{inspect(__MODULE__)}\.BadRootTagAttrDirectiveMacroComponent, got: false
++
++      name must be a compile-time string, and value must be a compile-time string or true
++      """
++
++      assert_raise ParseError,
++                   message,
++                   fn ->
++                     defmodule TestBadRootTagAttrDirective do
++                       use Phoenix.Component
++
++                       def render(assigns) do
++                         ~H"""
++                         <div :type={BadRootTagAttrDirectiveMacroComponent}></div>
++                         """
++                       end
++                     end
++                   end
++    end
++
++    test "raises if macro components with directives are not defined at the beginning of the template" do
++      message =
++        ~r/macro component #{inspect(__MODULE__)}\.DirectiveMacroComponent specified directives and therefore must appear at the very beginning of the template/
++
++      defmodule TestComponentDirectiveAtBeginning1 do
++        use Phoenix.Component
++
++        def render(assigns) do
++          ~H"""
++          <div :type={DirectiveMacroComponent}></div>
++          """
++        end
++      end
++
++      # whitespace is allowed
++      defmodule TestComponentDirectiveAtBeginning2 do
++        use Phoenix.Component
++
++        def render(assigns) do
++          ~H"""
++
++
++
++          <div :type={DirectiveMacroComponent}></div>
++          """noformat
++        end
++      end
++
++      assert_raise ParseError,
++                   message,
++                   fn ->
++                     defmodule TestComponentDirectiveAtBeginning3 do
++                       use Phoenix.Component
++
++                       def render(assigns) do
++                         ~H"""
++                         <div />
++                         <div :type={DirectiveMacroComponent}></div>
++                         """
++                       end
++                     end
++                   end
++
++      assert_raise ParseError,
++                   message,
++                   fn ->
++                     defmodule TestComponentDirectiveAtBeginning4 do
++                       use Phoenix.Component
++
++                       def render(assigns) do
++                         ~H"""
++                         <div></div>
++                         <div :type={DirectiveMacroComponent}></div>
++                         """
++                       end
++                     end
++                   end
++
++      assert_raise ParseError,
++                   message,
++                   fn ->
++                     defmodule TestComponentDirectiveAtBeginning5 do
++                       use Phoenix.Component
++
++                       def render(assigns) do
++                         ~H"""
++                         <.link>Link</.link>
++                         <div :type={DirectiveMacroComponent}></div>
++                         """
++                       end
++                     end
++                   end
++
++      assert_raise ParseError,
++                   message,
++                   fn ->
++                     defmodule TestComponentDirectiveAtBeginning6 do
++                       use Phoenix.Component
++
++                       def render(assigns) do
++                         ~H"""
++                         <Phoenix.Component.link>Link</Phoenix.Component.link>
++                         <div :type={DirectiveMacroComponent}></div>
++                         """
++                       end
++                     end
++                   end
++
++      assert_raise ParseError,
++                   message,
++                   fn ->
++                     defmodule TestComponentDirectiveAtBeginning7 do
++                       use Phoenix.Component
++
++                       def render(assigns) do
++                         ~H"""
++                         {if true, do: "Test"}
++                         <div :type={DirectiveMacroComponent}></div>
++                         """
++                       end
++                     end
++                   end
++
++      assert_raise ParseError,
++                   message,
++                   fn ->
++                     defmodule TestComponentDirectiveAtBeginning8 do
++                       use Phoenix.Component
++
++                       def render(assigns) do
++                         ~H"""
++                         <%= if true do %>
++                           <div :type={DirectiveMacroComponent}></div>
++                         <% end %>
++                         """
++                       end
++                     end
++                   end
++
++      assert_raise ParseError,
++                   message,
++                   fn ->
++                     defmodule TestComponentDirectiveAtBeginning9 do
++                       use Phoenix.Component
++
++                       def render(assigns) do
++                         ~H"""
++                         <div>
++                           <div :type={DirectiveMacroComponent}></div>
++                         </div>
++                         """
++                       end
++                     end
++                   end
++
++      assert_raise ParseError,
++                   message,
++                   fn ->
++                     defmodule TestComponentDirectiveAtBeginning10 do
++                       use Phoenix.Component
++
++                       def render(assigns) do
++                         ~H"""
++                         <.link>
++                           <div :type={DirectiveMacroComponent}></div>
++                         </.link>
++                         """
++                       end
++                     end
++                   end
++
++      assert_raise ParseError,
++                   message,
++                   fn ->
++                     defmodule TestComponentDirectiveAtBeginning11 do
++                       use Phoenix.Component
++
++                       def render(assigns) do
++                         ~H"""
++                         <Phoenix.Component.link>
++                           <div :type={DirectiveMacroComponent}></div>
++                         </Phoenix.Component.link>
++                         """
++                       end
++                     end
++                   end
++    end
++  end
++
+   defp eval_heex(source) do
+     Phoenix.LiveView.TagEngine.compile(source,
+       file: __ENV__.file,
+diff --git a/test/phoenix_live_view/html_engine_test.exs b/test/phoenix_live_view/html_engine_test.exs
+index 94ecadd9ca..2aa9a39810 100644
+--- a/test/phoenix_live_view/html_engine_test.exs
++++ b/test/phoenix_live_view/html_engine_test.exs
+@@ -2388,4 +2388,315 @@ defmodule Phoenix.LiveView.HTMLEngineTest do
+       assert meta[:column] == 10
+     end
+   end
++
++  describe "root tag attributes" do
++    alias Phoenix.LiveViewTest.Support.RootTagAttr
++    alias Phoenix.LiveViewTest.TreeDOM
++    import Phoenix.LiveViewTest.TreeDOM, only: [sigil_X: 2]
++
++    test "single self-closing tag" do
++      assigns = %{}
++
++      compiled = compile("<RootTagAttr.single_self_close/>")
++
++      expected = ~X"<div phx-r></div>"
++
++      assert TreeDOM.normalize_to_tree(compiled) == expected
++    end
++
++    test "single tag with body" do
++      assigns = %{}
++
++      compiled = compile("<RootTagAttr.single_with_body/>")
++
++      expected = ~X"<div phx-r>Test</div>"
++
++      assert TreeDOM.normalize_to_tree(compiled) == expected
++    end
++
++    test "multiple self-closing tags" do
++      assigns = %{}
++
++      compiled = compile("<RootTagAttr.multiple_self_close/>")
++
++      expected = ~X"""
++      <div phx-r></div>
++      <div phx-r></div>
++      <div phx-r></div>
++      """
++
++      assert TreeDOM.normalize_to_tree(compiled) == expected
++    end
++
++    test "multiple tags with bodies" do
++      assigns = %{}
++
++      compiled = compile("<RootTagAttr.multiple_with_bodies/>")
++
++      expected = ~X"""
++      <div phx-r>Test1</div>
++      <div phx-r>Test2</div>
++      <div phx-r>Test3</div>
++      """
++
++      assert TreeDOM.normalize_to_tree(compiled) == expected
++    end
++
++    test "tags root tags of nested tags" do
++      assigns = %{}
++
++      compiled = compile("<RootTagAttr.nested_tags/>")
++
++      expected = ~X"""
++      <div phx-r>
++        <div>
++          <div></div>
++        </div>
++        <div>
++          <div></div>
++        </div>
++      </div>
++      <div phx-r>
++        <div>
++          <div></div>
++        </div>
++        <div>
++          <div></div>
++        </div>
++      </div>
++      """
++
++      assert TreeDOM.normalize_to_tree(compiled) == expected
++    end
++
++    test "tags root tags of component inner_blocks" do
++      assigns = %{}
++
++      compiled = compile("<RootTagAttr.component_inner_blocks/>")
++
++      expected =
++        ~X"""
++        <div phx-r>
++          <div>
++            <section phx-r>
++              <div phx-r>
++                <div>
++                  Inner Block 1
++                </div>
++              </div>
++            </section>
++            <section phx-r>
++              <div phx-r>
++                <div>
++                  Inner Block 2
++                </div>
++              </div>
++            </section>
++          </div>
++        </div>
++        """
++
++      assert TreeDOM.normalize_to_tree(compiled) == expected
++    end
++
++    test "tags root tags of component named slots" do
++      assigns = %{}
++
++      compiled = compile("<RootTagAttr.component_named_slots/>")
++
++      expected =
++        ~X"""
++        <div phx-r>
++          <div>
++            <section phx-r>
++              <aside>
++                <div phx-r>
++                  <div>
++                    Inner Block 1
++                  </div>
++                </div>
++              </aside>
++            </section>
++            <section phx-r>
++              <aside>
++                <div phx-r>
++                  <div>
++                    Inner Block 2
++                  </div>
++                </div>
++              </aside>
++            </section>
++          </div>
++        </div>
++        """
++
++      assert TreeDOM.normalize_to_tree(compiled) == expected
++    end
++
++    test "tags root tags correctly for complex nestings of tags, components, and slots" do
++      assigns = %{}
++
++      compiled = compile("<RootTagAttr.nested_tags_components_slots/>")
++
++      expected =
++        ~X"""
++        <div phx-r>
++          <div>
++            <section phx-r>
++                <div phx-r>
++                  <section phx-r>
++                    <div phx-r>
++                      <p phx-r>Simple</p>
++                    </div>
++                    <aside>
++                      <div phx-r>
++                        <p phx-r>Simple</p>
++                      </div>
++                    </aside>
++                  </section>
++                </div>
++              <aside>
++                <div phx-r>
++                  <section phx-r>
++                    <div phx-r>
++                      <p phx-r>Simple</p>
++                    </div>
++                    <aside>
++                      <div phx-r>
++                        <p phx-r>Simple</p>
++                      </div>
++                    </aside>
++                  </section>
++                </div>
++              </aside>
++            </section>
++          </div>
++        </div>
++        """
++
++      assert TreeDOM.normalize_to_tree(compiled) == expected
++    end
++
++    test "within nestings" do
++      assigns = %{}
++
++      compiled = compile("<RootTagAttr.within_nestings bool={true}/>")
++
++      expected = ~X"""
++        <div phx-r>
++          <div>
++              <section phx-r>
++                <p phx-r>
++                  <span>True</span>
++                </p>
++              </section>
++          </div>
++        </div>
++      """
++
++      assert TreeDOM.normalize_to_tree(compiled) == expected
++
++      compiled = compile("<RootTagAttr.within_nestings bool={false}/>")
++
++      expected = ~X"""
++        <div phx-r>
++          <div>
++              <section phx-r>
++                <p phx-r>
++                  <span>False</span>
++                </p>
++              </section>
++          </div>
++        </div>
++      """
++
++      assert TreeDOM.normalize_to_tree(compiled) == expected
++    end
++
++    test "extra attributes with values provided by macro component directives" do
++      assigns = %{}
++
++      compiled = compile("<RootTagAttr.macro_component_attrs_with_values/>")
++
++      expected =
++        ~X"""
++        <div phx-r phx-sample-one="test" phx-sample-two="test">
++          <div>
++            <section phx-r>
++              <div phx-r phx-sample-two="test" phx-sample-one="test">Inner Block</div>
++              <aside>
++                <div phx-r phx-sample-two="test" phx-sample-one="test">
++                  Named Slot
++                </div>
++              </aside>
++            </section>
++          </div>
++        </div>
++        """
++
++      assert TreeDOM.normalize_to_tree(compiled) == expected
++    end
++
++    test "extra attributes without values provided by macro component directives" do
++      assigns = %{}
++
++      compiled = compile("<RootTagAttr.macro_component_attrs_without_values/>")
++
++      expected =
++        ~X"""
++        <div phx-r phx-sample-two phx-sample-one>
++          <div>
++            <section phx-r>
++              <div phx-r phx-sample-two phx-sample-one>Inner Block</div>
++              <aside>
++                <div phx-r phx-sample-two phx-sample-one>
++                  Named Slot
++                </div>
++              </aside>
++            </section>
++          </div>
++        </div>
++        """
++
++      assert TreeDOM.normalize_to_tree(compiled) == expected
++    end
++
++    test "extra attributes with values provided by macro component directives within nestings" do
++      assigns = %{}
++
++      compiled =
++        compile("<RootTagAttr.macro_component_attrs_with_values_within_nestings bool={true}/>")
++
++      expected = ~X"""
++        <div phx-r phx-sample-two="test" phx-sample-one="test">
++          <div>
++              <section phx-r>
++                <p phx-r phx-sample-two="test" phx-sample-one="test">
++                  <span>True</span>
++                </p>
++              </section>
++          </div>
++        </div>
++      """
++
++      assert TreeDOM.normalize_to_tree(compiled) == expected
++
++      compiled =
++        compile("<RootTagAttr.macro_component_attrs_with_values_within_nestings bool={false}/>")
++
++      expected = ~X"""
++        <div phx-r phx-sample-two="test" phx-sample-one="test">
++          <div>
++              <section phx-r>
++                <p phx-r phx-sample-two="test" phx-sample-one="test">
++                  <span>False</span>
++                </p>
++              </section>
++          </div>
++        </div>
++      """
++
++      assert TreeDOM.normalize_to_tree(compiled) == expected
++    end
++  end
+ end
+diff --git a/test/support/live_views/root_tag_attr.exs b/test/support/live_views/root_tag_attr.exs
+new file mode 100644
+index 0000000000..e3a59a453f
+--- /dev/null
++++ b/test/support/live_views/root_tag_attr.exs
+@@ -0,0 +1,275 @@
++# Note this file is intentionally a .exs file because it is loaded
++# in the test helper with :root_tag_attribute turned on.
++defmodule Phoenix.LiveViewTest.Support.RootTagAttr do
++  use Phoenix.Component
++
++  defmodule RootTagsWithValuesMacroComponent do
++    @behaviour Phoenix.Component.MacroComponent
++
++    @impl true
++    def transform(_ast, _meta) do
++      {:ok, "", %{},
++       [
++         root_tag_attribute: {"phx-sample-one", "test"},
++         root_tag_attribute: {"phx-sample-two", "test"}
++       ]}
++    end
++  end
++
++  defmodule RootTagsWithoutValuesMacroComponent do
++    @behaviour Phoenix.Component.MacroComponent
++
++    @impl true
++    def transform(_ast, _meta) do
++      {:ok, "", %{},
++       [
++         root_tag_attribute: {"phx-sample-one", true},
++         root_tag_attribute: {"phx-sample-two", true}
++       ]}
++    end
++  end
++
++  def macro_component_attrs_with_values_within_nestings(assigns) do
++    ~H"""
++    <div :type={Phoenix.LiveViewTest.Support.RootTagAttr.RootTagsWithValuesMacroComponent}></div>
++    <%= if true do %>
++      <div>
++        <div>
++          <%= if @bool do %>
++            <.inner_block_and_slot>
++              <p>
++                <span>True</span>
++              </p>
++            </.inner_block_and_slot>
++          <% else %>
++            <.inner_block_and_slot>
++              <p>
++                <span>False</span>
++              </p>
++            </.inner_block_and_slot>
++          <% end %>
++        </div>
++      </div>
++    <% end %>
++    """
++  end
++
++  def within_nestings(assigns) do
++    ~H"""
++    <%= if true do %>
++      <div>
++        <div>
++          <%= if @bool do %>
++            <.inner_block_and_slot>
++              <p>
++                <span>True</span>
++              </p>
++            </.inner_block_and_slot>
++          <% else %>
++            <.inner_block_and_slot>
++              <p>
++                <span>False</span>
++              </p>
++            </.inner_block_and_slot>
++          <% end %>
++        </div>
++      </div>
++    <% end %>
++    """
++  end
++
++  def macro_component_attrs_with_values(assigns) do
++    ~H"""
++    <div :type={Phoenix.LiveViewTest.Support.RootTagAttr.RootTagsWithValuesMacroComponent}></div>
++    <div>
++      <div>
++        <.inner_block_and_slot>
++          <div>Inner Block</div>
++          <:test>
++            <div>
++              Named Slot
++            </div>
++          </:test>
++        </.inner_block_and_slot>
++      </div>
++    </div>
++    """
++  end
++
++  def macro_component_attrs_without_values(assigns) do
++    ~H"""
++    <div :type={Phoenix.LiveViewTest.Support.RootTagAttr.RootTagsWithoutValuesMacroComponent}></div>
++    <div>
++      <div>
++        <.inner_block_and_slot>
++          <div>Inner Block</div>
++          <:test>
++            <div>
++              Named Slot
++            </div>
++          </:test>
++        </.inner_block_and_slot>
++      </div>
++    </div>
++    """
++  end
++
++  slot :inner_block, required: true
++  slot :test
++
++  def single_self_close(assigns) do
++    ~H"""
++    <div />
++    """
++  end
++
++  def single_with_body(assigns) do
++    ~H"""
++    <div>Test</div>
++    """
++  end
++
++  def multiple_self_close(assigns) do
++    ~H"""
++    <div />
++    <div />
++    <div />
++    """
++  end
++
++  def multiple_with_bodies(assigns) do
++    ~H"""
++    <div>Test1</div>
++    <div>Test2</div>
++    <div>Test3</div>
++    """
++  end
++
++  def nested_tags(assigns) do
++    ~H"""
++    <div>
++      <div>
++        <div></div>
++      </div>
++      <div>
++        <div></div>
++      </div>
++    </div>
++    <div>
++      <div>
++        <div></div>
++      </div>
++      <div>
++        <div></div>
++      </div>
++    </div>
++    """
++  end
++
++  def component_inner_blocks(assigns) do
++    ~H"""
++    <div>
++      <div>
++        <.inner_block_and_slot>
++          <div>
++            <div>
++              Inner Block 1
++            </div>
++          </div>
++        </.inner_block_and_slot>
++        <.inner_block_and_slot>
++          <div>
++            <div>
++              Inner Block 2
++            </div>
++          </div>
++        </.inner_block_and_slot>
++      </div>
++    </div>
++    """
++  end
++
++  def component_named_slots(assigns) do
++    ~H"""
++    <div>
++      <div>
++        <.inner_block_and_slot>
++          <:test>
++            <div>
++              <div>
++                Inner Block 1
++              </div>
++            </div>
++          </:test>
++        </.inner_block_and_slot>
++        <.inner_block_and_slot>
++          <:test>
++            <div>
++              <div>
++                Inner Block 2
++              </div>
++            </div>
++          </:test>
++        </.inner_block_and_slot>
++      </div>
++    </div>
++    """
++  end
++
++  def nested_tags_components_slots(assigns) do
++    ~H"""
++    <div>
++      <div>
++        <.inner_block_and_slot>
++          <div>
++            <.inner_block_and_slot>
++              <div>
++                <.simple />
++              </div>
++              <:test>
++                <div>
++                  <.simple />
++                </div>
++              </:test>
++            </.inner_block_and_slot>
++          </div>
++          <:test>
++            <div>
++              <.inner_block_and_slot>
++                <div>
++                  <.simple />
++                </div>
++                <:test>
++                  <div>
++                    <.simple />
++                  </div>
++                </:test>
++              </.inner_block_and_slot>
++            </div>
++          </:test>
++        </.inner_block_and_slot>
++      </div>
++    </div>
++    """
++  end
++
++  slot :inner_block, required: true
++  slot :test
++
++  defp inner_block_and_slot(assigns) do
++    ~H"""
++    <section>
++      {render_slot(@inner_block)}
++      <aside :for={test <- @test}>
++        {render_slot(@test)}
++      </aside>
++    </section>
++    """
++  end
++
++  defp simple(assigns) do
++    ~H"""
++    <p>Simple</p>
++    """
++  end
++end
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index 29ec48055a..7e9611ace4 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -5,5 +5,9 @@ Code.require_file("test/support/live_views/debug_anno_opt_out.exs")
+ Application.put_env(:phoenix_live_view, :debug_attributes, false)
+ Application.put_env(:phoenix_live_view, :debug_heex_annotations, false)
+ 
++Application.put_env(:phoenix_live_view, :root_tag_attribute, "phx-r")
++Code.require_file("test/support/live_views/root_tag_attr.exs")
++Application.delete_env(:phoenix_live_view, :root_tag_attribute)
++
+ {:ok, _} = Phoenix.LiveViewTest.Support.Endpoint.start_link()
+ ExUnit.start()

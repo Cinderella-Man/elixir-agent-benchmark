@@ -1,0 +1,281 @@
+diff --git a/.iex.exs b/.iex.exs
+index 2d68cf508..ebe1a24a7 100644
+--- a/.iex.exs
++++ b/.iex.exs
+@@ -21,3 +21,5 @@ alias Pinchflat.FastIndexing.YoutubeRss
+ alias Pinchflat.Metadata.MetadataFileHelpers
+ 
+ alias Pinchflat.SlowIndexing.FileFollowerServer
++
++Pinchflat.Release.check_file_permissions()
+diff --git a/README.md b/README.md
+index 1b9dbab34..46f0771bc 100644
+--- a/README.md
++++ b/README.md
+@@ -49,6 +49,7 @@ If it doesn't work for your use case, please make a feature request! You can als
+ - Custom rules for handling YouTube Shorts and livestreams
+ - Advanced options like setting cutoff dates and filtering by title
+ - Reliable hands-off operation
++- Can pass cookies to YouTube to download your private playlists ([docs](https://github.com/kieraneglin/pinchflat/wiki/YouTube-Cookies))
+ 
+ ## Screenshots
+ 
+@@ -102,7 +103,7 @@ You _must_ ensure the host directories you've mounted are writable by the user r
+ 
+ It's recommended to not run the container as root. Doing so can create permission issues if other apps need to work with the downloaded media. If you need to run any command as root, you can run `su` from the container's shell as there is no password set for the root user.
+ 
+-## Authentication
++## Username and Password
+ 
+ HTTP basic authentication is optionally supported. To use it, set the `BASIC_AUTH_USERNAME` and `BASIC_AUTH_PASSWORD` environment variables when starting the container. No authentication will be required unless you set _both_ of these.
+ 
+diff --git a/config/config.exs b/config/config.exs
+index e1f5e1db2..76f4b0127 100644
+--- a/config/config.exs
++++ b/config/config.exs
+@@ -16,6 +16,7 @@ config :pinchflat,
+   media_directory: "/downloads",
+   # The user may or may not store metadata for their needs, but the app will always store its copy
+   metadata_directory: "/config/metadata",
++  extras_directory: "/config/extras",
+   tmpfile_directory: Path.join([System.tmp_dir!(), "pinchflat", "data"]),
+   # Setting BASIC_AUTH_USERNAME and BASIC_AUTH_PASSWORD implies you want to use basic auth.
+   # If either is unset, basic auth will not be used.
+diff --git a/config/dev.exs b/config/dev.exs
+index cedbe262f..887322b54 100644
+--- a/config/dev.exs
++++ b/config/dev.exs
+@@ -3,6 +3,7 @@ import Config
+ config :pinchflat,
+   media_directory: Path.join([File.cwd!(), "tmp", "media"]),
+   metadata_directory: Path.join([File.cwd!(), "tmp", "metadata"]),
++  extras_directory: Path.join([File.cwd!(), "tmp", "extras"]),
+   tmpfile_directory: Path.join([File.cwd!(), "tmp", "tmpfiles"])
+ 
+ # Configure your database
+diff --git a/config/runtime.exs b/config/runtime.exs
+index 89d1d1aae..d2a9335d0 100644
+--- a/config/runtime.exs
++++ b/config/runtime.exs
+@@ -41,16 +41,11 @@ config :pinchflat, Pinchflat.Repo,
+   ]
+ 
+ if config_env() == :prod do
+-  config_path =
+-    System.get_env("CONFIG_PATH") ||
+-      raise """
+-      environment variable CONFIG_PATH is missing.
+-      For example: /etc/pinchflat/config
+-      """
+-
++  config_path = "/config"
+   db_path = System.get_env("DATABASE_PATH", Path.join([config_path, "db", "pinchflat.db"]))
+   log_path = System.get_env("LOG_PATH", Path.join([config_path, "logs", "pinchflat.log"]))
+   metadata_path = System.get_env("METADATA_PATH", Path.join([config_path, "metadata"]))
++  extras_path = System.get_env("EXTRAS_PATH", Path.join([config_path, "extras"]))
+ 
+   # We want to force _some_ level of useful logging in production
+   acceptable_log_levels = ~w(debug info)a
+@@ -65,7 +60,10 @@ if config_env() == :prod do
+ 
+   config :pinchflat,
+     yt_dlp_executable: System.find_executable("yt-dlp"),
++    media_directory: "/downloads",
+     metadata_directory: metadata_path,
++    extras_directory: extras_path,
++    tmpfile_directory: Path.join([System.tmp_dir!(), "pinchflat", "data"]),
+     dns_cluster_query: System.get_env("DNS_CLUSTER_QUERY")
+ 
+   config :pinchflat, Pinchflat.Repo,
+diff --git a/lib/pinchflat/boot/pre_job_startup_tasks.ex b/lib/pinchflat/boot/pre_job_startup_tasks.ex
+index 27b8e1b05..087f2b972 100644
+--- a/lib/pinchflat/boot/pre_job_startup_tasks.ex
++++ b/lib/pinchflat/boot/pre_job_startup_tasks.ex
+@@ -14,6 +14,7 @@ defmodule Pinchflat.Boot.PreJobStartupTasks do
+ 
+   alias Pinchflat.Repo
+   alias Pinchflat.Settings
++  alias Pinchflat.Filesystem.FilesystemHelpers
+ 
+   def start_link(opts \\ []) do
+     GenServer.start_link(__MODULE__, %{}, opts)
+@@ -31,6 +32,7 @@ defmodule Pinchflat.Boot.PreJobStartupTasks do
+   @impl true
+   def init(state) do
+     reset_executing_jobs()
++    create_blank_cookie_file()
+     apply_default_settings()
+     rename_old_job_workers()
+ 
+@@ -49,6 +51,19 @@ defmodule Pinchflat.Boot.PreJobStartupTasks do
+     Logger.info("Reset #{count} executing jobs")
+   end
+ 
++  defp create_blank_cookie_file do
++    base_dir = Application.get_env(:pinchflat, :extras_directory)
++    filepath = Path.join(base_dir, "cookies.txt")
++
++    if File.exists?(filepath) do
++      Logger.info("Cookies file exists")
++    else
++      Logger.info("Cookies does not exist - creating it")
++
++      FilesystemHelpers.write_p!(filepath, "")
++    end
++  end
++
+   defp apply_default_settings do
+     Settings.fetch!(:onboarding, true)
+     Settings.fetch!(:pro_enabled, false)
+diff --git a/lib/pinchflat/release.ex b/lib/pinchflat/release.ex
+index c47200a48..a7e067b97 100644
+--- a/lib/pinchflat/release.ex
++++ b/lib/pinchflat/release.ex
+@@ -30,6 +30,7 @@ defmodule Pinchflat.Release do
+       "/downloads",
+       Application.get_env(:pinchflat, :media_directory),
+       Application.get_env(:pinchflat, :tmpfile_directory),
++      Application.get_env(:pinchflat, :extras_directory),
+       Application.get_env(:pinchflat, :metadata_directory)
+     ]
+ 
+diff --git a/lib/pinchflat/yt_dlp/command_runner.ex b/lib/pinchflat/yt_dlp/command_runner.ex
+index 3e36e746a..9fa213609 100644
+--- a/lib/pinchflat/yt_dlp/command_runner.ex
++++ b/lib/pinchflat/yt_dlp/command_runner.ex
+@@ -31,7 +31,8 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+     # Also, can't use RAM file since yt-dlp needs a concrete filepath.
+     output_filepath = Keyword.get(addl_opts, :output_filepath, FSUtils.generate_metadata_tmpfile(:json))
+     print_to_file_opts = [{:print_to_file, output_template}, output_filepath]
+-    formatted_command_opts = [url] ++ parse_options(command_opts ++ print_to_file_opts)
++    cookie_opts = build_cookie_options()
++    formatted_command_opts = [url] ++ parse_options(command_opts ++ print_to_file_opts ++ cookie_opts)
+ 
+     Logger.info("[yt-dlp] called with: #{Enum.join(formatted_command_opts, " ")}")
+ 
+@@ -47,6 +48,19 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+     end
+   end
+ 
++  defp build_cookie_options do
++    base_dir = Application.get_env(:pinchflat, :extras_directory)
++    cookie_file = Path.join(base_dir, "cookies.txt")
++
++    case File.read(cookie_file) do
++      {:ok, cookie_data} ->
++        if String.trim(cookie_data) != "", do: [cookies: cookie_file], else: []
++
++      {:error, _} ->
++        []
++    end
++  end
++
+   # We want to satisfy the following behaviours:
+   #
+   # 1. If the key is an atom, convert it to a string and convert it to kebab case (for convenience)
+diff --git a/selfhosted.Dockerfile b/selfhosted.Dockerfile
+index 8d6ecb0f1..5f7f128b1 100644
+--- a/selfhosted.Dockerfile
++++ b/selfhosted.Dockerfile
+@@ -77,7 +77,7 @@ FROM ${RUNNER_IMAGE}
+ 
+ RUN apt-get update -y
+ RUN apt-get install -y libstdc++6 openssl libncurses5 locales ca-certificates \
+-  ffmpeg curl git openssh-client
++  ffmpeg curl git openssh-client nano
+ RUN apt-get clean && rm -f /var/lib/apt/lists/*_*
+ 
+ # Download and update YT-DLP
+@@ -101,7 +101,6 @@ RUN chown nobody /config /downloads
+ 
+ # set runner ENV
+ ENV MIX_ENV="prod"
+-ENV CONFIG_PATH="/config"
+ ENV PORT=8945
+ ENV RUN_CONTEXT="selfhosted"
+ 
+diff --git a/test/pinchflat/downloading/download_option_builder_test.exs b/test/pinchflat/downloading/download_option_builder_test.exs
+index 02103d665..e08eb8012 100644
+--- a/test/pinchflat/downloading/download_option_builder_test.exs
++++ b/test/pinchflat/downloading/download_option_builder_test.exs
+@@ -1,8 +1,8 @@
+ defmodule Pinchflat.Downloading.DownloadOptionBuilderTest do
+   use Pinchflat.DataCase
+   import Pinchflat.MediaFixtures
+-  import Pinchflat.ProfilesFixtures
+   import Pinchflat.SourcesFixtures
++  import Pinchflat.ProfilesFixtures
+ 
+   alias Pinchflat.Profiles
+   alias Pinchflat.Downloading.DownloadOptionBuilder
+diff --git a/test/pinchflat/yt_dlp/command_runner_test.exs b/test/pinchflat/yt_dlp/command_runner_test.exs
+index 0ba111ecf..f23095646 100644
+--- a/test/pinchflat/yt_dlp/command_runner_test.exs
++++ b/test/pinchflat/yt_dlp/command_runner_test.exs
+@@ -1,6 +1,8 @@
+ defmodule Pinchflat.YtDlp.CommandRunnerTest do
+   use ExUnit.Case, async: true
+ 
++  alias Pinchflat.Filesystem.FilesystemHelpers
++
+   alias Pinchflat.YtDlp.CommandRunner, as: Runner
+ 
+   @original_executable Application.compile_env(:pinchflat, :yt_dlp_executable)
+@@ -65,6 +67,41 @@ defmodule Pinchflat.YtDlp.CommandRunnerTest do
+     end
+   end
+ 
++  describe "run/4 when testing cookie options" do
++    setup do
++      base_dir = Application.get_env(:pinchflat, :extras_directory)
++      cookie_file = Path.join(base_dir, "cookies.txt")
++
++      {:ok, cookie_file: cookie_file}
++    end
++
++    test "includes cookie options when cookies.txt exists", %{cookie_file: cookie_file} do
++      FilesystemHelpers.write_p!(cookie_file, "cookie data")
++
++      assert {:ok, output} = Runner.run(@media_url, [], "")
++
++      assert String.contains?(output, "--cookies #{cookie_file}")
++    end
++
++    test "doesn't include cookie options when cookies.txt blank", %{cookie_file: cookie_file} do
++      FilesystemHelpers.write_p!(cookie_file, " \n \n ")
++
++      assert {:ok, output} = Runner.run(@media_url, [], "")
++
++      refute String.contains?(output, "--cookies")
++      refute String.contains?(output, cookie_file)
++    end
++
++    test "doesn't include cookie options when cookies.txt doesn't exist", %{cookie_file: cookie_file} do
++      File.rm(cookie_file)
++
++      assert {:ok, output} = Runner.run(@media_url, [], "")
++
++      refute String.contains?(output, "--cookies")
++      refute String.contains?(output, cookie_file)
++    end
++  end
++
+   defp wrap_executable(new_executable, fun) do
+     Application.put_env(:pinchflat, :yt_dlp_executable, new_executable)
+     fun.()
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index 887534c3f..bea0589c0 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -11,9 +11,11 @@ Faker.start()
+ ExUnit.after_suite(fn _ ->
+   File.rm_rf!(Application.get_env(:pinchflat, :media_directory))
+   File.rm_rf!(Application.get_env(:pinchflat, :metadata_directory))
++  File.rm_rf!(Application.get_env(:pinchflat, :extras_directory))
+   File.rm_rf!(Application.get_env(:pinchflat, :tmpfile_directory))
+ 
+   File.mkdir_p!(Application.get_env(:pinchflat, :media_directory))
+   File.mkdir_p!(Application.get_env(:pinchflat, :metadata_directory))
++  File.mkdir_p!(Application.get_env(:pinchflat, :extras_directory))
+   File.mkdir_p!(Application.get_env(:pinchflat, :tmpfile_directory))
+ end)

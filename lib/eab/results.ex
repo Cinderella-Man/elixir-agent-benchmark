@@ -75,7 +75,11 @@ defmodule Eab.Results do
     model = run["model"] || %{}
     identity = ModelIdentity.details(model)
     quant = Keyword.get(opts, :quantization, identity["quantization"])
-    size = Keyword.get(opts, :size_bytes, identity["size_bytes"])
+
+    file_size =
+      Eab.Results.Resources.weight_size(run["memory"], identity["artifact"], model["backend"])
+
+    size = Keyword.get(opts, :size_bytes, identity["size_bytes"] || file_size)
 
     resources =
       case Keyword.fetch(opts, :resources) do
@@ -94,10 +98,12 @@ defmodule Eab.Results do
         "quantization_source" => source(opts, :quantization, quant),
         "size_bytes" => size,
         "size_source" =>
-          if(Keyword.has_key?(opts, :size_bytes),
-            do: opts[:size_source] || "owner_supplied",
-            else: source([], :size_bytes, size)
-          ),
+          cond do
+            Keyword.has_key?(opts, :size_bytes) -> opts[:size_source] || "owner_supplied"
+            identity["size_bytes"] -> "reported"
+            file_size -> "artifact_files"
+            true -> "not_reported"
+          end,
         "parameter_count" => identity["parameter_count"]
       },
       "benchmark" => selected["id"],

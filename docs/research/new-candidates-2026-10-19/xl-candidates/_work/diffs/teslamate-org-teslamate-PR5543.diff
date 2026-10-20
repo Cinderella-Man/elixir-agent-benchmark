@@ -1,0 +1,1660 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1c9ef8343b..f7cd021613 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,10 @@
+ 
+ Existing charging processes are recomputed once during the upgrade migration: previously empty or zero `charge_energy_used` values (short or mixed AC sessions) gain values, the first start after the upgrade can take a few minutes longer on databases with years of history and slow HW, and charge costs are deliberately not changed retroactively.
+ 
++### Note for manual Home Assistant configurations
++
++The documented manual [mqtt_sensors.yaml](https://docs.teslamate.org/docs/integrations/home_assistant#mqtt_sensorsyaml-mqtt-section-of-configurationyaml) now uses `state_class: total_increasing` for the `charge_energy_added` sensor (#5543). If you re-sync your manual YAML, Home Assistant will treat the per-charge resets as meter cycles, which changes the long-term statistics behavior (e.g. in the Energy dashboard).
++
+ ### New features
+ 
+ - feat: add service mode to webview and reduce log when car is Unlocked at service mode (#5289 - @NirKli)
+@@ -14,6 +18,7 @@ Existing charging processes are recomputed once during the upgrade migration: pr
+ - feat: link the software update icon to the notateslaapp release notes (#5490 - @NirKli)
+ - feat: add fullscreen mode to vehicle summary map (#5495 - @hakong)
+ - feat(web): expose VIN in car summary ( #5556 - @Helvio88, @magrathean-uk)
++- feat(mqtt): add opt-in Home Assistant MQTT discovery (#5543 - @brianmay, @JakobLichterfeld)
+ 
+ ### Improvements and bug fixes
+ 
+diff --git a/config/runtime.exs b/config/runtime.exs
+index ec08aaf2a7..1cefec5913 100644
+--- a/config/runtime.exs
++++ b/config/runtime.exs
+@@ -12,9 +12,20 @@ defmodule Util do
+   def validate_namespace!(""), do: nil
+ 
+   def validate_namespace!(ns) when is_binary(ns) do
+-    case String.contains?(ns, "/") do
+-      true -> raise "MQTT_NAMESPACE must not contain '/'"
+-      false -> ns
++    cond do
++      String.contains?(ns, "/") -> raise "MQTT_NAMESPACE must not contain '/'"
++      String.contains?(ns, ["+", "#"]) -> raise "MQTT_NAMESPACE must not contain MQTT wildcards"
++      true -> ns
++    end
++  end
++
++  def validate_discovery_prefix!(nil), do: nil
++  def validate_discovery_prefix!(""), do: nil
++
++  def validate_discovery_prefix!(prefix) when is_binary(prefix) do
++    case String.contains?(prefix, ["+", "#"]) do
++      true -> raise "MQTT_HOME_ASSISTANT_DISCOVERY_PREFIX must not contain MQTT wildcards"
++      false -> prefix
+     end
+   end
+ 
+@@ -181,7 +192,11 @@ if System.get_env("DISABLE_MQTT") != "true" or config_env() == :test do
+     tls: System.get_env("MQTT_TLS") == "true",
+     accept_invalid_certs: System.get_env("MQTT_TLS_ACCEPT_INVALID_CERTS") == "true",
+     namespace: System.get_env("MQTT_NAMESPACE") |> Util.validate_namespace!(),
+-    ipv6: System.get_env("MQTT_IPV6") == "true"
++    ipv6: System.get_env("MQTT_IPV6") == "true",
++    discovery: System.get_env("MQTT_HOME_ASSISTANT_DISCOVERY") == "true",
++    discovery_base_url: System.get_env("MQTT_HOME_ASSISTANT_DISCOVERY_URL"),
++    discovery_prefix:
++      System.get_env("MQTT_HOME_ASSISTANT_DISCOVERY_PREFIX") |> Util.validate_discovery_prefix!()
+ end
+ 
+ if config_env() != :test do
+diff --git a/lib/teslamate/mqtt.ex b/lib/teslamate/mqtt.ex
+index 1dcbe6e93d..c4d62edfa4 100644
+--- a/lib/teslamate/mqtt.ex
++++ b/lib/teslamate/mqtt.ex
+@@ -16,7 +16,14 @@ defmodule TeslaMate.Mqtt do
+     children = [
+       {Tortoise311.Connection, connection_config(opts) ++ [client_id: client_id]},
+       {Publisher, client_id: client_id},
+-      {PubSub, namespace: opts[:namespace]}
++      {PubSub,
++       [
++         namespace: opts[:namespace],
++         discovery: opts[:discovery],
++         discovery_base_url: opts[:discovery_base_url],
++         discovery_prefix: opts[:discovery_prefix]
++       ]
++       |> Enum.reject(fn {_key, value} -> is_nil(value) end)}
+     ]
+ 
+     Supervisor.init(children, strategy: :one_for_one)
+diff --git a/lib/teslamate/mqtt/pubsub.ex b/lib/teslamate/mqtt/pubsub.ex
+index 061f2af3ce..39965deb8b 100644
+--- a/lib/teslamate/mqtt/pubsub.ex
++++ b/lib/teslamate/mqtt/pubsub.ex
+@@ -1,8 +1,14 @@
+ defmodule TeslaMate.Mqtt.PubSub do
+   use Supervisor
+ 
++  require Logger
++
+   alias __MODULE__.VehicleSubscriber
++  alias __MODULE__.HomeAssistant
++  alias TeslaMate.Log
++  alias TeslaMate.Mqtt.Publisher
+   alias TeslaMate.Vehicles
++  alias TeslaMate.Vehicles.Vehicle.Summary
+ 
+   # API
+ 
+@@ -12,10 +18,48 @@ defmodule TeslaMate.Mqtt.PubSub do
+ 
+   @impl true
+   def init(opts) do
++    subscriber_opts =
++      opts
++      |> Keyword.take([:namespace, :discovery, :discovery_base_url, :discovery_prefix])
++
++    vehicles = Vehicles.list()
++
++    if Keyword.get(opts, :discovery, false) do
++      # Runs concurrently with the supervised children starting up, so it may
++      # fire before the MQTT connection is established. Failures are only
++      # logged; since the cleanup is idempotent and repeated on every start,
++      # a missed run is corrected on the next restart.
++      Task.start(fn -> clear_removed_vehicles(vehicles, opts) end)
++    end
++
+     children =
+-      Vehicles.list()
+-      |> Enum.map(&{VehicleSubscriber, Keyword.merge(opts, car_id: &1.car.id)})
++      vehicles
++      |> Enum.map(&{VehicleSubscriber, Keyword.merge(subscriber_opts, car_id: &1.car.id)})
+ 
+     Supervisor.init(children, strategy: :one_for_one)
+   end
++
++  @doc """
++  Clears Home Assistant discovery configs for cars that are no longer
++  tracked by a vehicle process, e.g. because they were removed from the
++  Tesla account or because logging was disabled, so their entities are
++  removed from Home Assistant.
++  """
++  @spec clear_removed_vehicles([Summary.t()], keyword()) :: :ok
++  def clear_removed_vehicles(vehicles, opts) do
++    publisher = Keyword.get(opts, :deps_publisher, Publisher)
++    active_ids = Enum.map(vehicles, & &1.car.id)
++    clear_opts = Keyword.take(opts, [:namespace, :discovery_prefix])
++
++    Log.list_cars()
++    |> Enum.reject(&(&1.id in active_ids))
++    |> Enum.each(fn car ->
++      case HomeAssistant.clear(car.id, clear_opts, publisher) do
++        :ok -> :ok
++        {:error, reason} -> Logger.warning("MQTT HA discovery cleanup failed: #{inspect(reason)}")
++      end
++    end)
++
++    :ok
++  end
+ end
+diff --git a/lib/teslamate/mqtt/pubsub/home_assistant.ex b/lib/teslamate/mqtt/pubsub/home_assistant.ex
+new file mode 100644
+index 0000000000..6086665f31
+--- /dev/null
++++ b/lib/teslamate/mqtt/pubsub/home_assistant.ex
+@@ -0,0 +1,576 @@
++defmodule TeslaMate.Mqtt.PubSub.HomeAssistant do
++  @moduledoc """
++  Publishes Home Assistant MQTT discovery configuration payloads, one per
++  vehicle entity, so users can opt out of manually configuring the MQTT
++  sensors in `configuration.yaml`.
++
++  See: https://www.home-assistant.io/integrations/mqtt/#mqtt-discovery
++  """
++
++  import Core.Dependency, only: [call: 3]
++
++  alias TeslaMate.Vehicles.Vehicle.Summary
++  alias TeslaMate.Log.Car
++
++  @discovery_prefix "homeassistant"
++  @node "teslamate"
++
++  @type publish_opts :: [
++          car_id: pos_integer(),
++          namespace: String.t() | nil,
++          base_url: String.t() | nil,
++          discovery_prefix: String.t()
++        ]
++
++  @doc """
++  Publishes discovery configuration payloads for every entity derived from
++  the given vehicle summary.
++
++  Each payload is published retained (QoS 1) to
++  `<discovery_prefix>/<component>/<node>/<object_id>/config` where `node` is
++  `#{@node}_<car_id>` (with the `MQTT_NAMESPACE` inserted after `#{@node}`
++  when set). Returns `:ok` on success.
++  """
++  @spec publish(term(), publish_opts(), term()) :: :ok | {:error, term()}
++  def publish(%Summary{} = summary, opts, publisher) do
++    car_id = Keyword.fetch!(opts, :car_id)
++    namespace = Keyword.get(opts, :namespace)
++    base_url = Keyword.get(opts, :base_url)
++    prefix = Keyword.get(opts, :discovery_prefix, @discovery_prefix)
++    node = node(car_id, namespace)
++
++    device = device(summary, car_id, base_url, namespace)
++
++    Enum.reduce_while(entities(), :ok, fn {component, object_id, config}, _acc ->
++      topic = discovery_topic(prefix, component, node, object_id)
++
++      payload =
++        config
++        |> resolve_topics(car_id, namespace)
++        |> Map.put(:unique_id, "#{node}_#{object_id}")
++        |> Map.put(:object_id, "tesla_#{object_id}")
++        |> Map.put(:device, device)
++        |> Jason.encode!()
++
++      case call(publisher, :publish, [topic, payload, [retain: true, qos: 1]]) do
++        :ok -> {:cont, :ok}
++        {:error, _} = error -> {:halt, error}
++      end
++    end)
++  end
++
++  @doc """
++  Publishes an empty retained payload to clear a discovery topic, so entities
++  are removed from Home Assistant when discovery is disabled or a vehicle is
++  removed.
++  """
++  @spec clear(pos_integer(), publish_opts(), term()) :: :ok | {:error, term()}
++  def clear(car_id, opts, publisher) do
++    namespace = Keyword.get(opts, :namespace)
++    prefix = Keyword.get(opts, :discovery_prefix, @discovery_prefix)
++    node = node(car_id, namespace)
++
++    Enum.reduce_while(entities(), :ok, fn {component, object_id, _config}, _acc ->
++      topic = discovery_topic(prefix, component, node, object_id)
++
++      case call(publisher, :publish, [topic, "", [retain: true, qos: 1]]) do
++        :ok -> {:cont, :ok}
++        {:error, _} = error -> {:halt, error}
++      end
++    end)
++  end
++
++  defp discovery_topic(prefix, component, node, object_id) do
++    Enum.join([prefix, component, node, object_id, "config"], "/")
++  end
++
++  defp resolve_topics(config, car_id, namespace) do
++    Enum.reduce(config, %{}, fn
++      {:state_topic_key, key}, acc ->
++        Map.put(acc, :state_topic, topic(key, car_id, namespace))
++
++      {:json_attributes_topic_key, key}, acc ->
++        Map.put(acc, :json_attributes_topic, topic(key, car_id, namespace))
++
++      {:availability_topic_key, key}, acc ->
++        availability = %{
++          topic: topic(key, car_id, namespace),
++          value_template: "{{ 'offline' if value_json.error else 'online' }}"
++        }
++
++        Map.put(acc, :availability, availability)
++
++      {key, value}, acc ->
++        Map.put(acc, key, value)
++    end)
++  end
++
++  defp topic(key, car_id, namespace) do
++    ["teslamate", namespace, "cars", car_id, key]
++    |> Enum.reject(&is_nil/1)
++    |> Enum.join("/")
++  end
++
++  defp node(car_id, namespace) do
++    [@node, namespace, car_id]
++    |> Enum.reject(&is_nil/1)
++    |> Enum.join("_")
++  end
++
++  defp device(%Summary{} = summary, car_id, base_url, namespace) do
++    name = summary.display_name || car_name(summary) || "Tesla ##{car_id}"
++    model = summary.model || "Tesla"
++
++    %{
++      identifiers: [device_identifier(car_id, namespace)],
++      manufacturer: "Tesla",
++      name: name,
++      model: model
++    }
++    |> maybe_put(:configuration_url, base_url)
++  end
++
++  defp device_identifier(car_id, namespace) do
++    [@node, namespace, "car", car_id] |> Enum.reject(&is_nil/1) |> Enum.join("_")
++  end
++
++  defp car_name(%Summary{car: %Car{name: name}}) when is_binary(name) and name != "", do: name
++  defp car_name(_), do: nil
++
++  defp maybe_put(map, _key, nil), do: map
++  defp maybe_put(map, key, value), do: Map.put(map, key, value)
++
++  defp entities do
++    true_false = %{payload_on: "true", payload_off: "false"}
++
++    [
++      # --- Generic sensors (string/raw values) ---
++      {"sensor", "display_name",
++       %{state_topic_key: :display_name, name: "Display Name", icon: "mdi:car"}},
++      {"sensor", "state", %{state_topic_key: :state, name: "State", icon: "mdi:car-connected"}},
++      {"sensor", "charging_state",
++       %{state_topic_key: :charging_state, name: "Charging State", icon: "mdi:ev-station"}},
++      {"sensor", "since",
++       %{
++         state_topic_key: :since,
++         name: "Since",
++         device_class: "timestamp",
++         icon: "mdi:clock-outline"
++       }},
++      {"sensor", "version",
++       %{state_topic_key: :version, name: "Version", icon: "mdi:alphabetical"}},
++      {"sensor", "update_version",
++       %{state_topic_key: :update_version, name: "Update Version", icon: "mdi:alphabetical"}},
++      {"sensor", "model", %{state_topic_key: :model, name: "Model"}},
++      {"sensor", "trim_badging",
++       %{state_topic_key: :trim_badging, name: "Trim Badging", icon: "mdi:shield-star-outline"}},
++      {"sensor", "exterior_color",
++       %{state_topic_key: :exterior_color, name: "Exterior Color", icon: "mdi:palette"}},
++      {"sensor", "wheel_type", %{state_topic_key: :wheel_type, name: "Wheel Type"}},
++      {"sensor", "spoiler_type",
++       %{state_topic_key: :spoiler_type, name: "Spoiler Type", icon: "mdi:car-sports"}},
++      {"sensor", "geofence", %{state_topic_key: :geofence, name: "Geofence", icon: "mdi:earth"}},
++      {"sensor", "shift_state",
++       %{state_topic_key: :shift_state, name: "Shift State", icon: "mdi:car-shift-pattern"}},
++
++      # Park brake - binary sensor derived from shift_state
++      {"binary_sensor", "park_brake",
++       %{
++         state_topic_key: :shift_state,
++         name: "Parking Brake",
++         value_template: "{% if value == 'P' %}ON{% else %}OFF{% endif %}",
++         icon: "mdi:car-brake-parking"
++       }},
++
++      # --- Numeric sensors ---
++      {"sensor", "power",
++       %{
++         state_topic_key: :power,
++         name: "Power",
++         device_class: "power",
++         unit_of_measurement: "kW",
++         icon: "mdi:flash"
++       }},
++      {"sensor", "speed",
++       %{
++         state_topic_key: :speed,
++         name: "Speed",
++         device_class: "speed",
++         unit_of_measurement: "km/h",
++         icon: "mdi:speedometer"
++       }},
++      {"sensor", "heading",
++       %{
++         state_topic_key: :heading,
++         name: "Heading",
++         unit_of_measurement: "°",
++         icon: "mdi:compass"
++       }},
++      {"sensor", "elevation",
++       %{
++         state_topic_key: :elevation,
++         name: "Elevation",
++         device_class: "distance",
++         unit_of_measurement: "m",
++         icon: "mdi:image-filter-hdr"
++       }},
++      {"sensor", "inside_temp",
++       %{
++         state_topic_key: :inside_temp,
++         name: "Inside Temp",
++         device_class: "temperature",
++         unit_of_measurement: "°C",
++         icon: "mdi:thermometer-lines"
++       }},
++      {"sensor", "outside_temp",
++       %{
++         state_topic_key: :outside_temp,
++         name: "Outside Temp",
++         device_class: "temperature",
++         unit_of_measurement: "°C",
++         icon: "mdi:thermometer-lines"
++       }},
++      {"sensor", "odometer",
++       %{
++         state_topic_key: :odometer,
++         name: "Odometer",
++         device_class: "distance",
++         unit_of_measurement: "km",
++         icon: "mdi:counter"
++       }},
++      {"sensor", "est_battery_range",
++       %{
++         state_topic_key: :est_battery_range_km,
++         name: "Est Battery Range",
++         device_class: "distance",
++         unit_of_measurement: "km",
++         icon: "mdi:gauge"
++       }},
++      {"sensor", "rated_battery_range",
++       %{
++         state_topic_key: :rated_battery_range_km,
++         name: "Rated Battery Range",
++         device_class: "distance",
++         unit_of_measurement: "km",
++         icon: "mdi:gauge"
++       }},
++      {"sensor", "ideal_battery_range",
++       %{
++         state_topic_key: :ideal_battery_range_km,
++         name: "Ideal Battery Range",
++         device_class: "distance",
++         unit_of_measurement: "km",
++         icon: "mdi:gauge"
++       }},
++      {"sensor", "battery_level",
++       %{
++         state_topic_key: :battery_level,
++         name: "Battery Level",
++         device_class: "battery",
++         unit_of_measurement: "%",
++         icon: "mdi:battery-80"
++       }},
++      {"sensor", "usable_battery_level",
++       %{
++         state_topic_key: :usable_battery_level,
++         name: "Usable Battery Level",
++         device_class: "battery",
++         unit_of_measurement: "%",
++         icon: "mdi:battery-80"
++       }},
++      {"sensor", "charge_energy_added",
++       %{
++         state_topic_key: :charge_energy_added,
++         name: "Charge Energy Added",
++         device_class: "energy",
++         state_class: "total_increasing",
++         unit_of_measurement: "kWh",
++         icon: "mdi:battery-charging"
++       }},
++      {"sensor", "charge_limit_soc",
++       %{
++         state_topic_key: :charge_limit_soc,
++         name: "Charge Limit Soc",
++         device_class: "battery",
++         unit_of_measurement: "%",
++         icon: "mdi:battery-charging-100"
++       }},
++      {"sensor", "charger_actual_current",
++       %{
++         state_topic_key: :charger_actual_current,
++         name: "Charger Actual Current",
++         device_class: "current",
++         unit_of_measurement: "A",
++         icon: "mdi:lightning-bolt"
++       }},
++      {"sensor", "charger_phases",
++       %{state_topic_key: :charger_phases, name: "Charger Phases", icon: "mdi:sine-wave"}},
++      {"sensor", "charger_power",
++       %{
++         state_topic_key: :charger_power,
++         name: "Charger Power",
++         device_class: "power",
++         unit_of_measurement: "kW",
++         icon: "mdi:lightning-bolt"
++       }},
++      {"sensor", "charger_voltage",
++       %{
++         state_topic_key: :charger_voltage,
++         name: "Charger Voltage",
++         device_class: "voltage",
++         unit_of_measurement: "V",
++         icon: "mdi:lightning-bolt"
++       }},
++      {"sensor", "scheduled_charging_start_time",
++       %{
++         state_topic_key: :scheduled_charging_start_time,
++         name: "Scheduled Charging Start Time",
++         device_class: "timestamp",
++         icon: "mdi:clock-outline"
++       }},
++      {"sensor", "time_to_full_charge",
++       %{
++         state_topic_key: :time_to_full_charge,
++         name: "Time To Full Charge",
++         device_class: "duration",
++         unit_of_measurement: "h",
++         icon: "mdi:clock-outline"
++       }},
++
++      # TPMS pressure (bar)
++      {"sensor", "tpms_pressure_fl",
++       %{
++         state_topic_key: :tpms_pressure_fl,
++         name: "TPMS Pressure Front Left",
++         device_class: "pressure",
++         unit_of_measurement: "bar",
++         icon: "mdi:car-tire-alert"
++       }},
++      {"sensor", "tpms_pressure_fr",
++       %{
++         state_topic_key: :tpms_pressure_fr,
++         name: "TPMS Pressure Front Right",
++         device_class: "pressure",
++         unit_of_measurement: "bar",
++         icon: "mdi:car-tire-alert"
++       }},
++      {"sensor", "tpms_pressure_rl",
++       %{
++         state_topic_key: :tpms_pressure_rl,
++         name: "TPMS Pressure Rear Left",
++         device_class: "pressure",
++         unit_of_measurement: "bar",
++         icon: "mdi:car-tire-alert"
++       }},
++      {"sensor", "tpms_pressure_rr",
++       %{
++         state_topic_key: :tpms_pressure_rr,
++         name: "TPMS Pressure Rear Right",
++         device_class: "pressure",
++         unit_of_measurement: "bar",
++         icon: "mdi:car-tire-alert"
++       }},
++
++      # TPMS pressure (psi) - derived via value_template from the bar topic
++      {"sensor", "tpms_pressure_fl_psi",
++       %{
++         state_topic_key: :tpms_pressure_fl,
++         name: "TPMS Pressure Front Left (psi)",
++         device_class: "pressure",
++         unit_of_measurement: "psi",
++         icon: "mdi:car-tire-alert",
++         value_template: "{{ (value | float * 14.50377) | round(2) }}",
++         suggested_display_precision: 2
++       }},
++      {"sensor", "tpms_pressure_fr_psi",
++       %{
++         state_topic_key: :tpms_pressure_fr,
++         name: "TPMS Pressure Front Right (psi)",
++         device_class: "pressure",
++         unit_of_measurement: "psi",
++         icon: "mdi:car-tire-alert",
++         value_template: "{{ (value | float * 14.50377) | round(2) }}",
++         suggested_display_precision: 2
++       }},
++      {"sensor", "tpms_pressure_rl_psi",
++       %{
++         state_topic_key: :tpms_pressure_rl,
++         name: "TPMS Pressure Rear Left (psi)",
++         device_class: "pressure",
++         unit_of_measurement: "psi",
++         icon: "mdi:car-tire-alert",
++         value_template: "{{ (value | float * 14.50377) | round(2) }}",
++         suggested_display_precision: 2
++       }},
++      {"sensor", "tpms_pressure_rr_psi",
++       %{
++         state_topic_key: :tpms_pressure_rr,
++         name: "TPMS Pressure Rear Right (psi)",
++         device_class: "pressure",
++         unit_of_measurement: "psi",
++         icon: "mdi:car-tire-alert",
++         value_template: "{{ (value | float * 14.50377) | round(2) }}",
++         suggested_display_precision: 2
++       }},
++
++      # --- Active route sensors (derived from the JSON active_route topic) ---
++      {"sensor", "active_route_destination",
++       %{
++         state_topic_key: :active_route,
++         name: "Active route destination",
++         icon: "mdi:map-marker",
++         value_template:
++           "{% if not value_json.error and value_json.destination %}{{ value_json.destination }}{% endif %}",
++         availability_topic_key: :active_route
++       }},
++      {"sensor", "active_route_energy_at_arrival",
++       %{
++         state_topic_key: :active_route,
++         name: "Active route energy at arrival",
++         device_class: "battery",
++         unit_of_measurement: "%",
++         icon: "mdi:battery-80",
++         value_template:
++           "{% if not value_json.error and value_json.energy_at_arrival %}{{ value_json.energy_at_arrival }}{% endif %}",
++         availability_topic_key: :active_route
++       }},
++      {"sensor", "active_route_distance_to_arrival",
++       %{
++         state_topic_key: :active_route,
++         name: "Active route distance to arrival",
++         device_class: "distance",
++         unit_of_measurement: "km",
++         icon: "mdi:map-marker-distance",
++         value_template:
++           "{% if not value_json.error and value_json.miles_to_arrival %}{{ (value_json.miles_to_arrival | float * 1.60934) | round(2) }}{% endif %}",
++         availability_topic_key: :active_route
++       }},
++      {"sensor", "active_route_minutes_to_arrival",
++       %{
++         state_topic_key: :active_route,
++         name: "Active route minutes to arrival",
++         device_class: "duration",
++         unit_of_measurement: "min",
++         icon: "mdi:clock-outline",
++         value_template:
++           "{% if not value_json.error and value_json.minutes_to_arrival %}{{ value_json.minutes_to_arrival }}{% endif %}",
++         availability_topic_key: :active_route
++       }},
++      {"sensor", "active_route_traffic_minutes_delay",
++       %{
++         state_topic_key: :active_route,
++         name: "Active route traffic minutes delay",
++         device_class: "duration",
++         unit_of_measurement: "min",
++         icon: "mdi:clock-alert-outline",
++         value_template:
++           "{% if not value_json.error and value_json.traffic_minutes_delay %}{{ value_json.traffic_minutes_delay }}{% endif %}",
++         availability_topic_key: :active_route
++       }},
++
++      # --- Device trackers (JSON attributes) ---
++      {"device_tracker", "location",
++       %{json_attributes_topic_key: :location, name: "Location", icon: "mdi:crosshairs-gps"}},
++      {"device_tracker", "active_route_location",
++       %{
++         json_attributes_topic_key: :active_route,
++         name: "Active route location",
++         icon: "mdi:crosshairs-gps",
++         json_attributes_template:
++           "{% if not value_json.error and value_json.location %}{{ value_json.location | tojson }}{% else %}{}{% endif %}",
++         availability_topic_key: :active_route
++       }},
++
++      # --- Binary sensors (generic true/false on/off) ---
++      {"binary_sensor", "healthy",
++       Map.merge(true_false, %{
++         state_topic_key: :healthy,
++         name: "Healthy",
++         icon: "mdi:heart-pulse"
++       })},
++      {"binary_sensor", "update_available",
++       Map.merge(true_false, %{
++         state_topic_key: :update_available,
++         name: "Update Available",
++         icon: "mdi:alarm"
++       })},
++      {"binary_sensor", "sentry_mode",
++       Map.merge(true_false, %{
++         state_topic_key: :sentry_mode,
++         name: "Sentry Mode",
++         icon: "mdi:cctv"
++       })},
++      {"binary_sensor", "windows_open",
++       Map.merge(true_false, %{
++         state_topic_key: :windows_open,
++         name: "Windows Open",
++         device_class: "window",
++         icon: "mdi:car-door"
++       })},
++      {"binary_sensor", "doors_open",
++       Map.merge(true_false, %{
++         state_topic_key: :doors_open,
++         name: "Doors Open",
++         device_class: "door",
++         icon: "mdi:car-door"
++       })},
++      {"binary_sensor", "trunk_open",
++       Map.merge(true_false, %{
++         state_topic_key: :trunk_open,
++         name: "Trunk Open",
++         device_class: "opening",
++         icon: "mdi:car-side"
++       })},
++      {"binary_sensor", "frunk_open",
++       Map.merge(true_false, %{
++         state_topic_key: :frunk_open,
++         name: "Frunk Open",
++         device_class: "opening",
++         icon: "mdi:car-side"
++       })},
++      {"binary_sensor", "is_user_present",
++       Map.merge(true_false, %{
++         state_topic_key: :is_user_present,
++         name: "Is User Present",
++         device_class: "presence",
++         icon: "mdi:human-greeting"
++       })},
++      {"binary_sensor", "is_climate_on",
++       Map.merge(true_false, %{
++         state_topic_key: :is_climate_on,
++         name: "Is Climate On",
++         icon: "mdi:fan"
++       })},
++      {"binary_sensor", "is_preconditioning",
++       Map.merge(true_false, %{
++         state_topic_key: :is_preconditioning,
++         name: "Is Preconditioning",
++         icon: "mdi:fan"
++       })},
++      {"binary_sensor", "plugged_in",
++       Map.merge(true_false, %{
++         state_topic_key: :plugged_in,
++         name: "Plugged In",
++         device_class: "plug",
++         icon: "mdi:ev-station"
++       })},
++      {"binary_sensor", "charge_port_door_open",
++       Map.merge(true_false, %{
++         state_topic_key: :charge_port_door_open,
++         name: "Charge Port Door OPEN",
++         device_class: "opening",
++         icon: "mdi:ev-plug-tesla"
++       })},
++
++      # Lock - inverted (locked when "false")
++      {"binary_sensor", "locked",
++       %{
++         state_topic_key: :locked,
++         name: "Locked",
++         device_class: "lock",
++         payload_on: "false",
++         payload_off: "true"
++       }}
++    ]
++  end
++end
+diff --git a/lib/teslamate/mqtt/pubsub/vehicle_subscriber.ex b/lib/teslamate/mqtt/pubsub/vehicle_subscriber.ex
+index 573cfabe17..e12d110521 100644
+--- a/lib/teslamate/mqtt/pubsub/vehicle_subscriber.ex
++++ b/lib/teslamate/mqtt/pubsub/vehicle_subscriber.ex
+@@ -5,10 +5,21 @@ defmodule TeslaMate.Mqtt.PubSub.VehicleSubscriber do
+   import Core.Dependency, only: [call: 3]
+ 
+   alias TeslaMate.Mqtt.Publisher
++  alias TeslaMate.Mqtt.PubSub.HomeAssistant
+   alias TeslaMate.Vehicles.Vehicle.Summary
+   alias TeslaMate.Vehicles
+ 
+-  defstruct [:car_id, :last_values, :deps, :namespace]
++  defstruct [
++    :car_id,
++    :last_values,
++    :deps,
++    :namespace,
++    :discovery,
++    :discovery_base_url,
++    :discovery_prefix,
++    discovery_published: false
++  ]
++
+   alias __MODULE__, as: State
+ 
+   def child_spec(arg) do
+@@ -54,9 +65,21 @@ defmodule TeslaMate.Mqtt.PubSub.VehicleSubscriber do
+       publisher: Keyword.get(opts, :deps_publisher, Publisher)
+     }
+ 
++    discovery = Keyword.get(opts, :discovery, false)
++    discovery_base_url = Keyword.get(opts, :discovery_base_url)
++    discovery_prefix = Keyword.get(opts, :discovery_prefix)
++
+     :ok = call(deps.vehicles, :subscribe_to_summary, [car_id])
+ 
+-    {:ok, %State{car_id: car_id, namespace: namespace, deps: deps}, {:continue, :clear_retained}}
++    {:ok,
++     %State{
++       car_id: car_id,
++       namespace: namespace,
++       deps: deps,
++       discovery: discovery,
++       discovery_base_url: discovery_base_url,
++       discovery_prefix: discovery_prefix
++     }, {:continue, :clear_retained}}
+   end
+ 
+   @impl true
+@@ -65,9 +88,22 @@ defmodule TeslaMate.Mqtt.PubSub.VehicleSubscriber do
+         %State{car_id: car_id, namespace: namespace, deps: deps} = state
+       ) do
+     clear_retained(car_id, namespace, deps.publisher)
++    clear_discovery(state)
+     {:noreply, state}
+   end
+ 
++  defp clear_discovery(%State{discovery: false, deps: deps} = state) do
++    case HomeAssistant.clear(state.car_id, discovery_opts(state), deps.publisher) do
++      :ok ->
++        :ok
++
++      {:error, reason} ->
++        Logger.warning("MQTT HA discovery cleanup failed: #{inspect(reason)}")
++    end
++  end
++
++  defp clear_discovery(%State{}), do: :ok
++
+   @publish_if_nil ~w(charge_energy_added charger_actual_current charger_phases
+                        charger_power charger_voltage scheduled_charging_start_time
+                        time_to_full_charge shift_state geofence trim_badging)a
+@@ -82,9 +118,40 @@ defmodule TeslaMate.Mqtt.PubSub.VehicleSubscriber do
+       |> add_active_route(summary)
+ 
+     last_values = publish_values(values, state)
++
++    state =
++      if state.discovery and not state.discovery_published do
++        publish_discovery(summary, state)
++        %{state | discovery_published: true}
++      else
++        state
++      end
++
+     {:noreply, %{state | last_values: last_values}}
+   end
+ 
++  defp publish_discovery(%Summary{} = summary, %State{deps: deps} = state) do
++    opts = discovery_opts(state)
++
++    case HomeAssistant.publish(summary, opts, deps.publisher) do
++      :ok ->
++        :ok
++
++      {:error, reason} ->
++        Logger.warning("MQTT HA discovery publishing failed: #{inspect(reason)}")
++    end
++  end
++
++  defp discovery_opts(%State{} = state) do
++    [
++      car_id: state.car_id,
++      namespace: state.namespace,
++      base_url: state.discovery_base_url,
++      discovery_prefix: state.discovery_prefix
++    ]
++    |> Enum.reject(fn {_k, v} -> is_nil(v) end)
++  end
++
+   defp publish_values(values, state) do
+     last_values = state.last_values || %{}
+ 
+diff --git a/lib/teslamate/vehicles/vehicle/summary.ex b/lib/teslamate/vehicles/vehicle/summary.ex
+index c4782e3bf7..1234dd8120 100644
+--- a/lib/teslamate/vehicles/vehicle/summary.ex
++++ b/lib/teslamate/vehicles/vehicle/summary.ex
+@@ -5,6 +5,84 @@ defmodule TeslaMate.Vehicles.Vehicle.Summary do
+   alias TeslaApi.Vehicle
+   alias TeslaMate.Log.Car
+ 
++  @type t :: %__MODULE__{
++          car: %Car{} | nil,
++          display_name: String.t() | nil,
++          state: atom() | nil,
++          since: DateTime.t() | nil,
++          healthy: boolean() | nil,
++          latitude: float() | nil,
++          longitude: float() | nil,
++          heading: float() | nil,
++          battery_level: integer() | nil,
++          charging_state: String.t() | nil,
++          usable_battery_level: integer() | nil,
++          ideal_battery_range_km: float() | nil,
++          est_battery_range_km: float() | nil,
++          rated_battery_range_km: float() | nil,
++          charge_energy_added: float() | nil,
++          speed: float() | nil,
++          outside_temp: float() | nil,
++          inside_temp: float() | nil,
++          is_climate_on: boolean() | nil,
++          is_preconditioning: boolean() | nil,
++          locked: boolean() | nil,
++          sentry_mode: boolean() | nil,
++          plugged_in: boolean() | nil,
++          scheduled_charging_start_time: DateTime.t() | nil,
++          charge_limit_soc: integer() | nil,
++          charger_power: float() | nil,
++          windows_open: boolean() | nil,
++          doors_open: boolean() | nil,
++          odometer: float() | nil,
++          shift_state: String.t() | nil,
++          charge_port_door_open: boolean() | nil,
++          time_to_full_charge: float() | nil,
++          charger_phases: integer() | nil,
++          charger_actual_current: float() | nil,
++          charger_voltage: float() | nil,
++          version: String.t() | nil,
++          update_available: boolean() | nil,
++          update_version: String.t() | nil,
++          update_status: String.t() | nil,
++          is_user_present: boolean() | nil,
++          geofence: String.t() | nil,
++          model: String.t() | nil,
++          trim_badging: String.t() | nil,
++          exterior_color: String.t() | nil,
++          wheel_type: String.t() | nil,
++          spoiler_type: String.t() | nil,
++          trunk_open: boolean() | nil,
++          frunk_open: boolean() | nil,
++          elevation: float() | nil,
++          power: float() | nil,
++          charge_current_request: integer() | nil,
++          charge_current_request_max: integer() | nil,
++          tpms_pressure_fl: float() | nil,
++          tpms_pressure_fr: float() | nil,
++          tpms_pressure_rl: float() | nil,
++          tpms_pressure_rr: float() | nil,
++          tpms_soft_warning_fl: boolean() | nil,
++          tpms_soft_warning_fr: boolean() | nil,
++          tpms_soft_warning_rl: boolean() | nil,
++          tpms_soft_warning_rr: boolean() | nil,
++          climate_keeper_mode: String.t() | nil,
++          active_route_destination: String.t() | nil,
++          active_route_latitude: float() | nil,
++          active_route_longitude: float() | nil,
++          active_route_energy_at_arrival: float() | nil,
++          active_route_miles_to_arrival: float() | nil,
++          active_route_minutes_to_arrival: float() | nil,
++          active_route_traffic_minutes_delay: float() | nil,
++          center_display_state: integer() | nil,
++          service_mode: boolean() | nil,
++          sun_roof_state: String.t() | nil,
++          sun_roof_installed: boolean() | nil,
++          sun_roof_percent_open: integer() | nil,
++          download_perc: integer() | nil,
++          install_perc: integer() | nil
++        }
++
+   defstruct ~w(
+     car display_name state since healthy latitude longitude heading battery_level charging_state usable_battery_level
+     ideal_battery_range_km est_battery_range_km rated_battery_range_km charge_energy_added
+diff --git a/nix/module.nix b/nix/module.nix
+index 7ee9c5dbdb..9959291c3e 100644
+--- a/nix/module.nix
++++ b/nix/module.nix
+@@ -170,6 +170,24 @@ in
+         example = 1883;
+         description = "MQTT port.";
+       };
++
++      discovery = {
++        enable = mkEnableOption "Home Assistant MQTT discovery";
++
++        url = mkOption {
++          type = types.str;
++          default = "";
++          example = "https://teslamate.example.com/";
++          description = "The TeslaMate URL surfaced in the discovered device panel.";
++        };
++
++        prefix = mkOption {
++          type = types.str;
++          default = "homeassistant";
++          example = "homeassistant";
++          description = "Discovery topic prefix. Must match Home Assistant's discovery_prefix setting.";
++        };
++      };
+     };
+   };
+ 
+@@ -229,6 +247,11 @@ in
+           (mkIf cfg.mqtt.enable {
+             MQTT_HOST = cfg.mqtt.host;
+             MQTT_PORT = mkIf (cfg.mqtt.port != null) (toString cfg.mqtt.port);
++            MQTT_HOME_ASSISTANT_DISCOVERY = mkIf cfg.mqtt.discovery.enable "true";
++            MQTT_HOME_ASSISTANT_DISCOVERY_PREFIX = mkIf cfg.mqtt.discovery.enable cfg.mqtt.discovery.prefix;
++            MQTT_HOME_ASSISTANT_DISCOVERY_URL = mkIf (
++              cfg.mqtt.discovery.enable && cfg.mqtt.discovery.url != ""
++            ) cfg.mqtt.discovery.url;
+           })
+         ];
+       };
+diff --git a/test/support/test_helper.ex b/test/support/test_helper.ex
+index 57b66e9309..dfe4e6d7dd 100644
+--- a/test/support/test_helper.ex
++++ b/test/support/test_helper.ex
+@@ -12,6 +12,17 @@ defmodule TestHelper do
+       eventually(fun, attempts - 1, delay)
+   end
+ 
++  # Drains all Home Assistant discovery config messages published by
++  # MqttPublisherMock, so they don't leak into subsequent assertions.
++  def drain_discovery_configs do
++    receive do
++      {MqttPublisherMock, {:publish, "homeassistant/" <> _, _, [retain: true, qos: 1]}} ->
++        drain_discovery_configs()
++    after
++      200 -> :ok
++    end
++  end
++
+   defmacro decimal(value) do
+     value
+     |> to_string()
+diff --git a/test/teslamate/mqtt/pubsub/home_assistant_test.exs b/test/teslamate/mqtt/pubsub/home_assistant_test.exs
+new file mode 100644
+index 0000000000..a554702b9f
+--- /dev/null
++++ b/test/teslamate/mqtt/pubsub/home_assistant_test.exs
+@@ -0,0 +1,212 @@
++defmodule TeslaMate.Mqtt.PubSub.HomeAssistantTest do
++  use ExUnit.Case, async: true
++
++  alias TeslaMate.Mqtt.PubSub.HomeAssistant
++  alias TeslaMate.Vehicles.Vehicle.Summary
++  alias TeslaMate.Log.Car
++
++  defp start_publisher(name) do
++    publisher_name = :"mqtt_publisher_#{name}"
++
++    {:ok, _pid} =
++      start_supervised({MqttPublisherMock, name: publisher_name, pid: self(), responses: %{}})
++
++    publisher_name
++  end
++
++  @summary %Summary{
++    display_name: "Foo",
++    model: "3",
++    healthy: true,
++    state: :online,
++    latitude: 37.889602,
++    longitude: 41.129182,
++    car: %Car{id: 0, name: "Tesla Model 3", model: "3"}
++  }
++
++  test "publishes a discovery config per entity", %{test: name} do
++    publisher_name = start_publisher(name)
++
++    opts = [car_id: 0, namespace: nil, base_url: "https://teslamate.example.com/"]
++    :ok = HomeAssistant.publish(@summary, opts, {MqttPublisherMock, publisher_name})
++
++    # Collect every config topic published within a short window
++    {topics, payloads} =
++      for _ <- 1..200,
++          reduce: {MapSet.new(), []} do
++        {topics, payloads} ->
++          receive do
++            {MqttPublisherMock,
++             {:publish, "homeassistant/" <> _ = topic, payload, [retain: true, qos: 1]}} ->
++              {MapSet.put(topics, topic), [Jason.decode!(payload) | payloads]}
++          after
++            0 -> {topics, payloads}
++          end
++      end
++
++    topics_count = MapSet.size(topics)
++    assert topics_count > 0
++    assert topics_count == length(payloads)
++
++    for decoded <- payloads do
++      assert Map.has_key?(decoded, "unique_id")
++      assert Map.has_key?(decoded, "object_id")
++      device = decoded["device"]
++      assert device["identifiers"] == ["teslamate_car_0"]
++      assert device["manufacturer"] == "Tesla"
++      assert device["configuration_url"] == "https://teslamate.example.com/"
++    end
++  end
++
++  test "device name falls back to car.name when display_name is nil", %{test: name} do
++    publisher_name = start_publisher(name)
++
++    summary = %{@summary | display_name: nil}
++
++    :ok = HomeAssistant.publish(summary, [car_id: 0], {MqttPublisherMock, publisher_name})
++
++    {_topic, decoded} = receive_one_config()
++    assert decoded["device"]["name"] == "Tesla Model 3"
++  end
++
++  test "device name falls back to Tesla #<car_id> when display_name and car.name are nil",
++       %{test: name} do
++    publisher_name = start_publisher(name)
++
++    summary = %{@summary | display_name: nil, car: nil}
++
++    :ok = HomeAssistant.publish(summary, [car_id: 0], {MqttPublisherMock, publisher_name})
++
++    {_topic, decoded} = receive_one_config()
++    assert decoded["device"]["name"] == "Tesla #0"
++  end
++
++  test "uses custom discovery prefix", %{test: name} do
++    publisher_name = start_publisher(name)
++
++    :ok =
++      HomeAssistant.publish(
++        @summary,
++        [car_id: 0, discovery_prefix: "custom_prefix"],
++        {MqttPublisherMock, publisher_name}
++      )
++
++    assert_receive {MqttPublisherMock,
++                    {:publish, "custom_prefix/" <> _ = topic, _payload, [retain: true, qos: 1]}}
++
++    assert String.starts_with?(topic, "custom_prefix/")
++  end
++
++  test "scopes node, unique_id and device by namespace", %{test: name} do
++    publisher_name = start_publisher(name)
++
++    :ok =
++      HomeAssistant.publish(
++        @summary,
++        [car_id: 0, namespace: "ns1"],
++        {MqttPublisherMock, publisher_name}
++      )
++
++    find_config("homeassistant/sensor/teslamate_ns1_0/speed/config", fn decoded ->
++      assert decoded["object_id"] == "tesla_speed"
++      assert decoded["unique_id"] == "teslamate_ns1_0_speed"
++      assert decoded["state_topic"] == "teslamate/ns1/cars/0/speed"
++      assert decoded["device"]["identifiers"] == ["teslamate_ns1_car_0"]
++    end)
++
++    find_config("homeassistant/sensor/teslamate_ns1_0/display_name/config", fn decoded ->
++      assert decoded["unique_id"] == "teslamate_ns1_0_display_name"
++    end)
++  end
++
++  test "locked binary sensor is inverted", %{test: name} do
++    publisher_name = start_publisher(name)
++
++    :ok = HomeAssistant.publish(@summary, [car_id: 0], {MqttPublisherMock, publisher_name})
++
++    find_config("homeassistant/binary_sensor/teslamate_0/locked/config", fn decoded ->
++      assert decoded["payload_on"] == "false"
++      assert decoded["payload_off"] == "true"
++      assert decoded["device_class"] == "lock"
++      assert decoded["state_topic"] == "teslamate/cars/0/locked"
++    end)
++  end
++
++  test "active route sensors include availability and template", %{test: name} do
++    publisher_name = start_publisher(name)
++
++    :ok = HomeAssistant.publish(@summary, [car_id: 0], {MqttPublisherMock, publisher_name})
++
++    find_config("homeassistant/sensor/teslamate_0/active_route_destination/config", fn decoded ->
++      assert decoded["state_topic"] == "teslamate/cars/0/active_route"
++      assert String.contains?(decoded["value_template"], "value_json.destination")
++      assert %{"topic" => "teslamate/cars/0/active_route"} = decoded["availability"]
++    end)
++  end
++
++  test "psi sensor derives value from the bar topic", %{test: name} do
++    publisher_name = start_publisher(name)
++
++    :ok = HomeAssistant.publish(@summary, [car_id: 0], {MqttPublisherMock, publisher_name})
++
++    find_config("homeassistant/sensor/teslamate_0/tpms_pressure_fl_psi/config", fn decoded ->
++      assert decoded["state_topic"] == "teslamate/cars/0/tpms_pressure_fl"
++      assert decoded["unit_of_measurement"] == "psi"
++      assert String.contains?(decoded["value_template"], "14.50377")
++    end)
++  end
++
++  test "entity ids match the manual mqtt_sensors.yaml naming", %{test: name} do
++    publisher_name = start_publisher(name)
++
++    :ok = HomeAssistant.publish(@summary, [car_id: 0], {MqttPublisherMock, publisher_name})
++
++    find_config("homeassistant/sensor/teslamate_0/speed/config", fn decoded ->
++      assert decoded["object_id"] == "tesla_speed"
++      assert decoded["unique_id"] == "teslamate_0_speed"
++    end)
++
++    find_config("homeassistant/sensor/teslamate_0/est_battery_range/config", fn decoded ->
++      assert decoded["object_id"] == "tesla_est_battery_range"
++      assert decoded["unique_id"] == "teslamate_0_est_battery_range"
++    end)
++
++    find_config("homeassistant/binary_sensor/teslamate_0/healthy/config", fn decoded ->
++      assert decoded["object_id"] == "tesla_healthy"
++      assert decoded["unique_id"] == "teslamate_0_healthy"
++    end)
++  end
++
++  test "clear publishes empty payloads per entity", %{test: name} do
++    publisher_name = start_publisher(name)
++
++    :ok = HomeAssistant.clear(0, [car_id: 0], {MqttPublisherMock, publisher_name})
++
++    assert_receive {MqttPublisherMock,
++                    {:publish, "homeassistant/sensor/teslamate_0/display_name/config", "",
++                     [retain: true, qos: 1]}}
++
++    assert_receive {MqttPublisherMock,
++                    {:publish, "homeassistant/binary_sensor/teslamate_0/locked/config", "",
++                     [retain: true, qos: 1]}}
++  end
++
++  defp receive_one_config(timeout \\ 200) do
++    assert_receive {MqttPublisherMock,
++                    {:publish, "homeassistant/" <> _ = topic, payload, [retain: true, qos: 1]}},
++                   timeout
++
++    {topic, Jason.decode!(payload)}
++  end
++
++  # Drains the mailbox looking for a specific config topic, invoking `fun`
++  # with the decoded payload once found.
++  defp find_config(target, fun, timeout \\ 500) do
++    receive do
++      {MqttPublisherMock, {:publish, ^target, payload, [retain: true, qos: 1]}} ->
++        fun.(Jason.decode!(payload))
++    after
++      timeout -> flunk("Did not receive #{target}")
++    end
++  end
++end
+diff --git a/test/teslamate/mqtt/pubsub/pubsub_test.exs b/test/teslamate/mqtt/pubsub/pubsub_test.exs
+new file mode 100644
+index 0000000000..bce017e785
+--- /dev/null
++++ b/test/teslamate/mqtt/pubsub/pubsub_test.exs
+@@ -0,0 +1,74 @@
++defmodule TeslaMate.Mqtt.PubSubTest do
++  use TeslaMate.DataCase, async: false
++
++  alias TeslaMate.Log
++  alias TeslaMate.Mqtt.PubSub
++  alias TeslaMate.Vehicles.Vehicle.Summary
++
++  test "clears discovery configs for removed vehicles", %{test: name} do
++    {:ok, active_car} = Log.create_car(%{name: "Active", eid: 1, vid: 1, vin: "VIN1"})
++    {:ok, removed_car} = Log.create_car(%{name: "Removed", eid: 2, vid: 2, vin: "VIN2"})
++
++    publisher_name = :"mqtt_publisher_#{name}"
++    {:ok, _pid} = start_supervised({MqttPublisherMock, name: publisher_name, pid: self()})
++
++    vehicles = [%Summary{car: active_car}]
++    active_topic = "homeassistant/sensor/teslamate_#{active_car.id}/display_name/config"
++    removed_topic = "homeassistant/sensor/teslamate_#{removed_car.id}/display_name/config"
++    removed_locked_topic = "homeassistant/binary_sensor/teslamate_#{removed_car.id}/locked/config"
++
++    :ok =
++      PubSub.clear_removed_vehicles(vehicles,
++        deps_publisher: {MqttPublisherMock, publisher_name}
++      )
++
++    # Active vehicle is untouched
++    refute_receive {MqttPublisherMock, {:publish, ^active_topic, _, _}}
++
++    # Removed vehicle's discovery configs are cleared
++    assert_receive {MqttPublisherMock, {:publish, ^removed_topic, "", [retain: true, qos: 1]}}
++
++    assert_receive {MqttPublisherMock,
++                    {:publish, ^removed_locked_topic, "", [retain: true, qos: 1]}}
++  end
++
++  test "clears discovery configs under the namespace-scoped node", %{test: name} do
++    {:ok, active_car} = Log.create_car(%{name: "Active", eid: 4, vid: 4, vin: "VIN4"})
++    {:ok, removed_car} = Log.create_car(%{name: "Removed", eid: 5, vid: 5, vin: "VIN5"})
++
++    publisher_name = :"mqtt_publisher_#{name}"
++    {:ok, _pid} = start_supervised({MqttPublisherMock, name: publisher_name, pid: self()})
++
++    vehicles = [%Summary{car: active_car}]
++
++    removed_topic = "homeassistant/sensor/teslamate_ns1_#{removed_car.id}/display_name/config"
++    unscoped_topic = "homeassistant/sensor/teslamate_#{removed_car.id}/display_name/config"
++
++    :ok =
++      PubSub.clear_removed_vehicles(vehicles,
++        namespace: "ns1",
++        deps_publisher: {MqttPublisherMock, publisher_name}
++      )
++
++    # Cleared under the namespace-scoped node only
++    assert_receive {MqttPublisherMock, {:publish, ^removed_topic, "", [retain: true, qos: 1]}}
++    refute_receive {MqttPublisherMock, {:publish, ^unscoped_topic, _, _}}
++  end
++
++  test "does not clear discovery configs when no vehicles are removed", %{test: name} do
++    {:ok, car} = Log.create_car(%{name: "Only", eid: 3, vid: 3, vin: "VIN3"})
++
++    publisher_name = :"mqtt_publisher_#{name}"
++    {:ok, _pid} = start_supervised({MqttPublisherMock, name: publisher_name, pid: self()})
++
++    vehicles = [%Summary{car: car}]
++
++    :ok =
++      PubSub.clear_removed_vehicles(vehicles,
++        deps_publisher: {MqttPublisherMock, publisher_name}
++      )
++
++    refute_receive {MqttPublisherMock,
++                    {:publish, "homeassistant/" <> _, "", [retain: true, qos: 1]}}
++  end
++end
+diff --git a/test/teslamate/mqtt/pubsub/vehicle_subscriber_test.exs b/test/teslamate/mqtt/pubsub/vehicle_subscriber_test.exs
+index 49432de51f..6916b2f8b2 100644
+--- a/test/teslamate/mqtt/pubsub/vehicle_subscriber_test.exs
++++ b/test/teslamate/mqtt/pubsub/vehicle_subscriber_test.exs
+@@ -1,6 +1,8 @@
+ defmodule TeslaMate.Mqtt.PubSub.VehicleSubscriberTest do
+   use TeslaMate.DataCase, async: true
+ 
++  import TestHelper, only: [drain_discovery_configs: 0]
++
+   alias TeslaMate.Mqtt.PubSub.VehicleSubscriber
+   alias TeslaMate.Vehicles.Vehicle.Summary
+   alias TeslaMate.Locations.GeoFence
+@@ -19,7 +21,13 @@ defmodule TeslaMate.Mqtt.PubSub.VehicleSubscriberTest do
+     end
+   end
+ 
+-  defp start_subscriber(name, car_id, namespace \\ nil, publisher_responses \\ %{}) do
++  defp start_subscriber(
++         name,
++         car_id,
++         namespace \\ nil,
++         publisher_responses \\ %{},
++         extra_opts \\ []
++       ) do
+     publisher_name = :"mqtt_publisher_#{name}"
+     vehicles_name = :"vehicles_#{name}"
+ 
+@@ -38,7 +46,8 @@ defmodule TeslaMate.Mqtt.PubSub.VehicleSubscriberTest do
+          namespace: namespace,
+          deps_publisher: {MqttPublisherMock, publisher_name},
+          deps_vehicles: {VehiclesMock, vehicles_name}
+-       ]}
++       ]
++       |> Keyword.merge(extra_opts)}
+     )
+   end
+ 
+@@ -99,6 +108,8 @@ defmodule TeslaMate.Mqtt.PubSub.VehicleSubscriberTest do
+ 
+     assert_receive {VehiclesMock, {:subscribe_to_summary, 0}}
+ 
++    drain_discovery_configs()
++
+     summary = %Summary{
+       healthy: true,
+       display_name: "Foo",
+@@ -213,6 +224,8 @@ defmodule TeslaMate.Mqtt.PubSub.VehicleSubscriberTest do
+ 
+     assert_receive {VehiclesMock, {:subscribe_to_summary, 0}}
+ 
++    drain_discovery_configs()
++
+     summary = %Summary{
+       plugged_in: false,
+       battery_level: 60.0,
+@@ -352,6 +365,8 @@ defmodule TeslaMate.Mqtt.PubSub.VehicleSubscriberTest do
+ 
+     assert_receive {VehiclesMock, {:subscribe_to_summary, 0}}
+ 
++    drain_discovery_configs()
++
+     summary = %Summary{
+       display_name: "Foo",
+       state: :online
+@@ -415,4 +430,55 @@ defmodule TeslaMate.Mqtt.PubSub.VehicleSubscriberTest do
+ 
+     refute_receive _
+   end
++
++  test "publishes Home Assistant discovery config on the first summary", %{test: name} do
++    {:ok, pid} =
++      start_subscriber(name, 0, nil, %{},
++        discovery: true,
++        discovery_base_url: "https://teslamate.example.com/"
++      )
++
++    assert_receive {VehiclesMock, {:subscribe_to_summary, 0}}
++
++    summary = %Summary{healthy: true, display_name: "Foo", model: "3", state: :online}
++    send(pid, summary)
++
++    # The discovery config messages are emitted synchronously on the first
++    # summary. Wait for and drain them all so they don't carry over to the
++    # refute on the next summary.
++    assert_receive {MqttPublisherMock,
++                    {:publish, "homeassistant/" <> _ = _topic, payload, [retain: true, qos: 1]}},
++                   500
++
++    decoded = Jason.decode!(payload)
++    assert Map.has_key?(decoded, "unique_id")
++    assert Map.has_key?(decoded, "device")
++
++    drain_discovery_configs()
++
++    send(pid, %Summary{summary | version: "1"})
++
++    # No new discovery config should be published on subsequent summaries
++    refute_receive {MqttPublisherMock,
++                    {:publish, "homeassistant/" <> _, _, [retain: true, qos: 1]}}
++  end
++
++  test "clears discovery configs when discovery is disabled", %{test: name} do
++    {:ok, pid} = start_subscriber(name, 0)
++
++    assert_receive {VehiclesMock, {:subscribe_to_summary, 0}}
++
++    # Retained discovery configs are cleared on init so entities are removed
++    # from Home Assistant when discovery is disabled.
++    assert_receive {MqttPublisherMock,
++                    {:publish, "homeassistant/sensor/teslamate_0/display_name/config", "",
++                     [retain: true, qos: 1]}}
++
++    drain_discovery_configs()
++
++    send(pid, %Summary{healthy: true, display_name: "Foo", state: :online})
++
++    # No discovery config should be published when discovery is disabled
++    refute_receive {MqttPublisherMock, {:publish, "homeassistant/" <> _, _, _}}
++  end
+ end
+diff --git a/test/teslamate/vehicles/vehicle_sync_test.exs b/test/teslamate/vehicles/vehicle_sync_test.exs
+index a47a91cce9..25e72d123f 100644
+--- a/test/teslamate/vehicles/vehicle_sync_test.exs
++++ b/test/teslamate/vehicles/vehicle_sync_test.exs
+@@ -1,6 +1,8 @@
+ defmodule TeslaMate.Vehicles.VehicleSyncTest do
+   use TeslaMate.VehicleCase, async: false
+ 
++  import TestHelper, only: [drain_discovery_configs: 0]
++
+   describe "Summary" do
+     alias TeslaMate.Vehicles.Vehicle.Summary
+     alias TeslaMate.Mqtt.PubSub.VehicleSubscriber
+@@ -72,6 +74,8 @@ defmodule TeslaMate.Vehicles.VehicleSyncTest do
+       :ok = start_vehicle(name, events, car: car, log: false)
+       {:ok, subscriber} = start_subscriber(name, car)
+ 
++      drain_discovery_configs()
++
+       assert_receive {:pubsub, {:broadcast, _, _, %Summary{state: :asleep} = summary}}
+ 
+       assert summary == %Summary{
+diff --git a/website/docs/configuration/environment_variables.md b/website/docs/configuration/environment_variables.md
+index c363939014..2d3a83a4b7 100644
+--- a/website/docs/configuration/environment_variables.md
++++ b/website/docs/configuration/environment_variables.md
+@@ -6,56 +6,59 @@ sidebar_label: Environment Variables
+ 
+ TeslaMate accepts the following environment variables for runtime configuration:
+ 
+-| Variable Name                          | Description                                                                                                                                                                                                                                                                                                      | Default Value                                                                                                                                                       |
+-| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+-| **ENCRYPTION_KEY**                     | A key used to encrypt the Tesla API tokens (**required**)                                                                                                                                                                                                                                                        |                                                                                                                                                                     |
+-| **DATABASE_USER**                      | Username. Also used with `DATABASE_SOCKET_DIR` when the socket connection requires password authentication.                                                                                                                                                                                                      |                                                                                                                                                                     |
+-| **DATABASE_PASS**                      | User password. Also used with `DATABASE_SOCKET_DIR` when the socket connection requires password authentication.                                                                                                                                                                                                 |                                                                                                                                                                     |
+-| **DATABASE_NAME**                      | The database to connect to                                                                                                                                                                                                                                                                                       |                                                                                                                                                                     |
+-| **DATABASE_HOST**                      | Hostname of the database server                                                                                                                                                                                                                                                                                  |                                                                                                                                                                     |
+-| **DATABASE_PORT**                      | Port of the database server                                                                                                                                                                                                                                                                                      | 5432                                                                                                                                                                |
+-| **DATABASE_SOCKET_DIR**                | Local path containing a UNIX socket for the database. `DATABASE_USER` and `DATABASE_PASS` are honored when set; omit them to use peer authentication.                                                                                                                                                            |                                                                                                                                                                     |
+-| **DATABASE_POOL_SIZE**                 | Size of the database connection pool                                                                                                                                                                                                                                                                             | 10                                                                                                                                                                  |
+-| **DATABASE_TIMEOUT**                   | The time in milliseconds to wait for database query calls to finish                                                                                                                                                                                                                                              | 60000                                                                                                                                                               |
+-| **DATABASE_SSL**                       | Set to `true` if SSL should be enabled or `noverify` if certificate verification should not be performed.                                                                                                                                                                                                        | false                                                                                                                                                               |
+-| **DATABASE_SSL_CA_CERT_FILE**          | Path to a file containing PEM-encoded CA certificates (required if `DATABASE_SSL` is set to `true`)                                                                                                                                                                                                              |                                                                                                                                                                     |
+-| **DATABASE_SSL_SNI**                   | set SNI for host under SSL mode                                                                                                                                                                                                                                                                                  |                                                                                                                                                                     |
+-| **DATABASE_IPV6**                      | Set to `true` if IPv6 should be used                                                                                                                                                                                                                                                                             | false                                                                                                                                                               |
+-| **VIRTUAL_HOST**                       | Host part used for generating URLs throughout the app                                                                                                                                                                                                                                                            | localhost                                                                                                                                                           |
+-| **URL_PATH**                           | Path used for generating URLs (can be used with a reverse proxy)                                                                                                                                                                                                                                                 | /                                                                                                                                                                   |
+-| **CHECK_ORIGIN**                       | Configures whether to check the origin header or not. May be `true` (**recommended**), `false` (_default_) or a comma-separated list of hosts that are allowed (e.g. `https://example.com,//another.com:8080`). Hosts also support wildcards. If `true`, it will check against the host value in `VIRTUAL_HOST`. | false                                                                                                                                                               |
+-| **PORT**                               | Port where the web interface is exposed                                                                                                                                                                                                                                                                          | 4000                                                                                                                                                                |
+-| **HTTP_BINDING_ADDRESS**               | IP address where the web interface is exposed, or blank (_default_) meaning all addresses.                                                                                                                                                                                                                       |                                                                                                                                                                     |
+-| **DISABLE_MQTT**                       | Disables the MQTT feature if `true`                                                                                                                                                                                                                                                                              | false                                                                                                                                                               |
+-| **MQTT_HOST**                          | Hostname of the broker (**required** unless DISABLE_MQTT is `true`)                                                                                                                                                                                                                                              |                                                                                                                                                                     |
+-| **MQTT_PORT**                          | Port of the broker                                                                                                                                                                                                                                                                                               | 1883 (8883 for MQTT over TLS)                                                                                                                                       |
+-| **MQTT_USERNAME**                      | Username                                                                                                                                                                                                                                                                                                         |                                                                                                                                                                     |
+-| **MQTT_PASSWORD**                      | Password                                                                                                                                                                                                                                                                                                         |                                                                                                                                                                     |
+-| **MQTT_TLS**                           | Enables TLS if `true`                                                                                                                                                                                                                                                                                            | false                                                                                                                                                               |
+-| **MQTT_TLS_ACCEPT_INVALID_CERTS**      | Accepts invalid certificates if `true`                                                                                                                                                                                                                                                                           | false                                                                                                                                                               |
+-| **MQTT_IPV6**                          | Set to `true` if IPv6 should be used                                                                                                                                                                                                                                                                             | false                                                                                                                                                               |
+-| **MQTT_NAMESPACE**                     | Inserts a custom namespace into the MQTT topic. For example, with `MQTT_NAMESPACE=account_0`: `teslamate/account_0/cars/$car_id/state`.                                                                                                                                                                          |                                                                                                                                                                     |
+-| **IMPORT_DIR**                         | The path of the directory for the import of data (e.g. TeslaFi)                                                                                                                                                                                                                                                  | ./import                                                                                                                                                            |
+-| **TZ**                                 | Used to establish the local time zone, e.g. to use the local time in logs. See [List of tz database time zones](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).                                                                                                                                   |                                                                                                                                                                     |
+-| **DEFAULT_GEOFENCE**                   | The default GEOFENCE to send via GEOFENCE if car not in geofence. Overrides the default of "" which will delete any retained value.                                                                                                                                                                              | "" (no quotes)                                                                                                                                                      |
+-| **TESLAFI_IMPORT_VEHICLE_ID**          | The default Vehicle ID used when importing from TeslaFi. If it is not defined and the import source does not contain the data, 1 is used.                                                                                                                                                                        |                                                                                                                                                                     |
+-| **TESLA_API_HOST**                     | Hostname of the Tesla API                                                                                                                                                                                                                                                                                        | [https://owner-api.teslamotors.com](https://owner-api.teslamotors.com) (or for chinese: [https://owner-api.vn.cloud.tesla.cn](https://owner-api.vn.cloud.tesla.cn)) |
+-| **TESLA_API_POOL_SIZE**                | HTTP pool size limit for `TESLA_API_HOST` domain API                                                                                                                                                                                                                                                             | 10                                                                                                                                                                  |
+-|                                        |
+-| **TESLA_AUTH_HOST**                    | Hostname of the Tesla authentication API                                                                                                                                                                                                                                                                         | [https://auth.tesla.com](https://auth.tesla.com)                                                                                                                    |
+-| **TESLA_AUTH_PATH**                    | The Tesla authentication path                                                                                                                                                                                                                                                                                    | /oauth2/v3                                                                                                                                                          |
+-| **TESLA_AUTH_CLIENT_ID**               | Client ID of the application registered on [developer.tesla.com](https://developer.tesla.com)                                                                                                                                                                                                                    | ownerapi                                                                                                                                                            |
+-| **TESLA_WSS_HOST**                     | Hostname of the Tesla streaming                                                                                                                                                                                                                                                                                  | wss://streaming.vn.teslamotors.com (or for chinese: wss://streaming.vn.cloud.tesla.cn)                                                                              |
+-| **TESLA_WSS_TLS_ACCEPT_INVALID_CERTS** | Accepts invalid certificates on TESLA_WSS_HOST if `true`                                                                                                                                                                                                                                                         |                                                                                                                                                                     |
+-| **TESLA_WSS_USE_VIN**                  | Use the `vin` field instead of `vid` to connect stream if `true`                                                                                                                                                                                                                                                 |                                                                                                                                                                     |
+-| **TOKEN**                              | Token given by a third party Tesla API provider. It is sent as an `Authorization: Bearer` header on each API request (and in the streaming subscribe message), so provide only the raw token, e.g. `xxxx-xxxx-xxxx`. For backward compatibility the legacy `?token=xxxx-xxxx-xxxx` format is still accepted.     |                                                                                                                                                                     |
+-| **POLLING_ASLEEP_INTERVAL**            | Interval between API fetch when the vehicle is asleep (in seconds). **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                         | 30                                                                                                                                                                  |
+-| **POLLING_CHARGING_INTERVAL**          | Minimum interval between API fetch when the vehicle is charging (in seconds). **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                               | 5                                                                                                                                                                   |
+-| **POLLING_DRIVING_INTERVAL**           | Interval between API fetch when the vehicle is driving (in seconds). **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                        | 2.5                                                                                                                                                                 |
+-| **POLLING_ONLINE_INTERVAL**            | Interval between API fetch when the vehicle is online (in seconds). **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                         | 60                                                                                                                                                                  |
+-| **POLLING_DEFAULT_INTERVAL**           | Default interval between API fetch (in seconds). **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                                            | 15                                                                                                                                                                  |
+-| **POLLING_MINIMUM_INTERVAL**           | Minimum interval between API fetch. No minimum by default. **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                                  | 0                                                                                                                                                                   |
+-| **HTTP_POOL_SIZE**                     | The default size of the HTTP connection pool for domains other than `TESLA_API_HOST`, `nominatim.openstreetmap.org`, and `api.github.com`. This setting determines the maximum number of simultaneous connections allowed for these domains.                                                                     | 5                                                                                                                                                                   |
+-| **HTTP_POOL_TIMEOUT**                  | The maximum time (in microseconds) to wait for a connection from the HTTP pool before timing out. This setting helps prevent indefinite waits when the pool is exhausted.                                                                                                                                        | 10000                                                                                                                                                               |
+-| **ULIMIT_MAX_NOFILE**                  | Sets the maximum number of open file descriptors for the TeslaMate process. This can prevent memory bloat in environments with very high default `ulimit` values. Set to `0` to disable this feature.                                                                                                            | 65536                                                                                                                                                               |
+-| **NOMINATIM_PROXY**                    | HTTP proxy for OpenStreetMap Nominatim API requests (e.g. `http://127.0.0.1:7897`, HTTP only). Similar to [`nominatim_http_proxy`](https://nominatim.org/release-docs/latest/customize/Settings/#nominatim_http_proxy).                                                                                          |                                                                                                                                                                     |
++| Variable Name                            | Description                                                                                                                                                                                                                                                                                                                       | Default Value                                                                                                                                                       |
++| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
++| **ENCRYPTION_KEY**                       | A key used to encrypt the Tesla API tokens (**required**)                                                                                                                                                                                                                                                                         |                                                                                                                                                                     |
++| **DATABASE_USER**                        | Username. Also used with `DATABASE_SOCKET_DIR` when the socket connection requires password authentication.                                                                                                                                                                                                                       |                                                                                                                                                                     |
++| **DATABASE_PASS**                        | User password. Also used with `DATABASE_SOCKET_DIR` when the socket connection requires password authentication.                                                                                                                                                                                                                  |                                                                                                                                                                     |
++| **DATABASE_NAME**                        | The database to connect to                                                                                                                                                                                                                                                                                                        |                                                                                                                                                                     |
++| **DATABASE_HOST**                        | Hostname of the database server                                                                                                                                                                                                                                                                                                   |                                                                                                                                                                     |
++| **DATABASE_PORT**                        | Port of the database server                                                                                                                                                                                                                                                                                                       | 5432                                                                                                                                                                |
++| **DATABASE_SOCKET_DIR**                  | Local path containing a UNIX socket for the database. `DATABASE_USER` and `DATABASE_PASS` are honored when set; omit them to use peer authentication.                                                                                                                                                                             |                                                                                                                                                                     |
++| **DATABASE_POOL_SIZE**                   | Size of the database connection pool                                                                                                                                                                                                                                                                                              | 10                                                                                                                                                                  |
++| **DATABASE_TIMEOUT**                     | The time in milliseconds to wait for database query calls to finish                                                                                                                                                                                                                                                               | 60000                                                                                                                                                               |
++| **DATABASE_SSL**                         | Set to `true` if SSL should be enabled or `noverify` if certificate verification should not be performed.                                                                                                                                                                                                                         | false                                                                                                                                                               |
++| **DATABASE_SSL_CA_CERT_FILE**            | Path to a file containing PEM-encoded CA certificates (required if `DATABASE_SSL` is set to `true`)                                                                                                                                                                                                                               |                                                                                                                                                                     |
++| **DATABASE_SSL_SNI**                     | set SNI for host under SSL mode                                                                                                                                                                                                                                                                                                   |                                                                                                                                                                     |
++| **DATABASE_IPV6**                        | Set to `true` if IPv6 should be used                                                                                                                                                                                                                                                                                              | false                                                                                                                                                               |
++| **VIRTUAL_HOST**                         | Host part used for generating URLs throughout the app                                                                                                                                                                                                                                                                             | localhost                                                                                                                                                           |
++| **URL_PATH**                             | Path used for generating URLs (can be used with a reverse proxy)                                                                                                                                                                                                                                                                  | /                                                                                                                                                                   |
++| **CHECK_ORIGIN**                         | Configures whether to check the origin header or not. May be `true` (**recommended**), `false` (_default_) or a comma-separated list of hosts that are allowed (e.g. `https://example.com,//another.com:8080`). Hosts also support wildcards. If `true`, it will check against the host value in `VIRTUAL_HOST`.                  | false                                                                                                                                                               |
++| **PORT**                                 | Port where the web interface is exposed                                                                                                                                                                                                                                                                                           | 4000                                                                                                                                                                |
++| **HTTP_BINDING_ADDRESS**                 | IP address where the web interface is exposed, or blank (_default_) meaning all addresses.                                                                                                                                                                                                                                        |                                                                                                                                                                     |
++| **DISABLE_MQTT**                         | Disables the MQTT feature if `true`                                                                                                                                                                                                                                                                                               | false                                                                                                                                                               |
++| **MQTT_HOST**                            | Hostname of the broker (**required** unless DISABLE_MQTT is `true`)                                                                                                                                                                                                                                                               |                                                                                                                                                                     |
++| **MQTT_PORT**                            | Port of the broker                                                                                                                                                                                                                                                                                                                | 1883 (8883 for MQTT over TLS)                                                                                                                                       |
++| **MQTT_USERNAME**                        | Username                                                                                                                                                                                                                                                                                                                          |                                                                                                                                                                     |
++| **MQTT_PASSWORD**                        | Password                                                                                                                                                                                                                                                                                                                          |                                                                                                                                                                     |
++| **MQTT_TLS**                             | Enables TLS if `true`                                                                                                                                                                                                                                                                                                             | false                                                                                                                                                               |
++| **MQTT_TLS_ACCEPT_INVALID_CERTS**        | Accepts invalid certificates if `true`                                                                                                                                                                                                                                                                                            | false                                                                                                                                                               |
++| **MQTT_IPV6**                            | Set to `true` if IPv6 should be used                                                                                                                                                                                                                                                                                              | false                                                                                                                                                               |
++| **MQTT_NAMESPACE**                       | Inserts a custom namespace into the MQTT topic. For example, with `MQTT_NAMESPACE=account_0`: `teslamate/account_0/cars/$car_id/state`.                                                                                                                                                                                           |                                                                                                                                                                     |
++| **MQTT_HOME_ASSISTANT_DISCOVERY**        | Enables Home Assistant MQTT discovery if `true`. TeslaMate publishes discovery config payloads to `<MQTT_HOME_ASSISTANT_DISCOVERY_PREFIX>/.../config` so entities appear in Home Assistant automatically, removing the need for the manual `mqtt_sensors.yaml`. Optionally set together with `MQTT_HOME_ASSISTANT_DISCOVERY_URL`. | false                                                                                                                                                               |
++| **MQTT_HOME_ASSISTANT_DISCOVERY_URL**    | Optional: the TeslaMate URL surfaced in the discovered device panel (e.g. `https://teslamate.example.com/`). Only used when `MQTT_HOME_ASSISTANT_DISCOVERY` is `true`.                                                                                                                                                            |                                                                                                                                                                     |
++| **MQTT_HOME_ASSISTANT_DISCOVERY_PREFIX** | Discovery topic prefix. Matches Home Assistant's MQTT discovery prefix.                                                                                                                                                                                                                                                           | homeassistant                                                                                                                                                       |
++| **IMPORT_DIR**                           | The path of the directory for the import of data (e.g. TeslaFi)                                                                                                                                                                                                                                                                   | ./import                                                                                                                                                            |
++| **TZ**                                   | Used to establish the local time zone, e.g. to use the local time in logs. See [List of tz database time zones](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).                                                                                                                                                    |                                                                                                                                                                     |
++| **DEFAULT_GEOFENCE**                     | The default GEOFENCE to send via GEOFENCE if car not in geofence. Overrides the default of "" which will delete any retained value.                                                                                                                                                                                               | "" (no quotes)                                                                                                                                                      |
++| **TESLAFI_IMPORT_VEHICLE_ID**            | The default Vehicle ID used when importing from TeslaFi. If it is not defined and the import source does not contain the data, 1 is used.                                                                                                                                                                                         |                                                                                                                                                                     |
++| **TESLA_API_HOST**                       | Hostname of the Tesla API                                                                                                                                                                                                                                                                                                         | [https://owner-api.teslamotors.com](https://owner-api.teslamotors.com) (or for chinese: [https://owner-api.vn.cloud.tesla.cn](https://owner-api.vn.cloud.tesla.cn)) |
++| **TESLA_API_POOL_SIZE**                  | HTTP pool size limit for `TESLA_API_HOST` domain API                                                                                                                                                                                                                                                                              | 10                                                                                                                                                                  |
++|                                          |
++| **TESLA_AUTH_HOST**                      | Hostname of the Tesla authentication API                                                                                                                                                                                                                                                                                          | [https://auth.tesla.com](https://auth.tesla.com)                                                                                                                    |
++| **TESLA_AUTH_PATH**                      | The Tesla authentication path                                                                                                                                                                                                                                                                                                     | /oauth2/v3                                                                                                                                                          |
++| **TESLA_AUTH_CLIENT_ID**                 | Client ID of the application registered on [developer.tesla.com](https://developer.tesla.com)                                                                                                                                                                                                                                     | ownerapi                                                                                                                                                            |
++| **TESLA_WSS_HOST**                       | Hostname of the Tesla streaming                                                                                                                                                                                                                                                                                                   | wss://streaming.vn.teslamotors.com (or for chinese: wss://streaming.vn.cloud.tesla.cn)                                                                              |
++| **TESLA_WSS_TLS_ACCEPT_INVALID_CERTS**   | Accepts invalid certificates on TESLA_WSS_HOST if `true`                                                                                                                                                                                                                                                                          |                                                                                                                                                                     |
++| **TESLA_WSS_USE_VIN**                    | Use the `vin` field instead of `vid` to connect stream if `true`                                                                                                                                                                                                                                                                  |                                                                                                                                                                     |
++| **TOKEN**                                | Token given by a third party Tesla API provider. It is sent as an `Authorization: Bearer` header on each API request (and in the streaming subscribe message), so provide only the raw token, e.g. `xxxx-xxxx-xxxx`. For backward compatibility the legacy `?token=xxxx-xxxx-xxxx` format is still accepted.                      |                                                                                                                                                                     |
++| **POLLING_ASLEEP_INTERVAL**              | Interval between API fetch when the vehicle is asleep (in seconds). **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                                          | 30                                                                                                                                                                  |
++| **POLLING_CHARGING_INTERVAL**            | Minimum interval between API fetch when the vehicle is charging (in seconds). **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                                | 5                                                                                                                                                                   |
++| **POLLING_DRIVING_INTERVAL**             | Interval between API fetch when the vehicle is driving (in seconds). **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                                         | 2.5                                                                                                                                                                 |
++| **POLLING_ONLINE_INTERVAL**              | Interval between API fetch when the vehicle is online (in seconds). **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                                          | 60                                                                                                                                                                  |
++| **POLLING_DEFAULT_INTERVAL**             | Default interval between API fetch (in seconds). **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                                                             | 15                                                                                                                                                                  |
++| **POLLING_MINIMUM_INTERVAL**             | Minimum interval between API fetch. No minimum by default. **Important: Do not alter this setting unless you are certain of the implications.**                                                                                                                                                                                   | 0                                                                                                                                                                   |
++| **HTTP_POOL_SIZE**                       | The default size of the HTTP connection pool for domains other than `TESLA_API_HOST`, `nominatim.openstreetmap.org`, and `api.github.com`. This setting determines the maximum number of simultaneous connections allowed for these domains.                                                                                      | 5                                                                                                                                                                   |
++| **HTTP_POOL_TIMEOUT**                    | The maximum time (in microseconds) to wait for a connection from the HTTP pool before timing out. This setting helps prevent indefinite waits when the pool is exhausted.                                                                                                                                                         | 10000                                                                                                                                                               |
++| **ULIMIT_MAX_NOFILE**                    | Sets the maximum number of open file descriptors for the TeslaMate process. This can prevent memory bloat in environments with very high default `ulimit` values. Set to `0` to disable this feature.                                                                                                                             | 65536                                                                                                                                                               |
++| **NOMINATIM_PROXY**                      | HTTP proxy for OpenStreetMap Nominatim API requests (e.g. `http://127.0.0.1:7897`, HTTP only). Similar to [`nominatim_http_proxy`](https://nominatim.org/release-docs/latest/customize/Settings/#nominatim_http_proxy).                                                                                                           |                                                                                                                                                                     |
+diff --git a/website/docs/installation/nixos.md b/website/docs/installation/nixos.md
+index 81adfd3f44..79efc7bb84 100644
+--- a/website/docs/installation/nixos.md
++++ b/website/docs/installation/nixos.md
+@@ -79,6 +79,12 @@ config = services.teslamate = {
+         enable = true;
+         host = "127.0.0.1";
+         port = 1883;
++
++        # Optional: Home Assistant MQTT discovery
++        discovery = {
++          enable = true;
++          url = "https://teslamate.example.com/";
++        };
+       };
+     };
+ }
+diff --git a/website/docs/integrations/home_assistant.md b/website/docs/integrations/home_assistant.md
+index 95192cf51f..ac57b95661 100644
+--- a/website/docs/integrations/home_assistant.md
++++ b/website/docs/integrations/home_assistant.md
+@@ -23,6 +23,54 @@ import useBaseUrl from '@docusaurus/useBaseUrl';
+ - Locks: Not implemented
+ - Climate: Not implemented
+ 
++## MQTT Discovery (automatic configuration)
++
++TeslaMate can publish [Home Assistant MQTT discovery](https://www.home-assistant.io/integrations/mqtt/#mqtt-discovery) payloads, so the entities below are created automatically and you no longer need to maintain `mqtt_sensors.yaml`.
++
++Enable it with the following environment variables (see [Environment variables](../configuration/environment_variables.md)):
++
++| Variable                               | Description                                                                                    | Default         |
++| -------------------------------------- | ---------------------------------------------------------------------------------------------- | --------------- |
++| `MQTT_HOME_ASSISTANT_DISCOVERY`        | Set to `true` to enable discovery.                                                             | `false`         |
++| `MQTT_HOME_ASSISTANT_DISCOVERY_URL`    | TeslaMate URL surfaced in the discovered device panel (e.g. `https://teslamate.example.com/`). | _none_          |
++| `MQTT_HOME_ASSISTANT_DISCOVERY_PREFIX` | Discovery topic prefix. Must match Home Assistant's `discovery_prefix` setting.                | `homeassistant` |
++
++When enabled, TeslaMate publishes a retained `config` payload per entity to
++`<discovery_prefix>/<component>/<node>/<object_id>/config` on the first
++vehicle summary, where `<node>` is `teslamate_<car_id>`. If
++`MQTT_NAMESPACE` is set, it is inserted after `teslamate_` (e.g.
++`teslamate_<namespace>_<car_id>`), so multiple TeslaMate instances sharing a
++broker do not collide on the same discovery topics. The device is grouped
++under the `teslamate_car_<car_id>` identifier (likewise namespace-scoped), and
++the entity IDs match those produced by the manual `mqtt_sensors.yaml` below.
++
++:::note
++
++The `unique_id`s of the discovered entities match those of the manual
++`mqtt_sensors.yaml`, so enabling discovery while the manual configuration is
++still active will produce duplicate-ID errors in Home Assistant. Remove the
++manual `mqtt: !include mqtt_sensors.yaml` section from `configuration.yaml`
++(and the entities it created) before enabling discovery.
++
++:::
++
++On startup, discovery configs are also cleared for cars that are no longer
++tracked, e.g. because they were removed from the Tesla account or because
++logging was disabled, so their entities are removed from Home Assistant.
++
++The discovered entities cover the same set of `teslamate/cars/<id>/...` topics
++as the manual `mqtt_sensors.yaml` below. The list is easy to extend in the
++future, as configs are published per entity.
++
++:::note
++
++Configs are only cleared at startup. A car removed while TeslaMate is running
++keeps its entities until the next restart, and changing
++`MQTT_HOME_ASSISTANT_DISCOVERY_PREFIX` does not clean up topics published under
++the previous prefix.
++
++:::
++
+ ## Configuration
+ 
+ The following configurations assume a car ID of 1 (`teslamate/cars/1`). It usually starts at 1, but it can be different if you have multiple cars in TeslaMate for example.
+@@ -104,6 +152,14 @@ Don't forget to replace `<teslamate url>`, `<your tesla model>` and `<your tesla
+     state_topic: "teslamate/cars/1/state"
+     icon: mdi:car-connected
+ 
++- sensor:
++    name: Charging State
++    default_entity_id: sensor.tesla_charging_state
++    unique_id: teslamate_1_charging_state
++    device: *teslamate_device_info
++    state_topic: "teslamate/cars/1/charging_state"
++    icon: mdi:ev-station
++
+ - sensor:
+     name: Since
+     default_entity_id: sensor.tesla_since
+@@ -323,7 +379,7 @@ Don't forget to replace `<teslamate url>`, `<your tesla model>` and `<your tesla
+     device: *teslamate_device_info
+     state_topic: "teslamate/cars/1/charge_energy_added"
+     device_class: energy
+-    state_class: total
++    state_class: total_increasing
+     unit_of_measurement: kWh
+     icon: mdi:battery-charging
+ 

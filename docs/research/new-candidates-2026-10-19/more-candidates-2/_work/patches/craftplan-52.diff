@@ -1,0 +1,794 @@
+diff --git a/docs/src/pages/docs/settings.md b/docs/src/pages/docs/settings.md
+index c279b14e..98f19e9d 100644
+--- a/docs/src/pages/docs/settings.md
++++ b/docs/src/pages/docs/settings.md
+@@ -13,6 +13,7 @@ The Settings area at **Manage → Settings** controls global configuration for y
+ - **Hourly rate** — Default labor rate used in BOM labor step calculations. Individual steps can override this value.
+ - **Overhead percentage** — Applied on top of labor costs during BOM rollup calculations.
+ - **Default currency** — Sets the currency for all monetary values (prices, costs, invoices).
++- **Use scientific notation on production batch sheets** — Off by default, so printed quantities use ordinary decimals (for example, `1000` instead of `1E+3`). Enable it to use scientific notation when applicable. This affects batch-sheet quantities, including materials, lots, and labor; configured units and stored quantities stay the same.
+ 
+ ## Markup Configuration
+ 
+diff --git a/lib/craftplan/production/batch_sheet.ex b/lib/craftplan/production/batch_sheet.ex
+index 08e8fe80..2a4aee0a 100644
+--- a/lib/craftplan/production/batch_sheet.ex
++++ b/lib/craftplan/production/batch_sheet.ex
+@@ -4,6 +4,7 @@ defmodule Craftplan.Production.BatchSheet do
+   """
+ 
+   alias Craftplan.Production
++  alias Craftplan.Settings
+   alias Decimal, as: D
+ 
+   @template_path "priv/typst/batch_sheet.typ"
+@@ -20,7 +21,8 @@ defmodule Craftplan.Production.BatchSheet do
+     report = Production.batch_report!(batch_code, actor: actor)
+     bom = load_bom_details(report.bom, actor)
+ 
+-    data = build_data(report, bom, currency)
++    settings = Settings.get_settings!(actor: actor)
++    data = build_data(report, bom, currency, settings.batch_sheet_scientific_notation)
+     template = File.read!(Application.app_dir(:craftplan, @template_path))
+ 
+     config = Imprintor.Config.new(template, data)
+@@ -33,7 +35,8 @@ defmodule Craftplan.Production.BatchSheet do
+     Ash.load!(bom, [:labor_steps, components: [:material]], actor: actor)
+   end
+ 
+-  defp build_data(report, bom, currency) do
++  @doc false
++  def build_data(report, bom, currency, scientific_notation? \\ false) do
+     batch = report.production_batch
+     product = report.product
+     completed? = batch && batch.status == :completed
+@@ -43,32 +46,32 @@ defmodule Craftplan.Production.BatchSheet do
+       "product_name" => (product && product.name) || "Unknown",
+       "product_sku" => (product && product.sku) || "",
+       "status" => format_status(batch),
+-      "planned_qty" => format_decimal((batch && batch.planned_qty) || D.new(0)),
++      "planned_qty" => format_decimal((batch && batch.planned_qty) || D.new(0), scientific_notation?),
+       "produced_at" => format_datetime(report.produced_at),
+       "observations" => (bom && bom.notes) || "",
+-      "orders" => build_orders(report.orders),
+-      "bom_components" => build_bom_components(bom, report.totals),
+-      "labor_steps" => build_labor_steps(bom),
+-      "lots" => build_lots(report.lots),
++      "orders" => build_orders(report.orders, scientific_notation?),
++      "bom_components" => build_bom_components(bom, report.totals, scientific_notation?),
++      "labor_steps" => build_labor_steps(bom, scientific_notation?),
++      "lots" => build_lots(report.lots, scientific_notation?),
+       "show_costs" => if(completed?, do: "yes", else: "no"),
+       "costs" => build_costs(report.totals, currency)
+     }
+   end
+ 
+-  defp build_orders(orders) do
++  defp build_orders(orders, scientific_notation?) do
+     Enum.map(orders, fn order ->
+       %{
+         "reference" => order.order.reference || "",
+         "customer_name" => order.customer_name || "—",
+-        "quantity" => format_decimal(order.quantity),
++        "quantity" => format_decimal(order.quantity, scientific_notation?),
+         "delivery_date" => format_date(order.order.delivery_date)
+       }
+     end)
+   end
+ 
+-  defp build_bom_components(nil, _totals), do: []
++  defp build_bom_components(nil, _totals, _scientific_notation?), do: []
+ 
+-  defp build_bom_components(bom, totals) do
++  defp build_bom_components(bom, totals, scientific_notation?) do
+     planned_qty = totals.quantity
+ 
+     bom.components
+@@ -81,35 +84,35 @@ defmodule Craftplan.Production.BatchSheet do
+ 
+       %{
+         "name" => (material && material.name) || "Unknown",
+-        "qty_per_unit" => format_decimal(qty_per),
+-        "total_required" => format_decimal(total_req),
++        "qty_per_unit" => format_decimal(qty_per, scientific_notation?),
++        "total_required" => format_decimal(total_req, scientific_notation?),
+         "unit" => (material && to_string(material.unit)) || "",
+-        "waste_percent" => format_decimal(comp.waste_percent || D.new(0))
++        "waste_percent" => format_decimal(comp.waste_percent || D.new(0), scientific_notation?)
+       }
+     end)
+   end
+ 
+-  defp build_labor_steps(nil), do: []
++  defp build_labor_steps(nil, _scientific_notation?), do: []
+ 
+-  defp build_labor_steps(bom) do
++  defp build_labor_steps(bom, scientific_notation?) do
+     bom.labor_steps
+     |> Enum.sort_by(& &1.sequence)
+     |> Enum.map(fn step ->
+       %{
+         "sequence" => to_string(step.sequence),
+         "name" => step.name,
+-        "duration_minutes" => format_decimal(step.duration_minutes),
+-        "units_per_run" => format_decimal(step.units_per_run)
++        "duration_minutes" => format_decimal(step.duration_minutes, scientific_notation?),
++        "units_per_run" => format_decimal(step.units_per_run, scientific_notation?)
+       }
+     end)
+   end
+ 
+-  defp build_lots(lots) do
++  defp build_lots(lots, scientific_notation?) do
+     Enum.map(lots, fn lot ->
+       %{
+         "lot_code" => lot.lot_code || "—",
+         "material_name" => (lot.material && lot.material.name) || "Unknown",
+-        "quantity_used" => format_decimal(lot.quantity_used),
++        "quantity_used" => format_decimal(lot.quantity_used, scientific_notation?),
+         "expiry_date" => format_date(lot.expiry_date),
+         "supplier" => (lot.supplier && lot.supplier.name) || "—"
+       }
+@@ -130,8 +133,11 @@ defmodule Craftplan.Production.BatchSheet do
+ 
+   defp format_status(batch), do: batch.status |> to_string() |> String.replace("_", " ") |> String.capitalize()
+ 
+-  defp format_decimal(%D{} = d), do: D.to_string(D.normalize(d))
+-  defp format_decimal(_), do: "0"
++  defp format_decimal(%D{} = d, scientific_notation?) do
++    D.to_string(D.normalize(d), if(scientific_notation?, do: :scientific, else: :normal))
++  end
++
++  defp format_decimal(_, _scientific_notation?), do: "0"
+ 
+   defp format_date(nil), do: "—"
+   defp format_date(%Date{} = d), do: Calendar.strftime(d, "%b %d, %Y")
+diff --git a/lib/craftplan/settings/settings.ex b/lib/craftplan/settings/settings.ex
+index a6022f17..73a4436f 100644
+--- a/lib/craftplan/settings/settings.ex
++++ b/lib/craftplan/settings/settings.ex
+@@ -87,6 +87,13 @@ defmodule Craftplan.Settings.Settings do
+       default :USD
+     end
+ 
++    attribute :batch_sheet_scientific_notation, :boolean do
++      public? true
++      allow_nil? false
++      default false
++      description "Use scientific notation for quantities on printable production batch sheets."
++    end
++
+     attribute :food_business_name, :string do
+       public? true
+       allow_nil? true
+diff --git a/lib/craftplan_web/live/manage/settings_live/form_component.ex b/lib/craftplan_web/live/manage/settings_live/form_component.ex
+index 7097f3da..ba70759b 100644
+--- a/lib/craftplan_web/live/manage/settings_live/form_component.ex
++++ b/lib/craftplan_web/live/manage/settings_live/form_component.ex
+@@ -34,6 +34,15 @@ defmodule CraftplanWeb.SettingsLive.FormComponent do
+                 options={currency_options()}
+                 label="Default currency"
+               />
++              <.input
++                field={@form[:batch_sheet_scientific_notation]}
++                type="checkbox"
++                label="Use scientific notation on production batch sheets"
++              />
++              <p class="text-sm text-stone-600">
++                Leave unchecked to print quantities as ordinary decimals, such as 1000 instead of 1E+3.
++                Quantities keep their configured units.
++              </p>
+             </div>
+           </section>
+ 
+diff --git a/priv/repo/migrations/20261007133702_readable_batch_sheet.exs b/priv/repo/migrations/20261007133702_readable_batch_sheet.exs
+new file mode 100644
+index 00000000..12b4e677
+--- /dev/null
++++ b/priv/repo/migrations/20261007133702_readable_batch_sheet.exs
+@@ -0,0 +1,21 @@
++defmodule Craftplan.Repo.Migrations.ReadableBatchSheet do
++  @moduledoc """
++  Updates resources based on their most recent snapshots.
++
++  This file was autogenerated with `mix ash_postgres.generate_migrations`
++  """
++
++  use Ecto.Migration
++
++  def up do
++    alter table(:settings) do
++      add :batch_sheet_scientific_notation, :boolean, null: false, default: false
++    end
++  end
++
++  def down do
++    alter table(:settings) do
++      remove :batch_sheet_scientific_notation
++    end
++  end
++end
+diff --git a/priv/resource_snapshots/repo/settings/20261007133703.json b/priv/resource_snapshots/repo/settings/20261007133703.json
+new file mode 100644
+index 00000000..319ba43f
+--- /dev/null
++++ b/priv/resource_snapshots/repo/settings/20261007133703.json
+@@ -0,0 +1,452 @@
++{
++  "attributes": [
++    {
++      "allow_nil?": false,
++      "default": "fragment(\"gen_random_uuid()\")",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": true,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "id",
++      "type": "uuid"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"USD\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "currency",
++      "type": "text"
++    },
++    {
++      "allow_nil?": false,
++      "default": "false",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "batch_sheet_scientific_notation",
++      "type": "boolean"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "food_business_name",
++      "type": "text"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "food_business_address",
++      "type": "text"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"exclusive\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "tax_mode",
++      "type": "text"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "tax_rate",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": false,
++      "default": "true",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "offers_pickup",
++      "type": "boolean"
++    },
++    {
++      "allow_nil?": false,
++      "default": "true",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "offers_delivery",
++      "type": "boolean"
++    },
++    {
++      "allow_nil?": false,
++      "default": "0",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "lead_time_days",
++      "type": "bigint"
++    },
++    {
++      "allow_nil?": false,
++      "default": "0",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "daily_capacity",
++      "type": "bigint"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "shipping_flat",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "labor_hourly_rate",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "labor_overhead_percent",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"percent\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "retail_markup_mode",
++      "type": "text"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "retail_markup_value",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"percent\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "wholesale_markup_mode",
++      "type": "text"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "wholesale_markup_value",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"Craftplan\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "email_from_name",
++      "type": "text"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"noreply@craftplan.app\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "email_from_address",
++      "type": "text"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"smtp\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "email_provider",
++      "type": "text"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "email_api_key",
++      "type": "binary"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "email_api_secret",
++      "type": "binary"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "email_api_domain",
++      "type": "text"
++    },
++    {
++      "allow_nil?": true,
++      "default": "\"us-east-1\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "email_api_region",
++      "type": "text"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "smtp_host",
++      "type": "text"
++    },
++    {
++      "allow_nil?": true,
++      "default": "587",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "smtp_port",
++      "type": "bigint"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "smtp_username",
++      "type": "text"
++    },
++    {
++      "allow_nil?": true,
++      "default": "nil",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "smtp_password",
++      "type": "text"
++    },
++    {
++      "allow_nil?": true,
++      "default": "\"if_available\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "smtp_tls",
++      "type": "text"
++    },
++    {
++      "allow_nil?": false,
++      "default": "42",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "forecast_lookback_days",
++      "type": "bigint"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0.6\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "forecast_actual_weight",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0.4\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "forecast_planned_weight",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": false,
++      "default": "10",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "forecast_min_samples",
++      "type": "bigint"
++    },
++    {
++      "allow_nil?": false,
++      "default": "\"0.95\"",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "forecast_default_service_level",
++      "type": "decimal"
++    },
++    {
++      "allow_nil?": false,
++      "default": "14",
++      "generated?": false,
++      "precision": null,
++      "primary_key?": false,
++      "references": null,
++      "scale": null,
++      "size": null,
++      "source": "forecast_default_horizon_days",
++      "type": "bigint"
++    }
++  ],
++  "base_filter": null,
++  "check_constraints": [],
++  "create_table_options": null,
++  "custom_indexes": [],
++  "custom_statements": [],
++  "has_create_action": true,
++  "hash": "7BAA4BCF867A825B99392EF8520847EDD4331B1D756BF151A23B8FD0F7D8C0CD",
++  "identities": [],
++  "multitenancy": {
++    "attribute": null,
++    "global": null,
++    "strategy": null
++  },
++  "repo": "Elixir.Craftplan.Repo",
++  "schema": null,
++  "table": "settings"
++}
+\ No newline at end of file
+diff --git a/test/craftplan/batch_sheet_test.exs b/test/craftplan/batch_sheet_test.exs
+new file mode 100644
+index 00000000..21c72ca3
+--- /dev/null
++++ b/test/craftplan/batch_sheet_test.exs
+@@ -0,0 +1,77 @@
++defmodule Craftplan.Production.BatchSheetTest do
++  use ExUnit.Case, async: true
++
++  alias Craftplan.Production.BatchSheet
++  alias Decimal, as: D
++
++  defp sheet(scientific_notation?) do
++    report = %{
++      batch_code: "B-TEST",
++      production_batch: %{planned_qty: D.new("1000"), status: :open},
++      product: %{name: "Blend", sku: "BLEND"},
++      produced_at: nil,
++      orders: [
++        %{
++          order: %{reference: "OR-TEST", delivery_date: nil},
++          customer_name: "Test",
++          quantity: D.new("1000")
++        }
++      ],
++      lots: [
++        %{
++          lot_code: "L-TEST",
++          material: %{name: "Oil"},
++          quantity_used: D.new("0.000001"),
++          expiry_date: nil,
++          supplier: nil
++        }
++      ],
++      totals: %{
++        quantity: D.new("1000"),
++        material_cost: D.new(0),
++        labor_cost: D.new(0),
++        overhead_cost: D.new(0),
++        total_cost: D.new(0),
++        unit_cost: D.new(0)
++      }
++    }
++
++    bom = %{
++      notes: nil,
++      components: [
++        %{
++          component_type: :material,
++          position: 1,
++          material: %{name: "Oil", unit: :gram},
++          quantity: D.new("1000"),
++          waste_percent: D.new("0.001")
++        }
++      ],
++      labor_steps: [
++        %{sequence: 1, name: "Mix", duration_minutes: D.new("1000"), units_per_run: D.new("1000")}
++      ]
++    }
++
++    BatchSheet.build_data(report, bom, :USD, scientific_notation?)
++  end
++
++  test "ordinary decimal mode preserves exact large and small quantities throughout the sheet" do
++    data = sheet(false)
++    assert data["planned_qty"] == "1000"
++    assert hd(data["orders"])["quantity"] == "1000"
++    assert hd(data["bom_components"])["qty_per_unit"] == "1000"
++    assert hd(data["bom_components"])["total_required"] == "1000000"
++    assert hd(data["bom_components"])["waste_percent"] == "0.001"
++    assert hd(data["bom_components"])["unit"] == "gram"
++    assert hd(data["lots"])["quantity_used"] == "0.000001"
++    assert hd(data["labor_steps"])["duration_minutes"] == "1000"
++    assert hd(data["labor_steps"])["units_per_run"] == "1000"
++  end
++
++  test "scientific notation can be enabled" do
++    data = sheet(true)
++    assert data["planned_qty"] == "1E+3"
++    assert hd(data["bom_components"])["total_required"] == "1E+6"
++    assert hd(data["lots"])["quantity_used"] == "0.000001"
++  end
++end
+diff --git a/test/craftplan_web/manage_settings_interactions_live_test.exs b/test/craftplan_web/manage_settings_interactions_live_test.exs
+index e863ea3b..c451fecd 100644
+--- a/test/craftplan_web/manage_settings_interactions_live_test.exs
++++ b/test/craftplan_web/manage_settings_interactions_live_test.exs
+@@ -3,6 +3,37 @@ defmodule CraftplanWeb.ManageSettingsInteractionsLiveTest do
+ 
+   import Phoenix.LiveViewTest
+ 
++  @tag role: :admin
++  test "batch sheet notation defaults to ordinary decimals and persists changes", %{
++    conn: conn,
++    user: user
++  } do
++    {:ok, view, _} = live(conn, ~p"/manage/settings/general")
++
++    assert has_element?(
++             view,
++             "#settings-form input[name='settings[batch_sheet_scientific_notation]']:not([checked])"
++           )
++
++    view
++    |> form("#settings-form", settings: %{batch_sheet_scientific_notation: true})
++    |> render_submit()
++
++    assert Craftplan.Settings.get_settings!(actor: user).batch_sheet_scientific_notation
++    {:ok, view, _} = live(conn, ~p"/manage/settings/general")
++
++    assert has_element?(
++             view,
++             "#settings-form input[type=checkbox][name='settings[batch_sheet_scientific_notation]'][checked]"
++           )
++
++    view
++    |> form("#settings-form", settings: %{batch_sheet_scientific_notation: false})
++    |> render_submit()
++
++    refute Craftplan.Settings.get_settings!(actor: user).batch_sheet_scientific_notation
++  end
++
+   @tag role: :admin
+   test "general settings can be saved", %{conn: conn} do
+     {:ok, view, _html} = live(conn, ~p"/manage/settings/general")

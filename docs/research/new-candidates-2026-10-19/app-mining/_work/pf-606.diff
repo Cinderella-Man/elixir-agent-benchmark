@@ -1,0 +1,171 @@
+diff --git a/lib/pinchflat/fast_indexing/youtube_api.ex b/lib/pinchflat/fast_indexing/youtube_api.ex
+index 95e6b39a4..04c73265c 100644
+--- a/lib/pinchflat/fast_indexing/youtube_api.ex
++++ b/lib/pinchflat/fast_indexing/youtube_api.ex
+@@ -12,6 +12,8 @@ defmodule Pinchflat.FastIndexing.YoutubeApi do
+ 
+   @behaviour YoutubeBehaviour
+ 
++  @agent_name {:global, __MODULE__.KeyIndex}
++
+   @doc """
+   Determines if the YouTube API is enabled for fast indexing by checking
+   if the user has an API key set
+@@ -19,7 +21,7 @@ defmodule Pinchflat.FastIndexing.YoutubeApi do
+   Returns boolean()
+   """
+   @impl YoutubeBehaviour
+-  def enabled?(), do: is_binary(api_key())
++  def enabled?, do: Enum.any?(api_keys())
+ 
+   @doc """
+   Fetches the recent media IDs from the YouTube API for a given source.
+@@ -74,8 +76,45 @@ defmodule Pinchflat.FastIndexing.YoutubeApi do
+     |> FunctionUtils.wrap_ok()
+   end
+ 
+-  defp api_key do
+-    Settings.get!(:youtube_api_key)
++  defp api_keys do
++    case Settings.get!(:youtube_api_key) do
++      nil ->
++        []
++
++      keys ->
++        keys
++        |> String.split(",")
++        |> Enum.map(&String.trim/1)
++        |> Enum.reject(&(&1 == ""))
++    end
++  end
++
++  defp get_or_start_api_key_agent do
++    case Agent.start(fn -> 0 end, name: @agent_name) do
++      {:ok, pid} -> pid
++      {:error, {:already_started, pid}} -> pid
++    end
++  end
++
++  # Gets the next API key in round-robin fashion
++  defp next_api_key do
++    keys = api_keys()
++
++    case keys do
++      [] ->
++        nil
++
++      keys ->
++        pid = get_or_start_api_key_agent()
++
++        current_index =
++          Agent.get_and_update(pid, fn current ->
++            {current, rem(current + 1, length(keys))}
++          end)
++
++        Logger.debug("Using YouTube API key: #{Enum.at(keys, current_index)}")
++        Enum.at(keys, current_index)
++    end
+   end
+ 
+   defp construct_api_endpoint(playlist_id) do
+@@ -83,7 +122,7 @@ defmodule Pinchflat.FastIndexing.YoutubeApi do
+     property_type = "contentDetails"
+     max_results = 50
+ 
+-    "#{api_base}?part=#{property_type}&maxResults=#{max_results}&playlistId=#{playlist_id}&key=#{api_key()}"
++    "#{api_base}?part=#{property_type}&maxResults=#{max_results}&playlistId=#{playlist_id}&key=#{next_api_key()}"
+   end
+ 
+   defp http_client do
+diff --git a/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex b/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
+index 52ae08dd8..b75e58b20 100644
+--- a/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
++++ b/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
+@@ -34,9 +34,9 @@
+ 
+       <.input
+         field={f[:youtube_api_key]}
+-        placeholder="ABC123"
++        placeholder="ABC123,DEF456"
+         type="text"
+-        label="YouTube API Key"
++        label="YouTube API Key(s)"
+         help={youtube_api_help()}
+         html_help={true}
+         inputclass="font-mono text-sm mr-4"
+diff --git a/test/pinchflat/fast_indexing/youtube_api_test.exs b/test/pinchflat/fast_indexing/youtube_api_test.exs
+index cc310d6ca..dde4068c1 100644
+--- a/test/pinchflat/fast_indexing/youtube_api_test.exs
++++ b/test/pinchflat/fast_indexing/youtube_api_test.exs
+@@ -7,31 +7,67 @@ defmodule Pinchflat.FastIndexing.YoutubeApiTest do
+   alias Pinchflat.FastIndexing.YoutubeApi
+ 
+   describe "enabled?/0" do
+-    test "returns true if the user has set a YouTube API key" do
++    test "returns true if the user has set YouTube API keys" do
++      Settings.set(youtube_api_key: "key1, key2")
++      assert YoutubeApi.enabled?()
++    end
++
++    test "returns true with a single API key" do
+       Settings.set(youtube_api_key: "test_key")
+ 
+       assert YoutubeApi.enabled?()
+     end
+ 
+-    test "returns false if the user has not set an API key" do
++    test "returns false if the user has not set any API keys" do
+       Settings.set(youtube_api_key: nil)
++      refute YoutubeApi.enabled?()
++    end
+ 
++    test "returns false if only empty or whitespace keys are provided" do
++      Settings.set(youtube_api_key: "  ,  ,")
+       refute YoutubeApi.enabled?()
+     end
+   end
+ 
+   describe "get_recent_media_ids/1" do
+     setup do
++      case :global.whereis_name(YoutubeApi.KeyIndex) do
++        :undefined -> :ok
++        pid -> Agent.stop(pid)
++      end
++
+       source = source_fixture()
+-      Settings.set(youtube_api_key: "test_key")
++      Settings.set(youtube_api_key: "key1, key2")
+ 
+       {:ok, source: source}
+     end
+ 
++    test "rotates through API keys", %{source: source} do
++      expect(HTTPClientMock, :get, fn url, _headers ->
++        assert url =~ "key=key1"
++        {:ok, "{}"}
++      end)
++
++      expect(HTTPClientMock, :get, fn url, _headers ->
++        assert url =~ "key=key2"
++        {:ok, "{}"}
++      end)
++
++      expect(HTTPClientMock, :get, fn url, _headers ->
++        assert url =~ "key=key1"
++        {:ok, "{}"}
++      end)
++
++      # three calls to verify rotation
++      YoutubeApi.get_recent_media_ids(source)
++      YoutubeApi.get_recent_media_ids(source)
++      YoutubeApi.get_recent_media_ids(source)
++    end
++
+     test "calls the expected URL", %{source: source} do
+       expect(HTTPClientMock, :get, fn url, headers ->
+         api_base = "https://youtube.googleapis.com/youtube/v3/playlistItems"
+-        request_url = "#{api_base}?part=contentDetails&maxResults=50&playlistId=#{source.collection_id}&key=test_key"
++        request_url = "#{api_base}?part=contentDetails&maxResults=50&playlistId=#{source.collection_id}&key=key1"
+ 
+         assert url == request_url
+         assert headers == [accept: "application/json"]

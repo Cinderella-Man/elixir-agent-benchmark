@@ -1,0 +1,938 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/" xml:lang="en-US">
+  <id>tag:github.com,2008:/mtrudel/thousand_island/commits/main/lib/thousand_island/transport.ex</id>
+  <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commits/main/lib/thousand_island/transport.ex"/>
+  <link type="application/atom+xml" rel="self" href="https://github.com/mtrudel/thousand_island/commits/main/lib/thousand_island/transport.ex.atom"/>
+  <title>Recent Commits to thousand_island:main</title>
+  <updated>2026-08-31T20:31:11Z</updated>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/6146e1bfdd1a85c5c16c3c92ad98ff5f11066820</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/6146e1bfdd1a85c5c16c3c92ad98ff5f11066820"/>
+    <title>
+        Fix: Omit the TCP_NODELAY default for Unix domain listeners (#225)
+    </title>
+    <updated>2026-08-31T20:31:11Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/94031664?s=30&amp;v=4"/>
+    <author>
+      <name>mpettibone</name>
+      <uri>https://github.com/mpettibone</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Fix: Omit the TCP_NODELAY default for Unix domain listeners (#225)
+
+Note: I asked Claude to specifically look for spec non-conformance. It found below. Claude helped write the desc, test case and identification of the PR.
+
+## Summary
+
+- Omit Thousand Island&amp;#39;s default `nodelay: true` option when the configured listener address is a Unix domain socket, for both the `ip:` and `ifaddr:` forms of `{:local, path}`.
+- Apply the change once in the shared `ThousandIsland.Transport.resolve_options/1` helper so TCP and SSL listeners behave identically.
+- Document that `nodelay` is conditional and add a regression test that checks the exact options passed to OTP without requiring AF_UNIX support in the test environment.
+
+## Non-conformance
+
+**The rule.** OTP&amp;#39;s [`gen_tcp` documentation](https://www.erlang.org/doc/apps/kernel/gen_tcp.html) states it directly: &amp;quot;The option nodelay is a TCP specific option that is not compatible with domain = local.&amp;quot; On the backend difference it adds: &amp;quot;This does not actually work for inet_backend = inet either, but in that case the error is simply ignored, which is a bad idea. We have chosen to not ignore this error for inet_backend = socket.&amp;quot; The [SSL transport accepts the same underlying listen options](https://www.erlang.org/doc/apps/ssl/ssl.html#type-socket_option). Meanwhile Thousand Island&amp;#39;s own documentation supports `ip: {:local, path}` as a listener address, and OTP additionally accepts the `ifaddr: {:local, path}` form.
+
+**What Thousand Island does today.** `ThousandIsland.Transport.resolve_options/1` appends the default `nodelay: true` to every listener&amp;#39;s options, Unix domain listeners included, for both the TCP and SSL transports.
+
+**What goes wrong.** Under the legacy inet backend the invalid combination is silently ignored, so it happens to work. Under `inet_backend: :socket`, whether selected per listener or node-wide, the incompatibility is enforced and the listener cannot start at all: on OTP 27.3.4 I observed the listen call fail fatally with a `badarg` exit (the documentation describes the rejection as `{:error, :enotsup}`; the observed shape differs, the substance does not). Thousand Island injects an option OTP declares invalid for an address type Thousand Island declares supported, and the cost is a listener that cannot start on the modern backend.
+
+**What this PR makes it do.** The `nodelay: true` default is omitted when the listener address (via `ip:` or `ifaddr:`) is `{:local, path}`. An explicit `nodelay` value from the caller is passed through unchanged in all cases, and IP listeners keep the existing default.
+
+## Test plan
+
+Verified on Elixir 1.18.4 / Erlang OTP 27.3.4 against current `main`:
+
+- `mix test test/thousand_island/transport_options_test.exs` passes.
+- `mix test test/thousand_island/server_test.exs` passes.
+- `mix format --check-formatted`, `mix credo --strict`, and `mix dialyzer` pass.
+- The new test fails on unpatched `main` and passes with this change.
+
+The new test traces the public transport calls into OTP and asserts that both TCP and SSL omit `nodelay` for the `ip` and `ifaddr` forms of `{:local, path}`, preserve an explicit `nodelay` value, and retain `nodelay: true` for IP listeners. This remains deterministic on hosts where Unix domain sockets cannot be opened. The test uses process-scoped call tracing, runs synchronously, and removes its trace pattern after each transport so other tests are unaffected.
+
+## Compatibility / risks
+
+- IP listeners retain the existing `nodelay: true` default.
+- Unix domain listeners no longer receive an inapplicable TCP option, which also unbreaks them under `inet_backend: :socket`.
+- An explicitly supplied `nodelay` option is passed through unchanged.&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/62385e80f43d2197ac55b4092cc8ca44be7491d6</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/62385e80f43d2197ac55b4092cc8ca44be7491d6"/>
+    <title>
+        Fix: Handle socket ownership-transfer errors during connection start …
+    </title>
+    <updated>2026-08-31T20:22:24Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/94031664?s=30&amp;v=4"/>
+    <author>
+      <name>mpettibone</name>
+      <uri>https://github.com/mpettibone</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Fix: Handle socket ownership-transfer errors during connection start (#220)
+
+Note: I asked Claude to specifically look for spec non-conformance. It found below. Claude helped write the desc, test case and identification of the PR.
+
+## Summary
+
+- Check the result of the transport&amp;#39;s `controlling_process/2` callback before activating a newly spawned handler.
+- On ownership-transfer failure, close the accepted socket, terminate the idle handler child, and return a typed `{:controlling_process, reason}` error.
+- Keep the acceptor alive for this per-connection setup failure and emit the existing `:spawn_error` telemetry event with the error attached.
+- Add a deterministic regression test backed by a custom transport proving cleanup occurs and the handler never receives the ready message, plus a server-level test that injects the failure through a live acceptor.
+
+## Non-conformance
+
+Thousand Island discards the return value from `controlling_process/2` and sends `:thousand_island_ready` unconditionally. Both OTP transports document that ownership transfer can return `{:error, reason}`. Continuing after that result violates the ownership contract: the spawned handler is not the controlling process, yet it is told to begin using the socket, while the acceptor still owns the accepted socket.
+
+Authoritative documentation:
+
+- [`gen_tcp:controlling_process/2`](https://www.erlang.org/doc/apps/kernel/gen_tcp.html#controlling_process-2) defines the socket-owner transfer and its error returns.
+- [`ssl:controlling_process/2`](https://www.erlang.org/doc/apps/ssl/ssl.html#controlling_process-2) requires the caller to be the current controlling process and documents `{:error, reason}`.
+
+## Test plan
+
+Verified on Elixir 1.18.4 / Erlang OTP 27.3.4 against current `main`:
+
+- `mix test test/thousand_island/connection_test.exs test/thousand_island/acceptor_test.exs` passes.
+- `mix test test/thousand_island/server_test.exs` passes.
+- `mix format --check-formatted`, `mix credo --strict`, and `mix dialyzer` pass.
+- The new tests fail on unpatched `main` and pass with this change.
+
+The unit regression uses a custom transport implementing `ThousandIsland.Transport`. It deterministically returns `{:error, :badarg}` from `controlling_process/2` and records each operation, verifying that the socket is closed, the handler terminates with `:shutdown`, no ready message is sent, the child is removed from the dynamic supervisor, and the typed error is returned.
+
+The server-level regression injects the same failure through a live acceptor. It verifies the accepted socket closes, `:spawn_error` telemetry contains `{:controlling_process, :badarg}`, the acceptor process survives, and the next client is accepted and echoed normally.
+
+## Compatibility / risks
+
+- Successful ownership transfers are unchanged.
+- A failed transfer now cleans up immediately and is treated as a recoverable per-connection spawn error instead of activating a handler that cannot own the socket.
+- The cleanup waits for the handler&amp;#39;s configured supervisor shutdown behavior. This occurs only on the ownership-transfer error path and ensures the spawned child is not leaked.
+- Existing custom transports are unaffected if they obey the documented `:ok | {:error, reason}` callback contract.&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/6d6a50eec05f1308d4324ca0fbb5b8531795c134</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/6d6a50eec05f1308d4324ca0fbb5b8531795c134"/>
+    <title>
+        Refactor: Share listener option resolution across transports (#218)
+    </title>
+    <updated>2026-08-25T21:37:00Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/94031664?s=30&amp;v=4"/>
+    <author>
+      <name>mpettibone</name>
+      <uri>https://github.com/mpettibone</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Refactor: Share listener option resolution across transports (#218)
+
+During me reading the code, I noticed something that could be simplified. Claude helped with desc.
+
+- Move the shared required and default listener options to `ThousandIsland.Transport`.
+- Add one hidden option resolver used by TCP and SSL.
+- Reduce the transport implementations by 17 lines.
+
+## Why
+
+TCP and SSL independently defined the same required options, the same five defaults, and the same
+first-occurrence option resolution. Keeping that policy in one place makes precedence explicit and
+prevents the transports from drifting.
+
+## Behavior and performance
+
+- Precedence remains required options, then user options, then defaults.
+- The first occurrence of each option key still wins.
+- Bare Erlang transport options remain supported.
+- TCP still moves `inet_backend` to the first position after resolution.
+- SSL still performs the same certificate and key validation after resolution.
+
+Resolution runs once when a listener starts. The extra remote function call is outside the
+per-connection path and has no meaningful performance effect.&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/a2858bbe3d5196c75028fccade983fd8486321ba</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/a2858bbe3d5196c75028fccade983fd8486321ba"/>
+    <title>
+        add a handshake_timeout server option (#211)
+    </title>
+    <updated>2026-08-21T00:41:25Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/94031664?s=30&amp;v=4"/>
+    <author>
+      <name>mpettibone</name>
+      <uri>https://github.com/mpettibone</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;add a handshake_timeout server option (#211)
+
+* add a handshake_timeout server option
+
+Note: ~50 lines of code / ~175 test lines. Claude helped with desc and tests.
+
+
+## What this adds
+
+A new top-level server option, `handshake_timeout`, bounding how long a freshly accepted connection may take to complete its transport handshake (TLS negotiation, in practice). It defaults to 5000 ms; `:infinity` disables the bound. When the timeout elapses, the connection tears down through the existing handshake-error path: the socket is closed, the `num_connections` slot is reclaimed, and the handler sees `c:handle_error/3` with a reason of `:timeout`.
+
+## Why it matters
+
+Today the SSL transport performs its handshake with `:ssl.handshake(socket)`, which per the OTP docs is equivalent to a call with an infinite timeout. `read_timeout` only begins counting after the handshake returns, and nothing else bounds the window. The consequence: a client that opens a TCP connection to a TLS listener and then goes quiet, or dribbles handshake bytes slowly, holds a connection process, a file descriptor, and one slot of `num_connections` indefinitely. A modest number of such sockets, malicious or just broken, quietly eats capacity; with the default capacity math (100 acceptors x 16,384 connections) the file descriptor limit is usually what actually gives out first.
+
+The OTP ssl documentation calls the risk out directly: &amp;quot;Not setting the timeout makes the server more vulnerable to Denial of Service (DoS) attacks.&amp;quot; Ranch has bounded this window since 1.6 with a `handshake_timeout` option defaulting to 5000 ms (confirmed at source: `maps:get(handshake_timeout, TransOpts, 5000)` in ranch_conns_sup), so this is straight competitive parity as well as hardening. The project&amp;#39;s own history shows these servers meet exactly this kind of traffic: the `:econnaborted` handling added to the acceptor in PR #72 was motivated by &amp;quot;SSL weakness probing or incomplete TCP handshakes&amp;quot; observed in the wild.
+
+## Standards and prior art
+
+RFC 8446 does not mandate a server-side handshake timer, but bounding half-open negotiations is standard TLS server hardening, and every mainstream implementation does it: Ranch (`handshake_timeout`, 5000 ms), nginx (`ssl_handshake_timeout`), HAProxy (`timeout client` applies during the handshake). The mechanism here uses only the documented `:ssl.handshake/2` timeout argument, available since OTP 21.
+
+## Design rationale
+
+The plumbing mirrors how `read_timeout` already flows through the codebase: an option on `ThousandIsland`, a field on `ServerConfig`, copied into `HandlerConfig` (the struct acceptors precompute once), carried on the `Socket`, and consumed at the single handshake call site in `Socket.handshake/1`.
+
+The decision worth defending in review is how the timeout reaches transports. `ThousandIsland.Transport.handshake/1` takes only a socket, and custom transports are a documented extension point of this library (the &amp;quot;When Handler Isn&amp;#39;t Enough&amp;quot; escape hatch; issues #141 and #144 both involve people building them), so changing that callback&amp;#39;s arity would break them at runtime. Instead, `handshake/2` (socket, timeout) is added as an optional callback alongside the existing `handshake/1`: `Socket.handshake/1` prefers `handshake/2` when the transport exports it and falls back to `handshake/1` otherwise, via a one-line `function_exported?/3` check. Both bundled transports implement it (TCP ignores the timeout, since it has no handshake; SSL passes it to `:ssl.handshake/2`), and a dedicated compatibility test exercises a transport that implements only `handshake/1` to lock the fallback in. This is the same optional-callback pattern OTP itself uses to evolve behaviours.
+
+On the default: 5000 ms matches Ranch and the OTP guidance, and makes servers safe out of the box. It is a deliberate behavior change for TLS servers that relied on unbounded handshakes, which is why the docs state it plainly and the suggested PR text below proposes a changelog note in the same spirit as the 1.5.0 timeout-separation note. If the maintainer prefers introducing the option with zero behavior change, flipping the default to `:infinity` is a one-line change and the rest of the PR stands as is.
+
+## Performance
+
+Nothing on the per-byte path. Per connection, the additions are one struct field copy and one `function_exported?/3` check (a BIF, nanoseconds) before the handshake call. The timeout itself is managed inside OTP&amp;#39;s ssl app, which already runs a timer-capable state machine per handshake. TCP connections are completely unaffected.
+
+## Tests
+
+Four tests in a new `test/thousand_island/handshake_timeout_test.exs`:
+
+1. Configuration: `handshake_timeout` defaults to 5_000 and accepts `:infinity`.
+2. Stalled handshake: a client connects to a TLS listener at the TCP level and never begins a handshake; with `handshake_timeout: 250` the handler&amp;#39;s `handle_error/3` receives `:timeout`, `connection_pids/1` returns empty (the slot is reclaimed), and the client observes the close.
+3. Happy path: a well-behaved TLS client handshakes and echoes normally under the default timeout, with no option passed.
+4. Compatibility: a transport defined in the test file that implements only `handshake/1` (delegating everything else to the TCP transport) serves a full echo round trip with a finite `handshake_timeout` configured, proving third-party transports keep working untouched.
+
+## Suggested PR description
+
+Title: `Add a handshake_timeout server option (default 5000 ms)`
+
+&amp;gt; A client that connects to a TLS listener and then goes quiet (or dribbles handshake bytes) currently holds its connection process forever: `:ssl.handshake/1` runs with an infinite timeout, and `read_timeout` only starts counting after the handshake completes. Each such socket pins a process, an fd, and a `num_connections` slot. The OTP docs call this out directly (&amp;quot;Not setting the timeout makes the server more vulnerable to Denial of Service (DoS) attacks&amp;quot;), and ranch has bounded it with a 5 second default since 1.6.
+&amp;gt;
+&amp;gt; This adds a `handshake_timeout` option, plumbed the same way `read_timeout` is (ServerConfig -&amp;gt; HandlerConfig -&amp;gt; Socket) and applied at the existing single handshake call site. On timeout the connection tears down through the existing handshake-error path and the handler sees `handle_error/3` with `:timeout`.
+&amp;gt;
+&amp;gt; To keep third-party transports working, `handshake/2` lands as an optional callback alongside the existing `handshake/1`: `Socket.handshake/1` prefers `handshake/2` when a transport exports it and falls back to `handshake/1` otherwise (one `function_exported?/3` check per connection; nothing on the data path). Both bundled transports implement it, TCP ignoring the timeout. A test exercises a transport that implements only `handshake/1` to lock the compatibility in.
+&amp;gt;
+&amp;gt; The default is 5000 ms to match ranch and the OTP guidance, with `:infinity` restoring the previous behaviour. That is a deliberate behavior change for TLS servers that relied on unbounded handshakes, so it likely deserves a changelog note in the same spirit as the 1.5.0 timeout-separation note; happy to flip the default to `:infinity` instead if you&amp;#39;d rather introduce this without any behavior change.
+&amp;gt;
+&amp;gt; Tests cover the stalled-client teardown (error callback, slot reclaimed, client sees close), the happy path under the default, the only-handshake/1 transport fallback, and config defaults.
+
+## The diff
+
+Applies cleanly to main at cbc55d1 with `git apply`.
+
+```diff
+diff --git a/lib/thousand_island.ex b/lib/thousand_island.ex
+index a0dfecd..4218c68 100644
+--- a/lib/thousand_island.ex
++++ b/lib/thousand_island.ex
+@@ -141,6 +141,16 @@ defmodule ThousandIsland do
+   above. Defaults to `5`
+   * `read_timeout`: How long to wait for client data before closing the connection, in
+   milliseconds. Defaults to 60_000
++  * `handshake_timeout`: How long to allow for the transport handshake (such as TLS negotiation)
++  to complete after a client connects, in milliseconds (or `:infinity`). Connections which do not
++  complete their handshake within this time are closed and surfaced to the handler via
++  `c:ThousandIsland.Handler.handle_error/3` with a reason of `:timeout`. Without such a bound, a
++  client which connects and then stalls mid-handshake will hold its connection process (and its
++  slot within `num_connections`) indefinitely. This value is only consulted by transports which
++  perform a handshake (it is ignored by `ThousandIsland.Transports.TCP`, and by custom transports
++  which do not implement the optional `c:ThousandIsland.Transport.handshake/2` callback).
++  Defaults to `5_000` (the same default that Ranch uses); pass `:infinity` to restore the
++  previous unbounded behaviour
+   * `shutdown_timeout`: How long to wait for existing client connections to complete before
+   forcibly shutting those connections down at server shutdown time, in milliseconds. Defaults to
+   15_000. May also be `:infinity` or `:brutal_kill` as described in the `Supervisor`
+@@ -165,6 +175,7 @@ defmodule ThousandIsland do
+           max_connections_retry_count: non_neg_integer(),
+           max_connections_retry_wait: timeout(),
+           read_timeout: timeout(),
++          handshake_timeout: timeout(),
+           shutdown_timeout: timeout(),
+           silent_terminate_on_error: boolean()
+         ]
+diff --git a/lib/thousand_island/handler_config.ex b/lib/thousand_island/handler_config.ex
+index d9608d3..e7d73e4 100644
+--- a/lib/thousand_island/handler_config.ex
++++ b/lib/thousand_island/handler_config.ex
+@@ -6,12 +6,13 @@ defmodule ThousandIsland.HandlerConfig do
+   &amp;quot;&amp;quot;&amp;quot;
+ 
+   @enforce_keys [:handler_module, :transport_module, :read_timeout, :silent_terminate_on_error]
+-  defstruct @enforce_keys
++  defstruct @enforce_keys ++ [handshake_timeout: 5_000]
+ 
+   @type t :: %__MODULE__{
+           handler_module: nil,
+           transport_module: module(),
+           read_timeout: timeout(),
++          handshake_timeout: timeout(),
+           silent_terminate_on_error: boolean()
+         }
+ 
+@@ -25,6 +26,7 @@ defmodule ThousandIsland.HandlerConfig do
+       handler_module: config.handler_module,
+       transport_module: config.transport_module,
+       read_timeout: config.read_timeout,
++      handshake_timeout: config.handshake_timeout,
+       silent_terminate_on_error: config.silent_terminate_on_error
+     }
+   end
+diff --git a/lib/thousand_island/server_config.ex b/lib/thousand_island/server_config.ex
+index eec77cb..f6f985d 100644
+--- a/lib/thousand_island/server_config.ex
++++ b/lib/thousand_island/server_config.ex
+@@ -20,6 +20,7 @@ defmodule ThousandIsland.ServerConfig do
+           max_connections_retry_count: non_neg_integer(),
+           max_connections_retry_wait: timeout(),
+           read_timeout: timeout(),
++          handshake_timeout: timeout(),
+           shutdown_timeout: timeout(),
+           silent_terminate_on_error: boolean()
+         }
+@@ -37,6 +38,7 @@ defmodule ThousandIsland.ServerConfig do
+             max_connections_retry_count: 5,
+             max_connections_retry_wait: 1000,
+             read_timeout: 60_000,
++            handshake_timeout: 5_000,
+             shutdown_timeout: 15_000,
+             silent_terminate_on_error: false
+ 
+diff --git a/lib/thousand_island/socket.ex b/lib/thousand_island/socket.ex
+index 8c23448..ead415d 100644
+--- a/lib/thousand_island/socket.ex
++++ b/lib/thousand_island/socket.ex
+@@ -5,13 +5,14 @@ defmodule ThousandIsland.Socket do
+   &amp;quot;&amp;quot;&amp;quot;
+ 
+   @enforce_keys [:socket, :transport_module, :read_timeout, :silent_terminate_on_error, :span]
+-  defstruct @enforce_keys ++ [:read_timer]
++  defstruct @enforce_keys ++ [:read_timer, handshake_timeout: 5_000]
+ 
+   @typedoc &amp;quot;A reference to a socket along with metadata describing how to use it&amp;quot;
+   @type t :: %__MODULE__{
+           socket: ThousandIsland.Transport.socket(),
+           transport_module: module(),
+           read_timeout: timeout(),
++          handshake_timeout: timeout(),
+           read_timer: reference() | nil,
+           silent_terminate_on_error: boolean(),
+           span: ThousandIsland.Telemetry.t()
+@@ -33,6 +34,7 @@ defmodule ThousandIsland.Socket do
+       socket: raw_socket,
+       transport_module: handler_config.transport_module,
+       read_timeout: handler_config.read_timeout,
++      handshake_timeout: handler_config.handshake_timeout,
+       silent_terminate_on_error: handler_config.silent_terminate_on_error,
+       span: span
+     }
+@@ -46,7 +48,7 @@ defmodule ThousandIsland.Socket do
+   &amp;quot;&amp;quot;&amp;quot;
+   @spec handshake(t()) :: ThousandIsland.Transport.on_handshake()
+   def handshake(%__MODULE__{} = socket) do
+-    case socket.transport_module.handshake(socket.socket) do
++    case do_handshake(socket) do
+       {:ok, inner_socket} -&amp;gt;
+         {:ok, %{socket | socket: inner_socket}}
+ 
+@@ -56,6 +58,14 @@ defmodule ThousandIsland.Socket do
+     end
+   end
+ 
++  defp do_handshake(%__MODULE__{} = socket) do
++    if function_exported?(socket.transport_module, :handshake, 2) do
++      socket.transport_module.handshake(socket.socket, socket.handshake_timeout)
++    else
++      socket.transport_module.handshake(socket.socket)
++    end
++  end
++
+   @doc &amp;quot;&amp;quot;&amp;quot;
+   Upgrades the transport of the socket to use the specified transport module, performing any client
+   handshaking that may be required. The passed options are blindly passed through to the new
+diff --git a/lib/thousand_island/transport.ex b/lib/thousand_island/transport.ex
+index 24ee01d..dbfa123 100644
+--- a/lib/thousand_island/transport.ex
++++ b/lib/thousand_island/transport.ex
+@@ -122,6 +122,18 @@ defmodule ThousandIsland.Transport do
+   &amp;quot;&amp;quot;&amp;quot;
+   @callback handshake(socket()) :: on_handshake()
+ 
++  @doc &amp;quot;&amp;quot;&amp;quot;
++  Performs an initial handshake on a new client connection (such as that done when negotiating an
++  SSL connection), waiting at most `timeout` milliseconds for it to complete. This optional
++  callback is invoked in preference to `c:handshake/1` whenever it is implemented; transports
++  which do not implement it will have `c:handshake/1` called regardless of any configured
++  `handshake_timeout`. Transports which do not have a handshake can simply pass the socket
++  through unchanged.
++  &amp;quot;&amp;quot;&amp;quot;
++  @callback handshake(socket(), timeout()) :: on_handshake()
++
++  @optional_callbacks handshake: 2
++
+   @doc &amp;quot;&amp;quot;&amp;quot;
+   Performs an upgrade of an existing client connection (for example upgrading
+   an already-established connection to SSL). Transports which do not support upgrading can return
+diff --git a/lib/thousand_island/transports/ssl.ex b/lib/thousand_island/transports/ssl.ex
+index 35c81d4..7ecfdbe 100644
+--- a/lib/thousand_island/transports/ssl.ex
++++ b/lib/thousand_island/transports/ssl.ex
+@@ -93,8 +93,13 @@ defmodule ThousandIsland.Transports.SSL do
+ 
+   @impl ThousandIsland.Transport
+   @spec handshake(socket()) :: ThousandIsland.Transport.on_handshake()
+-  def handshake(socket) do
+-    case :ssl.handshake(socket) do
++  def handshake(socket), do: handshake(socket, :infinity)
++
++  @impl ThousandIsland.Transport
++  @spec handshake(socket(), timeout()) :: ThousandIsland.Transport.on_handshake()
++  def handshake(socket, timeout) do
++    case :ssl.handshake(socket, timeout) do
++      {:ok, socket} -&amp;gt; {:ok, socket}
+       {:ok, socket, _protocol_extensions} -&amp;gt; {:ok, socket}
+       other -&amp;gt; other
+     end
+diff --git a/lib/thousand_island/transports/tcp.ex b/lib/thousand_island/transports/tcp.ex
+index f0e9e2d..4580a22 100644
+--- a/lib/thousand_island/transports/tcp.ex
++++ b/lib/thousand_island/transports/tcp.ex
+@@ -83,6 +83,10 @@ defmodule ThousandIsland.Transports.TCP do
+   @spec handshake(socket()) :: ThousandIsland.Transport.on_handshake()
+   def handshake(socket), do: {:ok, socket}
+ 
++  @impl ThousandIsland.Transport
++  @spec handshake(socket(), timeout()) :: ThousandIsland.Transport.on_handshake()
++  def handshake(socket, _timeout), do: {:ok, socket}
++
+   @impl ThousandIsland.Transport
+   @spec upgrade(socket(), options()) :: ThousandIsland.Transport.on_upgrade()
+   def upgrade(_, _), do: {:error, :unsupported_upgrade}
+diff --git a/test/thousand_island/handshake_timeout_test.exs b/test/thousand_island/handshake_timeout_test.exs
+new file mode 100644
+index 0000000..961f903
+--- /dev/null
++++ b/test/thousand_island/handshake_timeout_test.exs
+@@ -0,0 +1,175 @@
++defmodule ThousandIsland.HandshakeTimeoutTest do
++  use ExUnit.Case, async: true
++
++  defmodule Echo do
++    use ThousandIsland.Handler
++
++    @impl ThousandIsland.Handler
++    def handle_data(data, socket, state) do
++      ThousandIsland.Socket.send(socket, data)
++      {:continue, state}
++    end
++  end
++
++  defmodule Error do
++    use ThousandIsland.Handler
++
++    @impl ThousandIsland.Handler
++    def handle_error(error, _socket, state) do
++      # Send error to test process
++      case :proplists.get_value(:test_pid, state) do
++        pid when is_pid(pid) -&amp;gt;
++          send(pid, error)
++          :ok
++
++        _ -&amp;gt;
++          raise &amp;quot;missing :test_pid for Error handler&amp;quot;
++      end
++    end
++  end
++
++  defmodule LegacyTransport do
++    # A transport which implements only the original handshake/1 callback, as any third-party
++    # transport written before the optional handshake/2 callback existed would. Everything else
++    # delegates to the TCP transport
++    @behaviour ThousandIsland.Transport
++
++    @impl ThousandIsland.Transport
++    defdelegate listen(port, options), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate accept(listener_socket), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    def handshake(socket), do: {:ok, socket}
++
++    @impl ThousandIsland.Transport
++    defdelegate upgrade(socket, opts), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate controlling_process(socket, pid), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate recv(socket, length, timeout), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate send(socket, data), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate sendfile(socket, filename, offset, length), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate getopts(socket, options), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate setopts(socket, options), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate shutdown(socket, way), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate close(socket), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate sockname(socket), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate peername(socket), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate peercert(socket), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate secure?(), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate getstat(socket), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate negotiated_protocol(socket), to: ThousandIsland.Transports.TCP
++
++    @impl ThousandIsland.Transport
++    defdelegate connection_information(socket), to: ThousandIsland.Transports.TCP
++  end
++
++  describe &amp;quot;configuration&amp;quot; do
++    test &amp;quot;handshake_timeout defaults to 5000 ms and accepts :infinity&amp;quot; do
++      config = ThousandIsland.ServerConfig.new(handler_module: Echo)
++      assert config.handshake_timeout == 5_000
++
++      config = ThousandIsland.ServerConfig.new(handler_module: Echo, handshake_timeout: :infinity)
++      assert config.handshake_timeout == :infinity
++    end
++  end
++
++  describe &amp;quot;TLS handshakes&amp;quot; do
++    @tag capture_log: true
++    test &amp;quot;a stalled handshake is actively closed once handshake_timeout elapses&amp;quot; do
++      {:ok, server_pid, port} =
++        start_handler(Error,
++          handler_options: [test_pid: self()],
++          handshake_timeout: 250,
++          transport_module: ThousandIsland.Transports.SSL,
++          transport_options: [
++            certfile: Path.join(__DIR__, &amp;quot;../support/cert.pem&amp;quot;),
++            keyfile: Path.join(__DIR__, &amp;quot;../support/key.pem&amp;quot;)
++          ]
++        )
++
++      # Connect at the TCP level but never start a TLS handshake
++      {:ok, client} = :gen_tcp.connect(~c&amp;quot;localhost&amp;quot;, port, active: false)
++
++      assert_receive :timeout, 1000
++
++      # The connection process should be gone and the socket closed underneath the client
++      Process.sleep(100)
++      assert {:ok, []} = ThousandIsland.connection_pids(server_pid)
++      assert :gen_tcp.recv(client, 0, 100) == {:error, :closed}
++
++      :gen_tcp.close(client)
++    end
++
++    test &amp;quot;well-behaved clients handshake and communicate normally under the default timeout&amp;quot; do
++      {:ok, _server_pid, port} =
++        start_handler(Echo,
++          transport_module: ThousandIsland.Transports.SSL,
++          transport_options: [
++            certfile: Path.join(__DIR__, &amp;quot;../support/cert.pem&amp;quot;),
++            keyfile: Path.join(__DIR__, &amp;quot;../support/key.pem&amp;quot;)
++          ]
++        )
++
++      {:ok, client} =
++        :ssl.connect(~c&amp;quot;localhost&amp;quot;, port,
++          active: false,
++          verify: :verify_peer,
++          cacertfile: Path.join(__DIR__, &amp;quot;../support/ca.pem&amp;quot;)
++        )
++
++      :ok = :ssl.send(client, &amp;quot;HELLO&amp;quot;)
++      assert :ssl.recv(client, 5, 1000) == {:ok, ~c&amp;quot;HELLO&amp;quot;}
++
++      :ssl.close(client)
++    end
++  end
++
++  describe &amp;quot;backwards compatibility&amp;quot; do
++    test &amp;quot;transports which implement only handshake/1 continue to work&amp;quot; do
++      {:ok, _server_pid, port} =
++        start_handler(Echo, transport_module: LegacyTransport, handshake_timeout: 250)
++
++      {:ok, client} = :gen_tcp.connect(~c&amp;quot;localhost&amp;quot;, port, active: false)
++      :ok = :gen_tcp.send(client, &amp;quot;HELLO&amp;quot;)
++      assert :gen_tcp.recv(client, 0, 1000) == {:ok, ~c&amp;quot;HELLO&amp;quot;}
++
++      :gen_tcp.close(client)
++    end
++  end
++
++  defp start_handler(handler, opts) do
++    resolved_args = opts |&amp;gt; Keyword.put_new(:port, 0) |&amp;gt; Keyword.put(:handler_module, handler)
++    {:ok, server_pid} = start_supervised({ThousandIsland, resolved_args})
++    {:ok, {_ip, port}} = ThousandIsland.listener_info(server_pid)
++    {:ok, server_pid, port}
++  end
++end
+```
+
+* Drop redundant handshake_timeout struct defaults
+
+* Fold handshake timeout tests into socket_test and config_test
+
+* Delete test/thousand_island/handshake_timeout_test.exs
+
+* Fixup busted merge
+
+* Add missing setup func
+
+---------
+
+Co-authored-by: Mat Trudel &amp;lt;mat@geeky.net&amp;gt;&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/a3bd50df4ae21b2431d1725393994ee83e4a9c6d</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/a3bd50df4ae21b2431d1725393994ee83e4a9c6d"/>
+    <title>
+        Add support for Socket.connection_infomation/1 (#169)
+    </title>
+    <updated>2025-05-25T19:35:54Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Add support for Socket.connection_infomation/1 (#169)&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/d899b490a0f7ea0e9dc214dc750ac8bdeb79ecfc</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/d899b490a0f7ea0e9dc214dc750ac8bdeb79ecfc"/>
+    <title>
+        feat: allow switching the transport while running (#86)
+    </title>
+    <updated>2023-12-29T17:36:21Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/1357760?s=30&amp;v=4"/>
+    <author>
+      <name>icehaunter</name>
+      <uri>https://github.com/icehaunter</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;feat: allow switching the transport while running (#86)
+
+* feat: allow switching the transport while running
+
+* Fixed a typo in test
+
+* disabled client verify
+
+* Move credo config to file
+
+* Tidy up typespecs
+
+* Move to upgrade naming
+
+---------
+
+Co-authored-by: Mat Trudel &amp;lt;mat@geeky.net&amp;gt;&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/bcf5f031095161c4fe81e41016ecbf7b3494d1f7</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/bcf5f031095161c4fe81e41016ecbf7b3494d1f7"/>
+    <title>
+        Fix doc typo
+    </title>
+    <updated>2023-07-14T13:48:36Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Fix doc typo&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/29caa87034087e8d906a3908a3f29b24e76e81f8</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/29caa87034087e8d906a3908a3f29b24e76e81f8"/>
+    <title>
+        Pulling the signatures up from OTP from peer_info/1, local_info/1 (#67)
+    </title>
+    <updated>2023-06-16T17:48:08Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/29058?s=30&amp;v=4"/>
+    <author>
+      <name>asakura</name>
+      <uri>https://github.com/asakura</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Pulling the signatures up from OTP from peer_info/1, local_info/1 (#67)
+
+* Delegate peer_info/1, local_info/1 to OTP library
+
+* Rename peer_info/1 to peername/1
+
+* Rename local_info/1 to sockname/1
+
+* Add and implement peercert/1 callback
+
+* Handle errors in peername/1, sockname/1 during initi. and conne.
+
+* Ignore returned value
+
+* Simply close the socket and stop GenServer if conn. closed prematurely
+
+* Revert dot access for server_config
+
+* Revert to dot access&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/1c960ca480ac4ecbee030e9dc247ef8d0931aaf1</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/1c960ca480ac4ecbee030e9dc247ef8d0931aaf1"/>
+    <title>
+        Redesign Telemetry so its implementation details won&#39;t leak outside (…
+    </title>
+    <updated>2023-06-14T13:34:23Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/29058?s=30&amp;v=4"/>
+    <author>
+      <name>asakura</name>
+      <uri>https://github.com/asakura</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Redesign Telemetry so its implementation details won&amp;#39;t leak outside (#65)
+
+* Redesign Telemetry so its implementation details won&amp;#39;t leak outside
+
+* Partially revert &amp;quot;Redesign Telemetry so its implementation details won&amp;#39;t leak outside&amp;quot;
+
+This reverts commit 77717c8afdc8034131d80bb7efe3950904b67dfd.
+
+* Tidy up specs in Telemetry&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/50447270eba5676597a5ac727a935cbfe3a34909</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/50447270eba5676597a5ac727a935cbfe3a34909"/>
+    <title>
+        Adjust types for local_info/1, peer_info/1, negotiated_protocol/1 (#66)
+    </title>
+    <updated>2023-06-12T13:04:57Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/29058?s=30&amp;v=4"/>
+    <author>
+      <name>asakura</name>
+      <uri>https://github.com/asakura</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Adjust types for local_info/1, peer_info/1, negotiated_protocol/1 (#66)&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/3d1b1b568e548d93121e85210700181c10812f6c</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/3d1b1b568e548d93121e85210700181c10812f6c"/>
+    <title>
+        Tackle some rough edges (#64)
+    </title>
+    <updated>2023-06-05T16:58:30Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/29058?s=30&amp;v=4"/>
+    <author>
+      <name>asakura</name>
+      <uri>https://github.com/asakura</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Tackle some rough edges (#64)
+
+* Use elixirc paths to require modules in the support folder
+
+* Convert private types to public to reveal their internals in docs
+
+* Fixes couple of things in doc strings
+
+* Adds transport_module type
+
+* Fixes Dialyzer warnings in macro generated code in Handler module
+
+* Ignore :unmatch_return in telemetry_collector.exs&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/8076441dbeef4f9b6596c6d99e77628fbf5e8dfe</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/8076441dbeef4f9b6596c6d99e77628fbf5e8dfe"/>
+    <title>
+        :ssl.negotiated_protocol/1 might return :closed (#63)
+    </title>
+    <updated>2023-06-02T14:57:50Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/29058?s=30&amp;v=4"/>
+    <author>
+      <name>asakura</name>
+      <uri>https://github.com/asakura</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;:ssl.negotiated_protocol/1 might return :closed (#63)
+
+There is a PR for the OTP: https://github.com/erlang/otp/pull/7279&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/c289c57b7ecd2d3cc8561874e862448bc956c314</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/c289c57b7ecd2d3cc8561874e862448bc956c314"/>
+    <title>
+        Refines types for Transport behaviour, TCP, and SSL implementations (…
+    </title>
+    <updated>2023-06-01T16:19:53Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/29058?s=30&amp;v=4"/>
+    <author>
+      <name>asakura</name>
+      <uri>https://github.com/asakura</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Refines types for Transport behaviour, TCP, and SSL implementations (#62)
+
+* Refines types for Transport behaviour, TCP, and SSL implementations
+
+* Use narrow types for transports and their behaviour&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/6ea0dd69ed83208eb67614ac1c344affd0a4c15d</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/6ea0dd69ed83208eb67614ac1c344affd0a4c15d"/>
+    <title>
+        Tighten up typespecs
+    </title>
+    <updated>2022-07-18T18:09:06Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Tighten up typespecs&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/fc4ec06ed8e94cd5af05cd38219ab7cc129f73fd</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/fc4ec06ed8e94cd5af05cd38219ab7cc129f73fd"/>
+    <title>
+        Fixup to changes introduced in 0.5.6
+    </title>
+    <updated>2022-04-14T20:41:11Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Fixup to changes introduced in 0.5.6&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/a7a861cab2048d68d1b0b2a7c96d19f76f1ccfa7</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/a7a861cab2048d68d1b0b2a7c96d19f76f1ccfa7"/>
+    <title>
+        Fixup to changes introduced in 0.5.5
+    </title>
+    <updated>2022-04-14T20:35:16Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Fixup to changes introduced in 0.5.5&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/c823636ce96a5ecafacca6ebc19bcd38cff5c4eb</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/c823636ce96a5ecafacca6ebc19bcd38cff5c4eb"/>
+    <title>
+        Remove local_port/1 in favour of listener_info/1
+    </title>
+    <updated>2022-04-06T23:24:56Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Remove local_port/1 in favour of listener_info/1&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/61a2b7af1c43edde59cae0cdba2a71fc13208a59</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/61a2b7af1c43edde59cae0cdba2a71fc13208a59"/>
+    <title>
+        Support Socket.getopts/2 (#11)
+    </title>
+    <updated>2022-02-03T21:14:30Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/13366?s=30&amp;v=4"/>
+    <author>
+      <name>ewildgoose</name>
+      <uri>https://github.com/ewildgoose</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Support Socket.getopts/2 (#11)
+
+We already have support for Socket.setopts/2, so also add support
+for getopts/2 to read socket options
+
+Note: also correcting the type specifications for {:error, error}
+results, which are defined as being Posix error results in general,
+however, the SSL app defines it&amp;#39;s errors as any(), so we go
+with the widest definition
+
+Co-authored-by: Ed Wildgoose &amp;lt;ed+git@wildgooses.com&amp;gt;&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/5a23685d55390d4c00dd5759a2bacac8a5c28d1c</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/5a23685d55390d4c00dd5759a2bacac8a5c28d1c"/>
+    <title>
+        Format and remove trailing whitespace (#12)
+    </title>
+    <updated>2022-02-01T15:11:42Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/13366?s=30&amp;v=4"/>
+    <author>
+      <name>ewildgoose</name>
+      <uri>https://github.com/ewildgoose</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Format and remove trailing whitespace (#12)
+
+Co-authored-by: Ed Wildgoose &amp;lt;ed+git@wildgooses.com&amp;gt;&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/c25caac5f19582bc596da8434c4841853bff7a3b</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/c25caac5f19582bc596da8434c4841853bff7a3b"/>
+    <title>
+        Define Socket.secure?/1 function
+    </title>
+    <updated>2021-09-24T00:48:10Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Define Socket.secure?/1 function&lt;/pre&gt;
+    </content>
+  </entry>
+</feed>

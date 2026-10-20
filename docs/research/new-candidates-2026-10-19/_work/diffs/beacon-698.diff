@@ -1,0 +1,100 @@
+diff --git a/lib/beacon/router.ex b/lib/beacon/router.ex
+index 50fd83dc8..e01b0aa61 100644
+--- a/lib/beacon/router.ex
++++ b/lib/beacon/router.ex
+@@ -270,10 +270,24 @@ defmodule Beacon.Router do
+   # match and invalidate the `beacon_site` mount.
+   def reachable?(%Beacon.Config{} = config, opts \\ []) do
+     %{site: site, endpoint: endpoint, router: router} = config
++
+     host = Keyword.get_lazy(opts, :host, fn -> endpoint.host() end)
+-    prefix = router.__beacon_scoped_prefix_for_site__(site)
++
++    prefix =
++      Keyword.get_lazy(opts, :prefix, fn ->
++        router.__beacon_scoped_prefix_for_site__(site)
++      end)
+ 
+     case Phoenix.Router.route_info(router, "GET", prefix, host) do
++      # bypass and allow booting beacon sites even though there's a route conflict
++      # but only for root paths, for example:
++      #   live /
++      #   beacon_site /
++      # that's because even though they share the same prefix,
++      # beacon can still serve pages at /:page
++      %{route: "/"} ->
++        true
++
+       %{phoenix_live_view: {Beacon.Web.PageLive, _, _, %{extra: %{session: %{"beacon_site" => ^site}}}}} ->
+         true
+ 
+diff --git a/test/beacon/router_test.exs b/test/beacon/router_test.exs
+index c0e900737..c53e3e2fa 100644
+--- a/test/beacon/router_test.exs
++++ b/test/beacon/router_test.exs
+@@ -63,14 +63,28 @@ defmodule Beacon.RouterTest do
+   end
+ 
+   describe "reachable?" do
+-    test "test" do
++    setup do
+       site = :host_test
+       config = Beacon.Config.fetch!(site)
+-      valid_host = "host.com"
++      [config: config]
++    end
+ 
++    test "match existing host", %{config: config} do
++      valid_host = "host.com"
+       assert Router.reachable?(config, host: valid_host)
+-      refute Router.reachable?(%{config | site: :my_site}, host: valid_host)
+-      refute Router.reachable?(config, host: "other.com")
++    end
++
++    test "existing nested conflicting route", %{config: config} do
++      valid_host = "host.com"
++      refute Router.reachable?(config, host: valid_host, prefix: "/nested/some_page")
++    end
++
++    test "with no specific host", %{config: config} do
++      assert Router.reachable?(config, host: nil)
++    end
++
++    test "do not match any existing host/path", %{config: config} do
++      refute Router.reachable?(config, host: nil, prefix: "/nested/invalid")
+     end
+   end
+ end
+diff --git a/test/support/live_views.ex b/test/support/live_views.ex
+new file mode 100644
+index 000000000..dc7f15889
+--- /dev/null
++++ b/test/support/live_views.ex
+@@ -0,0 +1,4 @@
++defmodule Beacon.BeaconTest.LiveViews.FooBarLive do
++  use Phoenix.LiveView
++  def render(assigns), do: ~H""
++end
+diff --git a/test/support/router.ex b/test/support/router.ex
+index 9668c15e2..ba17b83b3 100644
+--- a/test/support/router.ex
++++ b/test/support/router.ex
+@@ -16,8 +16,17 @@ defmodule Beacon.BeaconTest.Router do
+     beacon_site "/media", site: :s3_site
+   end
+ 
+-  # test :host
++  scope "/" do
++    pipe_through :browser
++
++    live_session :default do
++      live "/", Beacon.BeaconTest.LiveViews.FooBarLive
++      live "/nested/:page", Beacon.BeaconTest.LiveViews.FooBarLive
++    end
++  end
++
+   scope path: "/", host: "host.com" do
++    pipe_through :browser
+     beacon_site "/", site: :host_test
+   end
+ 

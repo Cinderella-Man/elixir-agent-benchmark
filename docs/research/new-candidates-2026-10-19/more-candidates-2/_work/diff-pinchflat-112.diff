@@ -1,0 +1,62 @@
+diff --git a/.iex.exs b/.iex.exs
+index 19b65cb63..2d68cf508 100644
+--- a/.iex.exs
++++ b/.iex.exs
+@@ -21,31 +21,3 @@ alias Pinchflat.FastIndexing.YoutubeRss
+ alias Pinchflat.Metadata.MetadataFileHelpers
+ 
+ alias Pinchflat.SlowIndexing.FileFollowerServer
+-
+-defmodule IexHelpers do
+-  def last_media_item do
+-    Repo.one(from m in MediaItem, limit: 1)
+-  end
+-
+-  def details(type) do
+-    source =
+-      case type do
+-        :playlist -> playlist_url()
+-        :channel -> channel_url()
+-      end
+-
+-    YtDlpCollection.get_source_details(source)
+-  end
+-
+-  def ids(type) do
+-    source =
+-      case type do
+-        :playlist -> playlist_url()
+-        :channel -> channel_url()
+-      end
+-
+-    YtDlpCollection.get_media_attributes_for_collection(source)
+-  end
+-end
+-
+-import IexHelpers
+diff --git a/lib/pinchflat/boot/pre_job_startup_tasks.ex b/lib/pinchflat/boot/pre_job_startup_tasks.ex
+index c3e5e9b27..df9bb7518 100644
+--- a/lib/pinchflat/boot/pre_job_startup_tasks.ex
++++ b/lib/pinchflat/boot/pre_job_startup_tasks.ex
+@@ -31,6 +31,7 @@ defmodule Pinchflat.Boot.PreJobStartupTasks do
+   """
+   @impl true
+   def init(state) do
++    reset_executing_jobs()
+     apply_default_settings()
+     ensure_directories_are_writeable()
+     rename_old_job_workers()
+@@ -38,6 +39,13 @@ defmodule Pinchflat.Boot.PreJobStartupTasks do
+     {:ok, state}
+   end
+ 
++  # If a node cannot gracefully shut down, the currently executing jobs get stuck
++  # in the "executing" state. This is a problem because the job runner will not
++  # pick them up again
++  defp reset_executing_jobs do
++    Repo.update_all(from(j in Oban.Job, where: j.state == "executing"), set: [state: "retryable"])
++  end
++
+   defp apply_default_settings do
+     Settings.fetch!(:onboarding, true)
+     Settings.fetch!(:pro_enabled, false)

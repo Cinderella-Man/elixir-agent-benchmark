@@ -779,6 +779,9 @@ defmodule EabWeb.DashboardLive do
               {@endpoint["identity_note"] ||
                 "Server-reported metadata. Artifact identity is unverified."}
             </p>
+            <p :if={not @chatgpt} id="memory-collection-status" class="fine-print">
+              {Eab.MemoryMonitor.configuration_label(@endpoint)}
+            </p>
           </div>
           <form id="settings" phx-change="settings">
             <details class="advanced">

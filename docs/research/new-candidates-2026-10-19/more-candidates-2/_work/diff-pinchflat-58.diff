@@ -1,0 +1,3798 @@
+diff --git a/.iex.exs b/.iex.exs
+index 52a238bbb..8a0ac7935 100644
+--- a/.iex.exs
++++ b/.iex.exs
+@@ -1,10 +1,10 @@
+ alias Pinchflat.Repo
+ 
+ alias Pinchflat.Tasks.Task
++alias Pinchflat.Sources.Source
+ alias Pinchflat.Media.MediaItem
+ alias Pinchflat.Tasks.SourceTasks
+ alias Pinchflat.Media.MediaMetadata
+-alias Pinchflat.Sources.Source
+ alias Pinchflat.Profiles.MediaProfile
+ 
+ alias Pinchflat.Tasks
+@@ -13,8 +13,12 @@ alias Pinchflat.Profiles
+ alias Pinchflat.Sources
+ alias Pinchflat.Settings
+ 
+-alias Pinchflat.MediaClient.{SourceDetails, MediaDownloader}
+-alias Pinchflat.Metadata.{Zipper, ThumbnailFetcher}
++alias Pinchflat.MediaClient.MediaDownloader
++alias Pinchflat.YtDlp.Backend.Media, as: YtDlpMedia
++alias Pinchflat.YtDlp.Backend.MediaCollection, as: YtDlpCollection
++
++alias Pinchflat.Api.YoutubeRss
++alias Pinchflat.Metadata.MetadataFileHelpers
+ 
+ alias Pinchflat.Utils.FilesystemUtils.FileFollowerServer
+ 
+@@ -38,7 +42,7 @@ defmodule IexHelpers do
+         :channel -> channel_url()
+       end
+ 
+-    SourceDetails.get_source_details(source)
++    YtDlpCollection.get_source_details(source)
+   end
+ 
+   def ids(type) do
+@@ -48,7 +52,7 @@ defmodule IexHelpers do
+         :channel -> channel_url()
+       end
+ 
+-    SourceDetails.get_media_attributes(source)
++    YtDlpCollection.get_media_attributes_for_collection(source)
+   end
+ end
+ 
+diff --git a/config/config.exs b/config/config.exs
+index 47182656a..4396f4bfb 100644
+--- a/config/config.exs
++++ b/config/config.exs
+@@ -12,7 +12,7 @@ config :pinchflat,
+   generators: [timestamp_type: :utc_datetime],
+   # Specifying backend data here makes mocking and local testing SUPER easy
+   yt_dlp_executable: System.find_executable("yt-dlp"),
+-  yt_dlp_runner: Pinchflat.MediaClient.Backends.YtDlp.CommandRunner,
++  yt_dlp_runner: Pinchflat.YtDlp.Backend.CommandRunner,
+   media_directory: "/downloads",
+   # The user may or may not store metadata for their needs, but the app will always store its copy
+   metadata_directory: "/config/metadata",
+@@ -40,7 +40,14 @@ config :pinchflat, Oban,
+   # Keep old jobs for 30 days for display in the UI
+   plugins: [{Oban.Plugins.Pruner, max_age: 30 * 24 * 60 * 60}],
+   # TODO: consider making this an env var or something?
+-  queues: [default: 10, media_indexing: 2, media_fetching: 2, media_local_metadata: 8]
++  queues: [
++    default: 10,
++    fast_indexing: 6,
++    media_indexing: 2,
++    media_collection_indexing: 2,
++    media_fetching: 2,
++    media_local_metadata: 8
++  ]
+ 
+ # Configures the mailer
+ #
+diff --git a/lib/pinchflat/api/youtube_rss.ex b/lib/pinchflat/api/youtube_rss.ex
+new file mode 100644
+index 000000000..7eef95925
+--- /dev/null
++++ b/lib/pinchflat/api/youtube_rss.ex
+@@ -0,0 +1,51 @@
++defmodule Pinchflat.Api.YoutubeRss do
++  @moduledoc """
++  Methods for interacting with YouTube RSS feeds
++  """
++
++  require Logger
++
++  alias Pinchflat.Sources.Source
++
++  @doc """
++  Fetches the recent media IDs from a YouTube RSS feed for a given source.
++
++  Returns {:ok, [binary()]} | {:error, binary()}
++  """
++  def get_recent_media_ids_from_rss(%Source{} = source) do
++    Logger.debug("Fetching recent media IDs from YouTube RSS feed for source: #{source.collection_id}")
++
++    case http_client().get(rss_url_for_source(source)) do
++      {:ok, response} ->
++        response = to_string(response)
++        media_id_regex = ~r/<yt:videoId>(.*?)<\/yt:videoId>/
++
++        # Don't get on me about using regex to search XML.
++        # The content is known, well-formed, and simple.
++        media_ids =
++          media_id_regex
++          |> Regex.scan(response)
++          |> Enum.map(fn [_, id] -> String.trim(id) end)
++          |> Enum.filter(&(String.length(&1) > 0))
++          |> Enum.uniq()
++
++        Logger.debug("Media ids fetched from RSS: #{inspect(media_ids)}")
++
++        {:ok, media_ids}
++
++      {:error, _reason} ->
++        {:error, "Failed to fetch RSS feed"}
++    end
++  end
++
++  defp rss_url_for_source(source) do
++    case source.collection_type do
++      :channel -> "https://www.youtube.com/feeds/videos.xml?channel_id=#{source.collection_id}"
++      :playlist -> "https://www.youtube.com/feeds/videos.xml?playlist_id=#{source.collection_id}"
++    end
++  end
++
++  defp http_client do
++    Application.get_env(:pinchflat, :http_client, Pinchflat.HTTP.HTTPClient)
++  end
++end
+diff --git a/lib/pinchflat/http/http_behaviour.ex b/lib/pinchflat/http/http_behaviour.ex
+index 2fe639e43..b9c37036d 100644
+--- a/lib/pinchflat/http/http_behaviour.ex
++++ b/lib/pinchflat/http/http_behaviour.ex
+@@ -4,5 +4,7 @@ defmodule Pinchflat.HTTP.HTTPBehaviour do
+   so I can use Mox to create an HTTP mock
+   """
+ 
++  @callback get(String.t()) :: {:ok, String.t()} | {:error, String.t()}
++  @callback get(String.t(), Keyword.t()) :: {:ok, String.t()} | {:error, String.t()}
+   @callback get(String.t(), Keyword.t(), Keyword.t()) :: {:ok, String.t()} | {:error, String.t()}
+ end
+diff --git a/lib/pinchflat/media.ex b/lib/pinchflat/media.ex
+index 3f2aed172..a3127f618 100644
+--- a/lib/pinchflat/media.ex
++++ b/lib/pinchflat/media.ex
+@@ -31,6 +31,22 @@ defmodule Pinchflat.Media do
+     |> Repo.all()
+   end
+ 
++  @doc """
++  Fetches all media items belonging to a given source that have a media_id in the given list.
++  Useful for determining the what media items we DON'T already have for fast indexing.
++
++  NOTE: These queries are getting a little tedious. When I have the time, I should see about
++  implementing a query pattern and having these compose queries from a common base. This would
++  also let me compose simple queries in the module using them for one-off methods
++
++  Returns [%MediaItem{}, ...].
++  """
++  def list_media_items_by_media_id_for(%Source{} = source, media_ids) do
++    MediaItem
++    |> where([mi], mi.source_id == ^source.id and mi.media_id in ^media_ids)
++    |> Repo.all()
++  end
++
+   @doc """
+   Returns a list of pending media_items for a given source, where
+   pending means the `media_filepath` is `nil` AND the media_item
+@@ -156,7 +172,9 @@ defmodule Pinchflat.Media do
+   end
+ 
+   @doc """
+-  Creates a media_item. Returns {:ok, %MediaItem{}} | {:error, %Ecto.Changeset{}}.
++  Creates a media_item.
++
++  Returns {:ok, %MediaItem{}} | {:error, %Ecto.Changeset{}}
+   """
+   def create_media_item(attrs) do
+     %MediaItem{}
+@@ -165,7 +183,21 @@ defmodule Pinchflat.Media do
+   end
+ 
+   @doc """
+-  Updates a media_item. Returns {:ok, %MediaItem{}} | {:error, %Ecto.Changeset{}}.
++  Creates a media item from the attributes returned by the video backend
++  (read: yt-dlp)
++
++  Returns {:ok, %MediaItem{}} | {:error, %Ecto.Changeset{}}
++  """
++  def create_media_item_from_backend_attrs(source, media_attrs_struct) do
++    %{source_id: source.id}
++    |> Map.merge(Map.from_struct(media_attrs_struct))
++    |> create_media_item()
++  end
++
++  @doc """
++  Updates a media_item.
++
++  Returns {:ok, %MediaItem{}} | {:error, %Ecto.Changeset{}}
+   """
+   def update_media_item(%MediaItem{} = media_item, attrs) do
+     media_item
+@@ -177,7 +209,7 @@ defmodule Pinchflat.Media do
+   Deletes a media_item and its associated tasks.
+   Can optionally delete the media_item's files.
+ 
+-  Returns {:ok, %MediaItem{}} | {:error, %Ecto.Changeset{}}.
++  Returns {:ok, %MediaItem{}} | {:error, %Ecto.Changeset{}}
+   """
+   def delete_media_item(%MediaItem{} = media_item, opts \\ []) do
+     delete_files = Keyword.get(opts, :delete_files, false)
+@@ -225,7 +257,7 @@ defmodule Pinchflat.Media do
+         {{:shorts_behaviour, :only}, %{livestream_behaviour: :only}} ->
+           dynamic(
+             [mi],
+-            ^dynamic and (mi.livestream == true or fragment("LOWER(?) LIKE LOWER(?)", mi.original_url, "%/shorts/%"))
++            ^dynamic and (mi.livestream == true or mi.short_form_content == true)
+           )
+ 
+         # Technically redundant, but makes the other clauses easier to parse
+@@ -234,16 +266,13 @@ defmodule Pinchflat.Media do
+           dynamic
+ 
+         {{:shorts_behaviour, :only}, _} ->
+-          # return records with /shorts/ in the original_url
+-          dynamic([mi], ^dynamic and fragment("LOWER(?) LIKE LOWER(?)", mi.original_url, "%/shorts/%"))
++          dynamic([mi], ^dynamic and mi.short_form_content == true)
+ 
+         {{:livestream_behaviour, :only}, _} ->
+-          # return records with livestream: true
+           dynamic([mi], ^dynamic and mi.livestream == true)
+ 
+         {{:shorts_behaviour, :exclude}, %{livestream_behaviour: lb}} when lb != :only ->
+-          # return records without /shorts/ in the original_url
+-          dynamic([mi], ^dynamic and fragment("LOWER(?) NOT LIKE LOWER(?)", mi.original_url, "%/shorts/%"))
++          dynamic([mi], ^dynamic and mi.short_form_content == false)
+ 
+         {{:livestream_behaviour, :exclude}, %{shorts_behaviour: sb}} when sb != :only ->
+           # return records with livestream: false
+diff --git a/lib/pinchflat/media/media_item.ex b/lib/pinchflat/media/media_item.ex
+index 0023e93ed..cd918124e 100644
+--- a/lib/pinchflat/media/media_item.ex
++++ b/lib/pinchflat/media/media_item.ex
+@@ -12,14 +12,15 @@ defmodule Pinchflat.Media.MediaItem do
+   alias Pinchflat.Media.MediaItemSearchIndex
+ 
+   @allowed_fields [
+-    # these fields are captured on indexing
++    # these fields are captured on indexing (and again on download)
+     :title,
+     :media_id,
+     :description,
+     :original_url,
+     :livestream,
+     :source_id,
+-    # these fields are captured on download
++    :short_form_content,
++    # these fields are captured only on download
+     :media_downloaded_at,
+     :media_filepath,
+     :media_size_bytes,
+@@ -27,7 +28,7 @@ defmodule Pinchflat.Media.MediaItem do
+     :thumbnail_filepath,
+     :metadata_filepath
+   ]
+-  @required_fields ~w(title original_url livestream media_id source_id)a
++  @required_fields ~w(title original_url livestream media_id source_id short_form_content)a
+ 
+   schema "media_items" do
+     field :title, :string
+@@ -35,6 +36,7 @@ defmodule Pinchflat.Media.MediaItem do
+     field :description, :string
+     field :original_url, :string
+     field :livestream, :boolean, default: false
++    field :short_form_content, :boolean, default: false
+     field :media_downloaded_at, :utc_datetime
+ 
+     field :media_filepath, :string
+diff --git a/lib/pinchflat/media_client/backends/yt_dlp/media.ex b/lib/pinchflat/media_client/backends/yt_dlp/media.ex
+deleted file mode 100644
+index a1e8c0356..000000000
+--- a/lib/pinchflat/media_client/backends/yt_dlp/media.ex
++++ /dev/null
+@@ -1,26 +0,0 @@
+-defmodule Pinchflat.MediaClient.Backends.YtDlp.Media do
+-  @moduledoc """
+-  Contains utilities for working with singular pieces of media
+-  """
+-
+-  @doc """
+-  Downloads a single piece of media (and possibly its metadata) directly to its
+-  final destination. Returns the parsed JSON output from yt-dlp.
+-
+-  Returns {:ok, map()} | {:error, any, ...}.
+-  """
+-  def download(url, command_opts \\ []) do
+-    opts = [:no_simulate] ++ command_opts
+-
+-    with {:ok, output} <- backend_runner().run(url, opts, "after_move:%()j"),
+-         {:ok, parsed_json} <- Phoenix.json_library().decode(output) do
+-      {:ok, parsed_json}
+-    else
+-      err -> err
+-    end
+-  end
+-
+-  defp backend_runner do
+-    Application.get_env(:pinchflat, :yt_dlp_runner)
+-  end
+-end
+diff --git a/lib/pinchflat/media_client/source_details.ex b/lib/pinchflat/media_client/source_details.ex
+deleted file mode 100644
+index d3cd2a1b0..000000000
+--- a/lib/pinchflat/media_client/source_details.ex
++++ /dev/null
+@@ -1,47 +0,0 @@
+-defmodule Pinchflat.MediaClient.SourceDetails do
+-  @moduledoc """
+-  This is the integration layer for actually working with sources.
+-
+-  Technically hardcodes the yt-dlp backend for now, but should leave
+-  it open-ish for future expansion (just in case).
+-  """
+-
+-  alias Pinchflat.Sources.Source
+-  alias Pinchflat.MediaClient.Backends.YtDlp.MediaCollection, as: YtDlpSource
+-
+-  @doc """
+-  Gets a source's ID and name from its URL using the given backend.
+-
+-  Returns {:ok, map()} | {:error, any, ...}.
+-  """
+-  def get_source_details(source_url, backend \\ :yt_dlp) do
+-    source_module(backend).get_source_details(source_url)
+-  end
+-
+-  @doc """
+-  Returns a list of basic media data maps for the given source URL OR
+-  source record using the given backend.
+-
+-  Options:
+-    - :file_listener_handler - a function that will be called with the path to the
+-      file that will be written to by yt-dlp. This is useful for
+-      setting up a file watcher to read the file as it gets written to.
+-
+-  Returns {:ok, [map()]} | {:error, any, ...}.
+-  """
+-  def get_media_attributes(sourceable, opts \\ [], backend \\ :yt_dlp)
+-
+-  def get_media_attributes(%Source{} = source, opts, backend) do
+-    get_media_attributes(source.collection_id, opts, backend)
+-  end
+-
+-  def get_media_attributes(source_url, opts, backend) when is_binary(source_url) do
+-    source_module(backend).get_media_attributes(source_url, opts)
+-  end
+-
+-  defp source_module(backend) do
+-    case backend do
+-      :yt_dlp -> YtDlpSource
+-    end
+-  end
+-end
+diff --git a/lib/pinchflat/media_client/backends/yt_dlp/metadata_file_helpers.ex b/lib/pinchflat/metadata/metadata_file_helpers.ex
+similarity index 96%
+rename from lib/pinchflat/media_client/backends/yt_dlp/metadata_file_helpers.ex
+rename to lib/pinchflat/metadata/metadata_file_helpers.ex
+index 8219c3946..794f30f53 100644
+--- a/lib/pinchflat/media_client/backends/yt_dlp/metadata_file_helpers.ex
++++ b/lib/pinchflat/metadata/metadata_file_helpers.ex
+@@ -1,4 +1,4 @@
+-defmodule Pinchflat.MediaClient.Backends.YtDlp.MetadataFileHelpers do
++defmodule Pinchflat.Metadata.MetadataFileHelpers do
+   @moduledoc """
+   Provides methods for creating/downloading/storing related metadata
+   out-of-band of the normal yt-dlp backend process.
+diff --git a/lib/pinchflat/media_client/backends/yt_dlp/metadata_parser.ex b/lib/pinchflat/metadata/metadata_parser.ex
+similarity index 89%
+rename from lib/pinchflat/media_client/backends/yt_dlp/metadata_parser.ex
+rename to lib/pinchflat/metadata/metadata_parser.ex
+index a32ea730f..7aa2ed062 100644
+--- a/lib/pinchflat/media_client/backends/yt_dlp/metadata_parser.ex
++++ b/lib/pinchflat/metadata/metadata_parser.ex
+@@ -1,4 +1,4 @@
+-defmodule Pinchflat.MediaClient.Backends.YtDlp.MetadataParser do
++defmodule Pinchflat.Metadata.MetadataParser do
+   @moduledoc """
+   yt-dlp offers a LOT of metadata in its JSON response, some of which
+   needs to be extracted and included in various models.
+@@ -25,9 +25,12 @@ defmodule Pinchflat.MediaClient.Backends.YtDlp.MetadataParser do
+ 
+   defp parse_media_metadata(metadata) do
+     %{
++      media_id: metadata["id"],
+       title: metadata["title"],
++      original_url: metadata["original_url"],
+       description: metadata["description"],
+-      media_filepath: metadata["filepath"]
++      media_filepath: metadata["filepath"],
++      livestream: metadata["was_live"]
+     }
+   end
+ 
+diff --git a/lib/pinchflat/profiles/options/yt_dlp/output_path_builder.ex b/lib/pinchflat/profiles/output_path_builder.ex
+similarity index 92%
+rename from lib/pinchflat/profiles/options/yt_dlp/output_path_builder.ex
+rename to lib/pinchflat/profiles/output_path_builder.ex
+index 4f76eb288..8ac62ef04 100644
+--- a/lib/pinchflat/profiles/options/yt_dlp/output_path_builder.ex
++++ b/lib/pinchflat/profiles/output_path_builder.ex
+@@ -1,8 +1,6 @@
+-defmodule Pinchflat.Profiles.Options.YtDlp.OutputPathBuilder do
++defmodule Pinchflat.Profiles.OutputPathBuilder do
+   @moduledoc """
+   Builds yt-dlp-friendly output paths for downloaded media
+-
+-  IDEA: consider making this a behaviour so I can add other backends later
+   """
+ 
+   alias Pinchflat.RenderedString.Parser, as: TemplateParser
+diff --git a/lib/pinchflat/sources.ex b/lib/pinchflat/sources.ex
+index 4f836bc08..eee7c64f6 100644
+--- a/lib/pinchflat/sources.ex
++++ b/lib/pinchflat/sources.ex
+@@ -11,7 +11,7 @@ defmodule Pinchflat.Sources do
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.Tasks.SourceTasks
+   alias Pinchflat.Profiles.MediaProfile
+-  alias Pinchflat.MediaClient.SourceDetails
++  alias Pinchflat.YtDlp.Backend.MediaCollection
+ 
+   @doc """
+   Returns the list of sources. Returns [%Source{}, ...]
+@@ -46,6 +46,7 @@ defmodule Pinchflat.Sources do
+   def create_source(attrs) do
+     %Source{}
+     |> change_source_from_url(attrs)
++    |> maybe_change_indexing_frequency()
+     |> commit_and_handle_tasks()
+   end
+ 
+@@ -62,6 +63,7 @@ defmodule Pinchflat.Sources do
+   def update_source(%Source{} = source, attrs) do
+     source
+     |> change_source_from_url(attrs)
++    |> maybe_change_indexing_frequency()
+     |> commit_and_handle_tasks()
+   end
+ 
+@@ -116,7 +118,7 @@ defmodule Pinchflat.Sources do
+   defp add_source_details_to_changeset(source, changeset) do
+     %Ecto.Changeset{changes: changes} = changeset
+ 
+-    case SourceDetails.get_source_details(changes.original_url) do
++    case MediaCollection.get_source_details(changes.original_url) do
+       {:ok, source_details} ->
+         add_source_details_by_collection_type(source, changeset, source_details)
+ 
+@@ -151,6 +153,20 @@ defmodule Pinchflat.Sources do
+     change_source(source, Map.merge(changes, collection_changes))
+   end
+ 
++  defp maybe_change_indexing_frequency(changeset) do
++    fast_index = Ecto.Changeset.get_field(changeset, :fast_index)
++
++    if fast_index do
++      Ecto.Changeset.put_change(
++        changeset,
++        :index_frequency_minutes,
++        Source.index_frequency_when_fast_indexing()
++      )
++    else
++      changeset
++    end
++  end
++
+   defp commit_and_handle_tasks(changeset) do
+     case Repo.insert_or_update(changeset) do
+       {:ok, %Source{} = source} ->
+@@ -188,13 +204,38 @@ defmodule Pinchflat.Sources do
+       # If the record has been persisted, only run indexing if the
+       # indexing frequency has been changed and is now greater than 0
+       %{__meta__: %{state: :loaded}} ->
+-        case changeset.changes do
+-          %{index_frequency_minutes: mins} when mins > 0 -> SourceTasks.kickoff_indexing_task(source)
+-          %{index_frequency_minutes: _} -> Tasks.delete_pending_tasks_for(source, "MediaIndexingWorker")
+-          _ -> :ok
+-        end
++        maybe_update_slow_indexing_task(changeset, source)
++        maybe_update_fast_indexing_task(changeset, source)
+     end
+ 
+     {:ok, source}
+   end
++
++  defp maybe_update_slow_indexing_task(changeset, source) do
++    case changeset.changes do
++      %{index_frequency_minutes: mins} when mins > 0 ->
++        SourceTasks.kickoff_indexing_task(source)
++
++      %{index_frequency_minutes: _} ->
++        Tasks.delete_pending_tasks_for(source, "FastIndexingWorker")
++        Tasks.delete_pending_tasks_for(source, "MediaIndexingWorker")
++        Tasks.delete_pending_tasks_for(source, "MediaCollectionIndexingWorker")
++
++      _ ->
++        :ok
++    end
++  end
++
++  defp maybe_update_fast_indexing_task(changeset, source) do
++    case changeset.changes do
++      %{fast_index: true} ->
++        SourceTasks.kickoff_fast_indexing_task(source)
++
++      %{fast_index: false} ->
++        Tasks.delete_pending_tasks_for(source, "FastIndexingWorker")
++
++      _ ->
++        :ok
++    end
++  end
+ end
+diff --git a/lib/pinchflat/media_source/source.ex b/lib/pinchflat/sources/source.ex
+similarity index 86%
+rename from lib/pinchflat/media_source/source.ex
+rename to lib/pinchflat/sources/source.ex
+index 6282e28bf..0ed8aaab5 100644
+--- a/lib/pinchflat/media_source/source.ex
++++ b/lib/pinchflat/sources/source.ex
+@@ -17,6 +17,7 @@ defmodule Pinchflat.Sources.Source do
+     collection_type
+     custom_name
+     index_frequency_minutes
++    fast_index
+     download_media
+     last_indexed_at
+     original_url
+@@ -29,6 +30,7 @@ defmodule Pinchflat.Sources.Source do
+     collection_type
+     custom_name
+     index_frequency_minutes
++    fast_index
+     download_media
+     original_url
+     media_profile_id
+@@ -40,6 +42,7 @@ defmodule Pinchflat.Sources.Source do
+     field :collection_id, :string
+     field :collection_type, Ecto.Enum, values: [:channel, :playlist]
+     field :index_frequency_minutes, :integer, default: 60 * 24
++    field :fast_index, :boolean, default: false
+     field :download_media, :boolean, default: true
+     field :last_indexed_at, :utc_datetime
+     # This should only be used for user reference going forward
+@@ -62,4 +65,16 @@ defmodule Pinchflat.Sources.Source do
+     |> validate_required(@required_fields)
+     |> unique_constraint([:collection_id, :media_profile_id])
+   end
++
++  @doc false
++  def index_frequency_when_fast_indexing do
++    # 30 days in minutes
++    60 * 24 * 30
++  end
++
++  @doc false
++  def fast_index_frequency do
++    # minutes
++    15
++  end
+ end
+diff --git a/lib/pinchflat/startup_tasks.ex b/lib/pinchflat/startup_tasks.ex
+index 41d0597aa..e4b1aec8b 100644
+--- a/lib/pinchflat/startup_tasks.ex
++++ b/lib/pinchflat/startup_tasks.ex
+@@ -32,5 +32,6 @@ defmodule Pinchflat.StartupTasks do
+ 
+   defp apply_default_settings do
+     Settings.fetch!(:onboarding, true)
++    Settings.fetch!(:pro_enabled, false)
+   end
+ end
+diff --git a/lib/pinchflat/tasks/media_item_tasks.ex b/lib/pinchflat/tasks/media_item_tasks.ex
+index c733ae6f0..afcb3d57e 100644
+--- a/lib/pinchflat/tasks/media_item_tasks.ex
++++ b/lib/pinchflat/tasks/media_item_tasks.ex
+@@ -6,6 +6,11 @@ defmodule Pinchflat.Tasks.MediaItemTasks do
+   do is also defined here. Essentially, a one-stop-shop for media-related tasks/workers.
+   """
+   alias Pinchflat.Media
++  alias Pinchflat.Tasks
++  alias Pinchflat.Sources.Source
++  alias Pinchflat.Workers.MediaDownloadWorker
++
++  alias Pinchflat.YtDlp.Backend.Media, as: YtDlpMedia
+ 
+   @doc """
+   Fetches the file size of a media item and saves it to the database.
+@@ -21,4 +26,36 @@ defmodule Pinchflat.Tasks.MediaItemTasks do
+         err
+     end
+   end
++
++  @doc """
++  Indexes a single media item for a source and enqueues a download job if the
++  media should be downloaded. This method creates the media item record so it's
++  the one-stop-shop for adding a media item (and possibly downloading it) just
++  by a URL and source.
++
++  Returns {:ok, media_item} | {:error, any()}
++  """
++  def index_and_enqueue_download_for_media_item(%Source{} = source, url) do
++    maybe_media_item = create_media_item_from_url(source, url)
++
++    case maybe_media_item do
++      {:ok, media_item} ->
++        if source.download_media && Media.pending_download?(media_item) do
++          %{id: media_item.id}
++          |> MediaDownloadWorker.new()
++          |> Tasks.create_job_with_task(media_item)
++        end
++
++        {:ok, media_item}
++
++      err ->
++        err
++    end
++  end
++
++  defp create_media_item_from_url(source, url) do
++    {:ok, media_attrs} = YtDlpMedia.get_media_attributes(url)
++
++    Media.create_media_item_from_backend_attrs(source, media_attrs)
++  end
+ end
+diff --git a/lib/pinchflat/tasks/source_tasks.ex b/lib/pinchflat/tasks/source_tasks.ex
+index ddec433a2..4c786eff6 100644
+--- a/lib/pinchflat/tasks/source_tasks.ex
++++ b/lib/pinchflat/tasks/source_tasks.ex
+@@ -12,31 +12,72 @@ defmodule Pinchflat.Tasks.SourceTasks do
+   alias Pinchflat.Tasks
+   alias Pinchflat.Sources
+   alias Pinchflat.Sources.Source
++  alias Pinchflat.Api.YoutubeRss
+   alias Pinchflat.Media.MediaItem
+-  alias Pinchflat.MediaClient.SourceDetails
+-  alias Pinchflat.Workers.MediaIndexingWorker
++  alias Pinchflat.Workers.FastIndexingWorker
+   alias Pinchflat.Workers.MediaDownloadWorker
++  alias Pinchflat.Workers.MediaIndexingWorker
++  alias Pinchflat.YtDlp.Backend.MediaCollection
++  alias Pinchflat.Workers.MediaCollectionIndexingWorker
+   alias Pinchflat.Utils.FilesystemUtils.FileFollowerServer
+ 
++  alias Pinchflat.YtDlp.Backend.Media, as: YtDlpMedia
++
+   @doc """
+   Starts tasks for indexing a source's media regardless of the source's indexing
+-  frequency. It's assumed the caller will check for that.
++  frequency. It's assumed the caller will check for indexing frequency.
+ 
+   Returns {:ok, %Task{}}.
+   """
+   def kickoff_indexing_task(%Source{} = source) do
++    Tasks.delete_pending_tasks_for(source, "FastIndexingWorker")
+     Tasks.delete_pending_tasks_for(source, "MediaIndexingWorker")
++    Tasks.delete_pending_tasks_for(source, "MediaCollectionIndexingWorker")
+ 
+-    source
+-    |> Map.take([:id])
++    %{id: source.id}
+     # Schedule this one immediately, but future ones will be on an interval
+-    |> MediaIndexingWorker.new()
++    |> MediaCollectionIndexingWorker.new()
++    |> Tasks.create_job_with_task(source)
++  end
++
++  @doc """
++  Starts tasks for running a fast indexing task for a source's media
++  regardless of the source's fast_index state. It's assumed the
++  caller will check for fast_index.
++
++  This is used for running fast index tasks on update. On creation, the
++  fast index is enqueued after the slow index is complete.
++
++  Returns {:ok, %Task{}}.
++  """
++  def kickoff_fast_indexing_task(%Source{} = source) do
++    Tasks.delete_pending_tasks_for(source, "FastIndexingWorker")
++
++    %{id: source.id}
++    # Schedule this one immediately, but future ones will be on an interval
++    |> FastIndexingWorker.new()
+     |> Tasks.create_job_with_task(source)
+-    |> case do
+-      # This should never return {:error, :duplicate_job} since we just deleted
+-      # any pending tasks. I'm being assertive about it so it's obvious if I'm wrong
+-      {:ok, task} -> {:ok, task}
+-    end
++  end
++
++  @doc """
++  Fetches new media IDs from a source's YouTube RSS feed and kicks off indexing tasks
++  for any new media items. See comments in `MediaIndexingWorker` for more info on the
++  order of operations and how this fits into the indexing process.
++
++  Returns :ok
++  """
++  def kickoff_indexing_tasks_from_youtube_rss_feed(%Source{} = source) do
++    {:ok, media_ids} = YoutubeRss.get_recent_media_ids_from_rss(source)
++    existing_media_items = Media.list_media_items_by_media_id_for(source, media_ids)
++    new_media_ids = media_ids -- Enum.map(existing_media_items, & &1.media_id)
++
++    Enum.each(new_media_ids, fn media_id ->
++      url = "https://www.youtube.com/watch?v=#{media_id}"
++
++      %{id: source.id, media_url: url}
++      |> MediaIndexingWorker.new()
++      |> Tasks.create_job_with_task(source)
++    end)
+   end
+ 
+   @doc """
+@@ -65,9 +106,9 @@ defmodule Pinchflat.Tasks.SourceTasks do
+   def index_and_enqueue_download_for_media_items(%Source{} = source) do
+     # See the method definition below for more info on how file watchers work
+     # (important reading if you're not familiar with it)
+-    {:ok, media_attributes} = get_media_attributes_and_setup_file_watcher(source)
+-
++    {:ok, media_attributes} = get_media_attributes_for_collection_and_setup_file_watcher(source)
+     result = Enum.map(media_attributes, fn media_attrs -> create_media_item_from_attributes(source, media_attrs) end)
++
+     Sources.update_source(source, %{last_indexed_at: DateTime.utc_now()})
+     enqueue_pending_media_tasks(source)
+ 
+@@ -89,8 +130,7 @@ defmodule Pinchflat.Tasks.SourceTasks do
+     source
+     |> Media.list_pending_media_items_for()
+     |> Enum.each(fn media_item ->
+-      media_item
+-      |> Map.take([:id])
++      %{id: media_item.id}
+       |> MediaDownloadWorker.new()
+       |> Tasks.create_job_with_task(media_item)
+     end)
+@@ -116,7 +156,7 @@ defmodule Pinchflat.Tasks.SourceTasks do
+   # lines (ie: you should gracefully fail if you can't parse a line).
+   #
+   # This works in-tandem with the normal (blocking) media indexing behaviour. When
+-  # the `get_media_attributes` method completes it'll return the FULL result to
++  # the `get_media_attributes_for_collection` method completes it'll return the FULL result to
+   # the caller for parsing. Ideally, every item in the list will have already
+   # been processed by the file follower, but if not, the caller handles creation
+   # of any media items that were missed/initially failed.
+@@ -124,11 +164,11 @@ defmodule Pinchflat.Tasks.SourceTasks do
+   # It attempts a graceful shutdown of the file follower after the indexing is done,
+   # but the FileFollowerServer will also stop itself if it doesn't see any activity
+   # for a sufficiently long time.
+-  defp get_media_attributes_and_setup_file_watcher(source) do
++  defp get_media_attributes_for_collection_and_setup_file_watcher(source) do
+     {:ok, pid} = FileFollowerServer.start_link()
+ 
+     handler = fn filepath -> setup_file_follower_watcher(pid, filepath, source) end
+-    result = SourceDetails.get_media_attributes(source.original_url, file_listener_handler: handler)
++    result = MediaCollection.get_media_attributes_for_collection(source.original_url, file_listener_handler: handler)
+ 
+     FileFollowerServer.stop(pid)
+ 
+@@ -141,7 +181,8 @@ defmodule Pinchflat.Tasks.SourceTasks do
+         {:ok, media_attrs} ->
+           Logger.debug("FileFollowerServer Handler: Got media attributes: #{inspect(media_attrs)}")
+ 
+-          create_media_item_and_enqueue_download(source, media_attrs)
++          media_struct = YtDlpMedia.response_to_struct(media_attrs)
++          create_media_item_and_enqueue_download(source, media_struct)
+ 
+         err ->
+           Logger.debug("FileFollowerServer Handler: Error decoding JSON: #{inspect(err)}")
+@@ -159,8 +200,7 @@ defmodule Pinchflat.Tasks.SourceTasks do
+         if source.download_media && Media.pending_download?(media_item) do
+           Logger.debug("FileFollowerServer Handler: Enqueuing download task for #{inspect(media_attrs)}")
+ 
+-          media_item
+-          |> Map.take([:id])
++          %{id: media_item.id}
+           |> MediaDownloadWorker.new()
+           |> Tasks.create_job_with_task(media_item)
+         end
+@@ -171,16 +211,7 @@ defmodule Pinchflat.Tasks.SourceTasks do
+   end
+ 
+   defp create_media_item_from_attributes(source, media_attrs) do
+-    attrs = %{
+-      source_id: source.id,
+-      title: media_attrs["title"],
+-      media_id: media_attrs["id"],
+-      original_url: media_attrs["original_url"],
+-      livestream: media_attrs["was_live"],
+-      description: media_attrs["description"]
+-    }
+-
+-    case Media.create_media_item(attrs) do
++    case Media.create_media_item_from_backend_attrs(source, media_attrs) do
+       {:ok, media_item} -> media_item
+       {:error, changeset} -> changeset
+     end
+diff --git a/lib/pinchflat/workers/fast_indexing_worker.ex b/lib/pinchflat/workers/fast_indexing_worker.ex
+new file mode 100644
+index 000000000..e2f135ec8
+--- /dev/null
++++ b/lib/pinchflat/workers/fast_indexing_worker.ex
+@@ -0,0 +1,42 @@
++defmodule Pinchflat.Workers.FastIndexingWorker do
++  @moduledoc false
++
++  use Oban.Worker,
++    queue: :fast_indexing,
++    unique: [period: :infinity, states: [:available, :scheduled, :retryable]],
++    tags: ["media_source", "fast_indexing"]
++
++  alias __MODULE__
++  alias Pinchflat.Tasks
++  alias Pinchflat.Sources
++  alias Pinchflat.Sources.Source
++  alias Pinchflat.Tasks.SourceTasks
++
++  @impl Oban.Worker
++  @doc """
++  TODO
++  """
++  def perform(%Oban.Job{args: %{"id" => source_id}}) do
++    source = Sources.get_source!(source_id)
++
++    if source.fast_index do
++      SourceTasks.kickoff_indexing_tasks_from_youtube_rss_feed(source)
++
++      reschedule_indexing(source)
++    else
++      :ok
++    end
++  end
++
++  defp reschedule_indexing(source) do
++    next_run_in = Source.fast_index_frequency() * 60
++
++    %{id: source.id}
++    |> FastIndexingWorker.new(schedule_in: next_run_in)
++    |> Tasks.create_job_with_task(source)
++    |> case do
++      {:ok, task} -> {:ok, task}
++      {:error, :duplicate_job} -> {:ok, :job_exists}
++    end
++  end
++end
+diff --git a/lib/pinchflat/workers/media_collection_indexing_worker.ex b/lib/pinchflat/workers/media_collection_indexing_worker.ex
+new file mode 100644
+index 000000000..3f7122ea5
+--- /dev/null
++++ b/lib/pinchflat/workers/media_collection_indexing_worker.ex
+@@ -0,0 +1,109 @@
++defmodule Pinchflat.Workers.MediaCollectionIndexingWorker do
++  @moduledoc false
++
++  use Oban.Worker,
++    queue: :media_collection_indexing,
++    unique: [period: :infinity, states: [:available, :scheduled, :retryable]],
++    tags: ["media_source", "media_collection_indexing"]
++
++  alias __MODULE__
++  alias Pinchflat.Tasks
++  alias Pinchflat.Sources
++  alias Pinchflat.Sources.Source
++  alias Pinchflat.Tasks.SourceTasks
++  alias Pinchflat.Workers.FastIndexingWorker
++
++  @impl Oban.Worker
++  @doc """
++  The ID is that of a source _record_, not a YouTube channel/playlist ID. Indexes
++  the provided source, kicks off downloads for each new MediaItem, and
++  reschedules the job to run again in the future. It will ALWAYS index a source
++  if it's never been indexed before, but rescheduling is determined by the
++  `index_frequency_minutes` field.
++
++  README: Re-scheduling here works a little different than you may expect.
++  The reschedule time is relative to the time the job has actually _completed_.
++  This has some benefits but also side effects to be aware of:
++
++  - Benefit: No chance for jobs to overlap if a job takes longer than the
++    scheduled interval. Less likely to hit API rate limits.
++  - Side effect: Intervals are "soft" and _always_ walk forward. This may cause
++    user confusion since a 30-minute job scheduled for every hour will
++    actually run every 1 hour and 30 minutes. The tradeoff of not inundating
++    the API with requests and also not overlapping jobs is worth it, IMO.
++
++  Order of operations:
++    1. The user saves a source
++    2. This job is automatically scheduled immediately. This happens in all cases.
++    3. This job indexes all content for the given source. A download job is
++       enqueued for each media item that should be downloaded. This can be impacted
++       by the `download_media` field on the source as well as the profile's
++       shorts/livestream behaviour. At this step we also attach a file reader
++       to the `yt-dlp` output file so we can create media items as they come in
++       for a little speedup (see SourceTasks comments for more)
++    4. If this job is meant to reschedule (ie: has an index frequency > 0),
++       it reschedules itself. If not, it runs once and does not reschedule
++    5. If the source uses fast indexing, that job is kicked off as well. It
++       uses RSS to run a smaller, faster, and more frequent index. That job
++       handles rescheduling itself but largely has a similar behaviour to this
++       job in that it kicks off index and maybe download jobs. The biggest difference
++       is that an index job is kicked off _for each new media item_ as opposed
++       to one larger index job. Check out `MediaIndexingWorker` comments for more.
++    6. If the job reschedules, the cycle from step 3 repeats until the heat death
++       of the universe. The user changing things like the index frequency can
++       dequeue or reschedule jobs as well
++
++  NOTE: Since indexing can take a LONG time, I should check what happens if an
++  application restart occurs while a job is running. Will the job be lost?
++
++  IDEA: Should I use paging and do indexing in chunks? Is that even faster?
++
++  Returns :ok | {:ok, %Task{}}
++  """
++  def perform(%Oban.Job{args: %{"id" => source_id}}) do
++    source = Sources.get_source!(source_id)
++
++    case {source.index_frequency_minutes, source.last_indexed_at} do
++      {index_freq, _} when index_freq > 0 ->
++        # If the indexing is on a schedule simply run indexing and reschedule
++        SourceTasks.index_and_enqueue_download_for_media_items(source)
++        maybe_enqueue_fast_indexing_task(source)
++        reschedule_indexing(source)
++
++      {_, nil} ->
++        # If the source has never been indexed, index it once
++        # even if it's not meant to reschedule
++        SourceTasks.index_and_enqueue_download_for_media_items(source)
++        :ok
++
++      _ ->
++        # If the source HAS been indexed and is not meant to reschedule,
++        # perform a no-op
++        :ok
++    end
++  end
++
++  defp reschedule_indexing(source) do
++    next_run_in = source.index_frequency_minutes * 60
++
++    %{id: source.id}
++    |> MediaCollectionIndexingWorker.new(schedule_in: next_run_in)
++    |> Tasks.create_job_with_task(source)
++    |> case do
++      {:ok, task} -> {:ok, task}
++      {:error, :duplicate_job} -> {:ok, :job_exists}
++    end
++  end
++
++  defp maybe_enqueue_fast_indexing_task(source) do
++    if source.fast_index do
++      Tasks.delete_pending_tasks_for(source, "FastIndexingWorker")
++
++      next_run_in = Source.fast_index_frequency() * 60
++
++      %{id: source.id}
++      |> FastIndexingWorker.new(schedule_in: next_run_in)
++      |> Tasks.create_job_with_task(source)
++    end
++  end
++end
+diff --git a/lib/pinchflat/workers/media_download_worker.ex b/lib/pinchflat/workers/media_download_worker.ex
+index 84fec7d8d..2b99489ee 100644
+--- a/lib/pinchflat/workers/media_download_worker.ex
++++ b/lib/pinchflat/workers/media_download_worker.ex
+@@ -45,8 +45,7 @@ defmodule Pinchflat.Workers.MediaDownloadWorker do
+   end
+ 
+   defp schedule_filesystem_data_worker(media_item) do
+-    media_item
+-    |> Map.take([:id])
++    %{id: media_item.id}
+     |> FilesystemDataWorker.new()
+     |> Tasks.create_job_with_task(media_item)
+     |> case do
+diff --git a/lib/pinchflat/workers/media_indexing_worker.ex b/lib/pinchflat/workers/media_indexing_worker.ex
+index d2ff6766e..74222b96c 100644
+--- a/lib/pinchflat/workers/media_indexing_worker.ex
++++ b/lib/pinchflat/workers/media_indexing_worker.ex
+@@ -6,67 +6,48 @@ defmodule Pinchflat.Workers.MediaIndexingWorker do
+     unique: [period: :infinity, states: [:available, :scheduled, :retryable]],
+     tags: ["media_source", "media_indexing"]
+ 
+-  alias __MODULE__
+-  alias Pinchflat.Tasks
++  require Logger
++
+   alias Pinchflat.Sources
+-  alias Pinchflat.Tasks.SourceTasks
++  alias Pinchflat.Tasks.MediaItemTasks
+ 
+   @impl Oban.Worker
+   @doc """
+-  The ID is that of a source _record_, not a YouTube channel/playlist ID. Indexes
+-  the provided source, kicks off downloads for each new MediaItem, and
+-  reschedules the job to run again in the future. It will ALWAYS index a source
+-  if it's never been indexed before, but rescheduling is determined by the
+-  `index_frequency_minutes` field.
+-
+-  README: Re-scheduling here works a little different than you may expect.
+-  The reschedule time is relative to the time the job has actually _completed_.
+-  This has some benefits but also side effects to be aware of:
+-
+-  - Benefit: No chance for jobs to overlap if a job takes longer than the
+-    scheduled interval. Less likely to hit API rate limits.
+-  - Side effect: Intervals are "soft" and _always_ walk forward. This may cause
+-    user confusion since a 30-minute job scheduled for every hour will
+-    actually run every 1 hour and 30 minutes. The tradeoff of not inundating
+-    the API with requests and also not overlapping jobs is worth it, IMO.
+-
+-  NOTE: Since indexing can take a LONG time, I should check what happens if an
+-  application restart occurs while a job is running. Will the job be lost?
+-
+-  IDEA: Should I use paging and do indexing in chunks? Is that even faster?
+-
+-  Returns :ok | {:ok, %Task{}}
++  Similar to `MediaCollectionIndexingWorker`, but for individual media items.
++  Does not reschedule or check anything to do with a source's indexing
++  frequency - only collects initial metadata then kicks off a download.
++  `MediaCollectionIndexingWorker` should be preferred in general, but this is
++  useful for downloading one-off media items based on a URL (like for fast indexing).
++
++  Only downloads media that _should_ be downloaded (ie: the source is set to download
++  and the media matches the profile's format preferences)
++
++  Order of operations:
++    1. SourceTasks.kickoff_indexing_tasks_from_youtube_rss_feed/1 (which is running
++       in its own worker) periodically checks the YouTube RSS feed for new media
++    2. If new media is found, it enqueues a MediaIndexingWorker (this module) for each new media
++       item
++    3. This worker fetches the media metadata and uses that to determine if it should be
++       downloaded. If so, it enqueues a MediaDownloadWorker
++
++  Each is a worker because they all either need to be scheduled periodically or call out to
++  an external service and will be long-running. They're split into different jobs to separate
++  retry logic for each step and allow us to better optimize various queues (eg: the indexing
++  steps can keep running while the slow download steps are worked through).
++
++  Returns :ok
+   """
+-  def perform(%Oban.Job{args: %{"id" => source_id}}) do
++  def perform(%Oban.Job{args: %{"id" => source_id, "media_url" => media_url}}) do
+     source = Sources.get_source!(source_id)
+ 
+-    case {source.index_frequency_minutes, source.last_indexed_at} do
+-      {index_freq, _} when index_freq > 0 ->
+-        # If the indexing is on a schedule simply run indexing and reschedule
+-        SourceTasks.index_and_enqueue_download_for_media_items(source)
+-        reschedule_indexing(source)
+-
+-      {_, nil} ->
+-        # If the source has never been indexed, index it once
+-        # even if it's not meant to reschedule
+-        SourceTasks.index_and_enqueue_download_for_media_items(source)
+-        :ok
++    case MediaItemTasks.index_and_enqueue_download_for_media_item(source, media_url) do
++      {:ok, media_item} ->
++        Logger.debug("Indexed and enqueued download for url: #{media_url} (media item: #{media_item.id})")
+ 
+-      _ ->
+-        # If the source HAS been indexed and is not meant to reschedule,
+-        # perform a no-op
+-        :ok
++      {:error, reason} ->
++        Logger.debug("Failed to index and enqueue download for url: #{media_url} (reason: #{inspect(reason)})")
+     end
+-  end
+ 
+-  defp reschedule_indexing(source) do
+-    source
+-    |> Map.take([:id])
+-    |> MediaIndexingWorker.new(schedule_in: source.index_frequency_minutes * 60)
+-    |> Tasks.create_job_with_task(source)
+-    |> case do
+-      {:ok, task} -> {:ok, task}
+-      {:error, :duplicate_job} -> {:ok, :job_exists}
+-    end
++    :ok
+   end
+ end
+diff --git a/lib/pinchflat/media_client/backends/backend_command_runner.ex b/lib/pinchflat/yt_dlp/backend/backend_command_runner.ex
+similarity index 64%
+rename from lib/pinchflat/media_client/backends/backend_command_runner.ex
+rename to lib/pinchflat/yt_dlp/backend/backend_command_runner.ex
+index cff945189..e0f708a5e 100644
+--- a/lib/pinchflat/media_client/backends/backend_command_runner.ex
++++ b/lib/pinchflat/yt_dlp/backend/backend_command_runner.ex
+@@ -1,6 +1,9 @@
+-defmodule Pinchflat.MediaClient.Backends.BackendCommandRunner do
++defmodule Pinchflat.YtDlp.Backend.BackendCommandRunner do
+   @moduledoc """
+-  A behaviour for running CLI commands against a downloader backend
++  A behaviour for running CLI commands against a downloader backend (yt-dlp).
++
++  Used so we can implement Mox for testing without actually running the
++  yt-dlp command.
+   """
+ 
+   @callback run(binary(), keyword(), binary()) :: {:ok, binary()} | {:error, binary(), integer()}
+diff --git a/lib/pinchflat/media_client/backends/yt_dlp/command_runner.ex b/lib/pinchflat/yt_dlp/backend/command_runner.ex
+similarity index 94%
+rename from lib/pinchflat/media_client/backends/yt_dlp/command_runner.ex
+rename to lib/pinchflat/yt_dlp/backend/command_runner.ex
+index c9fec4a52..765aaf880 100644
+--- a/lib/pinchflat/media_client/backends/yt_dlp/command_runner.ex
++++ b/lib/pinchflat/yt_dlp/backend/command_runner.ex
+@@ -1,4 +1,4 @@
+-defmodule Pinchflat.MediaClient.Backends.YtDlp.CommandRunner do
++defmodule Pinchflat.YtDlp.Backend.CommandRunner do
+   @moduledoc """
+   Runs yt-dlp commands using the `System.cmd/3` function
+   """
+@@ -7,7 +7,7 @@ defmodule Pinchflat.MediaClient.Backends.YtDlp.CommandRunner do
+ 
+   alias Pinchflat.Utils.StringUtils
+   alias Pinchflat.Utils.FilesystemUtils, as: FSUtils
+-  alias Pinchflat.MediaClient.Backends.BackendCommandRunner
++  alias Pinchflat.YtDlp.Backend.BackendCommandRunner
+ 
+   @behaviour BackendCommandRunner
+ 
+@@ -25,6 +25,7 @@ defmodule Pinchflat.MediaClient.Backends.YtDlp.CommandRunner do
+   """
+   @impl BackendCommandRunner
+   def run(url, command_opts, output_template, addl_opts \\ []) do
++    # This approach lets us mock the command for testing
+     command = backend_executable()
+     # These must stay in exactly this order, hence why I'm giving it its own variable.
+     # Also, can't use RAM file since yt-dlp needs a concrete filepath.
+diff --git a/lib/pinchflat/yt_dlp/backend/media.ex b/lib/pinchflat/yt_dlp/backend/media.ex
+new file mode 100644
+index 000000000..1c9623706
+--- /dev/null
++++ b/lib/pinchflat/yt_dlp/backend/media.ex
+@@ -0,0 +1,107 @@
++defmodule Pinchflat.YtDlp.Backend.Media do
++  @moduledoc """
++  Contains utilities for working with singular pieces of media
++  """
++
++  @enforce_keys [
++    :media_id,
++    :title,
++    :description,
++    :original_url,
++    :livestream,
++    :short_form_content
++  ]
++
++  defstruct [
++    :media_id,
++    :title,
++    :description,
++    :original_url,
++    :livestream,
++    :short_form_content
++  ]
++
++  alias __MODULE__
++  alias Pinchflat.Utils.FunctionUtils
++
++  @doc """
++  Downloads a single piece of media (and possibly its metadata) directly to its
++  final destination. Returns the parsed JSON output from yt-dlp.
++
++  Returns {:ok, map()} | {:error, any, ...}.
++  """
++  def download(url, command_opts \\ []) do
++    opts = [:no_simulate] ++ command_opts
++
++    with {:ok, output} <- backend_runner().run(url, opts, "after_move:%()j"),
++         {:ok, parsed_json} <- Phoenix.json_library().decode(output) do
++      {:ok, parsed_json}
++    else
++      err -> err
++    end
++  end
++
++  @doc """
++  Returns a map representing the media at the given URL.
++
++  Returns {:ok, [map()]} | {:error, any, ...}.
++  """
++  def get_media_attributes(url) do
++    runner = Application.get_env(:pinchflat, :yt_dlp_runner)
++    command_opts = [:simulate, :skip_download]
++    output_template = indexing_output_template()
++
++    case runner.run(url, command_opts, output_template) do
++      {:ok, output} ->
++        output
++        |> Phoenix.json_library().decode!()
++        |> response_to_struct()
++        |> FunctionUtils.wrap_ok()
++
++      res ->
++        res
++    end
++  end
++
++  @doc """
++  Returns the output template for yt-dlp's indexing command.
++  """
++  def indexing_output_template do
++    "%(.{id,title,was_live,webpage_url,description,aspect_ratio,duration})j"
++  end
++
++  @doc """
++  Transforms a response from yt-dlp into a struct. Interprets the response to
++  determine if the media is short-form content.
++
++  Returns %Media{}.
++  """
++  def response_to_struct(response) do
++    %Media{
++      media_id: response["id"],
++      title: response["title"],
++      description: response["description"],
++      original_url: response["webpage_url"],
++      livestream: response["was_live"],
++      short_form_content: short_form_content?(response)
++    }
++  end
++
++  defp short_form_content?(response) do
++    if String.contains?(response["webpage_url"], "/shorts/") do
++      true
++    else
++      # Sometimes shorts are returned without /shorts/ in the URL,
++      # so we need to do our best to determine if it's a short. This
++      # WILL returns false positives, but it's a best-effort approach
++      # that should work for most cases. The aspect_ratio check is
++      # based on a gut feeling and may need to be tweaked.
++      response["duration"] <= 60 && response["aspect_ratio"] < 0.8
++    end
++  end
++
++  defp backend_runner do
++    # This approach lets us mock the command for testing
++    Application.get_env(:pinchflat, :yt_dlp_runner)
++  end
++end
+diff --git a/lib/pinchflat/media_client/backends/yt_dlp/media_collection.ex b/lib/pinchflat/yt_dlp/backend/media_collection.ex
+similarity index 86%
+rename from lib/pinchflat/media_client/backends/yt_dlp/media_collection.ex
+rename to lib/pinchflat/yt_dlp/backend/media_collection.ex
+index 45a2a1765..ff8e044ef 100644
+--- a/lib/pinchflat/media_client/backends/yt_dlp/media_collection.ex
++++ b/lib/pinchflat/yt_dlp/backend/media_collection.ex
+@@ -1,4 +1,4 @@
+-defmodule Pinchflat.MediaClient.Backends.YtDlp.MediaCollection do
++defmodule Pinchflat.YtDlp.Backend.MediaCollection do
+   @moduledoc """
+   Contains utilities for working with collections of
+   media (aka: a source [ie: channels, playlists]).
+@@ -8,6 +8,7 @@ defmodule Pinchflat.MediaClient.Backends.YtDlp.MediaCollection do
+ 
+   alias Pinchflat.Utils.FunctionUtils
+   alias Pinchflat.Utils.FilesystemUtils
++  alias Pinchflat.YtDlp.Backend.Media, as: YtDlpMedia
+ 
+   @doc """
+   Returns a list of maps representing the media in the collection.
+@@ -19,10 +20,10 @@ defmodule Pinchflat.MediaClient.Backends.YtDlp.MediaCollection do
+ 
+   Returns {:ok, [map()]} | {:error, any, ...}.
+   """
+-  def get_media_attributes(url, addl_opts \\ []) do
++  def get_media_attributes_for_collection(url, addl_opts \\ []) do
+     runner = Application.get_env(:pinchflat, :yt_dlp_runner)
+     command_opts = [:simulate, :skip_download]
+-    output_template = "%(.{id,title,was_live,original_url,description})j"
++    output_template = YtDlpMedia.indexing_output_template()
+     output_filepath = FilesystemUtils.generate_metadata_tmpfile(:json)
+     file_listener_handler = Keyword.get(addl_opts, :file_listener_handler, false)
+ 
+@@ -35,6 +36,7 @@ defmodule Pinchflat.MediaClient.Backends.YtDlp.MediaCollection do
+         output
+         |> String.split("\n", trim: true)
+         |> Enum.map(&Phoenix.json_library().decode!/1)
++        |> Enum.map(&YtDlpMedia.response_to_struct/1)
+         |> FunctionUtils.wrap_ok()
+ 
+       res ->
+@@ -73,6 +75,7 @@ defmodule Pinchflat.MediaClient.Backends.YtDlp.MediaCollection do
+   end
+ 
+   defp backend_runner do
++    # This approach lets us mock the command for testing
+     Application.get_env(:pinchflat, :yt_dlp_runner)
+   end
+ end
+diff --git a/lib/pinchflat/profiles/options/yt_dlp/download_option_builder.ex b/lib/pinchflat/yt_dlp/download_option_builder.ex
+similarity index 95%
+rename from lib/pinchflat/profiles/options/yt_dlp/download_option_builder.ex
+rename to lib/pinchflat/yt_dlp/download_option_builder.ex
+index ac5c0dee6..d786123b9 100644
+--- a/lib/pinchflat/profiles/options/yt_dlp/download_option_builder.ex
++++ b/lib/pinchflat/yt_dlp/download_option_builder.ex
+@@ -1,12 +1,10 @@
+-defmodule Pinchflat.Profiles.Options.YtDlp.DownloadOptionBuilder do
++defmodule Pinchflat.YtDlp.DownloadOptionBuilder do
+   @moduledoc """
+   Builds the options for yt-dlp to download media based on the given media profile.
+-
+-  IDEA: consider making this a behaviour so I can add other backends later
+   """
+ 
+   alias Pinchflat.Media.MediaItem
+-  alias Pinchflat.Profiles.Options.YtDlp.OutputPathBuilder
++  alias Pinchflat.Profiles.OutputPathBuilder
+ 
+   @doc """
+   Builds the options for yt-dlp to download media based on the given media's profile.
+diff --git a/lib/pinchflat/media_client/media_downloader.ex b/lib/pinchflat/yt_dlp/media_downloader.ex
+similarity index 52%
+rename from lib/pinchflat/media_client/media_downloader.ex
+rename to lib/pinchflat/yt_dlp/media_downloader.ex
+index b952d8f8b..7202b1d0a 100644
+--- a/lib/pinchflat/media_client/media_downloader.ex
++++ b/lib/pinchflat/yt_dlp/media_downloader.ex
+@@ -1,25 +1,22 @@
+ defmodule Pinchflat.MediaClient.MediaDownloader do
+   @moduledoc """
+-  This is the integration layer for actually downloading medias.
++  This is the integration layer for actually downloading media.
+   It takes into account the media profile's settings in order
+   to download the media with the desired options.
+-
+-  Technically hardcodes the yt-dlp backend for now, but should leave
+-  it open-ish for future expansion (just in case).
+   """
+ 
+   alias Pinchflat.Repo
+   alias Pinchflat.Media
+   alias Pinchflat.Media.MediaItem
+ 
+-  alias Pinchflat.MediaClient.Backends.YtDlp.Media, as: YtDlpMedia
+-  alias Pinchflat.Profiles.Options.YtDlp.DownloadOptionBuilder, as: YtDlpDownloadOptionBuilder
+-  alias Pinchflat.MediaClient.Backends.YtDlp.MetadataParser, as: YtDlpMetadataParser
+-  alias Pinchflat.MediaClient.Backends.YtDlp.MetadataFileHelpers, as: YtDlpMetadataHelpers
++  alias Pinchflat.YtDlp.Backend.Media, as: YtDlpMedia
++  alias Pinchflat.YtDlp.DownloadOptionBuilder, as: YtDlpDownloadOptionBuilder
++  alias Pinchflat.Metadata.MetadataParser, as: YtDlpMetadataParser
++  alias Pinchflat.Metadata.MetadataFileHelpers, as: YtDlpMetadataHelpers
+ 
+   @doc """
+   Downloads media for a media item, updating the media item based on the metadata
+-  returned by the backend. Also saves the entire metadata response to the associated
++  returned by yt-dlp. Also saves the entire metadata response to the associated
+   media_metadata record.
+ 
+   NOTE: related methods (like the download worker) won't download if the media item's source
+@@ -28,12 +25,12 @@ defmodule Pinchflat.MediaClient.MediaDownloader do
+ 
+   Returns {:ok, %MediaItem{}} | {:error, any, ...any}
+   """
+-  def download_for_media_item(%MediaItem{} = media_item, backend \\ :yt_dlp) do
++  def download_for_media_item(%MediaItem{} = media_item) do
+     item_with_preloads = Repo.preload(media_item, [:metadata, source: :media_profile])
+ 
+-    case download_with_options(media_item.original_url, item_with_preloads, backend) do
++    case download_with_options(media_item.original_url, item_with_preloads) do
+       {:ok, parsed_json} ->
+-        {parser, helpers} = metadata_parsers(backend)
++        {parser, helpers} = {YtDlpMetadataParser, YtDlpMetadataHelpers}
+ 
+         parsed_attrs =
+           parsed_json
+@@ -55,29 +52,14 @@ defmodule Pinchflat.MediaClient.MediaDownloader do
+     end
+   end
+ 
+-  defp download_with_options(url, item_with_preloads, backend) do
+-    option_builder = option_builder(backend)
+-    media_backend = media_backend(backend)
+-    {:ok, options} = option_builder.build(item_with_preloads)
+-
+-    media_backend.download(url, options)
+-  end
++  # def download_for_source(source, url) do
++  #   # Create MI from source and URL
++  #   media_item = nil
++  # end
+ 
+-  defp option_builder(backend) do
+-    case backend do
+-      :yt_dlp -> YtDlpDownloadOptionBuilder
+-    end
+-  end
++  defp download_with_options(url, item_with_preloads) do
++    {:ok, options} = YtDlpDownloadOptionBuilder.build(item_with_preloads)
+ 
+-  defp media_backend(backend) do
+-    case backend do
+-      :yt_dlp -> YtDlpMedia
+-    end
+-  end
+-
+-  defp metadata_parsers(backend) do
+-    case backend do
+-      :yt_dlp -> {YtDlpMetadataParser, YtDlpMetadataHelpers}
+-    end
++    YtDlpMedia.download(url, options)
+   end
+ end
+diff --git a/lib/pinchflat_web.ex b/lib/pinchflat_web.ex
+index b9b303afc..e7fbc324d 100644
+--- a/lib/pinchflat_web.ex
++++ b/lib/pinchflat_web.ex
+@@ -54,8 +54,9 @@ defmodule PinchflatWeb do
+ 
+   def live_view do
+     quote do
+-      use Phoenix.LiveView,
+-        layout: {PinchflatWeb.Layouts, :app}
++      use Phoenix.Component, global_prefixes: ~w(x-)
++
++      use Phoenix.LiveView
+ 
+       alias Pinchflat.Settings
+ 
+@@ -75,7 +76,7 @@ defmodule PinchflatWeb do
+ 
+   def html do
+     quote do
+-      use Phoenix.Component
++      use Phoenix.Component, global_prefixes: ~w(x-)
+ 
+       # Import convenience functions from controllers
+       import Phoenix.Controller,
+diff --git a/lib/pinchflat_web/components/core_components.ex b/lib/pinchflat_web/components/core_components.ex
+index 3bd848624..3b81cdb20 100644
+--- a/lib/pinchflat_web/components/core_components.ex
++++ b/lib/pinchflat_web/components/core_components.ex
+@@ -40,6 +40,7 @@ defmodule PinchflatWeb.CoreComponents do
+   """
+   attr :id, :string, required: true
+   attr :show, :boolean, default: false
++  attr :allow_close, :boolean, default: true
+   attr :on_cancel, JS, default: %JS{}
+   slot :inner_block, required: true
+ 
+@@ -50,9 +51,9 @@ defmodule PinchflatWeb.CoreComponents do
+       phx-mounted={@show && show_modal(@id)}
+       phx-remove={hide_modal(@id)}
+       data-cancel={JS.exec(@on_cancel, "phx-remove")}
+-      class="relative z-50 hidden"
++      class="relative z-99999 hidden"
+     >
+-      <div id={"#{@id}-bg"} class="bg-zinc-50/90 fixed inset-0 transition-opacity" aria-hidden="true" />
++      <div id={"#{@id}-bg"} class="bg-black-2/80 fixed inset-0 transition-opacity" aria-hidden="true" />
+       <div
+         class="fixed inset-0 overflow-y-auto"
+         aria-labelledby={"#{@id}-title"}
+@@ -62,28 +63,28 @@ defmodule PinchflatWeb.CoreComponents do
+         tabindex="0"
+       >
+         <div class="flex min-h-full items-center justify-center">
+-          <div class="w-full max-w-3xl p-4 sm:p-6 lg:py-8">
+-            <.focus_wrap
++          <div class="w-full max-w-3xl p-2 sm:p-6 lg:py-8">
++            <div
+               id={"#{@id}-container"}
+-              phx-window-keydown={JS.exec("data-cancel", to: "##{@id}")}
++              phx-window-keydown={@allow_close && JS.exec("data-cancel", to: "##{@id}")}
+               phx-key="escape"
+-              phx-click-away={JS.exec("data-cancel", to: "##{@id}")}
+-              class="shadow-zinc-700/10 ring-zinc-700/10 relative hidden rounded-2xl bg-white p-14 shadow-lg ring-1 transition"
++              phx-click-away={@allow_close && JS.exec("data-cancel", to: "##{@id}")}
++              class="shadow-zinc-700/10 ring-zinc-700/10 relative hidden rounded-2xl bg-graydark p-8 sm:p-14 shadow-lg ring-1 transition"
+             >
+-              <div class="absolute top-6 right-5">
++              <div :if={@allow_close} class="absolute top-6 right-5">
+                 <button
+                   phx-click={JS.exec("data-cancel", to: "##{@id}")}
+                   type="button"
+-                  class="-m-3 flex-none p-3 opacity-20 hover:opacity-40"
++                  class="-m-3 flex-none p-3 opacity-60 hover:opacity-80"
+                   aria-label={gettext("close")}
+                 >
+-                  <.icon name="hero-x-mark-solid" class="h-5 w-5" />
++                  <.icon name="hero-x-mark-solid" class="h-5 w-5 text-white" />
+                 </button>
+               </div>
+               <div id={"#{@id}-content"}>
+                 <%= render_slot(@inner_block) %>
+               </div>
+-            </.focus_wrap>
++            </div>
+           </div>
+         </div>
+       </div>
+@@ -243,6 +244,7 @@ defmodule PinchflatWeb.CoreComponents do
+   attr :id, :any, default: nil
+   attr :name, :any
+   attr :label, :string, default: nil
++  attr :label_suffix, :string, default: nil
+   attr :value, :any
+   attr :help, :string, default: nil
+ 
+@@ -294,6 +296,7 @@ defmodule PinchflatWeb.CoreComponents do
+           {@rest}
+         />
+         <%= @label %>
++        <span :if={@label_suffix} class="text-xs text-bodydark"><%= @label_suffix %></span>
+       </label>
+       <.help :if={@help}><%= @help %></.help>
+       <.error :for={msg <- @errors}><%= msg %></.error>
+@@ -309,7 +312,10 @@ defmodule PinchflatWeb.CoreComponents do
+ 
+     ~H"""
+     <div x-data={"{ enabled: #{@checked}}"}>
+-      <.label for={@id}><%= @label %></.label>
++      <.label for={@id}>
++        <%= @label %>
++        <span :if={@label_suffix} class="text-xs text-bodydark"><%= @label_suffix %></span>
++      </.label>
+       <div class="relative">
+         <input type="hidden" name={@name} value="false" />
+         <input
+@@ -343,7 +349,9 @@ defmodule PinchflatWeb.CoreComponents do
+   def input(%{type: "select"} = assigns) do
+     ~H"""
+     <div phx-feedback-for={@name}>
+-      <.label for={@id}><%= @label %></.label>
++      <.label for={@id}>
++        <%= @label %><span :if={@label_suffix} class="text-xs text-bodydark"><%= @label_suffix %></span>
++      </.label>
+       <select
+         id={@id}
+         name={@name}
+@@ -367,7 +375,9 @@ defmodule PinchflatWeb.CoreComponents do
+   def input(%{type: "textarea"} = assigns) do
+     ~H"""
+     <div phx-feedback-for={@name}>
+-      <.label for={@id}><%= @label %></.label>
++      <.label for={@id}>
++        <%= @label %><span :if={@label_suffix} class="text-xs text-bodydark"><%= @label_suffix %></span>
++      </.label>
+       <textarea
+         id={@id}
+         name={@name}
+@@ -390,7 +400,9 @@ defmodule PinchflatWeb.CoreComponents do
+   def input(assigns) do
+     ~H"""
+     <div phx-feedback-for={@name}>
+-      <.label for={@id}><%= @label %></.label>
++      <.label for={@id}>
++        <%= @label %><span :if={@label_suffix} class="text-xs text-bodydark"><%= @label_suffix %></span>
++      </.label>
+       <input
+         type={@type}
+         name={@name}
+@@ -608,15 +620,15 @@ defmodule PinchflatWeb.CoreComponents do
+ 
+   ## Examples
+ 
+-      <.back navigate={~p"/posts"}>Back to posts</.back>
++      <.back href={~p"/posts"}>Back to posts</.back>
+   """
+-  attr :navigate, :any, required: true
++  attr :href, :any, required: true
+   slot :inner_block, required: true
+ 
+   def back(assigns) do
+     ~H"""
+     <div class="mt-16">
+-      <.link navigate={@navigate} class="text-sm font-semibold leading-6 text-zinc-900 hover:text-zinc-700">
++      <.link href={@href} class="text-sm font-semibold leading-6 text-zinc-900 hover:text-zinc-700">
+         <.icon name="hero-arrow-left-solid" class="h-3 w-3" />
+         <%= render_slot(@inner_block) %>
+       </.link>
+@@ -685,7 +697,6 @@ defmodule PinchflatWeb.CoreComponents do
+     )
+     |> show("##{id}-container")
+     |> JS.add_class("overflow-hidden", to: "body")
+-    |> JS.focus_first(to: "##{id}-content")
+   end
+ 
+   def hide_modal(js \\ %JS{}, id) do
+@@ -697,7 +708,6 @@ defmodule PinchflatWeb.CoreComponents do
+     |> hide("##{id}-container")
+     |> JS.hide(to: "##{id}", transition: {"block", "block", "hidden"})
+     |> JS.remove_class("overflow-hidden", to: "body")
+-    |> JS.pop_focus()
+   end
+ 
+   @doc """
+diff --git a/lib/pinchflat_web/components/custom_components/button_components.ex b/lib/pinchflat_web/components/custom_components/button_components.ex
+index a27857713..304e2803b 100644
+--- a/lib/pinchflat_web/components/custom_components/button_components.ex
++++ b/lib/pinchflat_web/components/custom_components/button_components.ex
+@@ -14,7 +14,9 @@ defmodule PinchflatWeb.CustomComponents.ButtonComponents do
+   attr :color, :string, default: "bg-primary"
+   attr :rounding, :string, default: "rounded-sm"
+   attr :class, :string, default: ""
++  attr :type, :string, default: "submit"
+   attr :disabled, :boolean, default: false
++  attr :rest, :global
+ 
+   slot :inner_block, required: true
+ 
+@@ -26,9 +28,11 @@ defmodule PinchflatWeb.CustomComponents.ButtonComponents do
+         "#{@rounding} inline-flex items-center justify-center px-8 py-4",
+         "#{@color}",
+         "hover:bg-opacity-90 lg:px-8 xl:px-10",
++        "disabled:bg-opacity-50 disabled:cursor-not-allowed disabled:text-gray-2",
+         @class
+       ]}
+       disabled={@disabled}
++      {@rest}
+     >
+       <%= render_slot(@inner_block) %>
+     </button>
+diff --git a/lib/pinchflat_web/components/layouts.ex b/lib/pinchflat_web/components/layouts.ex
+index 42172ec08..0efadc1fa 100644
+--- a/lib/pinchflat_web/components/layouts.ex
++++ b/lib/pinchflat_web/components/layouts.ex
+@@ -6,14 +6,16 @@ defmodule PinchflatWeb.Layouts do
+ 
+   attr :icon, :string, required: true
+   attr :text, :string, required: true
+-  attr :navigate, :any, required: true
++  attr :href, :any, required: true
++  attr :target, :any, default: "_self"
+ 
+   def sidebar_item(assigns) do
+     # I'm testing out grouping classes here. Tentative order: font, layout, color, animation, state-modifiers
+     ~H"""
+     <li>
+       <.link
+-        navigate={@navigate}
++        href={@href}
++        target={@target}
+         class={[
+           "font-medium text-bodydark1",
+           "group relative flex items-center gap-2.5 rounded-sm px-4 py-2 duration-300 ease-in-out",
+diff --git a/lib/pinchflat_web/components/layouts/partials/donate_modal.heex b/lib/pinchflat_web/components/layouts/partials/donate_modal.heex
+new file mode 100644
+index 000000000..a74d0894c
+--- /dev/null
++++ b/lib/pinchflat_web/components/layouts/partials/donate_modal.heex
+@@ -0,0 +1,26 @@
++<.modal id="donate-modal" allow_close={true}>
++  <section x-data="{ inputValue: '' }">
++    <h3 class="text-2xl text-white">Donate</h3>
++    <p class="text-sm">Thank you for your support :&rpar;</p>
++    <p class="mt-4">
++      If you find the project valuable and want to support its development, a
++      <.inline_link href="https://www.paypal.me/kieraneglin">donation</.inline_link>
++      would be greatly appreciated.
++    </p>
++    <p class="mt-4">
++      Plus, $5 USD from any donation over $10 USD will be donated to
++      <.inline_link href="https://www.eff.org/">The Electronic Frontier Foundation</.inline_link>
++      who defend your online liberties and backed
++      <.inline_code>youtube-dl</.inline_code>
++      when Google took them down<.inline_link href="https://github.com/github/dmca/blob/9a85e0f021f7967af80e186b890776a50443f06c/2020/11/2020-11-16-RIAA-reversal-effletter.pdf">
++        <.icon name="hero-arrow-top-right-on-square" class="h-3 w-3" />
++      </.inline_link>.
++    </p>
++
++    <.link href="https://www.paypal.me/kieraneglin" target="_blank">
++      <.button color="bg-primary" class="w-full mt-8">
++        Donate
++      </.button>
++    </.link>
++  </section>
++</.modal>
+diff --git a/lib/pinchflat_web/components/layouts/partials/sidebar.html.heex b/lib/pinchflat_web/components/layouts/partials/sidebar.html.heex
+index 13b72e1b9..b116ddcf7 100644
+--- a/lib/pinchflat_web/components/layouts/partials/sidebar.html.heex
++++ b/lib/pinchflat_web/components/layouts/partials/sidebar.html.heex
+@@ -1,31 +1,58 @@
+ <aside
+   x-bind:class="sidebarVisible ? 'translate-x-0' : '-translate-x-full'"
+   class={[
+-    "-translate-x-full absolute left-0 top-0 z-9999 flex h-screen w-60 flex-col overflow-y-hidden",
++    "-translate-x-full absolute left-0 top-0 z-9999 flex h-screen w-60 flex-col overflow-y-hidden justify-between",
+     "bg-black duration-300 ease-linear shadow-lg sm:shadow-none dark:bg-boxdark lg:static lg:translate-x-0"
+   ]}
+   @click.outside="sidebarVisible = false"
+ >
+-  <div class="flex items-center justify-between gap-2 px-6 py-5.5 lg:py-6.5">
+-    <a href="/" class="flex items-center">
+-      <img src={~p"/images/logo.png?cachebust=2024-02-29"} alt="Pinchflat" class="w-9 h-9" />
+-      <h2 class="text-xl font-bold text-white pl-2">Pinchflat</h2>
+-    </a>
++  <section>
++    <div class="flex items-center justify-between gap-2 px-6 py-5.5 lg:py-6.5">
++      <a href="/" class="flex items-center">
++        <img src={~p"/images/logo.png?cachebust=2024-02-29"} alt="Pinchflat" class="w-9 h-9" />
++        <h2 class="text-xl font-bold text-white pl-2">Pinchflat</h2>
++      </a>
+ 
+-    <button class="block lg:hidden" @click.stop="sidebarVisible = !sidebarVisible">
+-      <.icon name="hero-arrow-left" class="fill-current" />
+-    </button>
+-  </div>
+-  <div class="no-scrollbar flex flex-col overflow-y-auto duration-300 ease-linear">
+-    <nav class="mt-5 px-4 py-4 lg:mt-9 lg:px-6">
+-      <div>
++      <button class="block lg:hidden" @click.stop="sidebarVisible = !sidebarVisible">
++        <.icon name="hero-arrow-left" class="fill-current" />
++      </button>
++    </div>
++    <div class="no-scrollbar flex flex-col overflow-y-auto duration-300 ease-linear">
++      <nav class="mt-5 px-4 py-4 lg:mt-9 lg:px-6">
+         <h3 class="mb-4 ml-4 text-sm font-medium text-bodydark2">MENU</h3>
+-        <ul class="mb-6 flex flex-col gap-1.5">
+-          <.sidebar_item icon="hero-home" text="Home" navigate={~p"/"} />
+-          <.sidebar_item icon="hero-tv" text="Sources" navigate={~p"/sources"} />
+-          <.sidebar_item icon="hero-adjustments-vertical" text="Media Profiles" navigate={~p"/media_profiles"} />
+-        </ul>
+-      </div>
++        <div class="flex flex-col justify-between">
++          <ul class="mb-6 flex flex-col gap-1.5">
++            <.sidebar_item icon="hero-home" text="Home" href={~p"/"} />
++            <.sidebar_item icon="hero-tv" text="Sources" href={~p"/sources"} />
++            <.sidebar_item icon="hero-adjustments-vertical" text="Media Profiles" href={~p"/media_profiles"} />
++          </ul>
++        </div>
++      </nav>
++    </div>
++  </section>
++  <section>
++    <nav class="mt-5 px-4 py-4 lg:mt-9 lg:px-6">
++      <ul class="mb-6 flex flex-col gap-1.5">
++        <.sidebar_item
++          icon="hero-code-bracket"
++          text="Github"
++          target="_blank"
++          href="https://github.com/kieraneglin/pinchflat"
++        />
++        <li>
++          <span
++            class={[
++              "font-medium text-bodydark1",
++              "group relative flex items-center gap-2.5 rounded-sm px-4 py-2 duration-300 ease-in-out",
++              "duration-300 ease-in-out cursor-pointer",
++              "hover:bg-graydark dark:hover:bg-meta-4"
++            ]}
++            phx-click={show_modal("donate-modal")}
++          >
++            <.icon name="hero-currency-dollar" /> Donate
++          </span>
++        </li>
++      </ul>
+     </nav>
+-  </div>
++  </section>
+ </aside>
+diff --git a/lib/pinchflat_web/components/layouts/partials/upgrade_button_live.ex b/lib/pinchflat_web/components/layouts/partials/upgrade_button_live.ex
+new file mode 100644
+index 000000000..89c205b81
+--- /dev/null
++++ b/lib/pinchflat_web/components/layouts/partials/upgrade_button_live.ex
+@@ -0,0 +1,40 @@
++defmodule Pinchflat.UpgradeButtonLive do
++  use PinchflatWeb, :live_view
++
++  def render(assigns) do
++    ~H"""
++    <form phx-change="check_matching_text">
++      <.input type="text" name="unlock-pro-textbox" value="" />
++    </form>
++
++    <.button
++      class="w-full mt-4"
++      type="button"
++      disabled={@button_disabled}
++      phx-click={hide_modal("upgrade-modal")}
++      x-on:click="setTimeout(() => { proEnabled = true }, 200)"
++    >
++      Unlock Pro
++    </.button>
++    """
++  end
++
++  def mount(_params, _session, socket) do
++    {:ok, assign(socket, :button_disabled, true)}
++  end
++
++  def handle_event("check_matching_text", %{"unlock-pro-textbox" => text}, socket) do
++    normalized_text =
++      text
++      |> String.trim()
++      |> String.downcase()
++
++    if normalized_text == "got it!" do
++      Settings.set!(:pro_enabled, true)
++
++      {:noreply, update(socket, :button_disabled, fn _ -> false end)}
++    else
++      {:noreply, update(socket, :button_disabled, fn _ -> true end)}
++    end
++  end
++end
+diff --git a/lib/pinchflat_web/components/layouts/partials/upgrade_modal.heex b/lib/pinchflat_web/components/layouts/partials/upgrade_modal.heex
+new file mode 100644
+index 000000000..e51785550
+--- /dev/null
++++ b/lib/pinchflat_web/components/layouts/partials/upgrade_modal.heex
+@@ -0,0 +1,28 @@
++<.modal id="upgrade-modal" allow_close={false}>
++  <section>
++    <h3 class="text-2xl text-white">Pro Mode</h3>
++    <p class="text-sm">Don't worry - Pinchflat is completely free :&rpar;</p>
++    <p class="mt-4">
++      If you find the project valuable and want to support its development, a
++      <.inline_link href="https://www.paypal.me/kieraneglin">donation</.inline_link>
++      would be greatly appreciated.
++    </p>
++    <p class="mt-4">
++      Plus, $5 USD from any donation over $10 USD will be donated to
++      <.inline_link href="https://www.eff.org/">The Electronic Frontier Foundation</.inline_link>
++      who defend your online liberties and backed
++      <.inline_code>youtube-dl</.inline_code>
++      when Google took them down<.inline_link href="https://github.com/github/dmca/blob/9a85e0f021f7967af80e186b890776a50443f06c/2020/11/2020-11-16-RIAA-reversal-effletter.pdf">
++        <.icon name="hero-arrow-top-right-on-square" class="h-3 w-3" />
++      </.inline_link>. <strong>You do not need to donate to unlock Pro</strong>. It's just a way to say thanks!
++    </p>
++
++    <p class="mt-4">
++      To unlock Pro, simply type
++      <.inline_code>got it!</.inline_code>
++      into the text box and press the button.
++    </p>
++
++    <%= live_render(@conn, Pinchflat.UpgradeButtonLive) %>
++  </section>
++</.modal>
+diff --git a/lib/pinchflat_web/components/layouts/root.html.heex b/lib/pinchflat_web/components/layouts/root.html.heex
+index c562aa781..1e3fd03c8 100644
+--- a/lib/pinchflat_web/components/layouts/root.html.heex
++++ b/lib/pinchflat_web/components/layouts/root.html.heex
+@@ -12,7 +12,15 @@
+     <script defer phx-track-static type="text/javascript" src={~p"/assets/app.js"}>
+     </script>
+   </head>
+-  <body x-data="{ sidebarVisible: false }" class="dark text-bodydark bg-boxdark-2">
++  <body
++    x-data={"{ sidebarVisible: false, proEnabled: #{Settings.get!(:pro_enabled)} }"}
++    class="dark text-bodydark bg-boxdark-2"
++  >
+     <%= @inner_content %>
++
++    <.donate_modal conn={@conn} />
++    <template x-if="!proEnabled">
++      <.upgrade_modal conn={@conn} />
++    </template>
+   </body>
+ </html>
+diff --git a/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex b/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
+index 8056359ab..00bcb548a 100644
+--- a/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/media_items/media_item_html/show.html.heex
+@@ -1,6 +1,6 @@
+ <div class="mb-6 flex gap-3 flex-row items-center justify-between">
+   <div class="flex gap-3 items-center">
+-    <.link navigate={~p"/sources/#{@media_item.source_id}"}>
++    <.link href={~p"/sources/#{@media_item.source_id}"}>
+       <.icon name="hero-arrow-left" class="w-10 h-10 hover:dark:text-white" />
+     </.link>
+     <h2 class="text-title-md2 font-bold text-black dark:text-white ml-4">
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/edit.html.heex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/edit.html.heex
+index 6570b9b4f..3022c542f 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/edit.html.heex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/edit.html.heex
+@@ -1,5 +1,5 @@
+ <div class="mb-6 flex gap-3 flex-row items-center">
+-  <.link navigate={~p"/media_profiles"}>
++  <.link href={~p"/media_profiles"}>
+     <.icon name="hero-arrow-left" class="w-10 h-10 hover:dark:text-white" />
+   </.link>
+   <h2 class="text-title-md2 font-bold text-black dark:text-white ml-4">Edit Media Profile</h2>
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/index.html.heex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/index.html.heex
+index 7ba4ad86e..c0443d23b 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/index.html.heex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/index.html.heex
+@@ -3,7 +3,7 @@
+     Media Profiles
+   </h2>
+   <nav>
+-    <.link navigate={~p"/media_profiles/new"}>
++    <.link href={~p"/media_profiles/new"}>
+       <.button color="bg-primary" rounding="rounded-full">
+         <span class="font-bold text-xl mx-2">+</span> New <span class="hidden sm:inline pl-1">Media Profile</span>
+       </.button>
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/new.html.heex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/new.html.heex
+index a0311ab5a..fe3e9e751 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/new.html.heex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/new.html.heex
+@@ -1,5 +1,5 @@
+ <div class="mb-6 flex gap-3 flex-row items-center">
+-  <.link :if={!Settings.get!(:onboarding)} navigate={~p"/media_profiles"}>
++  <.link :if={!Settings.get!(:onboarding)} href={~p"/media_profiles"}>
+     <.icon name="hero-arrow-left" class="w-10 h-10 hover:dark:text-white" />
+   </.link>
+   <h2 class="text-title-md2 font-bold text-black dark:text-white ml-4">New Media Profile</h2>
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/show.html.heex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/show.html.heex
+index a7e5b1f92..27c7925ac 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/show.html.heex
+@@ -1,6 +1,6 @@
+ <div class="mb-6 flex gap-3 flex-row items-center justify-between">
+   <div class="flex items-center">
+-    <.link navigate={~p"/media_profiles"}>
++    <.link href={~p"/media_profiles"}>
+       <.icon name="hero-arrow-left" class="w-10 h-10 hover:dark:text-white" />
+     </.link>
+     <h2 class="text-title-md2 font-bold text-black dark:text-white ml-2">
+@@ -9,7 +9,7 @@
+   </div>
+ 
+   <nav>
+-    <.link navigate={~p"/media_profiles/#{@media_profile}/edit"}>
++    <.link href={~p"/media_profiles/#{@media_profile}/edit"}>
+       <.button color="bg-primary" rounding="rounded-full">
+         <.icon name="hero-pencil-square" class="mr-2" />Edit <span class="hidden sm:inline pl-1">Media Profile</span>
+       </.button>
+diff --git a/lib/pinchflat_web/controllers/pages/page_html/onboarding_checklist.html.heex b/lib/pinchflat_web/controllers/pages/page_html/onboarding_checklist.html.heex
+index 8a387b399..e336ce593 100644
+--- a/lib/pinchflat_web/controllers/pages/page_html/onboarding_checklist.html.heex
++++ b/lib/pinchflat_web/controllers/pages/page_html/onboarding_checklist.html.heex
+@@ -10,7 +10,7 @@
+         <p class="text-md text-bodydark">Media Profiles set your preferences for fetching and downloading media.</p>
+         <p class="text-md text-bodydark">Don't worry, you can create more Media Profiles later!</p>
+         <div class="mt-8">
+-          <.link navigate={~p"/media_profiles/new"}>
++          <.link href={~p"/media_profiles/new"}>
+             <.button color="bg-primary" rounding="rounded-full" disabled={@media_profiles_exist}>
+               <span class="font-bold mx-2">+</span> New Media Profile
+             </.button>
+@@ -24,7 +24,7 @@
+           Each Media Profile can control many Sources so it's easy to add more content!
+         </p>
+         <div class="mt-8">
+-          <.link navigate={~p"/sources/new"}>
++          <.link href={~p"/sources/new"}>
+             <.button color="bg-primary" rounding="rounded-full" disabled={not @media_profiles_exist}>
+               <span class="font-bold mx-2">+</span> New Source
+             </.button>
+@@ -39,7 +39,7 @@
+         </p>
+         <p class="text-md text-bodydark">Feel free to add more Media Profiles or Sources in the meantime!</p>
+         <div class="mt-8">
+-          <.link navigate={~p"/"}>
++          <.link href={~p"/"}>
+             <.button color="bg-primary" rounding="rounded-full" disabled={not @sources_exist}>
+               Let's Go <span class="font-bold mx-2">🚀</span>
+             </.button>
+diff --git a/lib/pinchflat_web/controllers/searches/search_html/show.html.heex b/lib/pinchflat_web/controllers/searches/search_html/show.html.heex
+index 4d2bfd55a..b592391ea 100644
+--- a/lib/pinchflat_web/controllers/searches/search_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/searches/search_html/show.html.heex
+@@ -17,7 +17,7 @@
+           </:col>
+           <:col :let={result} label="" class="flex place-content-evenly">
+             <.link
+-              navigate={~p"/sources/#{result.source_id}/media/#{result.id}"}
++              href={~p"/sources/#{result.source_id}/media/#{result.id}"}
+               class="hover:text-secondary duration-200 ease-in-out mx-0.5"
+             >
+               <.icon name="hero-eye" />
+diff --git a/lib/pinchflat_web/controllers/sources/source_controller.ex b/lib/pinchflat_web/controllers/sources/source_controller.ex
+index 757fb4426..60039f49a 100644
+--- a/lib/pinchflat_web/controllers/sources/source_controller.ex
++++ b/lib/pinchflat_web/controllers/sources/source_controller.ex
+@@ -3,8 +3,9 @@ defmodule PinchflatWeb.Sources.SourceController do
+ 
+   alias Pinchflat.Repo
+   alias Pinchflat.Media
+-  alias Pinchflat.Profiles
++  alias Pinchflat.Tasks
+   alias Pinchflat.Sources
++  alias Pinchflat.Profiles
+   alias Pinchflat.Sources.Source
+ 
+   def index(conn, _params) do
+@@ -43,15 +44,18 @@ defmodule PinchflatWeb.Sources.SourceController do
+   end
+ 
+   def show(conn, %{"id" => id}) do
+-    source =
+-      id
+-      |> Sources.get_source!()
+-      |> Repo.preload([:media_profile, tasks: [:job]])
++    source = Repo.preload(Sources.get_source!(id), :media_profile)
+ 
++    pending_tasks = Repo.preload(Tasks.list_pending_tasks_for(:source_id, source.id), :job)
+     pending_media = Media.list_pending_media_items_for(source, limit: 100)
+     downloaded_media = Media.list_downloaded_media_items_for(source, limit: 100)
+ 
+-    render(conn, :show, source: source, pending_media: pending_media, downloaded_media: downloaded_media)
++    render(conn, :show,
++      source: source,
++      pending_tasks: pending_tasks,
++      pending_media: pending_media,
++      downloaded_media: downloaded_media
++    )
+   end
+ 
+   def edit(conn, %{"id" => id}) do
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/edit.html.heex b/lib/pinchflat_web/controllers/sources/source_html/edit.html.heex
+index 78ca9f322..094dca243 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/edit.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/edit.html.heex
+@@ -1,5 +1,5 @@
+ <div class="mb-6 flex gap-3 flex-row items-center">
+-  <.link navigate={~p"/sources"}>
++  <.link href={~p"/sources"}>
+     <.icon name="hero-arrow-left" class="w-10 h-10 hover:dark:text-white" />
+   </.link>
+   <h2 class="text-title-md2 font-bold text-black dark:text-white ml-4">Edit Source</h2>
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/fast_indexing_help.html.heex b/lib/pinchflat_web/controllers/sources/source_html/fast_indexing_help.html.heex
+new file mode 100644
+index 000000000..710b2ed7b
+--- /dev/null
++++ b/lib/pinchflat_web/controllers/sources/source_html/fast_indexing_help.html.heex
+@@ -0,0 +1,21 @@
++<aside>
++  <h2 class="text-xl font-bold mb-2">What is fast indexing (experimental)?</h2>
++  <section class="ml-2 md:ml-4 mb-4 max-w-prose">
++    <p>
++      Indexing is the act of scanning a channel or playlist (aka: source) for new media.
++    </p>
++    <p class="mt-2">
++      Normal indexing uses <code class="text-sm">yt-dlp</code>
++      to scan the entire source on your specified frequency, but it's very slow for large sources. This is the most accurate way to find uploaded media with the tradeoff being that pairing a large source with a low index frequency will result in you spending most of your time indexing. Only so many indexing operations can be running at the same time, so this can impact your other source's ability to index.
++    </p>
++    <p class="mt-2">
++      Fast indexing takes a different approach. It still does an initial scan the slow way but after that it uses an RSS feed to frequently check for new videos. This has the potential to be hundreds of times faster, but it can miss videos if the uploader un-privates an old video or uploads dozens of videos in the space of a few minutes. It works well for most channels or playlists but it's not perfect.
++    </p>
++    <p class="mt-2">
++      To make up for this limitation, a normal index is still run monthly to catch any videos that were missed by fast indexing. Fast indexing overrides the normal index frequency.
++    </p>
++    <p class="mt-2">
++      Fast indexing is experimental so please report any issues on GitHub. It's only recommended for sources with over 200-ish videos and that upload frequently. Not recommended for small or inactive sources.
++    </p>
++  </section>
++</aside>
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/index.html.heex b/lib/pinchflat_web/controllers/sources/source_html/index.html.heex
+index 0b3f743ef..92e384c41 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/index.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/index.html.heex
+@@ -1,7 +1,7 @@
+ <div class="mb-6 flex gap-3 flex-row items-center justify-between">
+   <h2 class="text-title-md2 font-bold text-black dark:text-white">Sources</h2>
+   <nav>
+-    <.link navigate={~p"/sources/new"}>
++    <.link href={~p"/sources/new"}>
+       <.button color="bg-primary" rounding="rounded-full">
+         <span class="font-bold mx-2">+</span> New <span class="hidden sm:inline pl-1">Source</span>
+       </.button>
+@@ -22,7 +22,7 @@
+         </:col>
+         <:col :let={source} label="Media Profile">
+           <.link
+-            navigate={~p"/media_profiles/#{source.media_profile_id}"}
++            href={~p"/media_profiles/#{source.media_profile_id}"}
+             class="hover:text-secondary duration-200 ease-in-out"
+           >
+             <%= source.media_profile.name %>
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/new.html.heex b/lib/pinchflat_web/controllers/sources/source_html/new.html.heex
+index 4c9fbc486..2817c7804 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/new.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/new.html.heex
+@@ -1,5 +1,5 @@
+ <div class="mb-6 flex gap-3 flex-row items-center">
+-  <.link :if={!Settings.get!(:onboarding)} navigate={~p"/sources"}>
++  <.link :if={!Settings.get!(:onboarding)} href={~p"/sources"}>
+     <.icon name="hero-arrow-left" class="w-10 h-10 hover:dark:text-white" />
+   </.link>
+   <h2 class="text-title-md2 font-bold text-black dark:text-white ml-4">New Source</h2>
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/show.html.heex b/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
+index d8c69d269..d8f079529 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/show.html.heex
+@@ -1,6 +1,6 @@
+ <div class="mb-6 flex gap-3 flex-row items-center justify-between">
+   <div class="flex gap-3 items-center">
+-    <.link navigate={~p"/sources"}>
++    <.link href={~p"/sources"}>
+       <.icon name="hero-arrow-left" class="w-10 h-10 hover:dark:text-white" />
+     </.link>
+     <h2 class="text-title-md2 font-bold text-black dark:text-white ml-4">
+@@ -9,7 +9,7 @@
+   </div>
+ 
+   <nav>
+-    <.link navigate={~p"/sources/#{@source}/edit"}>
++    <.link href={~p"/sources/#{@source}/edit"}>
+       <.button color="bg-primary" rounding="rounded-full">
+         <.icon name="hero-pencil-square" class="mr-2" /> Edit <span class="hidden sm:inline pl-1">Source</span>
+       </.button>
+@@ -84,9 +84,9 @@
+           <p class="text-black dark:text-white">Nothing Here!</p>
+         <% end %>
+       </:tab>
+-      <:tab title="Tasks">
+-        <%= if match?([_|_], @source.tasks) do %>
+-          <.table rows={@source.tasks} table_class="text-black dark:text-white">
++      <:tab title="Pending Tasks">
++        <%= if match?([_|_], @pending_tasks) do %>
++          <.table rows={@pending_tasks} table_class="text-black dark:text-white">
+             <:col :let={task} label="Worker">
+               <%= task.job.worker %>
+             </:col>
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex b/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
+index c538c9673..5eff7c6bb 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
+@@ -3,6 +3,10 @@
+     Oops, something went wrong! Please check the errors below.
+   </.error>
+ 
++  <h3 class="mt-8 text-2xl text-black dark:text-white">
++    General Options
++  </h3>
++
+   <.input
+     field={f[:custom_name]}
+     type="text"
+@@ -19,6 +23,10 @@
+     label="Media Profile"
+   />
+ 
++  <h3 class="mt-8 text-2xl text-black dark:text-white">
++    Indexing Options
++  </h3>
++
+   <.input
+     field={f[:index_frequency_minutes]}
+     options={friendly_index_frequencies()}
+@@ -27,6 +35,21 @@
+     help="Time between one index of this source finishing and the next one starting. Setting to 'On Create' will still run an initial index but no subsequent ones"
+   />
+ 
++  <%!-- TODO: use Alpine to disable the index frequency when fast indexing is enabled --%>
++  <div phx-click={show_modal("upgrade-modal")}>
++    <.input
++      field={f[:fast_index]}
++      type="toggle"
++      label="Use Fast Indexing?"
++      label_suffix="(pro)"
++      help="Experimental. Ignores 'Index Frequency'. Recommended for large channels that upload frequently. See below for more info"
++    />
++  </div>
++
++  <h3 class="mt-8 text-2xl text-black dark:text-white">
++    Downloading Options
++  </h3>
++
+   <.input
+     field={f[:download_media]}
+     type="toggle"
+@@ -34,7 +57,9 @@
+     help="Unchecking still indexes media but it won't be downloaded until you enable this option"
+   />
+ 
+-  <:actions>
+-    <.button class="my-10 sm:mb-7.5 w-full sm:w-auto">Save Source</.button>
+-  </:actions>
++  <.button class="my-10 sm:mb-7.5 w-full sm:w-auto">Save Source</.button>
++
++  <div class="rounded-sm dark:bg-meta-4 p-4 md:p-6 mb-5">
++    <.fast_indexing_help />
++  </div>
+ </.simple_form>
+diff --git a/priv/repo/migrations/20240309052602_add_short_form_to_media_items.exs b/priv/repo/migrations/20240309052602_add_short_form_to_media_items.exs
+new file mode 100644
+index 000000000..0b774596f
+--- /dev/null
++++ b/priv/repo/migrations/20240309052602_add_short_form_to_media_items.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddShortFormToMediaItems do
++  use Ecto.Migration
++
++  def change do
++    alter table(:media_items) do
++      add :short_form_content, :boolean, null: false, default: false
++    end
++  end
++end
+diff --git a/priv/repo/migrations/20240309182418_add_fast_index_to_sources.exs b/priv/repo/migrations/20240309182418_add_fast_index_to_sources.exs
+new file mode 100644
+index 000000000..26b3a6cec
+--- /dev/null
++++ b/priv/repo/migrations/20240309182418_add_fast_index_to_sources.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddFastIndexToSources do
++  use Ecto.Migration
++
++  def change do
++    alter table(:sources) do
++      add :fast_index, :boolean, null: false, default: false
++    end
++  end
++end
+diff --git a/test/pinchflat/api/youtube_rss_test.exs b/test/pinchflat/api/youtube_rss_test.exs
+new file mode 100644
+index 000000000..34c386cb6
+--- /dev/null
++++ b/test/pinchflat/api/youtube_rss_test.exs
+@@ -0,0 +1,79 @@
++defmodule Pinchflat.Api.YoutubeRssTest do
++  use Pinchflat.DataCase
++  import Mox
++  import Pinchflat.SourcesFixtures
++
++  alias Pinchflat.Api.YoutubeRss
++
++  setup :verify_on_exit!
++
++  setup do
++    source = source_fixture()
++
++    {:ok, source: source}
++  end
++
++  describe "get_recent_media_ids_from_rss/1" do
++    test "calls the expected URL for channel sources" do
++      source = source_fixture(collection_type: :channel, collection_id: "channel_id")
++
++      expect(HTTPClientMock, :get, fn url ->
++        assert url =~ "https://www.youtube.com/feeds/videos.xml?channel_id=#{source.collection_id}"
++
++        {:ok, ""}
++      end)
++
++      assert {:ok, _} = YoutubeRss.get_recent_media_ids_from_rss(source)
++    end
++
++    test "calls the expected URL for playlist sources" do
++      source = source_fixture(collection_type: :playlist, collection_id: "playlist_id")
++
++      expect(HTTPClientMock, :get, fn url ->
++        assert url =~ "https://www.youtube.com/feeds/videos.xml?playlist_id=#{source.collection_id}"
++
++        {:ok, ""}
++      end)
++
++      assert {:ok, _} = YoutubeRss.get_recent_media_ids_from_rss(source)
++    end
++
++    test "returns an error if the HTTP request fails", %{source: source} do
++      expect(HTTPClientMock, :get, fn _url -> {:error, ""} end)
++
++      assert {:error, "Failed to fetch RSS feed"} = YoutubeRss.get_recent_media_ids_from_rss(source)
++    end
++
++    test "returns the media IDs from the RSS feed", %{source: source} do
++      expect(HTTPClientMock, :get, fn _url ->
++        {:ok, "<yt:videoId>test_1</yt:videoId><yt:videoId>test_2</yt:videoId>"}
++      end)
++
++      assert {:ok, ["test_1", "test_2"]} = YoutubeRss.get_recent_media_ids_from_rss(source)
++    end
++
++    test "strips whitespace from media IDs", %{source: source} do
++      expect(HTTPClientMock, :get, fn _url ->
++        {:ok, "<yt:videoId> test_1 </yt:videoId><yt:videoId> test_2 </yt:videoId>"}
++      end)
++
++      assert {:ok, ["test_1", "test_2"]} = YoutubeRss.get_recent_media_ids_from_rss(source)
++    end
++
++    test "removes empty media IDs", %{source: source} do
++      expect(HTTPClientMock, :get, fn _url ->
++        {:ok, "<yt:videoId>test_1</yt:videoId><yt:videoId></yt:videoId>"}
++      end)
++
++      assert {:ok, ["test_1"]} = YoutubeRss.get_recent_media_ids_from_rss(source)
++    end
++
++    test "removes duplicate media IDs", %{source: source} do
++      expect(HTTPClientMock, :get, fn _url ->
++        {:ok, "<yt:videoId>test_1</yt:videoId><yt:videoId>test_1</yt:videoId>"}
++      end)
++
++      assert {:ok, ["test_1"]} = YoutubeRss.get_recent_media_ids_from_rss(source)
++    end
++  end
++end
+diff --git a/test/pinchflat/media_client/backends/yt_dlp/media_test.exs b/test/pinchflat/media_client/backends/yt_dlp/media_test.exs
+deleted file mode 100644
+index e9fe0fc2f..000000000
+--- a/test/pinchflat/media_client/backends/yt_dlp/media_test.exs
++++ /dev/null
+@@ -1,56 +0,0 @@
+-defmodule Pinchflat.MediaClient.Backends.YtDlp.MediaTest do
+-  use Pinchflat.DataCase
+-  import Mox
+-
+-  alias Pinchflat.MediaClient.Backends.YtDlp.Media
+-
+-  @media_url "https://www.youtube.com/watch?v=TiZPUDkDYbk"
+-
+-  setup :verify_on_exit!
+-
+-  # expect(YtDlpRunnerMock, :run, fn _url, [_, _, json_output_path | _] ->
+-  # copy_metadata(json_output_path)
+-
+-  #   {:ok, ""}
+-  # end)
+-
+-  describe "download/2" do
+-    test "it calls the backend runner with the expected arguments" do
+-      expect(YtDlpRunnerMock, :run, fn @media_url, opts, ot ->
+-        assert [:no_simulate] = opts
+-        assert "after_move:%()j" = ot
+-
+-        {:ok, render_metadata(:media_metadata)}
+-      end)
+-
+-      assert {:ok, _} = Media.download(@media_url)
+-    end
+-
+-    test "it passes along additional options" do
+-      expect(YtDlpRunnerMock, :run, fn _url, opts, _ot ->
+-        assert [:no_simulate, :custom_arg] = opts
+-
+-        {:ok, "{}"}
+-      end)
+-
+-      assert {:ok, _} = Media.download(@media_url, [:custom_arg])
+-    end
+-
+-    test "it parses and returns the generated file as JSON" do
+-      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
+-        {:ok, render_metadata(:media_metadata)}
+-      end)
+-
+-      assert {:ok, %{"title" => "Trying to Wheelie Without the Rear Brake"}} =
+-               Media.download(@media_url)
+-    end
+-
+-    test "it returns errors" do
+-      expect(YtDlpRunnerMock, :run, fn _url, _opt, _ot ->
+-        {:error, "something"}
+-      end)
+-
+-      assert {:error, "something"} = Media.download(@media_url)
+-    end
+-  end
+-end
+diff --git a/test/pinchflat/media_client/source_details_test.exs b/test/pinchflat/media_client/source_details_test.exs
+deleted file mode 100644
+index 482c08e25..000000000
+--- a/test/pinchflat/media_client/source_details_test.exs
++++ /dev/null
+@@ -1,112 +0,0 @@
+-defmodule Pinchflat.MediaClient.SourceDetailsTest do
+-  use Pinchflat.DataCase
+-  import Mox
+-  import Pinchflat.ProfilesFixtures
+-  import Pinchflat.SourcesFixtures
+-
+-  alias Pinchflat.MediaClient.SourceDetails
+-
+-  @channel_url "https://www.youtube.com/c/TheUselessTrials"
+-
+-  setup :verify_on_exit!
+-
+-  describe "get_source_details/2" do
+-    test "it passes the expected arguments to the backend" do
+-      expect(YtDlpRunnerMock, :run, fn @channel_url, opts, ot ->
+-        assert opts == [:simulate, :skip_download, playlist_end: 1]
+-        assert ot == "%(.{channel,channel_id,playlist_id,playlist_title})j"
+-
+-        {:ok, "{}"}
+-      end)
+-
+-      assert {:ok, _} = SourceDetails.get_source_details(@channel_url)
+-    end
+-
+-    test "it returns a map composed of the returned data" do
+-      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
+-        Phoenix.json_library().encode(%{
+-          channel: "TheUselessTrials",
+-          channel_id: "UCQH2",
+-          playlist_id: "PLQH2",
+-          playlist_title: "TheUselessTrials - Videos"
+-        })
+-      end)
+-
+-      assert {:ok, res} = SourceDetails.get_source_details(@channel_url)
+-
+-      assert %{
+-               channel_id: "UCQH2",
+-               channel_name: "TheUselessTrials",
+-               playlist_id: "PLQH2",
+-               playlist_name: "TheUselessTrials - Videos"
+-             } = res
+-    end
+-  end
+-
+-  describe "get_media_attributes/2 when passed a string" do
+-    test "it passes the expected arguments to the backend" do
+-      expect(YtDlpRunnerMock, :run, fn @channel_url, opts, ot, _addl_opts ->
+-        assert opts == [:simulate, :skip_download]
+-        assert ot == "%(.{id,title,was_live,original_url,description})j"
+-
+-        {:ok, ""}
+-      end)
+-
+-      assert {:ok, _} = SourceDetails.get_media_attributes(@channel_url)
+-    end
+-
+-    test "it returns a list of maps" do
+-      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts ->
+-        {:ok, source_attributes_return_fixture()}
+-      end)
+-
+-      assert {:ok, [%{}, %{}, %{}]} = SourceDetails.get_media_attributes(@channel_url)
+-    end
+-  end
+-
+-  describe "get_media_attributes/2 when passed a Source record" do
+-    test "it calls the backend with the source's collection ID" do
+-      source = source_fixture()
+-
+-      expect(YtDlpRunnerMock, :run, fn url, _opts, _ot, _addl_opts ->
+-        assert source.collection_id == url
+-        {:ok, source_attributes_return_fixture()}
+-      end)
+-
+-      assert {:ok, _} = SourceDetails.get_media_attributes(source)
+-    end
+-
+-    test "it builds options based on the source's media profile" do
+-      expect(YtDlpRunnerMock, :run, fn _url, opts, _ot, _addl_opts ->
+-        assert opts == [:simulate, :skip_download]
+-        {:ok, ""}
+-      end)
+-
+-      media_profile =
+-        media_profile_fixture(
+-          shorts_behaviour: :include,
+-          livestream_behaviour: :exclude
+-        )
+-
+-      source = source_fixture(media_profile_id: media_profile.id)
+-      assert {:ok, _} = SourceDetails.get_media_attributes(source)
+-    end
+-
+-    test "lets you pass through an optional file_listener_handler" do
+-      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts ->
+-        {:ok, source_attributes_return_fixture()}
+-      end)
+-
+-      source = source_fixture()
+-      current_self = self()
+-
+-      handler = fn filename ->
+-        send(current_self, {:handler, filename})
+-      end
+-
+-      assert {:ok, _} = SourceDetails.get_media_attributes(source, file_listener_handler: handler)
+-
+-      assert_receive {:handler, _}
+-    end
+-  end
+-end
+diff --git a/test/pinchflat/media_test.exs b/test/pinchflat/media_test.exs
+index a4692b42d..870cef780 100644
+--- a/test/pinchflat/media_test.exs
++++ b/test/pinchflat/media_test.exs
+@@ -9,7 +9,9 @@ defmodule Pinchflat.MediaTest do
+ 
+   alias Pinchflat.Media
+   alias Pinchflat.Media.MediaItem
+-  alias Pinchflat.MediaClient.Backends.YtDlp.MetadataFileHelpers
++  alias Pinchflat.Metadata.MetadataFileHelpers
++
++  alias Pinchflat.YtDlp.Backend.Media, as: YtDlpMedia
+ 
+   setup :verify_on_exit!
+ 
+@@ -45,6 +47,23 @@ defmodule Pinchflat.MediaTest do
+     end
+   end
+ 
++  describe "list_media_items_by_media_id_for/2" do
++    test "returns media_items for a given source and media_ids" do
++      source = source_fixture()
++      media_item = media_item_fixture(%{source_id: source.id, media_id: "123"})
++
++      assert Media.list_media_items_by_media_id_for(source, ["123"]) == [media_item]
++    end
++
++    test "does not return matching media_ids for a different source" do
++      source = source_fixture()
++      other_source = source_fixture()
++      _media_item = media_item_fixture(%{source_id: other_source.id, media_id: "123"})
++
++      assert Media.list_media_items_by_media_id_for(source, ["123"]) == []
++    end
++  end
++
+   describe "list_pending_media_items_for/1" do
+     test "it returns pending without a filepath for a given source" do
+       source = source_fixture()
+@@ -78,7 +97,7 @@ defmodule Pinchflat.MediaTest do
+     test "returns shorts and normal media when shorts_behaviour is :include" do
+       source = source_fixture(%{media_profile_id: media_profile_fixture(%{shorts_behaviour: :include}).id})
+       normal = media_item_fixture(%{source_id: source.id, media_filepath: nil})
+-      short = media_item_fixture(%{source_id: source.id, media_filepath: nil, original_url: "/shorts/"})
++      short = media_item_fixture(%{source_id: source.id, media_filepath: nil, short_form_content: true})
+ 
+       assert Media.list_pending_media_items_for(source) == [normal, short]
+     end
+@@ -86,7 +105,7 @@ defmodule Pinchflat.MediaTest do
+     test "returns only shorts when shorts_behaviour is :only" do
+       source = source_fixture(%{media_profile_id: media_profile_fixture(%{shorts_behaviour: :only}).id})
+       _normal = media_item_fixture(%{source_id: source.id, media_filepath: nil})
+-      short = media_item_fixture(%{source_id: source.id, media_filepath: nil, original_url: "/shorts/"})
++      short = media_item_fixture(%{source_id: source.id, media_filepath: nil, short_form_content: true})
+ 
+       assert Media.list_pending_media_items_for(source) == [short]
+     end
+@@ -94,7 +113,7 @@ defmodule Pinchflat.MediaTest do
+     test "returns only normal media when shorts_behaviour is :exclude" do
+       source = source_fixture(%{media_profile_id: media_profile_fixture(%{shorts_behaviour: :exclude}).id})
+       normal = media_item_fixture(%{source_id: source.id, media_filepath: nil})
+-      _short = media_item_fixture(%{source_id: source.id, media_filepath: nil, original_url: "/shorts/"})
++      _short = media_item_fixture(%{source_id: source.id, media_filepath: nil, short_form_content: true})
+ 
+       assert Media.list_pending_media_items_for(source) == [normal]
+     end
+@@ -139,7 +158,7 @@ defmodule Pinchflat.MediaTest do
+ 
+       normal = media_item_fixture(%{source_id: source.id, media_filepath: nil})
+       livestream = media_item_fixture(%{source_id: source.id, media_filepath: nil, livestream: true})
+-      short = media_item_fixture(%{source_id: source.id, media_filepath: nil, original_url: "/shorts/"})
++      short = media_item_fixture(%{source_id: source.id, media_filepath: nil, short_form_content: true})
+ 
+       assert Media.list_pending_media_items_for(source) == [normal, livestream, short]
+     end
+@@ -156,7 +175,7 @@ defmodule Pinchflat.MediaTest do
+ 
+       _normal = media_item_fixture(%{source_id: source.id, media_filepath: nil})
+       livestream = media_item_fixture(%{source_id: source.id, media_filepath: nil, livestream: true})
+-      short = media_item_fixture(%{source_id: source.id, media_filepath: nil, original_url: "/shorts/"})
++      short = media_item_fixture(%{source_id: source.id, media_filepath: nil, short_form_content: true})
+ 
+       assert Media.list_pending_media_items_for(source) == [livestream, short]
+     end
+@@ -173,7 +192,7 @@ defmodule Pinchflat.MediaTest do
+ 
+       normal = media_item_fixture(%{source_id: source.id, media_filepath: nil})
+       _livestream = media_item_fixture(%{source_id: source.id, media_filepath: nil, livestream: true})
+-      _short = media_item_fixture(%{source_id: source.id, media_filepath: nil, original_url: "/shorts/"})
++      _short = media_item_fixture(%{source_id: source.id, media_filepath: nil, short_form_content: true})
+ 
+       assert Media.list_pending_media_items_for(source) == [normal]
+     end
+@@ -190,7 +209,7 @@ defmodule Pinchflat.MediaTest do
+ 
+       _normal = media_item_fixture(%{source_id: source.id, media_filepath: nil})
+       _livestream = media_item_fixture(%{source_id: source.id, media_filepath: nil, livestream: true})
+-      short = media_item_fixture(%{source_id: source.id, media_filepath: nil, original_url: "/shorts/"})
++      short = media_item_fixture(%{source_id: source.id, media_filepath: nil, short_form_content: true})
+ 
+       assert Media.list_pending_media_items_for(source) == [short]
+     end
+@@ -230,7 +249,7 @@ defmodule Pinchflat.MediaTest do
+ 
+     test "returns false if the media hasn't been downloaded but the profile doesn't DL shorts" do
+       source = source_fixture(%{media_profile_id: media_profile_fixture(%{shorts_behaviour: :exclude}).id})
+-      media_item = media_item_fixture(%{source_id: source.id, media_filepath: nil, original_url: "/shorts/"})
++      media_item = media_item_fixture(%{source_id: source.id, media_filepath: nil, short_form_content: true})
+ 
+       refute Media.pending_download?(media_item)
+     end
+@@ -368,6 +387,24 @@ defmodule Pinchflat.MediaTest do
+     end
+   end
+ 
++  describe "create_media_item_from_backend_attrs/2" do
++    test "creates a media item for a given source and attributes" do
++      source = source_fixture()
++
++      media_attrs =
++        media_attributes_return_fixture()
++        |> Phoenix.json_library().decode!()
++        |> YtDlpMedia.response_to_struct()
++
++      assert {:ok, %MediaItem{} = media_item} = Media.create_media_item_from_backend_attrs(source, media_attrs)
++      assert media_item.source_id == source.id
++      assert media_item.title == media_attrs.title
++      assert media_item.media_id == media_attrs.media_id
++      assert media_item.original_url == media_attrs.original_url
++      assert media_item.description == media_attrs.description
++    end
++  end
++
+   describe "update_media_item/2" do
+     test "updating with valid data updates the media_item" do
+       media_item = media_item_fixture()
+diff --git a/test/pinchflat/media_client/backends/yt_dlp/metadata_file_helpers_test.exs b/test/pinchflat/metadata/metadata_file_helpers_test.exs
+similarity index 94%
+rename from test/pinchflat/media_client/backends/yt_dlp/metadata_file_helpers_test.exs
+rename to test/pinchflat/metadata/metadata_file_helpers_test.exs
+index ffbfff9e1..e95a6f8b2 100644
+--- a/test/pinchflat/media_client/backends/yt_dlp/metadata_file_helpers_test.exs
++++ b/test/pinchflat/metadata/metadata_file_helpers_test.exs
+@@ -1,9 +1,9 @@
+-defmodule Pinchflat.MediaClient.Backends.YtDlp.MetadataFileHelpersTest do
++defmodule Pinchflat.Metadata.MetadataFileHelpersTest do
+   use Pinchflat.DataCase
+   import Mox
+   import Pinchflat.MediaFixtures
+ 
+-  alias Pinchflat.MediaClient.Backends.YtDlp.MetadataFileHelpers, as: Helpers
++  alias Pinchflat.Metadata.MetadataFileHelpers, as: Helpers
+ 
+   setup do
+     media_item = media_item_fixture()
+diff --git a/test/pinchflat/media_client/backends/yt_dlp/metadata_parser_test.exs b/test/pinchflat/metadata/metadata_parser_test.exs
+similarity index 82%
+rename from test/pinchflat/media_client/backends/yt_dlp/metadata_parser_test.exs
+rename to test/pinchflat/metadata/metadata_parser_test.exs
+index b34153466..e48c1b4ab 100644
+--- a/test/pinchflat/media_client/backends/yt_dlp/metadata_parser_test.exs
++++ b/test/pinchflat/metadata/metadata_parser_test.exs
+@@ -1,7 +1,7 @@
+-defmodule Pinchflat.MediaClient.Backends.YtDlp.MediaParserTest do
++defmodule Pinchflat.YtDlp.Backend.MediaParserTest do
+   use Pinchflat.DataCase
+ 
+-  alias Pinchflat.MediaClient.Backends.YtDlp.MetadataParser, as: Parser
++  alias Pinchflat.Metadata.MetadataParser, as: Parser
+ 
+   setup do
+     json_filepath =
+@@ -33,13 +33,31 @@ defmodule Pinchflat.MediaClient.Backends.YtDlp.MediaParserTest do
+     test "it extracts the title", %{metadata: metadata} do
+       result = Parser.parse_for_media_item(metadata)
+ 
+-      assert result.title == "Trying to Wheelie Without the Rear Brake"
++      assert result.title == metadata["title"]
+     end
+ 
+     test "it extracts the description", %{metadata: metadata} do
+       result = Parser.parse_for_media_item(metadata)
+ 
+-      assert is_binary(result.description)
++      assert result.description == metadata["description"]
++    end
++
++    test "it extracts the original_url", %{metadata: metadata} do
++      result = Parser.parse_for_media_item(metadata)
++
++      assert result.original_url == metadata["original_url"]
++    end
++
++    test "it extracts the media_id", %{metadata: metadata} do
++      result = Parser.parse_for_media_item(metadata)
++
++      assert result.media_id == metadata["id"]
++    end
++
++    test "it extracts the livestream flag", %{metadata: metadata} do
++      result = Parser.parse_for_media_item(metadata)
++
++      assert result.livestream == metadata["was_live"]
+     end
+   end
+ 
+diff --git a/test/pinchflat/sources_test.exs b/test/pinchflat/sources_test.exs
+index 0c9ab63b2..fe1db7eb6 100644
+--- a/test/pinchflat/sources_test.exs
++++ b/test/pinchflat/sources_test.exs
+@@ -9,8 +9,10 @@ defmodule Pinchflat.SourcesTest do
+   alias Pinchflat.Sources
+   alias Pinchflat.Tasks.SourceTasks
+   alias Pinchflat.Sources.Source
+-  alias Pinchflat.Workers.MediaIndexingWorker
++  alias Pinchflat.Workers.FastIndexingWorker
+   alias Pinchflat.Workers.MediaDownloadWorker
++  alias Pinchflat.Workers.MediaIndexingWorker
++  alias Pinchflat.Workers.MediaCollectionIndexingWorker
+ 
+   @invalid_source_attrs %{name: nil, collection_id: nil}
+ 
+@@ -166,7 +168,7 @@ defmodule Pinchflat.SourcesTest do
+ 
+       assert {:ok, %Source{} = source} = Sources.create_source(valid_attrs)
+ 
+-      assert_enqueued(worker: MediaIndexingWorker, args: %{"id" => source.id})
++      assert_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
+     end
+ 
+     test "creation schedules an index test even if the index frequency is 0" do
+@@ -180,7 +182,37 @@ defmodule Pinchflat.SourcesTest do
+ 
+       assert {:ok, %Source{} = source} = Sources.create_source(valid_attrs)
+ 
+-      assert_enqueued(worker: MediaIndexingWorker, args: %{"id" => source.id})
++      assert_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
++    end
++
++    test "fast_index forces the index frequency to be a default value" do
++      expect(YtDlpRunnerMock, :run, &channel_mock/3)
++
++      valid_attrs = %{
++        media_profile_id: media_profile_fixture().id,
++        original_url: "https://www.youtube.com/channel/abc123",
++        fast_index: true,
++        index_frequency_minutes: 0
++      }
++
++      assert {:ok, %Source{} = source} = Sources.create_source(valid_attrs)
++
++      assert source.index_frequency_minutes == Source.index_frequency_when_fast_indexing()
++    end
++
++    test "disabling fast index will not change the index frequency" do
++      expect(YtDlpRunnerMock, :run, &channel_mock/3)
++
++      valid_attrs = %{
++        media_profile_id: media_profile_fixture().id,
++        original_url: "https://www.youtube.com/channel/abc123",
++        fast_index: false,
++        index_frequency_minutes: 0
++      }
++
++      assert {:ok, %Source{} = source} = Sources.create_source(valid_attrs)
++
++      assert source.index_frequency_minutes == 0
+     end
+   end
+ 
+@@ -230,7 +262,7 @@ defmodule Pinchflat.SourcesTest do
+ 
+       assert {:ok, %Source{} = source} = Sources.update_source(source, update_attrs)
+       assert source.index_frequency_minutes == 123
+-      assert_enqueued(worker: MediaIndexingWorker, args: %{"id" => source.id})
++      assert_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
+     end
+ 
+     test "updating the index frequency to 0 will not re-schedule the indexing task" do
+@@ -239,18 +271,25 @@ defmodule Pinchflat.SourcesTest do
+ 
+       assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
+ 
+-      refute_enqueued(worker: MediaIndexingWorker, args: %{"id" => source.id})
++      refute_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
+     end
+ 
+     test "updating the index frequency to 0 will delete any pending tasks" do
+       source = source_fixture()
+-      {:ok, job} = Oban.insert(MediaIndexingWorker.new(%{"id" => source.id}))
+-      task = task_fixture(source_id: source.id, job_id: job.id)
+       update_attrs = %{index_frequency_minutes: 0}
+ 
++      {:ok, job_1} = Oban.insert(FastIndexingWorker.new(%{"id" => source.id}))
++      task_1 = task_fixture(source_id: source.id, job_id: job_1.id)
++      {:ok, job_2} = Oban.insert(MediaIndexingWorker.new(%{"id" => source.id}))
++      task_2 = task_fixture(source_id: source.id, job_id: job_2.id)
++      {:ok, job_3} = Oban.insert(MediaCollectionIndexingWorker.new(%{"id" => source.id}))
++      task_3 = task_fixture(source_id: source.id, job_id: job_3.id)
++
+       assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
+ 
+-      assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task) end
++      assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task_1) end
++      assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task_2) end
++      assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task_3) end
+     end
+ 
+     test "not updating the index frequency will not re-schedule the indexing task or delete tasks" do
+@@ -261,7 +300,7 @@ defmodule Pinchflat.SourcesTest do
+       assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
+ 
+       assert Repo.reload!(task)
+-      refute_enqueued(worker: MediaIndexingWorker, args: %{"id" => source.id})
++      refute_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
+     end
+ 
+     test "enabling the download_media attribute will schedule a download task" do
+@@ -285,6 +324,26 @@ defmodule Pinchflat.SourcesTest do
+       refute_enqueued(worker: MediaDownloadWorker)
+     end
+ 
++    test "enabling fast_index will schedule a fast indexing task" do
++      source = source_fixture(fast_index: false)
++      update_attrs = %{fast_index: true}
++
++      refute_enqueued(worker: FastIndexingWorker)
++      assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
++      assert_enqueued(worker: FastIndexingWorker, args: %{"id" => source.id})
++    end
++
++    test "disabling fast_index will cancel the fast indexing task" do
++      source = source_fixture(fast_index: true)
++      update_attrs = %{fast_index: false}
++      {:ok, job} = Oban.insert(FastIndexingWorker.new(%{"id" => source.id}))
++      task_fixture(source_id: source.id, job_id: job.id)
++
++      assert_enqueued(worker: FastIndexingWorker, args: %{"id" => source.id})
++      assert {:ok, %Source{}} = Sources.update_source(source, update_attrs)
++      refute_enqueued(worker: FastIndexingWorker)
++    end
++
+     test "updates with invalid data returns error changeset" do
+       source = source_fixture()
+ 
+@@ -293,6 +352,24 @@ defmodule Pinchflat.SourcesTest do
+ 
+       assert source == Sources.get_source!(source.id)
+     end
++
++    test "fast_index forces the index frequency to be a default value" do
++      source = source_fixture(%{fast_index: true})
++      update_attrs = %{index_frequency_minutes: 0}
++
++      assert {:ok, source} = Sources.update_source(source, update_attrs)
++
++      assert source.index_frequency_minutes == Source.index_frequency_when_fast_indexing()
++    end
++
++    test "disabling fast index will not change the index frequency" do
++      source = source_fixture(%{fast_index: false})
++      update_attrs = %{index_frequency_minutes: 0}
++
++      assert {:ok, source} = Sources.update_source(source, update_attrs)
++
++      assert source.index_frequency_minutes == 0
++    end
+   end
+ 
+   describe "delete_source/2" do
+diff --git a/test/pinchflat/tasks/media_items_tasks_test.exs b/test/pinchflat/tasks/media_items_tasks_test.exs
+index 7e890c57c..7cf18e8fc 100644
+--- a/test/pinchflat/tasks/media_items_tasks_test.exs
++++ b/test/pinchflat/tasks/media_items_tasks_test.exs
+@@ -1,9 +1,19 @@
+ defmodule Pinchflat.Tasks.MediaItemTasksTest do
+   use Pinchflat.DataCase
+ 
++  import Mox
+   import Pinchflat.MediaFixtures
++  import Pinchflat.SourcesFixtures
++  import Pinchflat.ProfilesFixtures
+ 
++  alias Pinchflat.Tasks
++  alias Pinchflat.Media.MediaItem
+   alias Pinchflat.Tasks.MediaItemTasks
++  alias Pinchflat.Workers.MediaDownloadWorker
++
++  setup :verify_on_exit!
++
++  @media_url "https://www.youtube.com/watch?v=1234"
+ 
+   describe "compute_and_save_media_filesize/1" do
+     test "updates the media item with the file size" do
+@@ -22,4 +32,70 @@ defmodule Pinchflat.Tasks.MediaItemTasksTest do
+       assert {:error, _} = MediaItemTasks.compute_and_save_media_filesize(media_item)
+     end
+   end
++
++  describe "index_and_enqueue_download_for_media_item/2" do
++    setup do
++      stub(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, media_attributes_return_fixture()}
++      end)
++
++      {:ok, [source: source_fixture()]}
++    end
++
++    test "creates a new media item based on the URL", %{source: source} do
++      assert Repo.aggregate(MediaItem, :count) == 0
++      assert {:ok, _} = MediaItemTasks.index_and_enqueue_download_for_media_item(source, @media_url)
++      assert Repo.aggregate(MediaItem, :count) == 1
++    end
++
++    test "won't duplicate media_items based on media_id and source", %{source: source} do
++      assert {:ok, _} = MediaItemTasks.index_and_enqueue_download_for_media_item(source, @media_url)
++      assert {:error, _} = MediaItemTasks.index_and_enqueue_download_for_media_item(source, @media_url)
++
++      assert Repo.aggregate(MediaItem, :count) == 1
++    end
++
++    test "enqueues a download job", %{source: source} do
++      assert {:ok, media_item} = MediaItemTasks.index_and_enqueue_download_for_media_item(source, @media_url)
++
++      assert_enqueued(worker: MediaDownloadWorker, args: %{"id" => media_item.id})
++    end
++
++    test "creates a download task record", %{source: source} do
++      assert {:ok, media_item} = MediaItemTasks.index_and_enqueue_download_for_media_item(source, @media_url)
++
++      assert [_] = Tasks.list_tasks_for(:media_item_id, media_item.id, "MediaDownloadWorker")
++    end
++
++    test "does not enqueue a download job if the source does not allow it" do
++      source = source_fixture(%{download_media: false})
++
++      assert {:ok, _} = MediaItemTasks.index_and_enqueue_download_for_media_item(source, @media_url)
++
++      refute_enqueued(worker: MediaDownloadWorker)
++    end
++
++    test "does not enqueue a download job if the media item does not match the format rules" do
++      profile = media_profile_fixture(%{shorts_behaviour: :exclude})
++      source = source_fixture(%{media_profile_id: profile.id})
++
++      stub(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        output =
++          Phoenix.json_library().encode!(%{
++            id: "video2",
++            title: "Video 2",
++            webpage_url: "https://example.com/shorts/video2",
++            was_live: true,
++            description: "desc2",
++            aspect_ratio: 1.67,
++            duration: 345.67
++          })
++
++        {:ok, output}
++      end)
++
++      assert {:ok, _media_item} = MediaItemTasks.index_and_enqueue_download_for_media_item(source, @media_url)
++      refute_enqueued(worker: MediaDownloadWorker)
++    end
++  end
+ end
+diff --git a/test/pinchflat/tasks/source_tasks_test.exs b/test/pinchflat/tasks/source_tasks_test.exs
+index 53cff698a..55df00ce8 100644
+--- a/test/pinchflat/tasks/source_tasks_test.exs
++++ b/test/pinchflat/tasks/source_tasks_test.exs
+@@ -11,8 +11,10 @@ defmodule Pinchflat.Tasks.SourceTasksTest do
+   alias Pinchflat.Tasks.Task
+   alias Pinchflat.Tasks.SourceTasks
+   alias Pinchflat.Media.MediaItem
+-  alias Pinchflat.Workers.MediaIndexingWorker
++  alias Pinchflat.Workers.FastIndexingWorker
+   alias Pinchflat.Workers.MediaDownloadWorker
++  alias Pinchflat.Workers.MediaIndexingWorker
++  alias Pinchflat.Workers.MediaCollectionIndexingWorker
+ 
+   setup :verify_on_exit!
+ 
+@@ -22,7 +24,7 @@ defmodule Pinchflat.Tasks.SourceTasksTest do
+ 
+       assert {:ok, _} = SourceTasks.kickoff_indexing_task(source)
+ 
+-      assert_enqueued(worker: MediaIndexingWorker, args: %{"id" => source.id})
++      assert_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
+     end
+ 
+     test "it creates and attaches a task" do
+@@ -33,7 +35,17 @@ defmodule Pinchflat.Tasks.SourceTasksTest do
+       assert task.source_id == source.id
+     end
+ 
+-    test "it deletes any pending tasks for the source" do
++    test "it deletes any pending media collection tasks for the source" do
++      source = source_fixture()
++      {:ok, job} = Oban.insert(MediaCollectionIndexingWorker.new(%{"id" => source.id}))
++      task = task_fixture(source_id: source.id, job_id: job.id)
++
++      assert {:ok, _} = SourceTasks.kickoff_indexing_task(source)
++
++      assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task) end
++    end
++
++    test "it deletes any pending media tasks for the source" do
+       source = source_fixture()
+       {:ok, job} = Oban.insert(MediaIndexingWorker.new(%{"id" => source.id}))
+       task = task_fixture(source_id: source.id, job_id: job.id)
+@@ -42,6 +54,69 @@ defmodule Pinchflat.Tasks.SourceTasksTest do
+ 
+       assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task) end
+     end
++
++    test "it deletes any fast indexing tasks for the source" do
++      source = source_fixture()
++      {:ok, job} = Oban.insert(FastIndexingWorker.new(%{"id" => source.id}))
++      task = task_fixture(source_id: source.id, job_id: job.id)
++
++      assert {:ok, _} = SourceTasks.kickoff_indexing_task(source)
++
++      assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task) end
++    end
++  end
++
++  describe "kickoff_fast_indexing_task/1" do
++    test "it schedules a job" do
++      source = source_fixture()
++
++      assert {:ok, _} = SourceTasks.kickoff_fast_indexing_task(source)
++
++      assert_enqueued(worker: FastIndexingWorker, args: %{"id" => source.id})
++    end
++
++    test "it creates and attaches a task" do
++      source = source_fixture()
++
++      assert {:ok, %Task{} = task} = SourceTasks.kickoff_fast_indexing_task(source)
++
++      assert task.source_id == source.id
++    end
++
++    test "it deletes any fast indexing tasks for the source" do
++      source = source_fixture()
++      {:ok, job} = Oban.insert(FastIndexingWorker.new(%{"id" => source.id}))
++      task = task_fixture(source_id: source.id, job_id: job.id)
++
++      assert {:ok, _} = SourceTasks.kickoff_fast_indexing_task(source)
++
++      assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task) end
++    end
++  end
++
++  describe "kickoff_indexing_tasks_from_youtube_rss_feed/1" do
++    setup do
++      {:ok, [source: source_fixture()]}
++    end
++
++    test "enqueues a new worker for each new media_id in the source's RSS feed", %{source: source} do
++      expect(HTTPClientMock, :get, fn _url -> {:ok, "<yt:videoId>test_1</yt:videoId>"} end)
++
++      assert :ok = SourceTasks.kickoff_indexing_tasks_from_youtube_rss_feed(source)
++
++      assert [worker] = all_enqueued(worker: MediaIndexingWorker)
++      assert worker.args["id"] == source.id
++      assert worker.args["media_url"] == "https://www.youtube.com/watch?v=test_1"
++    end
++
++    test "does not enqueue a new worker for the source's media IDs we already know about", %{source: source} do
++      expect(HTTPClientMock, :get, fn _url -> {:ok, "<yt:videoId>test_1</yt:videoId>"} end)
++      media_item_fixture(source_id: source.id, media_id: "test_1")
++
++      assert :ok = SourceTasks.kickoff_indexing_tasks_from_youtube_rss_feed(source)
++
++      refute_enqueued(worker: MediaIndexingWorker)
++    end
+   end
+ 
+   describe "index_and_enqueue_download_for_media_items/1" do
+@@ -203,9 +278,11 @@ defmodule Pinchflat.Tasks.SourceTasksTest do
+           Phoenix.json_library().encode!(%{
+             id: "video2",
+             title: "Video 2",
+-            original_url: "https://example.com/shorts/video2",
++            webpage_url: "https://example.com/shorts/video2",
+             was_live: true,
+-            description: "desc2"
++            description: "desc2",
++            aspect_ratio: 1.67,
++            duration: 345.67
+           })
+ 
+         File.write(filepath, contents)
+diff --git a/test/pinchflat/workers/fast_indexing_worker_test.exs b/test/pinchflat/workers/fast_indexing_worker_test.exs
+new file mode 100644
+index 000000000..701b82743
+--- /dev/null
++++ b/test/pinchflat/workers/fast_indexing_worker_test.exs
+@@ -0,0 +1,46 @@
++defmodule Pinchflat.Workers.FastIndexingWorkerTest do
++  use Pinchflat.DataCase
++
++  import Mox
++  import Pinchflat.SourcesFixtures
++
++  alias Pinchflat.Sources.Source
++  alias Pinchflat.Workers.FastIndexingWorker
++
++  setup :verify_on_exit!
++
++  describe "perform/1" do
++    test "calls out to Youtube RSS if enabled" do
++      expect(HTTPClientMock, :get, fn _url -> {:ok, ""} end)
++      source = source_fixture(fast_index: true)
++
++      perform_job(FastIndexingWorker, %{"id" => source.id})
++    end
++
++    test "reschedules itself if fast indexing is enabled" do
++      expect(HTTPClientMock, :get, fn _url -> {:ok, ""} end)
++      source = source_fixture(fast_index: true)
++      perform_job(FastIndexingWorker, %{"id" => source.id})
++
++      assert_enqueued(
++        worker: FastIndexingWorker,
++        args: %{"id" => source.id},
++        scheduled_at: now_plus(Source.fast_index_frequency(), :minutes)
++      )
++    end
++
++    test "does not call out to Youtube RSS if disabled" do
++      expect(HTTPClientMock, :get, 0, fn _url -> {:ok, ""} end)
++      source = source_fixture(fast_index: false)
++
++      perform_job(FastIndexingWorker, %{"id" => source.id})
++    end
++
++    test "does not reschedule itself if fast indexing is disabled" do
++      source = source_fixture(fast_index: false)
++      perform_job(FastIndexingWorker, %{"id" => source.id})
++
++      refute_enqueued(worker: FastIndexingWorker, args: %{"id" => source.id})
++    end
++  end
++end
+diff --git a/test/pinchflat/workers/media_collection_indexing_worker_test.exs b/test/pinchflat/workers/media_collection_indexing_worker_test.exs
+new file mode 100644
+index 000000000..4d3c5b781
+--- /dev/null
++++ b/test/pinchflat/workers/media_collection_indexing_worker_test.exs
+@@ -0,0 +1,162 @@
++defmodule Pinchflat.Workers.MediaCollectionIndexingWorkerTest do
++  use Pinchflat.DataCase
++
++  import Mox
++  import Pinchflat.TasksFixtures
++  import Pinchflat.MediaFixtures
++  import Pinchflat.SourcesFixtures
++
++  alias Pinchflat.Tasks
++  alias Pinchflat.Sources.Source
++  alias Pinchflat.Workers.FastIndexingWorker
++  alias Pinchflat.Workers.MediaDownloadWorker
++  alias Pinchflat.Workers.MediaCollectionIndexingWorker
++
++  setup :verify_on_exit!
++
++  describe "perform/1" do
++    test "it indexes the source if it should be indexed" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
++
++      source = source_fixture(index_frequency_minutes: 10)
++
++      perform_job(MediaCollectionIndexingWorker, %{id: source.id})
++    end
++
++    test "it indexes the source no matter what if the source has never been indexed before" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
++
++      source = source_fixture(index_frequency_minutes: 0, last_indexed_at: nil)
++
++      perform_job(MediaCollectionIndexingWorker, %{id: source.id})
++    end
++
++    test "it does not do any indexing if the source has been indexed and shouldn't be rescheduled" do
++      expect(YtDlpRunnerMock, :run, 0, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
++
++      source = source_fixture(index_frequency_minutes: -1, last_indexed_at: DateTime.utc_now())
++
++      perform_job(MediaCollectionIndexingWorker, %{id: source.id})
++    end
++
++    test "it does not reschedule if the source shouldn't be indexed" do
++      stub(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
++
++      source = source_fixture(index_frequency_minutes: -1)
++      perform_job(MediaCollectionIndexingWorker, %{id: source.id})
++
++      refute_enqueued(worker: MediaCollectionIndexingWorker, args: %{"id" => source.id})
++    end
++
++    test "it kicks off a download job for each pending media item" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts ->
++        {:ok, source_attributes_return_fixture()}
++      end)
++
++      source = source_fixture(index_frequency_minutes: 10)
++      perform_job(MediaCollectionIndexingWorker, %{id: source.id})
++
++      assert length(all_enqueued(worker: MediaDownloadWorker)) == 3
++    end
++
++    test "it starts a job for any pending media item even if it's from another run" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts ->
++        {:ok, source_attributes_return_fixture()}
++      end)
++
++      source = source_fixture(index_frequency_minutes: 10)
++      media_item_fixture(%{source_id: source.id, media_filepath: nil})
++      perform_job(MediaCollectionIndexingWorker, %{id: source.id})
++
++      assert length(all_enqueued(worker: MediaDownloadWorker)) == 4
++    end
++
++    test "it does not kick off a job for media items that could not be saved" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts ->
++        {:ok, source_attributes_return_fixture()}
++      end)
++
++      source = source_fixture(index_frequency_minutes: 10)
++      media_item_fixture(%{source_id: source.id, media_filepath: nil, media_id: "video1"})
++      perform_job(MediaCollectionIndexingWorker, %{id: source.id})
++
++      # Only 3 jobs should be enqueued, since the first video is a duplicate
++      assert length(all_enqueued(worker: MediaDownloadWorker))
++    end
++
++    test "it reschedules the job based on the index frequency" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
++
++      source = source_fixture(index_frequency_minutes: 10)
++      perform_job(MediaCollectionIndexingWorker, %{id: source.id})
++
++      assert_enqueued(
++        worker: MediaCollectionIndexingWorker,
++        args: %{"id" => source.id},
++        scheduled_at: now_plus(source.index_frequency_minutes, :minutes)
++      )
++    end
++
++    test "it creates a task for the rescheduled job" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
++
++      source = source_fixture(index_frequency_minutes: 10)
++      task_count_fetcher = fn -> Enum.count(Tasks.list_tasks()) end
++
++      assert_changed([from: 0, to: 1], task_count_fetcher, fn ->
++        perform_job(MediaCollectionIndexingWorker, %{id: source.id})
++      end)
++    end
++
++    test "it creates a future task for fast indexing if appropriate" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
++
++      source = source_fixture(index_frequency_minutes: 10, fast_index: true)
++      perform_job(MediaCollectionIndexingWorker, %{id: source.id})
++
++      assert_enqueued(
++        worker: FastIndexingWorker,
++        args: %{"id" => source.id},
++        scheduled_at: now_plus(Source.fast_index_frequency(), :minutes)
++      )
++    end
++
++    test "it deletes existing fast indexing tasks if a new one is created" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
++
++      source = source_fixture(index_frequency_minutes: 10, fast_index: true)
++      {:ok, job} = Oban.insert(FastIndexingWorker.new(%{"id" => source.id}))
++      task = task_fixture(source_id: source.id, job_id: job.id)
++
++      perform_job(MediaCollectionIndexingWorker, %{id: source.id})
++
++      assert_raise Ecto.NoResultsError, fn -> Repo.reload!(task) end
++    end
++
++    test "it does not create a task for fast indexing otherwise" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
++
++      source = source_fixture(index_frequency_minutes: 10, fast_index: false)
++      perform_job(MediaCollectionIndexingWorker, %{id: source.id})
++
++      refute_enqueued(worker: FastIndexingWorker)
++    end
++
++    test "it creates the basic media_item records" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, source_attributes_return_fixture()} end)
++
++      source = source_fixture(index_frequency_minutes: 10)
++
++      media_item_fetcher = fn ->
++        source
++        |> Repo.preload(:media_items)
++        |> Map.get(:media_items)
++        |> Enum.map(fn media_item -> media_item.media_id end)
++      end
++
++      assert_changed([from: [], to: ["video1", "video2", "video3"]], media_item_fetcher, fn ->
++        perform_job(MediaCollectionIndexingWorker, %{id: source.id})
++      end)
++    end
++  end
++end
+diff --git a/test/pinchflat/workers/media_indexing_worker_test.exs b/test/pinchflat/workers/media_indexing_worker_test.exs
+index d84436159..9db9b19e2 100644
+--- a/test/pinchflat/workers/media_indexing_worker_test.exs
++++ b/test/pinchflat/workers/media_indexing_worker_test.exs
+@@ -5,121 +5,40 @@ defmodule Pinchflat.Workers.MediaIndexingWorkerTest do
+   import Pinchflat.MediaFixtures
+   import Pinchflat.SourcesFixtures
+ 
+-  alias Pinchflat.Tasks
++  alias Pinchflat.Media.MediaItem
+   alias Pinchflat.Workers.MediaIndexingWorker
+   alias Pinchflat.Workers.MediaDownloadWorker
+ 
+-  setup :verify_on_exit!
+-
+-  describe "perform/1" do
+-    test "it indexes the source if it should be indexed" do
+-      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
+-
+-      source = source_fixture(index_frequency_minutes: 10)
+-
+-      perform_job(MediaIndexingWorker, %{id: source.id})
+-    end
+-
+-    test "it indexes the source no matter what if the source has never been indexed before" do
+-      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
+-
+-      source = source_fixture(index_frequency_minutes: 0, last_indexed_at: nil)
+-
+-      perform_job(MediaIndexingWorker, %{id: source.id})
+-    end
+-
+-    test "it does not do any indexing if the source has been indexed and shouldn't be rescheduled" do
+-      expect(YtDlpRunnerMock, :run, 0, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
+-
+-      source = source_fixture(index_frequency_minutes: -1, last_indexed_at: DateTime.utc_now())
+-
+-      perform_job(MediaIndexingWorker, %{id: source.id})
+-    end
+-
+-    test "it does not reschedule if the source shouldn't be indexed" do
+-      stub(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
+-
+-      source = source_fixture(index_frequency_minutes: -1)
+-      perform_job(MediaIndexingWorker, %{id: source.id})
+-
+-      refute_enqueued(worker: MediaIndexingWorker, args: %{"id" => source.id})
+-    end
+-
+-    test "it kicks off a download job for each pending media item" do
+-      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts ->
+-        {:ok, source_attributes_return_fixture()}
+-      end)
+-
+-      source = source_fixture(index_frequency_minutes: 10)
+-      perform_job(MediaIndexingWorker, %{id: source.id})
++  @media_url "https://www.youtube.com/watch?v=1234567890"
+ 
+-      assert length(all_enqueued(worker: MediaDownloadWorker)) == 3
+-    end
+-
+-    test "it starts a job for any pending media item even if it's from another run" do
+-      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts ->
+-        {:ok, source_attributes_return_fixture()}
+-      end)
++  setup :verify_on_exit!
+ 
+-      source = source_fixture(index_frequency_minutes: 10)
+-      media_item_fixture(%{source_id: source.id, media_filepath: nil})
+-      perform_job(MediaIndexingWorker, %{id: source.id})
++  setup do
++    source = source_fixture()
+ 
+-      assert length(all_enqueued(worker: MediaDownloadWorker)) == 4
+-    end
++    {:ok, source: source}
++  end
+ 
+-    test "it does not kick off a job for media items that could not be saved" do
+-      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts ->
+-        {:ok, source_attributes_return_fixture()}
++  describe "perform/1" do
++    test "indexes the media item and saves it to the database", %{source: source} do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, media_attributes_return_fixture()}
+       end)
+ 
+-      source = source_fixture(index_frequency_minutes: 10)
+-      media_item_fixture(%{source_id: source.id, media_filepath: nil, media_id: "video1"})
+-      perform_job(MediaIndexingWorker, %{id: source.id})
++      before = Repo.aggregate(MediaItem, :count, :id)
++      perform_job(MediaIndexingWorker, %{id: source.id, media_url: @media_url})
+ 
+-      # Only 3 jobs should be enqueued, since the first video is a duplicate
+-      assert length(all_enqueued(worker: MediaDownloadWorker))
++      assert Repo.aggregate(MediaItem, :count, :id) == before + 1
+     end
+ 
+-    test "it reschedules the job based on the index frequency" do
+-      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
+-
+-      source = source_fixture(index_frequency_minutes: 10)
+-      perform_job(MediaIndexingWorker, %{id: source.id})
+-
+-      assert_enqueued(
+-        worker: MediaIndexingWorker,
+-        args: %{"id" => source.id},
+-        scheduled_at: now_plus(source.index_frequency_minutes, :minutes)
+-      )
+-    end
+-
+-    test "it creates a task for the rescheduled job" do
+-      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
+-
+-      source = source_fixture(index_frequency_minutes: 10)
+-      task_count_fetcher = fn -> Enum.count(Tasks.list_tasks()) end
+-
+-      assert_changed([from: 0, to: 1], task_count_fetcher, fn ->
+-        perform_job(MediaIndexingWorker, %{id: source.id})
++    test "enqueues a download job for the media item", %{source: source} do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, media_attributes_return_fixture()}
+       end)
+-    end
+-
+-    test "it creates the basic media_item records" do
+-      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, source_attributes_return_fixture()} end)
+ 
+-      source = source_fixture(index_frequency_minutes: 10)
++      perform_job(MediaIndexingWorker, %{id: source.id, media_url: @media_url})
+ 
+-      media_item_fetcher = fn ->
+-        source
+-        |> Repo.preload(:media_items)
+-        |> Map.get(:media_items)
+-        |> Enum.map(fn media_item -> media_item.media_id end)
+-      end
+-
+-      assert_changed([from: [], to: ["video1", "video2", "video3"]], media_item_fetcher, fn ->
+-        perform_job(MediaIndexingWorker, %{id: source.id})
+-      end)
++      assert [_] = all_enqueued(worker: MediaDownloadWorker)
+     end
+   end
+ end
+diff --git a/test/pinchflat/media_client/backends/yt_dlp/command_runner_test.exs b/test/pinchflat/yt_dlp/backend/command_runner_test.exs
+similarity index 94%
+rename from test/pinchflat/media_client/backends/yt_dlp/command_runner_test.exs
+rename to test/pinchflat/yt_dlp/backend/command_runner_test.exs
+index fdab238f1..e21a1690c 100644
+--- a/test/pinchflat/media_client/backends/yt_dlp/command_runner_test.exs
++++ b/test/pinchflat/yt_dlp/backend/command_runner_test.exs
+@@ -1,7 +1,7 @@
+-defmodule Pinchflat.MediaClient.Backends.YtDlp.CommandRunnerTest do
++defmodule Pinchflat.YtDlp.Backend.CommandRunnerTest do
+   use ExUnit.Case, async: true
+ 
+-  alias Pinchflat.MediaClient.Backends.YtDlp.CommandRunner, as: Runner
++  alias Pinchflat.YtDlp.Backend.CommandRunner, as: Runner
+ 
+   @original_executable Application.compile_env(:pinchflat, :yt_dlp_executable)
+   @media_url "https://www.youtube.com/watch?v=-LHXuyzpex0"
+diff --git a/test/pinchflat/media_client/backends/yt_dlp/media_collection_test.exs b/test/pinchflat/yt_dlp/backend/media_collection_test.exs
+similarity index 79%
+rename from test/pinchflat/media_client/backends/yt_dlp/media_collection_test.exs
+rename to test/pinchflat/yt_dlp/backend/media_collection_test.exs
+index e82a1884c..1e5805dce 100644
+--- a/test/pinchflat/media_client/backends/yt_dlp/media_collection_test.exs
++++ b/test/pinchflat/yt_dlp/backend/media_collection_test.exs
+@@ -1,39 +1,40 @@
+-defmodule Pinchflat.MediaClient.Backends.YtDlp.MediaCollectionTest do
++defmodule Pinchflat.YtDlp.Backend.MediaCollectionTest do
+   use Pinchflat.DataCase
+   import Mox
+   import Pinchflat.SourcesFixtures
+ 
+-  alias Pinchflat.MediaClient.Backends.YtDlp.MediaCollection
++  alias Pinchflat.YtDlp.Backend.Media
++  alias Pinchflat.YtDlp.Backend.MediaCollection
+ 
+   @channel_url "https://www.youtube.com/c/TheUselessTrials"
+ 
+   setup :verify_on_exit!
+ 
+-  describe "get_media_attributes/2" do
++  describe "get_media_attributes_for_collection/2" do
+     test "returns a list of video attributes with no blank elements" do
+       expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts ->
+         {:ok, source_attributes_return_fixture() <> "\n\n"}
+       end)
+ 
+-      assert {:ok, [%{"id" => "video1"}, %{"id" => "video2"}, %{"id" => "video3"}]} =
+-               MediaCollection.get_media_attributes(@channel_url)
++      assert {:ok, [%Media{media_id: "video1"}, %Media{media_id: "video2"}, %Media{media_id: "video3"}]} =
++               MediaCollection.get_media_attributes_for_collection(@channel_url)
+     end
+ 
+     test "it passes the expected default args" do
+       expect(YtDlpRunnerMock, :run, fn _url, opts, ot, _addl_opts ->
+         assert opts == [:simulate, :skip_download]
+-        assert ot == "%(.{id,title,was_live,original_url,description})j"
++        assert ot == Media.indexing_output_template()
+ 
+         {:ok, ""}
+       end)
+ 
+-      assert {:ok, _} = MediaCollection.get_media_attributes(@channel_url)
++      assert {:ok, _} = MediaCollection.get_media_attributes_for_collection(@channel_url)
+     end
+ 
+     test "returns the error straight through when the command fails" do
+       expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:error, "Big issue", 1} end)
+ 
+-      assert {:error, "Big issue", 1} = MediaCollection.get_media_attributes(@channel_url)
++      assert {:error, "Big issue", 1} = MediaCollection.get_media_attributes_for_collection(@channel_url)
+     end
+ 
+     test "passes the explict tmpfile path to runner" do
+@@ -44,7 +45,7 @@ defmodule Pinchflat.MediaClient.Backends.YtDlp.MediaCollectionTest do
+         {:ok, ""}
+       end)
+ 
+-      assert {:ok, _} = MediaCollection.get_media_attributes(@channel_url)
++      assert {:ok, _} = MediaCollection.get_media_attributes_for_collection(@channel_url)
+     end
+ 
+     test "supports an optional file_listener_handler that gets passed a filename" do
+@@ -55,7 +56,8 @@ defmodule Pinchflat.MediaClient.Backends.YtDlp.MediaCollectionTest do
+         send(current_self, {:handler, filename})
+       end
+ 
+-      assert {:ok, _} = MediaCollection.get_media_attributes(@channel_url, file_listener_handler: handler)
++      assert {:ok, _} =
++               MediaCollection.get_media_attributes_for_collection(@channel_url, file_listener_handler: handler)
+ 
+       assert_receive {:handler, filename}
+       assert String.ends_with?(filename, ".json")
+diff --git a/test/pinchflat/yt_dlp/backend/media_test.exs b/test/pinchflat/yt_dlp/backend/media_test.exs
+new file mode 100644
+index 000000000..94c031df0
+--- /dev/null
++++ b/test/pinchflat/yt_dlp/backend/media_test.exs
+@@ -0,0 +1,139 @@
++defmodule Pinchflat.YtDlp.Backend.MediaTest do
++  use Pinchflat.DataCase
++  import Mox
++  import Pinchflat.MediaFixtures
++
++  alias Pinchflat.YtDlp.Backend.Media
++
++  @media_url "https://www.youtube.com/watch?v=TiZPUDkDYbk"
++
++  setup :verify_on_exit!
++
++  describe "download/2" do
++    test "it calls the backend runner with the expected arguments" do
++      expect(YtDlpRunnerMock, :run, fn @media_url, opts, ot ->
++        assert [:no_simulate] = opts
++        assert "after_move:%()j" = ot
++
++        {:ok, render_metadata(:media_metadata)}
++      end)
++
++      assert {:ok, _} = Media.download(@media_url)
++    end
++
++    test "it passes along additional options" do
++      expect(YtDlpRunnerMock, :run, fn _url, opts, _ot ->
++        assert [:no_simulate, :custom_arg] = opts
++
++        {:ok, "{}"}
++      end)
++
++      assert {:ok, _} = Media.download(@media_url, [:custom_arg])
++    end
++
++    test "it parses and returns the generated file as JSON" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, render_metadata(:media_metadata)}
++      end)
++
++      assert {:ok, %{"title" => "Trying to Wheelie Without the Rear Brake"}} =
++               Media.download(@media_url)
++    end
++
++    test "it returns errors" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opt, _ot ->
++        {:error, "something"}
++      end)
++
++      assert {:error, "something"} = Media.download(@media_url)
++    end
++  end
++
++  describe "get_media_attributes/1" do
++    test "returns a list of video attributes" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        {:ok, media_attributes_return_fixture()}
++      end)
++
++      assert {:ok, %{description: _, media_id: _, original_url: _, title: _, livestream: _}} =
++               Media.get_media_attributes(@media_url)
++    end
++
++    test "it passes the expected default args" do
++      expect(YtDlpRunnerMock, :run, fn _url, opts, ot ->
++        assert opts == [:simulate, :skip_download]
++        assert ot == Media.indexing_output_template()
++
++        {:ok, media_attributes_return_fixture()}
++      end)
++
++      assert {:ok, _} = Media.get_media_attributes(@media_url)
++    end
++
++    test "returns the error straight through when the command fails" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot -> {:error, "Big issue", 1} end)
++
++      assert {:error, "Big issue", 1} = Media.get_media_attributes(@media_url)
++    end
++  end
++
++  describe "indexing_output_template/0" do
++    test "contains all the greatest hits" do
++      assert "%(.{id,title,was_live,webpage_url,description,aspect_ratio,duration})j" ==
++               Media.indexing_output_template()
++    end
++  end
++
++  describe "response_to_struct/1" do
++    test "transforms a response into a struct" do
++      response = %{
++        "id" => "TiZPUDkDYbk",
++        "title" => "Trying to Wheelie Without the Rear Brake",
++        "description" => "I'm not sure what I expected.",
++        "webpage_url" => "https://www.youtube.com/watch?v=TiZPUDkDYbk",
++        "was_live" => false,
++        "aspect_ratio" => 1.0,
++        "duration" => 60
++      }
++
++      assert %Media{
++               media_id: "TiZPUDkDYbk",
++               title: "Trying to Wheelie Without the Rear Brake",
++               description: "I'm not sure what I expected.",
++               original_url: "https://www.youtube.com/watch?v=TiZPUDkDYbk",
++               livestream: false,
++               short_form_content: false
++             } = Media.response_to_struct(response)
++    end
++
++    test "sets short_form_content to true if the URL contains /shorts/" do
++      response = %{
++        "webpage_url" => "https://www.youtube.com/shorts/TiZPUDkDYbk",
++        "aspect_ratio" => 1.0,
++        "duration" => 61
++      }
++
++      assert %Media{short_form_content: true} = Media.response_to_struct(response)
++    end
++
++    test "sets short_form_content to true if the aspect ratio are duration are right" do
++      response = %{
++        "webpage_url" => "https://www.youtube.com/watch?v=TiZPUDkDYbk",
++        "aspect_ratio" => 0.5,
++        "duration" => 59
++      }
++
++      assert %Media{short_form_content: true} = Media.response_to_struct(response)
++    end
++
++    test "sets short_form_content to false otherwise" do
++      response = %{
++        "webpage_url" => "https://www.youtube.com/watch?v=TiZPUDkDYbk",
++        "aspect_ratio" => 1.0,
++        "duration" => 61
++      }
++
++      assert %Media{short_form_content: false} = Media.response_to_struct(response)
++    end
++  end
++end
+diff --git a/test/pinchflat/profiles/options/yt_dlp/download_option_builder_test.exs b/test/pinchflat/yt_dlp/download_option_builder_test.exs
+similarity index 98%
+rename from test/pinchflat/profiles/options/yt_dlp/download_option_builder_test.exs
+rename to test/pinchflat/yt_dlp/download_option_builder_test.exs
+index 55ce220f8..58c7e186b 100644
+--- a/test/pinchflat/profiles/options/yt_dlp/download_option_builder_test.exs
++++ b/test/pinchflat/yt_dlp/download_option_builder_test.exs
+@@ -1,11 +1,11 @@
+-defmodule Pinchflat.Profiles.Options.YtDlp.DownloadOptionBuilderTest do
++defmodule Pinchflat.YtDlp.DownloadOptionBuilderTest do
+   use Pinchflat.DataCase
+   import Pinchflat.MediaFixtures
+   import Pinchflat.ProfilesFixtures
+   import Pinchflat.SourcesFixtures
+ 
+   alias Pinchflat.Profiles
+-  alias Pinchflat.Profiles.Options.YtDlp.DownloadOptionBuilder
++  alias Pinchflat.YtDlp.DownloadOptionBuilder
+ 
+   setup do
+     media_profile = media_profile_fixture(%{output_path_template: "{{ title }}.%(ext)s"})
+diff --git a/test/pinchflat/media_client/media_downloader_test.exs b/test/pinchflat/yt_dlp/media_downloader_test.exs
+similarity index 100%
+rename from test/pinchflat/media_client/media_downloader_test.exs
+rename to test/pinchflat/yt_dlp/media_downloader_test.exs
+diff --git a/test/pinchflat/media_client/backends/yt_dlp/output_path_builder_test.exs b/test/profiles/output_path_builder_test.exs
+similarity index 87%
+rename from test/pinchflat/media_client/backends/yt_dlp/output_path_builder_test.exs
+rename to test/profiles/output_path_builder_test.exs
+index f9249817f..d44982df3 100644
+--- a/test/pinchflat/media_client/backends/yt_dlp/output_path_builder_test.exs
++++ b/test/profiles/output_path_builder_test.exs
+@@ -1,7 +1,7 @@
+-defmodule Pinchflat.MediaClient.Backends.YtDlp.OutputPathBuilderTest do
++defmodule Pinchflat.Profiles.OutputPathBuilderTest do
+   use Pinchflat.DataCase
+ 
+-  alias Pinchflat.Profiles.Options.YtDlp.OutputPathBuilder
++  alias Pinchflat.Profiles.OutputPathBuilder
+ 
+   describe "build/2" do
+     test "it expands 'standard' curly brace variables in the template" do
+diff --git a/test/support/fixtures/media_fixtures.ex b/test/support/fixtures/media_fixtures.ex
+index c327c4690..e4f3ffeb7 100644
+--- a/test/support/fixtures/media_fixtures.ex
++++ b/test/support/fixtures/media_fixtures.ex
+@@ -19,6 +19,7 @@ defmodule Pinchflat.MediaFixtures do
+         title: Faker.Commerce.product_name(),
+         original_url: "https://www.youtube.com/watch?v=#{media_id}",
+         livestream: false,
++        short_form_content: false,
+         media_filepath: "/video/#{Faker.File.file_name(:video)}",
+         source_id: SourcesFixtures.source_fixture().id
+       })
+@@ -65,4 +66,18 @@ defmodule Pinchflat.MediaFixtures do
+     merged_attrs = Map.merge(attrs, %{media_filepath: stored_media_filepath})
+     media_item_fixture(merged_attrs)
+   end
++
++  def media_attributes_return_fixture do
++    media_attributes = %{
++      id: "video1",
++      title: "Video 1",
++      webpage_url: "https://example.com/video1",
++      was_live: false,
++      description: "desc1",
++      aspect_ratio: 1.67,
++      duration: 123.45
++    }
++
++    Phoenix.json_library().encode!(media_attributes)
++  end
+ end
+diff --git a/test/support/fixtures/sources_fixtures.ex b/test/support/fixtures/sources_fixtures.ex
+index 5c25ffc02..89c113c12 100644
+--- a/test/support/fixtures/sources_fixtures.ex
++++ b/test/support/fixtures/sources_fixtures.ex
+@@ -35,23 +35,29 @@ defmodule Pinchflat.SourcesFixtures do
+       %{
+         id: "video1",
+         title: "Video 1",
+-        original_url: "https://example.com/video1",
++        webpage_url: "https://example.com/video1",
+         was_live: false,
+-        description: "desc1"
++        description: "desc1",
++        aspect_ratio: 1.67,
++        duration: 12.34
+       },
+       %{
+         id: "video2",
+         title: "Video 2",
+-        original_url: "https://example.com/video2",
++        webpage_url: "https://example.com/video2",
+         was_live: true,
+-        description: "desc2"
++        description: "desc2",
++        aspect_ratio: 1.67,
++        duration: 345.67
+       },
+       %{
+         id: "video3",
+         title: "Video 3",
+-        original_url: "https://example.com/video3",
++        webpage_url: "https://example.com/video3",
+         was_live: false,
+-        description: "desc3"
++        description: "desc3",
++        aspect_ratio: 1.0,
++        duration: 678.90
+       }
+     ]
+ 
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index 00db53186..203b35289 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -1,4 +1,4 @@
+-Mox.defmock(YtDlpRunnerMock, for: Pinchflat.MediaClient.Backends.BackendCommandRunner)
++Mox.defmock(YtDlpRunnerMock, for: Pinchflat.YtDlp.Backend.BackendCommandRunner)
+ Application.put_env(:pinchflat, :yt_dlp_runner, YtDlpRunnerMock)
+ 
+ Mox.defmock(HTTPClientMock, for: Pinchflat.HTTP.HTTPBehaviour)

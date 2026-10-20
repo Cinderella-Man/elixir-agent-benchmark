@@ -1,0 +1,1445 @@
+diff --git a/README.md b/README.md
+index be086d3e6..bdf24a5ed 100644
+--- a/README.md
++++ b/README.md
+@@ -48,6 +48,7 @@ If it doesn't work for your use case, please make a feature request! You can als
+   - Uses a novel approach to download new content more quickly than other apps
+ - Supports downloading audio content
+ - Custom rules for handling YouTube Shorts and livestreams
++- Apprise support for notifications
+ - Optionally automatically delete old content ([docs](https://github.com/kieraneglin/pinchflat/wiki/Automatically-Delete-Media))
+ - Advanced options like setting cutoff dates and filtering by title
+ - Reliable hands-off operation
+diff --git a/config/config.exs b/config/config.exs
+index 4e7a8543a..b3959502c 100644
+--- a/config/config.exs
++++ b/config/config.exs
+@@ -12,7 +12,9 @@ config :pinchflat,
+   generators: [timestamp_type: :utc_datetime],
+   # Specifying backend data here makes mocking and local testing SUPER easy
+   yt_dlp_executable: System.find_executable("yt-dlp"),
++  apprise_executable: System.find_executable("apprise"),
+   yt_dlp_runner: Pinchflat.YtDlp.CommandRunner,
++  apprise_runner: Pinchflat.Notifications.CommandRunner,
+   media_directory: "/downloads",
+   # The user may or may not store metadata for their needs, but the app will always store its copy
+   metadata_directory: "/config/metadata",
+diff --git a/config/test.exs b/config/test.exs
+index 6c7409e29..ce61044e6 100644
+--- a/config/test.exs
++++ b/config/test.exs
+@@ -3,6 +3,7 @@ import Config
+ config :pinchflat,
+   # Specifying backend data here makes mocking and local testing SUPER easy
+   yt_dlp_executable: Path.join([File.cwd!(), "/test/support/scripts/yt-dlp-mocks/repeater.sh"]),
++  apprise_executable: Path.join([File.cwd!(), "/test/support/scripts/yt-dlp-mocks/repeater.sh"]),
+   media_directory: Path.join([System.tmp_dir!(), "test", "media"]),
+   metadata_directory: Path.join([System.tmp_dir!(), "test", "metadata"]),
+   tmpfile_directory: Path.join([System.tmp_dir!(), "test", "tmpfiles"]),
+diff --git a/dev.Dockerfile b/dev.Dockerfile
+index 517ca6394..bbf26830e 100644
+--- a/dev.Dockerfile
++++ b/dev.Dockerfile
+@@ -5,15 +5,10 @@ ARG DEV_IMAGE="hexpm/elixir:${ELIXIR_VERSION}-erlang-${OTP_VERSION}-debian-${DEB
+ 
+ FROM ${DEV_IMAGE}
+ 
+-# Set the locale deets
+-ENV LANG en_US.UTF-8
+-ENV LANGUAGE en_US:en
+-ENV LC_ALL en_US.UTF-8
+-
+ # Install debian packages
+ RUN apt-get update -qq
+ RUN apt-get install -y inotify-tools ffmpeg curl git openssh-client \
+-  python3 python3-pip python3-setuptools python3-wheel python3-dev
++  python3 python3-pip python3-setuptools python3-wheel python3-dev locales
+ 
+ # Install nodejs
+ RUN curl -sL https://deb.nodesource.com/setup_20.x -o nodesource_setup.sh
+@@ -25,9 +20,20 @@ RUN npm install -g yarn
+ RUN mix local.hex --force
+ RUN mix local.rebar --force
+ 
+-# Download YT-DLP
++# Download and update YT-DLP
+ # NOTE: If you're seeing weird issues, consider using the FFMPEG released by yt-dlp
+-RUN python3 -m pip install -U --pre yt-dlp --break-system-packages
++RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
++RUN chmod a+rx /usr/local/bin/yt-dlp
++RUN yt-dlp -U
++
++# Download Apprise
++RUN python3 -m pip install -U apprise --break-system-packages
++
++# Set the locale
++RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
++ENV LANG en_US.UTF-8
++ENV LANGUAGE en_US:en
++ENV LC_ALL en_US.UTF-8
+ 
+ # Create app directory and copy the Elixir projects into it.
+ WORKDIR /app
+diff --git a/lib/pinchflat/boot/pre_job_startup_tasks.ex b/lib/pinchflat/boot/pre_job_startup_tasks.ex
+index d4f41681a..74b96d386 100644
+--- a/lib/pinchflat/boot/pre_job_startup_tasks.ex
++++ b/lib/pinchflat/boot/pre_job_startup_tasks.ex
+@@ -14,7 +14,6 @@ defmodule Pinchflat.Boot.PreJobStartupTasks do
+ 
+   alias Pinchflat.Repo
+   alias Pinchflat.Settings
+-  alias Pinchflat.YtDlp.CommandRunner
+   alias Pinchflat.Filesystem.FilesystemHelpers
+ 
+   def start_link(opts \\ []) do
+@@ -56,15 +55,25 @@ defmodule Pinchflat.Boot.PreJobStartupTasks do
+     filepath = Path.join(base_dir, "cookies.txt")
+ 
+     if !File.exists?(filepath) do
+-      Logger.info("Cookies does not exist - creating it")
++      Logger.info("yt-dlp cookie file does not exist - creating it")
+ 
+       FilesystemHelpers.write_p!(filepath, "")
+     end
+   end
+ 
+   defp apply_default_settings do
+-    {:ok, yt_dlp_version} = CommandRunner.version()
++    {:ok, yt_dlp_version} = yt_dlp_runner().version()
++    {:ok, apprise_version} = apprise_runner().version()
+ 
+     Settings.set(yt_dlp_version: yt_dlp_version)
++    Settings.set(apprise_version: apprise_version)
++  end
++
++  defp yt_dlp_runner do
++    Application.get_env(:pinchflat, :yt_dlp_runner)
++  end
++
++  defp apprise_runner do
++    Application.get_env(:pinchflat, :apprise_runner)
+   end
+ end
+diff --git a/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex b/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex
+index a38ccf7c7..b9d5a44f9 100644
+--- a/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex
++++ b/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex
+@@ -25,7 +25,7 @@ defmodule Pinchflat.FastIndexing.FastIndexingHelpers do
+   function starts individual indexing tasks for each new media item. I think it does
+   make sense grammatically, but I could see how that's confusing.
+ 
+-  Returns :ok
++  Returns [binary()] where each binary is the media ID of a new media item.
+   """
+   def kickoff_indexing_tasks_from_youtube_rss_feed(%Source{} = source) do
+     {:ok, media_ids} = YoutubeRss.get_recent_media_ids_from_rss(source)
+@@ -37,6 +37,8 @@ defmodule Pinchflat.FastIndexing.FastIndexingHelpers do
+ 
+       MediaIndexingWorker.kickoff_with_task(source, url)
+     end)
++
++    new_media_ids
+   end
+ 
+   @doc """
+diff --git a/lib/pinchflat/fast_indexing/fast_indexing_worker.ex b/lib/pinchflat/fast_indexing/fast_indexing_worker.ex
+index 1e0f70039..15d287fdf 100644
+--- a/lib/pinchflat/fast_indexing/fast_indexing_worker.ex
++++ b/lib/pinchflat/fast_indexing/fast_indexing_worker.ex
+@@ -11,8 +11,10 @@ defmodule Pinchflat.FastIndexing.FastIndexingWorker do
+   alias __MODULE__
+   alias Pinchflat.Tasks
+   alias Pinchflat.Sources
++  alias Pinchflat.Settings
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.FastIndexing.FastIndexingHelpers
++  alias Pinchflat.Notifications.SourceNotifications
+ 
+   @doc """
+   Starts the source fast indexing worker and creates a task for the source.
+@@ -37,8 +39,7 @@ defmodule Pinchflat.FastIndexing.FastIndexingWorker do
+     source = Sources.get_source!(source_id)
+ 
+     if source.fast_index do
+-      FastIndexingHelpers.kickoff_indexing_tasks_from_youtube_rss_feed(source)
+-
++      perform_indexing_and_notification(source)
+       reschedule_indexing(source)
+     else
+       :ok
+@@ -48,6 +49,13 @@ defmodule Pinchflat.FastIndexing.FastIndexingWorker do
+     Ecto.StaleEntryError -> Logger.info("#{__MODULE__} discarded: source #{source_id} stale")
+   end
+ 
++  defp perform_indexing_and_notification(source) do
++    apprise_server = Settings.get!(:apprise_server)
++    new_media_items = FastIndexingHelpers.kickoff_indexing_tasks_from_youtube_rss_feed(source)
++
++    SourceNotifications.send_new_media_notification(apprise_server, source, length(new_media_items))
++  end
++
+   defp reschedule_indexing(source) do
+     next_run_in = Source.fast_index_frequency() * 60
+ 
+diff --git a/lib/pinchflat/notifications/apprise_command_runner.ex b/lib/pinchflat/notifications/apprise_command_runner.ex
+new file mode 100644
+index 000000000..13ad3276d
+--- /dev/null
++++ b/lib/pinchflat/notifications/apprise_command_runner.ex
+@@ -0,0 +1,12 @@
++defmodule Pinchflat.Notifications.AppriseCommandRunner do
++  @moduledoc """
++  A behaviour for running CLI commands against a notification backend (apprise).
++
++  Used so we can implement Mox for testing without actually running the
++  apprise command.
++  """
++
++  @callback run(binary(), keyword()) :: :ok | {:error, binary()}
++  @callback run(List.t(), keyword()) :: :ok | {:error, binary()}
++  @callback version() :: {:ok, binary()} | {:error, binary()}
++end
+diff --git a/lib/pinchflat/notifications/command_runner.ex b/lib/pinchflat/notifications/command_runner.ex
+new file mode 100644
+index 000000000..8f1a806d8
+--- /dev/null
++++ b/lib/pinchflat/notifications/command_runner.ex
+@@ -0,0 +1,65 @@
++defmodule Pinchflat.Notifications.CommandRunner do
++  @moduledoc """
++  Runs apprise commands using the `System.cmd/3` function
++  """
++
++  require Logger
++
++  alias Pinchflat.Utils.CliUtils
++  alias Pinchflat.Utils.FunctionUtils
++  alias Pinchflat.Notifications.AppriseCommandRunner
++
++  @behaviour AppriseCommandRunner
++
++  @doc """
++  Runs an apprise command and returns the string output.
++  Can take a single server string or a list of servers as well as additional
++  arguments to pass to the command.
++
++  Returns {:ok, binary()} | {:error, :no_servers} | {:error, binary()}
++  """
++  @impl AppriseCommandRunner
++  def run(nil, _), do: {:error, :no_servers}
++  def run("", _), do: {:error, :no_servers}
++  def run([], _), do: {:error, :no_servers}
++
++  def run(endpoints, command_opts) do
++    endpoints = List.wrap(endpoints)
++    default_opts = [:verbose]
++    parsed_opts = CliUtils.parse_options(default_opts ++ command_opts)
++
++    Logger.info("[apprise] called with: #{Enum.join(parsed_opts ++ endpoints, " ")}")
++    {output, return_code} = System.cmd(backend_executable(), parsed_opts ++ endpoints)
++    Logger.info("[apprise] response: #{output}")
++
++    case return_code do
++      0 -> {:ok, String.trim(output)}
++      _ -> {:error, String.trim(output)}
++    end
++  end
++
++  @doc """
++  Returns the version of apprise as a string.
++
++  Returns {:ok, binary()} | {:error, binary()}
++  """
++  @impl AppriseCommandRunner
++  def version do
++    case System.cmd(backend_executable(), ["--version"]) do
++      {output, 0} ->
++        output
++        |> String.split(~r{\r?\n})
++        |> List.first()
++        |> String.replace("Apprise", "")
++        |> String.trim()
++        |> FunctionUtils.wrap_ok()
++
++      {output, _} ->
++        {:error, output}
++    end
++  end
++
++  defp backend_executable do
++    Application.get_env(:pinchflat, :apprise_executable)
++  end
++end
+diff --git a/lib/pinchflat/notifications/source_notifications.ex b/lib/pinchflat/notifications/source_notifications.ex
+new file mode 100644
+index 000000000..e39841d73
+--- /dev/null
++++ b/lib/pinchflat/notifications/source_notifications.ex
+@@ -0,0 +1,77 @@
++defmodule Pinchflat.Notifications.SourceNotifications do
++  @moduledoc """
++  Contains utilities for sending notifications about sources
++  """
++
++  require Logger
++
++  alias Pinchflat.Repo
++  alias Pinchflat.Media.MediaQuery
++
++  @doc """
++  Wraps a function that may change the number of pending  or downloaded
++  media items for a source, sending an apprise notification if
++  the count changes.
++
++  Returns the return value of the provided function
++  """
++  def wrap_new_media_notification(servers, source, func) do
++    before_count = relevant_media_item_count(source)
++    retval = func.()
++    after_count = relevant_media_item_count(source)
++
++    send_new_media_notification(servers, source, after_count - before_count)
++
++    retval
++  end
++
++  @doc """
++  Sends a notification if the count of new media items has changed
++
++  Returns :ok
++  """
++  def send_new_media_notification(_, _, count) when count <= 0, do: :ok
++
++  def send_new_media_notification(servers, source, changed_count) do
++    opts = [
++      title: "[Pinchflat] New media found",
++      body: "Found #{changed_count} new media item(s) for #{source.custom_name}. Downloading them now"
++    ]
++
++    case backend_runner().run(servers, opts) do
++      {:ok, _} ->
++        Logger.info("Sent new media notification for source #{source.id}")
++
++      {:error, :no_servers} ->
++        Logger.info("No notification servers provided for source #{source.id}")
++
++      {:error, err} ->
++        Logger.error("Failed to send new media notification for source #{source.id}: #{err}")
++    end
++
++    :ok
++  end
++
++  defp relevant_media_item_count(source) do
++    pending_media_item_count(source) + downloaded_media_item_count(source)
++  end
++
++  defp pending_media_item_count(source) do
++    MediaQuery.new()
++    |> MediaQuery.for_source(source)
++    |> MediaQuery.with_media_pending_download()
++    |> Repo.aggregate(:count)
++  end
++
++  defp downloaded_media_item_count(source) do
++    MediaQuery.new()
++    |> MediaQuery.for_source(source)
++    |> MediaQuery.with_media_filepath()
++    |> Repo.aggregate(:count)
++  end
++
++  defp backend_runner do
++    # This approach lets us mock the command for testing
++    Application.get_env(:pinchflat, :apprise_runner)
++  end
++end
+diff --git a/lib/pinchflat/settings/setting.ex b/lib/pinchflat/settings/setting.ex
+index 5fb7cf697..f9eb386e5 100644
+--- a/lib/pinchflat/settings/setting.ex
++++ b/lib/pinchflat/settings/setting.ex
+@@ -9,7 +9,9 @@ defmodule Pinchflat.Settings.Setting do
+   @allowed_fields [
+     :onboarding,
+     :pro_enabled,
+-    :yt_dlp_version
++    :yt_dlp_version,
++    :apprise_version,
++    :apprise_server
+   ]
+ 
+   @required_fields ~w(
+@@ -21,6 +23,8 @@ defmodule Pinchflat.Settings.Setting do
+     field :onboarding, :boolean, default: true
+     field :pro_enabled, :boolean, default: false
+     field :yt_dlp_version, :string
++    field :apprise_version, :string
++    field :apprise_server, :string
+   end
+ 
+   @doc false
+diff --git a/lib/pinchflat/settings/settings.ex b/lib/pinchflat/settings/settings.ex
+index 4b133c832..25a8d6837 100644
+--- a/lib/pinchflat/settings/settings.ex
++++ b/lib/pinchflat/settings/settings.ex
+@@ -20,6 +20,17 @@ defmodule Pinchflat.Settings do
+     |> Repo.one()
+   end
+ 
++  @doc """
++  Updates the setting record.
++
++  Returns {:ok, %Setting{}} | {:error, %Ecto.Changeset{}}
++  """
++  def update_setting(%Setting{} = setting, attrs) do
++    setting
++    |> Setting.changeset(attrs)
++    |> Repo.update()
++  end
++
+   @doc """
+   Updates a setting, returning the new value.
+   Is setup to take a keyword list argument so you
+@@ -29,8 +40,7 @@ defmodule Pinchflat.Settings do
+   """
+   def set([{attr, value}]) do
+     record()
+-    |> Setting.changeset(%{attr => value})
+-    |> Repo.update()
++    |> update_setting(%{attr => value})
+     |> case do
+       {:ok, %{^attr => _}} -> {:ok, value}
+       {:ok, _} -> {:error, :invalid_key}
+@@ -61,4 +71,11 @@ defmodule Pinchflat.Settings do
+       {:error, _} -> raise "Setting `#{name}` not found"
+     end
+   end
++
++  @doc """
++  Returns `%Ecto.Changeset{}`
++  """
++  def change_setting(%Setting{} = setting, attrs \\ %{}) do
++    Setting.changeset(setting, attrs)
++  end
+ end
+diff --git a/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex b/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex
+index 70f9c2e4c..0e982ebcd 100644
+--- a/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex
++++ b/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex
+@@ -11,9 +11,11 @@ defmodule Pinchflat.SlowIndexing.MediaCollectionIndexingWorker do
+   alias __MODULE__
+   alias Pinchflat.Tasks
+   alias Pinchflat.Sources
++  alias Pinchflat.Settings
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.FastIndexing.FastIndexingWorker
+   alias Pinchflat.SlowIndexing.SlowIndexingHelpers
++  alias Pinchflat.Notifications.SourceNotifications
+ 
+   @doc """
+   Starts the source slow indexing worker and creates a task for the source.
+@@ -78,21 +80,21 @@ defmodule Pinchflat.SlowIndexing.MediaCollectionIndexingWorker do
+     case {source.index_frequency_minutes, source.last_indexed_at} do
+       {index_freq, _} when index_freq > 0 ->
+         # If the indexing is on a schedule simply run indexing and reschedule
+-        SlowIndexingHelpers.index_and_enqueue_download_for_media_items(source)
++        perform_indexing_and_notification(source)
+         maybe_enqueue_fast_indexing_task(source)
+         reschedule_indexing(source)
+ 
+       {_, nil} ->
+         # If the source has never been indexed, index it once
+         # even if it's not meant to reschedule
+-        SlowIndexingHelpers.index_and_enqueue_download_for_media_items(source)
++        perform_indexing_and_notification(source)
+         :ok
+ 
+       _ ->
+         # If the source HAS been indexed and is not meant to reschedule,
+         # perform a no-op (unless forced)
+         if args["force"] do
+-          SlowIndexingHelpers.index_and_enqueue_download_for_media_items(source)
++          perform_indexing_and_notification(source)
+         end
+ 
+         :ok
+@@ -102,6 +104,14 @@ defmodule Pinchflat.SlowIndexing.MediaCollectionIndexingWorker do
+     Ecto.StaleEntryError -> Logger.info("#{__MODULE__} discarded: source #{source_id} stale")
+   end
+ 
++  defp perform_indexing_and_notification(source) do
++    apprise_server = Settings.get!(:apprise_server)
++
++    SourceNotifications.wrap_new_media_notification(apprise_server, source, fn ->
++      SlowIndexingHelpers.index_and_enqueue_download_for_media_items(source)
++    end)
++  end
++
+   defp reschedule_indexing(source) do
+     next_run_in = source.index_frequency_minutes * 60
+ 
+diff --git a/lib/pinchflat/slow_indexing/slow_indexing_helpers.ex b/lib/pinchflat/slow_indexing/slow_indexing_helpers.ex
+index c95306c61..b6b118aff 100644
+--- a/lib/pinchflat/slow_indexing/slow_indexing_helpers.ex
++++ b/lib/pinchflat/slow_indexing/slow_indexing_helpers.ex
+@@ -60,7 +60,7 @@ defmodule Pinchflat.SlowIndexing.SlowIndexingHelpers do
+   def index_and_enqueue_download_for_media_items(%Source{} = source) do
+     # See the method definition below for more info on how file watchers work
+     # (important reading if you're not familiar with it)
+-    {:ok, media_attributes} = get_media_attributes_for_collection_and_setup_file_watcher(source)
++    {:ok, media_attributes} = setup_file_watcher_and_kickoff_indexing(source)
+     # Reload because the source may have been updated during the (long-running) indexing process
+     # and important settings like `download_media` may have changed.
+     source = Repo.reload!(source)
+@@ -84,15 +84,15 @@ defmodule Pinchflat.SlowIndexing.SlowIndexingHelpers do
+   # lines (ie: you should gracefully fail if you can't parse a line).
+   #
+   # This works in-tandem with the normal (blocking) media indexing behaviour. When
+-  # the `get_media_attributes_for_collection` method completes it'll return the FULL result to
+-  # the caller for parsing. Ideally, every item in the list will have already
++  # the `setup_file_watcher_and_kickoff_indexing` method completes it'll return the
++  # FULL result to the caller for parsing. Ideally, every item in the list will have already
+   # been processed by the file follower, but if not, the caller handles creation
+   # of any media items that were missed/initially failed.
+   #
+   # It attempts a graceful shutdown of the file follower after the indexing is done,
+   # but the FileFollowerServer will also stop itself if it doesn't see any activity
+   # for a sufficiently long time.
+-  defp get_media_attributes_for_collection_and_setup_file_watcher(source) do
++  defp setup_file_watcher_and_kickoff_indexing(source) do
+     {:ok, pid} = FileFollowerServer.start_link()
+ 
+     handler = fn filepath -> setup_file_follower_watcher(pid, filepath, source) end
+diff --git a/lib/pinchflat/utils/cli_utils.ex b/lib/pinchflat/utils/cli_utils.ex
+new file mode 100644
+index 000000000..4e2a48894
+--- /dev/null
++++ b/lib/pinchflat/utils/cli_utils.ex
+@@ -0,0 +1,48 @@
++defmodule Pinchflat.Utils.CliUtils do
++  @moduledoc """
++  Utility methods for working with CLI executables
++  """
++
++  alias Pinchflat.Utils.StringUtils
++
++  @doc """
++  Parses a list of command options into a list of strings suitable for passing to
++  `System.cmd/3`.
++
++  We want to satisfy the following behaviours:
++    1. If the key is an atom, convert it to a string and convert it to kebab case (for convenience)
++    2. If the key is a string, assume we want it as-is and don't convert it
++    3. If the key is accompanied by a value, append the value to the list
++    4. If the key is not accompanied by a value, assume it's a flag and PREpend it to the list
++
++  Returns [binary()]
++  """
++  def parse_options(command_opts) do
++    command_opts
++    |> List.wrap()
++    |> Enum.reduce([], &parse_option/2)
++  end
++
++  defp parse_option({k, v}, acc) when is_atom(k) do
++    stringified_key = StringUtils.to_kebab_case(Atom.to_string(k))
++
++    parse_option({"--#{stringified_key}", v}, acc)
++  end
++
++  defp parse_option({k, v}, acc) when is_binary(k) do
++    acc ++ [k, to_string(v)]
++  end
++
++  defp parse_option(arg, acc) when is_atom(arg) do
++    stringified_arg =
++      arg
++      |> Atom.to_string()
++      |> StringUtils.to_kebab_case()
++
++    parse_option("--#{stringified_arg}", acc)
++  end
++
++  defp parse_option(arg, acc) when is_binary(arg) do
++    acc ++ [arg]
++  end
++end
+diff --git a/lib/pinchflat/yt_dlp/command_runner.ex b/lib/pinchflat/yt_dlp/command_runner.ex
+index 537dbd67c..7fc19bf2c 100644
+--- a/lib/pinchflat/yt_dlp/command_runner.ex
++++ b/lib/pinchflat/yt_dlp/command_runner.ex
+@@ -5,11 +5,11 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+ 
+   require Logger
+ 
+-  alias Pinchflat.Utils.StringUtils
++  alias Pinchflat.Utils.CliUtils
++  alias Pinchflat.YtDlp.YtDlpCommandRunner
+   alias Pinchflat.Filesystem.FilesystemHelpers, as: FSUtils
+-  alias Pinchflat.YtDlp.BackendCommandRunner
+ 
+-  @behaviour BackendCommandRunner
++  @behaviour YtDlpCommandRunner
+ 
+   @doc """
+   Runs a yt-dlp command and returns the string output. Saves the output to
+@@ -23,7 +23,7 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+ 
+   Returns {:ok, binary()} | {:error, output, status}.
+   """
+-  @impl BackendCommandRunner
++  @impl YtDlpCommandRunner
+   def run(url, command_opts, output_template, addl_opts \\ []) do
+     # This approach lets us mock the command for testing
+     command = backend_executable()
+@@ -32,7 +32,7 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+     output_filepath = generate_output_filepath(addl_opts)
+     print_to_file_opts = [{:print_to_file, output_template}, output_filepath]
+     cookie_opts = build_cookie_options()
+-    formatted_command_opts = [url] ++ parse_options(command_opts ++ print_to_file_opts ++ cookie_opts)
++    formatted_command_opts = [url] ++ CliUtils.parse_options(command_opts ++ print_to_file_opts ++ cookie_opts)
+ 
+     Logger.info("[yt-dlp] called with: #{Enum.join(formatted_command_opts, " ")}")
+ 
+@@ -48,7 +48,12 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+     end
+   end
+ 
+-  @impl BackendCommandRunner
++  @doc """
++  Returns the version of yt-dlp as a string
++
++  Returns {:ok, binary()} | {:error, binary()}
++  """
++  @impl YtDlpCommandRunner
+   def version do
+     command = backend_executable()
+ 
+@@ -81,36 +86,6 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+     end
+   end
+ 
+-  # We want to satisfy the following behaviours:
+-  #
+-  # 1. If the key is an atom, convert it to a string and convert it to kebab case (for convenience)
+-  # 2. If the key is a string, assume we want it as-is and don't convert it
+-  # 3. If the key is accompanied by a value, append the value to the list
+-  # 4. If the key is not accompanied by a value, assume it's a flag and PREpend it to the list
+-  defp parse_options(command_opts) do
+-    Enum.reduce(command_opts, [], &parse_option/2)
+-  end
+-
+-  defp parse_option({k, v}, acc) when is_atom(k) do
+-    stringified_key = StringUtils.to_kebab_case(Atom.to_string(k))
+-
+-    parse_option({"--#{stringified_key}", v}, acc)
+-  end
+-
+-  defp parse_option({k, v}, acc) when is_binary(k) do
+-    acc ++ [k, to_string(v)]
+-  end
+-
+-  defp parse_option(arg, acc) when is_atom(arg) do
+-    stringified_arg = StringUtils.to_kebab_case(Atom.to_string(arg))
+-
+-    parse_option("--#{stringified_arg}", acc)
+-  end
+-
+-  defp parse_option(arg, acc) when is_binary(arg) do
+-    acc ++ [arg]
+-  end
+-
+   defp backend_executable do
+     Application.get_env(:pinchflat, :yt_dlp_executable)
+   end
+diff --git a/lib/pinchflat/yt_dlp/backend_command_runner.ex b/lib/pinchflat/yt_dlp/yt_dlp_command_runner.ex
+similarity index 90%
+rename from lib/pinchflat/yt_dlp/backend_command_runner.ex
+rename to lib/pinchflat/yt_dlp/yt_dlp_command_runner.ex
+index e09eaebf2..9b46a32db 100644
+--- a/lib/pinchflat/yt_dlp/backend_command_runner.ex
++++ b/lib/pinchflat/yt_dlp/yt_dlp_command_runner.ex
+@@ -1,4 +1,4 @@
+-defmodule Pinchflat.YtDlp.BackendCommandRunner do
++defmodule Pinchflat.YtDlp.YtDlpCommandRunner do
+   @moduledoc """
+   A behaviour for running CLI commands against a downloader backend (yt-dlp).
+ 
+diff --git a/lib/pinchflat_web/components/core_components.ex b/lib/pinchflat_web/components/core_components.ex
+index f124b1629..654b743d6 100644
+--- a/lib/pinchflat_web/components/core_components.ex
++++ b/lib/pinchflat_web/components/core_components.ex
+@@ -247,6 +247,7 @@ defmodule PinchflatWeb.CoreComponents do
+   attr :label_suffix, :string, default: nil
+   attr :value, :any
+   attr :help, :string, default: nil
++  attr :html_help, :boolean, default: false
+ 
+   attr :type, :string,
+     default: "text",
+@@ -298,7 +299,7 @@ defmodule PinchflatWeb.CoreComponents do
+         <%= @label %>
+         <span :if={@label_suffix} class="text-xs text-bodydark"><%= @label_suffix %></span>
+       </label>
+-      <.help :if={@help}><%= @help %></.help>
++      <.help :if={@help}><%= if @html_help, do: Phoenix.HTML.raw(@help), else: @help %></.help>
+       <.error :for={msg <- @errors}><%= msg %></.error>
+     </div>
+     """
+@@ -325,7 +326,7 @@ defmodule PinchflatWeb.CoreComponents do
+           </label>
+         </div>
+       </section>
+-      <.help :if={@help}><%= @help %></.help>
++      <.help :if={@help}><%= if @html_help, do: Phoenix.HTML.raw(@help), else: @help %></.help>
+       <.error :for={msg <- @errors}><%= msg %></.error>
+     </div>
+     """
+@@ -356,7 +357,7 @@ defmodule PinchflatWeb.CoreComponents do
+           >
+           </div>
+         </div>
+-        <.help :if={@help}><%= @help %></.help>
++        <.help :if={@help}><%= if @html_help, do: Phoenix.HTML.raw(@help), else: @help %></.help>
+         <.error :for={msg <- @errors}><%= msg %></.error>
+       </div>
+     </div>
+@@ -387,7 +388,7 @@ defmodule PinchflatWeb.CoreComponents do
+         </select>
+         <%= render_slot(@inner_block) %>
+       </div>
+-      <.help :if={@help}><%= @help %></.help>
++      <.help :if={@help}><%= if @html_help, do: Phoenix.HTML.raw(@help), else: @help %></.help>
+       <.error :for={msg <- @errors}><%= msg %></.error>
+     </div>
+     """
+@@ -411,7 +412,7 @@ defmodule PinchflatWeb.CoreComponents do
+         ]}
+         {@rest}
+       ><%= Phoenix.HTML.Form.normalize_value("textarea", @value) %></textarea>
+-      <.help :if={@help}><%= @help %></.help>
++      <.help :if={@help}><%= if @html_help, do: Phoenix.HTML.raw(@help), else: @help %></.help>
+       <.error :for={msg <- @errors}><%= msg %></.error>
+     </div>
+     """
+@@ -438,7 +439,7 @@ defmodule PinchflatWeb.CoreComponents do
+         ]}
+         {@rest}
+       />
+-      <.help :if={@help}><%= @help %></.help>
++      <.help :if={@help}><%= if @html_help, do: Phoenix.HTML.raw(@help), else: @help %></.help>
+       <.error :for={msg <- @errors}><%= msg %></.error>
+     </div>
+     """
+diff --git a/lib/pinchflat_web/components/layouts/partials/sidebar.html.heex b/lib/pinchflat_web/components/layouts/partials/sidebar.html.heex
+index 978c471af..deae09766 100644
+--- a/lib/pinchflat_web/components/layouts/partials/sidebar.html.heex
++++ b/lib/pinchflat_web/components/layouts/partials/sidebar.html.heex
+@@ -24,6 +24,7 @@
+             <.sidebar_item icon="hero-home" text="Home" href={~p"/"} />
+             <.sidebar_item icon="hero-tv" text="Sources" href={~p"/sources"} />
+             <.sidebar_item icon="hero-adjustments-vertical" text="Media Profiles" href={~p"/media_profiles"} />
++            <.sidebar_item icon="hero-cog-6-tooth" text="Settings" href={~p"/settings"} />
+           </ul>
+         </div>
+       </nav>
+@@ -38,12 +39,7 @@
+           target="_blank"
+           href="https://github.com/kieraneglin/pinchflat/wiki"
+         />
+-        <.sidebar_item
+-          icon="hero-code-bracket"
+-          text="Github"
+-          target="_blank"
+-          href="https://github.com/kieraneglin/pinchflat"
+-        />
++        <.sidebar_item icon="hero-cog" text="Github" target="_blank" href="https://github.com/kieraneglin/pinchflat" />
+         <li>
+           <span
+             class={[
+diff --git a/lib/pinchflat_web/controllers/settings/setting_controller.ex b/lib/pinchflat_web/controllers/settings/setting_controller.ex
+new file mode 100644
+index 000000000..c87d51f42
+--- /dev/null
++++ b/lib/pinchflat_web/controllers/settings/setting_controller.ex
+@@ -0,0 +1,26 @@
++defmodule PinchflatWeb.Settings.SettingController do
++  use PinchflatWeb, :controller
++
++  alias Pinchflat.Settings
++
++  def show(conn, _params) do
++    setting = Settings.record()
++    changeset = Settings.change_setting(setting)
++
++    render(conn, "show.html", changeset: changeset)
++  end
++
++  def update(conn, %{"setting" => setting_params}) do
++    setting = Settings.record()
++
++    case Settings.update_setting(setting, setting_params) do
++      {:ok, _} ->
++        conn
++        |> put_flash(:info, "Settings updated successfully.")
++        |> redirect(to: ~p"/settings")
++
++      {:error, %Ecto.Changeset{} = changeset} ->
++        render(conn, "show.html", changeset: changeset)
++    end
++  end
++end
+diff --git a/lib/pinchflat_web/controllers/settings/setting_html.ex b/lib/pinchflat_web/controllers/settings/setting_html.ex
+new file mode 100644
+index 000000000..47ad97ca7
+--- /dev/null
++++ b/lib/pinchflat_web/controllers/settings/setting_html.ex
+@@ -0,0 +1,20 @@
++defmodule PinchflatWeb.Settings.SettingHTML do
++  use PinchflatWeb, :html
++
++  embed_templates "setting_html/*"
++
++  @doc """
++  Renders a setting form.
++  """
++  attr :changeset, Ecto.Changeset, required: true
++  attr :action, :string, required: true
++
++  def setting_form(assigns)
++
++  def apprise_server_help do
++    url = "https://github.com/caronc/apprise/wiki/URLBasics"
++    classes = "underline decoration-bodydark decoration-1 hover:decoration-white"
++
++    ~s(Server endpoint for Apprise notifications when new media is found. See <a href="#{url}" class="#{classes}" target="_blank">Apprise docs</a> for more information)
++  end
++end
+diff --git a/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex b/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
+new file mode 100644
+index 000000000..f3ba48ed3
+--- /dev/null
++++ b/lib/pinchflat_web/controllers/settings/setting_html/setting_form.html.heex
+@@ -0,0 +1,21 @@
++<.simple_form :let={f} for={@changeset} action={@action}>
++  <.error :if={@changeset.action}>
++    Oops, something went wrong! Please check the errors below.
++  </.error>
++
++  <h3 class="mt-8 text-2xl text-black dark:text-white">
++    Notification Settings
++  </h3>
++
++  <.input
++    field={f[:apprise_server]}
++    type="text"
++    label="Apprise Server"
++    help={apprise_server_help()}
++    html_help={true}
++    inputclass="font-mono text-sm"
++    placeholder="https://discordapp.com/api/webhooks/{WebhookID}/{WebhookToken}"
++  />
++
++  <.button class="my-10 sm:mb-7.5 w-full sm:w-auto" rounding="rounded-lg">Save Settings</.button>
++</.simple_form>
+diff --git a/lib/pinchflat_web/controllers/settings/setting_html/show.html.heex b/lib/pinchflat_web/controllers/settings/setting_html/show.html.heex
+new file mode 100644
+index 000000000..db90e0096
+--- /dev/null
++++ b/lib/pinchflat_web/controllers/settings/setting_html/show.html.heex
+@@ -0,0 +1,12 @@
++<div class="mb-6 flex gap-3 flex-row items-center justify-between">
++  <div class="flex gap-3 items-center">
++    <h2 class="text-title-md2 font-bold text-black dark:text-white ml-4">
++      Settings
++    </h2>
++  </div>
++</div>
++<div class="rounded-sm border border-stroke bg-white px-5 py-5 shadow-default dark:border-strokedark dark:bg-boxdark sm:px-7.5">
++  <div class="max-w-full overflow-x-auto">
++    <.setting_form changeset={@changeset} action={~p"/settings"} />
++  </div>
++</div>
+diff --git a/lib/pinchflat_web/router.ex b/lib/pinchflat_web/router.ex
+index b83e6d850..04edebe5a 100644
+--- a/lib/pinchflat_web/router.ex
++++ b/lib/pinchflat_web/router.ex
+@@ -30,6 +30,7 @@ defmodule PinchflatWeb.Router do
+ 
+     resources "/media_profiles", MediaProfiles.MediaProfileController
+     resources "/search", Searches.SearchController, only: [:show], singleton: true
++    resources "/settings", Settings.SettingController, only: [:show, :update], singleton: true
+ 
+     resources "/sources", Sources.SourceController do
+       post "/force_download", Sources.SourceController, :force_download
+diff --git a/priv/repo/migrations/20240404221551_add_apprise_servers_to_settings.exs b/priv/repo/migrations/20240404221551_add_apprise_servers_to_settings.exs
+new file mode 100644
+index 000000000..bba04c667
+--- /dev/null
++++ b/priv/repo/migrations/20240404221551_add_apprise_servers_to_settings.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddAppriseServersToSettings do
++  use Ecto.Migration
++
++  def change do
++    alter table(:settings) do
++      add :apprise_server, :string
++    end
++  end
++end
+diff --git a/priv/repo/migrations/20240408181121_add_apprise_version_to_settings.exs b/priv/repo/migrations/20240408181121_add_apprise_version_to_settings.exs
+new file mode 100644
+index 000000000..2a624b464
+--- /dev/null
++++ b/priv/repo/migrations/20240408181121_add_apprise_version_to_settings.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddAppriseVersionToSettings do
++  use Ecto.Migration
++
++  def change do
++    alter table(:settings) do
++      add :apprise_version, :string
++    end
++  end
++end
+diff --git a/selfhosted.Dockerfile b/selfhosted.Dockerfile
+index 0dfc70a7f..62b2c705e 100644
+--- a/selfhosted.Dockerfile
++++ b/selfhosted.Dockerfile
+@@ -79,7 +79,7 @@ ARG PORT=8945
+ 
+ RUN apt-get update -y
+ RUN apt-get install -y libstdc++6 openssl libncurses5 locales ca-certificates \
+-  ffmpeg curl git openssh-client nano
++  ffmpeg curl git openssh-client nano python3 python3-pip
+ RUN apt-get clean && rm -f /var/lib/apt/lists/*_*
+ 
+ # Download and update YT-DLP
+@@ -87,9 +87,11 @@ RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o
+ RUN chmod a+rx /usr/local/bin/yt-dlp
+ RUN yt-dlp -U
+ 
++# Download Apprise
++RUN python3 -m pip install -U apprise --break-system-packages
++
+ # Set the locale
+ RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+-
+ ENV LANG en_US.UTF-8
+ ENV LANGUAGE en_US:en
+ ENV LC_ALL en_US.UTF-8
+diff --git a/test/pinchflat/boot/pre_job_startup_tasks_test.exs b/test/pinchflat/boot/pre_job_startup_tasks_test.exs
+index f2cdd66b8..8fd81bb50 100644
+--- a/test/pinchflat/boot/pre_job_startup_tasks_test.exs
++++ b/test/pinchflat/boot/pre_job_startup_tasks_test.exs
+@@ -1,11 +1,19 @@
+ defmodule Pinchflat.Boot.PreJobStartupTasksTest do
+   use Pinchflat.DataCase
+ 
++  import Mox
+   import Pinchflat.JobFixtures
+ 
+   alias Pinchflat.Settings
+   alias Pinchflat.Boot.PreJobStartupTasks
+ 
++  setup do
++    stub(YtDlpRunnerMock, :version, fn -> {:ok, "1"} end)
++    stub(AppriseRunnerMock, :version, fn -> {:ok, "2"} end)
++
++    :ok
++  end
++
+   describe "reset_executing_jobs" do
+     test "resets executing jobs" do
+       job = job_fixture()
+@@ -13,7 +21,7 @@ defmodule Pinchflat.Boot.PreJobStartupTasksTest do
+ 
+       assert Repo.reload!(job).state == "executing"
+ 
+-      PreJobStartupTasks.start_link()
++      PreJobStartupTasks.init(%{})
+ 
+       assert Repo.reload!(job).state == "retryable"
+     end
+@@ -27,21 +35,31 @@ defmodule Pinchflat.Boot.PreJobStartupTasksTest do
+ 
+       refute File.exists?(filepath)
+ 
+-      PreJobStartupTasks.start_link()
++      PreJobStartupTasks.init(%{})
+ 
+       assert File.exists?(filepath)
+     end
+   end
+ 
+   describe "apply_default_settings" do
+-    test "sets default settings" do
++    test "sets yt_dlp version" do
+       Settings.set(yt_dlp_version: nil)
+ 
+       refute Settings.get!(:yt_dlp_version)
+ 
+-      PreJobStartupTasks.start_link()
++      PreJobStartupTasks.init(%{})
+ 
+       assert Settings.get!(:yt_dlp_version)
+     end
++
++    test "sets apprise version" do
++      Settings.set(apprise_version: nil)
++
++      refute Settings.get!(:apprise_version)
++
++      PreJobStartupTasks.init(%{})
++
++      assert Settings.get!(:apprise_version)
++    end
+   end
+ end
+diff --git a/test/pinchflat/fast_indexing/fast_indexing_helpers_test.exs b/test/pinchflat/fast_indexing/fast_indexing_helpers_test.exs
+index 6c5505147..23350c033 100644
+--- a/test/pinchflat/fast_indexing/fast_indexing_helpers_test.exs
++++ b/test/pinchflat/fast_indexing/fast_indexing_helpers_test.exs
+@@ -24,7 +24,7 @@ defmodule Pinchflat.FastIndexing.FastIndexingHelpersTest do
+     test "enqueues a new worker for each new media_id in the source's RSS feed", %{source: source} do
+       expect(HTTPClientMock, :get, fn _url -> {:ok, "<yt:videoId>test_1</yt:videoId>"} end)
+ 
+-      assert :ok = FastIndexingHelpers.kickoff_indexing_tasks_from_youtube_rss_feed(source)
++      assert [_] = FastIndexingHelpers.kickoff_indexing_tasks_from_youtube_rss_feed(source)
+ 
+       assert [worker] = all_enqueued(worker: MediaIndexingWorker)
+       assert worker.args["id"] == source.id
+@@ -35,10 +35,16 @@ defmodule Pinchflat.FastIndexing.FastIndexingHelpersTest do
+       expect(HTTPClientMock, :get, fn _url -> {:ok, "<yt:videoId>test_1</yt:videoId>"} end)
+       media_item_fixture(source_id: source.id, media_id: "test_1")
+ 
+-      assert :ok = FastIndexingHelpers.kickoff_indexing_tasks_from_youtube_rss_feed(source)
++      assert [] = FastIndexingHelpers.kickoff_indexing_tasks_from_youtube_rss_feed(source)
+ 
+       refute_enqueued(worker: MediaIndexingWorker)
+     end
++
++    test "returns the IDs of the found media items", %{source: source} do
++      expect(HTTPClientMock, :get, fn _url -> {:ok, "<yt:videoId>test_1</yt:videoId>"} end)
++
++      assert ["test_1"] = FastIndexingHelpers.kickoff_indexing_tasks_from_youtube_rss_feed(source)
++    end
+   end
+ 
+   describe "index_and_enqueue_download_for_media_item/2" do
+diff --git a/test/pinchflat/fast_indexing/fast_indexing_worker_test.exs b/test/pinchflat/fast_indexing/fast_indexing_worker_test.exs
+index a69a99d44..55007baf6 100644
+--- a/test/pinchflat/fast_indexing/fast_indexing_worker_test.exs
++++ b/test/pinchflat/fast_indexing/fast_indexing_worker_test.exs
+@@ -4,6 +4,7 @@ defmodule Pinchflat.FastIndexing.FastIndexingWorkerTest do
+   import Mox
+   import Pinchflat.SourcesFixtures
+ 
++  alias Pinchflat.Settings
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.FastIndexing.FastIndexingWorker
+ 
+@@ -74,4 +75,28 @@ defmodule Pinchflat.FastIndexing.FastIndexingWorkerTest do
+       assert :ok = perform_job(FastIndexingWorker, %{id: 0})
+     end
+   end
++
++  describe "perform/1 when testing notifications" do
++    setup do
++      Settings.set(apprise_server: "server_1")
++
++      :ok
++    end
++
++    test "sends a notification if new media was found" do
++      source = source_fixture(fast_index: true)
++
++      expect(HTTPClientMock, :get, fn _url -> {:ok, "<yt:videoId>test_1</yt:videoId>"} end)
++
++      expect(AppriseRunnerMock, :run, fn servers, opts ->
++        assert "server_1" = servers
++        assert is_binary(Keyword.get(opts, :title))
++        assert is_binary(Keyword.get(opts, :body))
++
++        {:ok, ""}
++      end)
++
++      perform_job(FastIndexingWorker, %{id: source.id})
++    end
++  end
+ end
+diff --git a/test/pinchflat/notifications/command_runner_test.exs b/test/pinchflat/notifications/command_runner_test.exs
+new file mode 100644
+index 000000000..0ed4cc642
+--- /dev/null
++++ b/test/pinchflat/notifications/command_runner_test.exs
+@@ -0,0 +1,65 @@
++defmodule Pinchflat.Notifications.CommandRunnerTest do
++  use ExUnit.Case, async: true
++
++  alias Pinchflat.Notifications.CommandRunner, as: Runner
++
++  @original_executable Application.compile_env(:pinchflat, :apprise_executable)
++
++  setup do
++    on_exit(&reset_executable/0)
++  end
++
++  describe "run/2" do
++    test "returns :ok when the command succeeds" do
++      assert {:ok, _} = Runner.run("server_1", [])
++    end
++
++    test "includes the servers as the first argument" do
++      assert {:ok, output} = Runner.run(["server_1", "server_2"], [])
++
++      assert String.contains?(output, "server_1 server_2")
++    end
++
++    test "lets you pass a single server as a string" do
++      assert {:ok, output} = Runner.run("server_1", [])
++
++      assert String.contains?(output, "server_1")
++    end
++
++    test "passes all arguments to the command" do
++      assert {:ok, output} = Runner.run("server_1", ["--dry-run"])
++
++      assert String.contains?(output, "--dry-run")
++    end
++
++    test "returns the output when the command fails" do
++      wrap_executable("/bin/false", fn ->
++        assert {:error, ""} = Runner.run("server_1", [])
++      end)
++    end
++
++    test "returns a relevant error if no servers are provided" do
++      assert {:error, :no_servers} = Runner.run(nil, [])
++      assert {:error, :no_servers} = Runner.run("", [])
++      assert {:error, :no_servers} = Runner.run([], [])
++    end
++  end
++
++  describe "version/0" do
++    test "adds the version arg" do
++      assert {:ok, output} = Runner.version()
++
++      assert String.contains?(output, "--version")
++    end
++  end
++
++  defp wrap_executable(new_executable, fun) do
++    Application.put_env(:pinchflat, :apprise_executable, new_executable)
++    fun.()
++    reset_executable()
++  end
++
++  def reset_executable do
++    Application.put_env(:pinchflat, :apprise_executable, @original_executable)
++  end
++end
+diff --git a/test/pinchflat/notifications/source_notifications_test.exs b/test/pinchflat/notifications/source_notifications_test.exs
+new file mode 100644
+index 000000000..0bf897e05
+--- /dev/null
++++ b/test/pinchflat/notifications/source_notifications_test.exs
+@@ -0,0 +1,100 @@
++defmodule Pinchflat.Notifications.SourceNotificationsTest do
++  use Pinchflat.DataCase
++
++  import Mox
++  import Pinchflat.MediaFixtures
++  import Pinchflat.SourcesFixtures
++
++  alias Pinchflat.Notifications.SourceNotifications
++
++  @apprise_servers ["server_1", "server_2"]
++
++  setup :verify_on_exit!
++
++  describe "wrap_new_media_notification/3" do
++    test "sends a notification when the pending count changes" do
++      source = source_fixture()
++
++      expect(AppriseRunnerMock, :run, fn servers, opts ->
++        assert servers == @apprise_servers
++
++        assert opts == [
++                 title: "[Pinchflat] New media found",
++                 body: "Found 1 new media item(s) for #{source.custom_name}. Downloading them now"
++               ]
++
++        {:ok, ""}
++      end)
++
++      SourceNotifications.wrap_new_media_notification(@apprise_servers, source, fn ->
++        media_item_fixture(%{source_id: source.id, media_filepath: nil})
++      end)
++    end
++
++    test "sends a notification when the downloaded count changes" do
++      source = source_fixture()
++
++      expect(AppriseRunnerMock, :run, fn servers, opts ->
++        assert servers == @apprise_servers
++
++        assert opts == [
++                 title: "[Pinchflat] New media found",
++                 body: "Found 1 new media item(s) for #{source.custom_name}. Downloading them now"
++               ]
++
++        {:ok, ""}
++      end)
++
++      SourceNotifications.wrap_new_media_notification(@apprise_servers, source, fn ->
++        media_item_fixture(%{source_id: source.id, media_filepath: "file.mp4"})
++      end)
++    end
++
++    test "does not send a notification when the count does not change" do
++      source = source_fixture()
++
++      expect(AppriseRunnerMock, :run, 0, fn _, _ -> {:ok, ""} end)
++
++      SourceNotifications.wrap_new_media_notification(@apprise_servers, source, fn ->
++        media_item_fixture(%{source_id: source.id, prevent_download: true, media_filepath: nil})
++      end)
++    end
++
++    test "returns the value of the function" do
++      source = source_fixture()
++      expect(AppriseRunnerMock, :run, 0, fn _, _ -> {:ok, ""} end)
++
++      retval = SourceNotifications.wrap_new_media_notification(@apprise_servers, source, fn -> "value" end)
++
++      assert retval == "value"
++    end
++  end
++
++  describe "send_new_media_notification/3" do
++    test "sends a notification when count is positive" do
++      source = source_fixture()
++
++      expect(AppriseRunnerMock, :run, fn servers, opts ->
++        assert servers == @apprise_servers
++
++        assert opts == [
++                 title: "[Pinchflat] New media found",
++                 body: "Found 1 new media item(s) for #{source.custom_name}. Downloading them now"
++               ]
++
++        {:ok, ""}
++      end)
++
++      :ok = SourceNotifications.send_new_media_notification(@apprise_servers, source, 1)
++    end
++
++    test "does not send a notification when count not positive" do
++      source = source_fixture()
++
++      expect(AppriseRunnerMock, :run, 0, fn _, _ -> {:ok, ""} end)
++
++      :ok = SourceNotifications.send_new_media_notification(@apprise_servers, source, 0)
++      :ok = SourceNotifications.send_new_media_notification(@apprise_servers, source, -1)
++    end
++  end
++end
+diff --git a/test/pinchflat/settings_test.exs b/test/pinchflat/settings_test.exs
+index bcfb97fbf..944eaf172 100644
+--- a/test/pinchflat/settings_test.exs
++++ b/test/pinchflat/settings_test.exs
+@@ -24,6 +24,16 @@ defmodule Pinchflat.SettingsTest do
+     end
+   end
+ 
++  describe "update_setting/2" do
++    test "updates the setting" do
++      setting = Settings.record()
++
++      assert {:ok, false} = Settings.get(:onboarding)
++      assert {:ok, %Setting{}} = Settings.update_setting(setting, %{onboarding: true})
++      assert {:ok, true} = Settings.get(:onboarding)
++    end
++  end
++
+   describe "set/1" do
+     test "updates the setting" do
+       assert {:ok, true} = Settings.set(onboarding: true)
+@@ -60,4 +70,12 @@ defmodule Pinchflat.SettingsTest do
+       end
+     end
+   end
++
++  describe "change_setting/2" do
++    test "returns a changeset" do
++      setting = Settings.record()
++
++      assert %Ecto.Changeset{} = Settings.change_setting(setting, %{onboarding: true})
++    end
++  end
+ end
+diff --git a/test/pinchflat/slow_indexing/media_collection_indexing_worker_test.exs b/test/pinchflat/slow_indexing/media_collection_indexing_worker_test.exs
+index 6a3c14091..083043581 100644
+--- a/test/pinchflat/slow_indexing/media_collection_indexing_worker_test.exs
++++ b/test/pinchflat/slow_indexing/media_collection_indexing_worker_test.exs
+@@ -7,6 +7,7 @@ defmodule Pinchflat.SlowIndexing.MediaCollectionIndexingWorkerTest do
+   import Pinchflat.SourcesFixtures
+ 
+   alias Pinchflat.Tasks
++  alias Pinchflat.Settings
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.FastIndexing.FastIndexingWorker
+   alias Pinchflat.Downloading.MediaDownloadWorker
+@@ -51,6 +52,12 @@ defmodule Pinchflat.SlowIndexing.MediaCollectionIndexingWorkerTest do
+   end
+ 
+   describe "perform/1" do
++    setup do
++      stub(AppriseRunnerMock, :run, fn _, _ -> {:ok, ""} end)
++
++      :ok
++    end
++
+     test "it indexes the source if it should be indexed" do
+       expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
+ 
+@@ -210,4 +217,30 @@ defmodule Pinchflat.SlowIndexing.MediaCollectionIndexingWorkerTest do
+       assert :ok = perform_job(MediaCollectionIndexingWorker, %{id: 0})
+     end
+   end
++
++  describe "perform/1 when testing apprise notifications" do
++    setup do
++      Settings.set(apprise_server: "server_1")
++
++      :ok
++    end
++
++    test "sends a notification if new media was found" do
++      source = source_fixture()
++
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts ->
++        {:ok, source_attributes_return_fixture()}
++      end)
++
++      expect(AppriseRunnerMock, :run, fn servers, opts ->
++        assert "server_1" = servers
++        assert is_binary(Keyword.get(opts, :title))
++        assert is_binary(Keyword.get(opts, :body))
++
++        {:ok, ""}
++      end)
++
++      perform_job(MediaCollectionIndexingWorker, %{id: source.id})
++    end
++  end
+ end
+diff --git a/test/pinchflat/utils/cli_utils_test.exs b/test/pinchflat/utils/cli_utils_test.exs
+new file mode 100644
+index 000000000..b0531584f
+--- /dev/null
++++ b/test/pinchflat/utils/cli_utils_test.exs
+@@ -0,0 +1,23 @@
++defmodule Pinchflat.Utils.CliUtilsTest do
++  use ExUnit.Case, async: true
++
++  alias Pinchflat.Utils.CliUtils
++
++  describe "parse_options/1" do
++    test "it converts symbol k-v arg keys to kebab case" do
++      assert ["--buffer-size", "1024"] = CliUtils.parse_options(buffer_size: 1024)
++    end
++
++    test "it keeps string k-v arg keys untouched" do
++      assert ["--under_score", "1024"] = CliUtils.parse_options({"--under_score", 1024})
++    end
++
++    test "it converts symbol arg keys to kebab case" do
++      assert ["--ignore-errors"] = CliUtils.parse_options(:ignore_errors)
++    end
++
++    test "it keeps string arg keys untouched" do
++      assert ["-v"] = CliUtils.parse_options("-v")
++    end
++  end
++end
+diff --git a/test/pinchflat/yt_dlp/command_runner_test.exs b/test/pinchflat/yt_dlp/command_runner_test.exs
+index 889b0309f..ac06a48af 100644
+--- a/test/pinchflat/yt_dlp/command_runner_test.exs
++++ b/test/pinchflat/yt_dlp/command_runner_test.exs
+@@ -17,31 +17,6 @@ defmodule Pinchflat.YtDlp.CommandRunnerTest do
+       assert {:ok, _output} = Runner.run(@media_url, [], "")
+     end
+ 
+-    test "it converts symbol k-v arg keys to kebab case" do
+-      assert {:ok, output} = Runner.run(@media_url, [buffer_size: 1024], "")
+-
+-      assert String.contains?(output, "--buffer-size 1024")
+-    end
+-
+-    test "it keeps string k-v arg keys untouched" do
+-      assert {:ok, output} = Runner.run(@media_url, [{"--under_score", 1024}], "")
+-
+-      assert String.contains?(output, "--under_score 1024")
+-    end
+-
+-    test "it converts symbol arg keys to kebab case" do
+-      assert {:ok, output} = Runner.run(@media_url, [:ignore_errors], "")
+-
+-      assert String.contains?(output, "--ignore-errors")
+-    end
+-
+-    test "it keeps string arg keys untouched" do
+-      assert {:ok, output} = Runner.run(@media_url, ["-v"], "")
+-
+-      assert String.contains?(output, "-v")
+-      refute String.contains?(output, "--v")
+-    end
+-
+     test "it includes the media url as the first argument" do
+       assert {:ok, output} = Runner.run(@media_url, [:ignore_errors], "")
+ 
+diff --git a/test/pinchflat_web/controllers/setting_controller_test.exs b/test/pinchflat_web/controllers/setting_controller_test.exs
+new file mode 100644
+index 000000000..0063ebcb8
+--- /dev/null
++++ b/test/pinchflat_web/controllers/setting_controller_test.exs
+@@ -0,0 +1,23 @@
++defmodule PinchflatWeb.SettingControllerTest do
++  use PinchflatWeb.ConnCase
++
++  describe "show settings" do
++    test "renders the page", %{conn: conn} do
++      conn = get(conn, ~p"/settings")
++
++      assert html_response(conn, 200) =~ "Settings"
++    end
++  end
++
++  describe "update settings" do
++    test "saves and redirects when data is valid", %{conn: conn} do
++      update_attrs = %{apprise_server: "test://server"}
++
++      conn = put(conn, ~p"/settings", setting: update_attrs)
++      assert redirected_to(conn) == ~p"/settings"
++
++      conn = get(conn, ~p"/settings")
++      assert html_response(conn, 200) =~ update_attrs[:apprise_server]
++    end
++  end
++end
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index bea0589c0..e6cd91ef3 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -1,6 +1,9 @@
+-Mox.defmock(YtDlpRunnerMock, for: Pinchflat.YtDlp.BackendCommandRunner)
++Mox.defmock(YtDlpRunnerMock, for: Pinchflat.YtDlp.YtDlpCommandRunner)
+ Application.put_env(:pinchflat, :yt_dlp_runner, YtDlpRunnerMock)
+ 
++Mox.defmock(AppriseRunnerMock, for: Pinchflat.Notifications.AppriseCommandRunner)
++Application.put_env(:pinchflat, :apprise_runner, AppriseRunnerMock)
++
+ Mox.defmock(HTTPClientMock, for: Pinchflat.HTTP.HTTPBehaviour)
+ Application.put_env(:pinchflat, :http_client, HTTPClientMock)
+ 

@@ -1,0 +1,930 @@
+diff --git a/lib/changelog/ffmpeg.ex b/lib/changelog/ffmpeg.ex
+deleted file mode 100644
+index 9a7275326d..0000000000
+--- a/lib/changelog/ffmpeg.ex
++++ /dev/null
+@@ -1,45 +0,0 @@
+-defmodule Changelog.FFmpeg do
+-  @doc """
+-  Extracts fmpeg's report of the given `file`'s duration. e.g - "56:18"
+-  """
+-  def duration(file) do
+-    try do
+-      {info, _exit_code} = System.cmd("ffmpeg", ["-i", file], stderr_to_stdout: true)
+-      [_match, duration] = Regex.run(~r/Duration: (.*?),/, info)
+-      duration
+-    catch
+-      _all ->
+-        "0"
+-    end
+-  end
+-
+-  @doc """
+-  Writes ID3 tags to the given `file` path for the given `episode`
+-  """
+-  def tag(file, episode) do
+-    cover_path = ChangelogWeb.PodcastView.cover_path(episode.podcast, :original)
+-    cover_file = Changelog.UrlKit.get_tempfile(cover_path)
+-    tagged = file <> "-TAGGED"
+-
+-    args = [
+-      "-f", "mp3", "-i", file, "-i", cover_file,
+-      "-map", "0:0", "-map", "1:0",
+-      "-acodec", "copy",
+-      "-metadata", "artist=Changelog Media",
+-      "-metadata", "publisher=Changelog Media",
+-      "-metadata", "album=#{episode.podcast.name}",
+-      "-metadata", "title=#{episode.title}",
+-      "-metadata", "date=#{episode.published_at.year}",
+-      "-metadata", "genre=Podcast",
+-      "-metadata", "comment=SGUgdGhhdCBoZWFycyBteSB3b3JkLCBhbmQgYmVsaWV2ZXMgb24gaGltIHRoYXQgc2VudCBtZSwgaGFzIGV2ZXJsYXN0aW5nIGxpZmUsIGFuZCBzaGFsbCBub3QgY29tZSBpbnRvIGNvbmRlbW5hdGlvbjsgYnV0IGlzIHBhc3NlZCBmcm9tIGRlYXRoIHVudG8gbGlmZQ==",
+-      "-f", "mp3", tagged
+-    ]
+-
+-    case System.cmd("ffmpeg", args, stderr_to_stdout: true) do
+-      {_info, 0} ->
+-        File.rename(tagged, file)
+-      {error_message, _exit_code} ->
+-        {:error, error_message}
+-    end
+-  end
+-end
+diff --git a/lib/changelog/files/file.ex b/lib/changelog/files/file.ex
+index acdab61696..3c2b1477ab 100644
+--- a/lib/changelog/files/file.ex
++++ b/lib/changelog/files/file.ex
+@@ -36,16 +36,9 @@ defmodule Changelog.File do
+         Enum.member?(unquote(types), file_type(file))
+       end
+ 
+-      def mime_type(file) do
+-        case file_type(file) do
+-          :jpg -> "image/jpg"
+-          :jpeg -> "image/jpg"
+-          :png -> "image/png"
+-          :gif -> "image/gif"
+-          :mp3 -> "audio/mpeg"
+-          :svg -> "image/svg+xml"
+-        end
+-      end
++      def file_type(file), do: Changelog.FileKit.get_type(file)
++
++      def mime_type(file), do: Changelog.FileKit.mime_type(file)
+ 
+       # Takes a list of strings and returns a joined string for passing to `convert`
+       # See https://www.smashingmagazine.com/2015/06/efficient-image-resizing-with-imagemagick/
+@@ -69,14 +62,6 @@ defmodule Changelog.File do
+         ] |> Enum.join(" ")
+       end
+ 
+-      defp file_type(file) do
+-        file.file_name
+-        |> Path.extname()
+-        |> String.replace(".", "")
+-        |> String.downcase()
+-        |> String.to_existing_atom()
+-      end
+-
+       defp hashed(id), do: Changelog.Hashid.encode(id)
+       defp source(scope), do: scope.__meta__.source
+     end
+diff --git a/lib/changelog/kits/file_kit.ex b/lib/changelog/kits/file_kit.ex
+new file mode 100644
+index 0000000000..dfcd7dd4ac
+--- /dev/null
++++ b/lib/changelog/kits/file_kit.ex
+@@ -0,0 +1,78 @@
++defmodule Changelog.FileKit do
++  @doc """
++  If the file exists, we know it's a path to said file
++  """
++  def is_path?(binary), do: File.exists?(binary)
++
++  @doc """
++  Attempts to identify the file type, first by matching its magic number,
++  if possible. Then it falls back to the file extension.
++  """
++  def get_type(binary) when is_binary(binary) do
++    if is_path?(binary) do
++      case File.read(binary) do
++        {:ok, data} -> get_type(data)
++        {:error, _e} -> :unknown
++      end
++    else
++      case file_type_by_magic_number(binary) do
++        :unknown -> file_type_by_extension(binary)
++        type -> type
++      end
++    end
++  end
++
++  # Convenience wrappers around `get_type/1` for calling with form data/etc
++
++  def get_type(%{file_name: file_name, path: nil}), do: get_type(file_name)
++  # If we get a path, normalize it as `binary` and re-process
++  def get_type(%{file_name: file_name, path: path}), do: get_type(%{file_name: file_name, binary: path})
++
++  def get_type(%{file_name: file_name, binary: nil}), do: get_type(file_name)
++  def get_type(%{file_name: file_name, binary: binary}) do
++    case get_type(binary) do
++      :unknown -> get_type(file_name)
++      type -> type
++    end
++  end
++
++  def get_type(%{file_name: file_name}), do: get_type(file_name)
++
++  @doc """
++  Returns the appropriate mime type based on the file's type
++  """
++  def mime_type(file) do
++    case get_type(file) do
++      :jpg -> "image/jpg"
++      :jpeg -> "image/jpg"
++      :png -> "image/png"
++      :gif -> "image/gif"
++      :mp3 -> "audio/mpeg"
++      :svg -> "image/svg+xml"
++      _else -> "unknown"
++    end
++  end
++
++  defp file_type_by_magic_number("GIF87a" <> _rest), do: :gif
++  defp file_type_by_magic_number("GIF89a" <> _rest), do: :gif
++  defp file_type_by_magic_number(<<0xff, 0xd8, 0xff>> <> _rest), do: :jpg
++  defp file_type_by_magic_number("<svg" <> _rest), do: :svg
++  defp file_type_by_magic_number(<<0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a>> <> _rest), do: :png
++  defp file_type_by_magic_number(_), do: :unknown
++
++  defp file_type_by_extension(binary) do
++    cond do
++      !String.valid?(binary) -> :unknown
++      Path.extname(binary) == "" -> :unknown
++      true -> string_to_extension(binary)
++    end
++  end
++
++  defp string_to_extension(string) do
++    string
++    |> Path.extname()
++    |> String.replace(".", "")
++    |> String.downcase()
++    |> String.to_existing_atom()
++  end
++end
+diff --git a/lib/changelog/kits/mp3_kit.ex b/lib/changelog/kits/mp3_kit.ex
+new file mode 100644
+index 0000000000..c5ebf0ee5c
+--- /dev/null
++++ b/lib/changelog/kits/mp3_kit.ex
+@@ -0,0 +1,242 @@
++defmodule Changelog.Mp3Kit do
++  alias Changelog.{FileKit, UrlKit}
++  alias ChangelogWeb.{PodcastView}
++  alias Id3vx.Tag
++
++  @text_frames %{
++    "artist"    => "TPE1",
++    "title"     => "TIT2",
++    "subtitle"  => "TIT3",
++    "album"     => "TALB",
++    "year"      => "TYER",
++    "date"      => "TDAT",
++    "genre"     => "TCON",
++    "publisher" => "TPUB",
++    "encoder"   => "TENC"
++  }
++
++  def tag(file_path, episode, chapters) do
++    cover_path = PodcastView.cover_path(episode.podcast, :original)
++    cover_file = UrlKit.get_tempfile(cover_path)
++    tagged_file_path = file_path <> "-tagged"
++
++    new_tag =
++      episode
++      |> tag_for_episode()
++      |> add_image_to_tag(cover_file)
++      |> add_chapters_to_tag(chapters)
++
++    Id3vx.replace_tag(new_tag, file_path, tagged_file_path)
++    remove_v1_tag(tagged_file_path)
++    File.rename(tagged_file_path, file_path)
++  end
++
++  @doc """
++  Removes ID3v1 tag (last 128 bytes of tagged files) from a given file path
++  """
++  def remove_v1_tag(file_path) do
++    {:ok, data} = File.read(file_path)
++    audio_byte_size = byte_size(data) - 128
++
++    << audio::binary-size(audio_byte_size), id3_tag::binary >> = data
++
++    if String.starts_with?(id3_tag, "TAG") do
++      File.write(file_path, audio)
++    else
++      :ok
++    end
++  end
++
++  @doc """
++  Creates and returns an ID3 tag for a given episode
++  """
++  def tag_for_episode(episode) do
++    Tag.create(3)
++    |> add_text_to_tag("encoder", "github.com/thechangelog/id3vx")
++    |> add_text_to_tag("genre", "Podcast")
++    |> add_text_to_tag("publisher", "changelog.com")
++    |> add_text_to_tag("artist", "Changelog Media")
++    |> add_text_to_tag("subtitle", episode.subtitle)
++    |> add_text_to_tag("title", episode.title)
++    |> add_text_to_tag("album", episode.podcast.name)
++    |> add_date_to_tag(episode.published_at)
++  end
++
++  @doc """
++  Returns a tag with chapter frames added to given tag
++  """
++  def add_chapters_to_tag(tag, []), do: tag
++  def add_chapters_to_tag(tag, chapters) do
++    Enum.reduce(chapters, tag, fn(c, acc) ->
++      Tag.add_typical_chapter_and_toc(acc,
++        in_milliseconds(c.starts_at),
++        in_milliseconds(c.ends_at),
++        0, 0, # settings start/end offsets to zero forces use of start/end times
++        c.title, fn(chapter) ->
++          chapter
++          |> add_link_to_chapter(c.link_url)
++          |> add_image_to_chapter(c.image_url)
++        end)
++    end)
++  end
++
++  defp add_link_to_chapter(tag, nil), do: tag
++  defp add_link_to_chapter(tag, ""), do: tag
++  defp add_link_to_chapter(tag, url) do
++    Tag.add_custom_url(tag, "chapter url", url)
++  end
++
++  defp add_image_to_chapter(tag, nil), do: tag
++  defp add_image_to_chapter(tag, ""), do: tag
++  defp add_image_to_chapter(tag, url) do
++    file_path = UrlKit.get_tempfile(url)
++    add_image_to_tag(tag, file_path)
++  end
++
++  @doc """
++  Returns a tag with date-related frames added to tag
++  """
++  def add_date_to_tag(tag, nil), do: tag
++  def add_date_to_tag(tag, datetime) do
++    {:ok, year} = Timex.format(datetime, "{YYYY}")
++    {:ok, date} = Timex.format(datetime, "{0D}{0M}")
++
++    tag
++    |> add_text_to_tag("year", year)
++    |> add_text_to_tag("date", date)
++  end
++
++  defp in_milliseconds(nil), do: 0
++  defp in_milliseconds(seconds), do: round(seconds * 1000)
++
++  @doc """
++  Returns a tag with image frame added to tag
++  """
++  def add_image_to_tag(tag, image_path) do
++    image_data = File.read!(image_path)
++    mime_type = FileKit.mime_type(image_data)
++    Tag.add_attached_picture(tag, "", mime_type, image_data)
++  end
++
++  @doc """
++  Returns a tag with text frame added to tag
++  """
++  def add_text_to_tag(tag, _type, ""), do: tag
++  def add_text_to_tag(tag, _type, nil), do: tag
++  def add_text_to_tag(tag, type, text) do
++    Tag.add_text_frame(tag, @text_frames[type], text)
++  end
++
++  @doc """
++  Returns duration in seconds, given mp3 data or a valid path to an mp3 file
++  (yoinked from https://gist.github.com/kommen/9391eb6391d76c2b42c0402fc5ca7353)
++  """
++  def get_duration(data_or_path) do
++    data = if FileKit.is_path?(data_or_path) do
++      File.read!(data_or_path)
++    else
++      data_or_path
++    end
++
++    data |> compute_duration(0, 0) |> round()
++  end
++
++  defp compute_duration(data, offset, duration) when byte_size(data) > offset do
++    case decode_header_at_offset(offset, data) do
++      {:ok, length, {samplerate, samples}} ->
++        compute_duration(data, offset + length, duration + (samples / samplerate))
++      _ ->
++        compute_duration(data, offset + 1, duration)
++    end
++  end
++  defp compute_duration(_data, _offset, duration) do
++    Float.round(duration, 3)
++  end
++
++  defp decode_header_at_offset(offset, data) do
++    try do
++      binary_part(data, offset, 4)
++      |> decode_header()
++    rescue
++      ArgumentError -> {:error, "not enough bytes"}
++    end
++  end
++
++  defp decode_header(<<255, 7::size(3),
++    audio_version_id :: size(2), layer_desc :: size(2), _d :: size(1), bitrate_index :: size(4),
++    sampling_rate_index :: size(2), padding :: size(1), _bits :: size(9)>>) do
++
++    with {:ok, version}     <- audio_version(audio_version_id),
++         {:ok, layer}       <- layer(layer_desc),
++         {:ok, bitrate}     <- bitrate(version, layer, bitrate_index),
++         {:ok, samplerate}  <- samplerate(version, sampling_rate_index),
++         {:ok, samples}     <- samples(version, layer),
++         {:ok, framelength} <- framelength(layer, bitrate, samplerate, padding),
++         do: {:ok, framelength, {samplerate, samples}}
++  end
++  defp decode_header(_a) do
++    {:error, :invalid_header}
++  end
++
++  defp framelength(v, br, sr, p) do
++    fl = compute_framelength(v, br, sr, p)
++    if fl < 27 do
++      {:error, "frame too short"}
++    else
++      {:ok, fl}
++    end
++  end
++  defp compute_framelength(1, bitrate, samplerate, padding) do
++    trunc(((12 * bitrate / samplerate) + padding) * 4)
++  end
++  defp compute_framelength(_, bitrate, samplerate, padding) do
++    trunc((144 * bitrate / samplerate) + padding)
++  end
++
++  defp audio_version(audio_version_id) do
++    case audio_version_id do
++      0 -> {:ok, {2, 5}}
++      2 -> {:ok, 2}
++      3 -> {:ok, 1}
++      1 -> {:error, "bad version"}
++    end
++  end
++
++  defp layer(layer_desc) do
++    case layer_desc do
++      0 -> {:error, "bad layer"}
++      1 -> {:ok, 3}
++      2 -> {:ok, 2}
++      3 -> {:ok, 1}
++    end
++  end
++
++  defp bitrate(_, _, 15), do: {:error, "bad bitrate"}
++  defp bitrate(v, l, e),  do: {:ok, bitrate_map(v, l, e) * 1000}
++  defp bitrate_map(1, 1, e), do: elem({0,32,64,96,128,160,192,224,256,288,320,352,384,416,448}, e)
++  defp bitrate_map(1, 2, e), do: elem({0,32,48,56,64,80,96,112,128,160,192,224,256,320,384}, e)
++  defp bitrate_map(1, 3, e), do: elem({0,32,40,48,56,64,80,96,112,128,160,192,224,256,320}, e)
++  defp bitrate_map(2, 1, e), do: elem({0,32,48,56,64,80,96,112,128,144,160,176,192,224,256}, e)
++  defp bitrate_map(2, 2, e), do: elem({0,8,16,24,32,40,48,56,64,80,96,112,128,144,160}, e)
++  defp bitrate_map(2, 3, e), do: bitrate_map(2, 2, e)
++  defp bitrate_map({2,5}, l, e), do: bitrate_map(2, l, e)
++
++  defp samplerate(1, 0), do: {:ok, 44100}
++  defp samplerate(1, 1), do: {:ok, 48000}
++  defp samplerate(1, 2), do: {:ok, 32000}
++  defp samplerate(2, 0), do: {:ok, 22050}
++  defp samplerate(2, 1), do: {:ok, 24000}
++  defp samplerate(2, 2), do: {:ok, 16000}
++  defp samplerate({2,5}, 0), do: {:ok, 11025}
++  defp samplerate({2,5}, 1), do: {:ok, 12000}
++  defp samplerate({2,5}, 2), do: {:ok, 8000}
++  defp samplerate(_, _), do: {:error, "bad samplerate"}
++
++  defp samples(1, 1), do: {:ok, 384}
++  defp samples(1, 2), do: {:ok, 1152}
++  defp samples(1, 3), do: {:ok, 1152}
++  defp samples(2, 1), do: {:ok, 384}
++  defp samples(2, 2), do: {:ok, 1152}
++  defp samples(2, 3), do: {:ok, 576}
++  defp samples({2,5}, l), do: samples(2, l)
++end
+diff --git a/lib/changelog/schema/episode/episode.ex b/lib/changelog/schema/episode/episode.ex
+index 554ed2212b..ac892189ad 100644
+--- a/lib/changelog/schema/episode/episode.ex
++++ b/lib/changelog/schema/episode/episode.ex
+@@ -21,8 +21,6 @@ defmodule Changelog.Episode do
+     Transcripts
+   }
+ 
+-  alias ChangelogWeb.{TimeView}
+-
+   defenum(Type, full: 0, bonus: 1, trailer: 2)
+ 
+   schema "episodes" do
+@@ -402,37 +400,29 @@ defmodule Changelog.Episode do
+   # just-transformed files to store in the changeset, which cannot be
+   # accomplished with Waffle at the time of implementation.
+   def prep_audio_file(changeset, %{"audio_file" => %Plug.Upload{path: path}}) do
+-    if is_nil(get_field(changeset, :published_at)) do
+-      add_error(changeset, :published_at, "can't be blank when uploading audio")
+-    else
+-      Changelog.FFmpeg.tag(path, changeset.data)
++    Changelog.Mp3Kit.tag(path, changeset.data, changeset.data.audio_chapters)
+ 
+-      case File.stat(path) do
+-        {:ok, stats} ->
+-          seconds = path |> Changelog.FFmpeg.duration() |> TimeView.seconds()
+-          change(changeset, audio_bytes: stats.size, audio_duration: seconds)
++    case File.stat(path) do
++      {:ok, stats} ->
++        seconds = Changelog.Mp3Kit.get_duration(path)
++        change(changeset, audio_bytes: stats.size, audio_duration: seconds)
+ 
+-        {:error, _} ->
+-          changeset
+-      end
++      {:error, _} ->
++        changeset
+     end
+   end
+   def prep_audio_file(changeset, _params), do: changeset
+ 
+   def prep_plusplus_file(changeset, %{"plusplus_file" => %Plug.Upload{path: path}}) do
+-    if is_nil(get_field(changeset, :published_at)) do
+-      add_error(changeset, :published_at, "can't be blank when uploading audio")
+-    else
+-      Changelog.FFmpeg.tag(path, changeset.data)
++    Changelog.Mp3Kit.tag(path, changeset.data, changeset.data.plusplus_chapters)
+ 
+-      case File.stat(path) do
+-        {:ok, stats} ->
+-          seconds = path |> Changelog.FFmpeg.duration() |> TimeView.seconds()
+-          change(changeset, plusplus_bytes: stats.size, plusplus_duration: seconds)
++    case File.stat(path) do
++      {:ok, stats} ->
++        seconds = Changelog.Mp3Kit.get_duration(path)
++        change(changeset, plusplus_bytes: stats.size, plusplus_duration: seconds)
+ 
+-        {:error, _} ->
+-          changeset
+-      end
++      {:error, _} ->
++        changeset
+     end
+   end
+   def prep_plusplus_file(changeset, _params), do: changeset
+diff --git a/lib/changelog/schema/factory.ex b/lib/changelog/schema/factory.ex
+index 185abb6e92..c1498ad017 100644
+--- a/lib/changelog/schema/factory.ex
++++ b/lib/changelog/schema/factory.ex
+@@ -25,6 +25,13 @@ defmodule Changelog.Factory do
+     }
+   end
+ 
++  def episode_chapter_factory do
++    %Changelog.EpisodeChapter{
++      title: sequence(:title, &"Chapter #{&1}"),
++      starts_at: 0.0
++    }
++  end
++
+   def episode_stat_factory do
+     %Changelog.EpisodeStat{
+       date: Timex.today(),
+diff --git a/lib/changelog_web/controllers/episode_controller.ex b/lib/changelog_web/controllers/episode_controller.ex
+index d1beade119..126f5f12ed 100644
+--- a/lib/changelog_web/controllers/episode_controller.ex
++++ b/lib/changelog_web/controllers/episode_controller.ex
+@@ -135,6 +135,23 @@ defmodule ChangelogWeb.EpisodeController do
+     |> render(:transcript, layout: false)
+   end
+ 
++  def chapters(conn, params = %{"slug" => slug}, podcast) do
++    episode =
++      assoc(podcast, :episodes)
++      |> Episode.published()
++      |> Repo.get_by!(slug: slug)
++
++    chapters = if Map.has_key?(params, "pp") do
++      episode.plusplus_chapters
++    else
++      episode.audio_chapters
++    end
++
++    conn
++    |> assign(:chapters, chapters)
++    |> render("chapters.json")
++  end
++
+   def live(conn, %{"slug" => slug}, podcast) do
+     episode =
+       assoc(podcast, :episodes)
+diff --git a/lib/changelog_web/router.ex b/lib/changelog_web/router.ex
+index 4c365e7e5c..bfded8d8be 100644
+--- a/lib/changelog_web/router.ex
++++ b/lib/changelog_web/router.ex
+@@ -273,7 +273,7 @@ defmodule ChangelogWeb.Router do
+     post "/:podcast/:slug/subscribe", EpisodeController, :subscribe, as: :episode
+     post "/:podcast/:slug/unsubscribe", EpisodeController, :unsubscribe, as: :episode
+ 
+-    for subpage <- ~w(embed preview play share discuss transcript live time)a do
++    for subpage <- ~w(embed preview play share discuss transcript live time chapters)a do
+       get "/:podcast/:slug/#{subpage}", EpisodeController, subpage, as: :episode
+     end
+ 
+diff --git a/lib/changelog_web/templates/feed/plusplus.xml.eex b/lib/changelog_web/templates/feed/plusplus.xml.eex
+index 9408fabf7d..a94e4ec8ef 100644
+--- a/lib/changelog_web/templates/feed/plusplus.xml.eex
++++ b/lib/changelog_web/templates/feed/plusplus.xml.eex
+@@ -54,6 +54,9 @@
+       <%= if Episode.has_transcript(episode) do %>
+         <podcast:transcript url="<%= Routes.episode_url(@conn, :transcript, episode.podcast.slug, episode.slug) %>" type="text/html" />
+       <% end %>
++      <%= if Enum.any?(episode.plusplus_chapters) do %>
++        <podcast:chapters url="<%= Routes.episode_url(@conn, :chapters, episode.podcast.slug, episode.slug, pp: true) %>" type="application/json+chapters" />
++      <% end %>
+       </item>
+     <% end %>
+   </channel>
+diff --git a/lib/changelog_web/templates/feed/podcast.xml.eex b/lib/changelog_web/templates/feed/podcast.xml.eex
+index 6e9c0d8aeb..5a761c7cb1 100644
+--- a/lib/changelog_web/templates/feed/podcast.xml.eex
++++ b/lib/changelog_web/templates/feed/podcast.xml.eex
+@@ -56,6 +56,9 @@
+     <%= if Episode.has_transcript(episode) do %>
+       <podcast:transcript url="<%= Routes.episode_url(@conn, :transcript, episode.podcast.slug, episode.slug) %>" type="text/html" />
+     <% end %>
++    <%= if Enum.any?(episode.audio_chapters) do %>
++      <podcast:chapters url="<%= Routes.episode_url(@conn, :chapters, episode.podcast.slug, episode.slug) %>" type="application/json+chapters" />
++    <% end %>
+     </item>
+   <% end %>
+   </channel>
+diff --git a/lib/changelog_web/views/episode_view.ex b/lib/changelog_web/views/episode_view.ex
+index 4cdf160778..0101bee968 100644
+--- a/lib/changelog_web/views/episode_view.ex
++++ b/lib/changelog_web/views/episode_view.ex
+@@ -228,6 +228,23 @@ defmodule ChangelogWeb.EpisodeView do
+     Github.Source.new("transcripts", episode).repo_url
+   end
+ 
++  # format: https://github.com/Podcastindex-org/podcast-namespace/blob/main/chapters/jsonChapters.md
++  def render("chapters.json", %{chapters: chapters}) do
++    %{
++      version: "1.2.0",
++      chapters: Enum.map(chapters, fn chapter ->
++        %{
++          title: chapter.title,
++          startTime: chapter.starts_at,
++          endTime: chapter.ends_at,
++          url: chapter.link_url,
++          img: chapter.image_url
++        # TODO: Switch to Map.reject once we're on Elixir 1.13
++        } |> Enum.reject(fn {_k, v} -> is_nil(v) end) |> Enum.into(%{})
++      end)
++    }
++  end
++
+   def render("play.json", %{podcast: podcast, episode: episode, prev: prev, next: next}) do
+     info = %{
+       podcast: podcast.name,
+diff --git a/mix.exs b/mix.exs
+index effca8e33e..b81c06f87c 100644
+--- a/mix.exs
++++ b/mix.exs
+@@ -77,6 +77,7 @@ defmodule Changelog.Mixfile do
+       {:tzdata, "~> 1.1.0"},
+       {:icalendar, "~> 1.0"},
+       {:shopify, "~> 0.4"},
++      {:id3vx, "~> 0.0.1-rc6"},
+       {:credo, "~> 1.6.4", only: [:dev, :test], runtime: false},
+       {:excoveralls, "~> 0.10", only: :test},
+       {:mock, "~> 0.3.0", only: :test}
+diff --git a/mix.lock b/mix.lock
+index 59bb4e2813..f132b085b7 100644
+--- a/mix.lock
++++ b/mix.lock
+@@ -38,6 +38,7 @@
+   "httpoison": {:hex, :httpoison, "1.8.1", "df030d96de89dad2e9983f92b0c506a642d4b1f4a819c96ff77d12796189c63e", [:mix], [{:hackney, "~> 1.17", [hex: :hackney, repo: "hexpm", optional: false]}], "hexpm", "35156a6d678d6d516b9229e208942c405cf21232edd632327ecfaf4fd03e79e0"},
+   "hut": {:hex, :hut, "1.3.0", "71f2f054e657c03f959cf1acc43f436ea87580696528ca2a55c8afb1b06c85e7", [:"erlang.mk", :rebar, :rebar3], [], "hexpm", "7e15d28555d8a1f2b5a3a931ec120af0753e4853a4c66053db354f35bf9ab563"},
+   "icalendar": {:hex, :icalendar, "1.1.2", "5d0afff5d0143c5bd43f18ae32a777bf0fb9a724543ab05229a460d368f0a5e7", [:mix], [{:timex, "~> 3.4", [hex: :timex, repo: "hexpm", optional: false]}], "hexpm", "2060f8e353fdf3047e95a3f012583dc3c0bbd7ca1010e32ed9e9fc5760ad4292"},
++  "id3vx": {:hex, :id3vx, "0.0.1-rc6", "825c1b70bf1d69f82428c21be1109f5d5a200ef765db28a7bf8fd07a17d3b291", [:mix], [], "hexpm", "750b4a25072d13d57f05f307aeb607ee18731e4215e6a5bd492f4778905cd832"},
+   "idna": {:hex, :idna, "6.1.1", "8a63070e9f7d0c62eb9d9fcb360a7de382448200fbbd1b106cc96d3d8099df8d", [:rebar3], [{:unicode_util_compat, "~>0.7.0", [hex: :unicode_util_compat, repo: "hexpm", optional: false]}], "hexpm", "92376eb7894412ed19ac475e4a86f7b413c1b9fbb5bd16dccd57934157944cea"},
+   "jason": {:hex, :jason, "1.3.0", "fa6b82a934feb176263ad2df0dbd91bf633d4a46ebfdffea0c8ae82953714946", [:mix], [{:decimal, "~> 1.0 or ~> 2.0", [hex: :decimal, repo: "hexpm", optional: true]}], "hexpm", "53fc1f51255390e0ec7e50f9cb41e751c260d065dcba2bf0d08dc51a4002c2ac"},
+   "meck": {:hex, :meck, "0.9.2", "85ccbab053f1db86c7ca240e9fc718170ee5bda03810a6292b5306bf31bae5f5", [:rebar3], [], "hexpm", "81344f561357dc40a8344afa53767c32669153355b626ea9fcbc8da6b3045826"},
+diff --git a/test/changelog/kits/file_kit_test.exs b/test/changelog/kits/file_kit_test.exs
+new file mode 100644
+index 0000000000..3759f46b92
+--- /dev/null
++++ b/test/changelog/kits/file_kit_test.exs
+@@ -0,0 +1,48 @@
++defmodule Changelog.FileKitTest do
++  use ExUnit.Case
++  import Changelog.TestCase
++  alias Changelog.FileKit
++
++  describe "get_type/1" do
++    test "detects a gif by its magic number" do
++      file = fixtures_path("/images/this-is-a-gif")
++      assert :gif == FileKit.get_type(file)
++    end
++
++    test "detects an svg by its magic number" do
++      file = fixtures_path("/images/this-is-an-svg")
++      assert :svg == FileKit.get_type(file)
++    end
++
++    test "detects a png by its file extension" do
++      file = fixtures_path("/images/avatar600x600.png")
++      assert :png == FileKit.get_type(file)
++    end
++
++    test "detects a jpg by its file extension" do
++      file = "test.jpg"
++      assert :jpg == FileKit.get_type(file)
++    end
++
++    test "prefers binary data when provided" do
++      data = File.read!(fixtures_path("/images/this-is-a-gif"))
++      map = %{file_name: "test.jpg", binary: data}
++      assert :gif == FileKit.get_type(map)
++    end
++
++    test "falls back to file name when binary errors" do
++      map = %{file_name: "test.jpg", binary: fixtures_path("/images/this-is-not-real")}
++      assert :jpg == FileKit.get_type(map)
++    end
++
++    test "reads and prefers binary data when path provided" do
++      map = %{file_name: "test.jpg", path: fixtures_path("/images/this-is-a-gif")}
++      assert :gif == FileKit.get_type(map)
++    end
++
++    test "works with just file name when on it is provided" do
++      map = %{file_name: "test.jpg"}
++      assert :jpg == FileKit.get_type(map)
++    end
++  end
++end
+diff --git a/test/changelog/kits/mp3_kit_test.exs b/test/changelog/kits/mp3_kit_test.exs
+new file mode 100644
+index 0000000000..f1a63b631b
+--- /dev/null
++++ b/test/changelog/kits/mp3_kit_test.exs
+@@ -0,0 +1,122 @@
++defmodule Changelog.Mp3KitTest do
++  use Changelog.SchemaCase
++
++  alias Changelog.Mp3Kit
++
++  describe "get_duration/1" do
++    test "works when given a path to an mp3" do
++      path = fixtures_path("/california.mp3")
++      assert Mp3Kit.get_duration(path) == 179
++    end
++
++    test "works when directly given mp3 data" do
++      {:ok, data} = File.read(fixtures_path("/california.mp3"))
++      assert Mp3Kit.get_duration(data) == 179
++    end
++  end
++
++  describe "tag_for_episode/1" do
++    test "when episode only has a title and subtitle" do
++      title = "Ohai this one has some emoj! 🤘"
++      episode = build(:episode, title: title)
++      tag = Mp3Kit.tag_for_episode(episode)
++
++      assert find_text_frame(tag, title)
++    end
++
++    test "when episode has subtitle and podcast" do
++      subtitle = "with the King of Swing"
++      podcast = build(:podcast)
++      episode = build(:episode, subtitle: subtitle, podcast: podcast)
++      tag = Mp3Kit.tag_for_episode(episode)
++
++      assert find_text_frame(tag, podcast.name)
++      assert find_text_frame(tag, subtitle)
++    end
++
++    test "when episode has a published_at time" do
++      episode = build(:episode, published_at: ~D[2022-09-02])
++      tag = Mp3Kit.tag_for_episode(episode)
++
++      assert find_text_frame(tag, "2022")
++      assert find_text_frame(tag, "0209")
++    end
++  end
++
++  describe "add_chapters_to_tag/2" do
++    test "returns the tag with no chapter frames when passed none" do
++      chapters =
++        build(:episode)
++        |> Mp3Kit.tag_for_episode()
++        |> Mp3Kit.add_chapters_to_tag([])
++        |> find_chapter_frames()
++
++      assert length(chapters) == 0
++    end
++
++    test "returns the tag with chapter frames applied" do
++      episode = build(:episode, audio_chapters: [
++        build(:episode_chapter, title: "Opener", starts_at: 0.0, ends_at: 100),
++        build(:episode_chapter, title: "Middle", starts_at: 0.0, ends_at: 1234, link_url: "https://jsparty.fm"),
++        build(:episode_chapter, title: "End", starts_at: 1235.0, ends_at: 9999)
++      ])
++
++      chapters =
++        episode
++        |> Mp3Kit.tag_for_episode()
++        |> Mp3Kit.add_chapters_to_tag(episode.audio_chapters)
++        |> find_chapter_frames()
++
++      assert length(chapters) == 3
++    end
++  end
++
++  describe "add_date_to_tag/2" do
++    test "when date is nil" do
++      tag = Id3vx.Tag.create(3)
++      assert Mp3Kit.add_date_to_tag(tag, nil) == tag
++    end
++
++    test "when date is valid" do
++      tag = Id3vx.Tag.create(3)
++      tag = Mp3Kit.add_date_to_tag(tag, ~D[2011-01-02])
++      assert find_text_frame(tag, "2011")
++      assert find_text_frame(tag, "0201")
++    end
++  end
++
++  describe "add_image_to_tag/2" do
++    test "when valid image path is provided" do
++      file_path = fixtures_path("/images/avatar600x600.png")
++
++      tag =
++        build(:episode)
++        |> Mp3Kit.tag_for_episode()
++        |> Mp3Kit.add_image_to_tag(file_path)
++
++      assert length(find_picture_frames(tag)) == 1
++    end
++  end
++
++  def find_chapter_frames(tag) do
++    Enum.filter(tag.frames, fn(%{data: data}) ->
++      case data do
++        %Id3vx.Frame.Chapter{} -> true
++        _ -> false
++      end
++    end)
++  end
++
++  def find_picture_frames(tag) do
++    Enum.filter(tag.frames, fn(%{data: data}) ->
++      case data do
++        %Id3vx.Frame.AttachedPicture{} -> true
++        _ -> false
++      end
++    end)
++  end
++
++  def find_text_frame(tag, text) do
++    Enum.find(tag.frames, fn(f) -> Enum.member?(f.data.text, text) end)
++  end
++end
+diff --git a/test/changelog/schema/person_test.exs b/test/changelog/schema/person_test.exs
+index b6b326c7c7..e7a175cf5f 100644
+--- a/test/changelog/schema/person_test.exs
++++ b/test/changelog/schema/person_test.exs
+@@ -27,7 +27,7 @@ defmodule Changelog.PersonTest do
+ 
+   test "admin_update_changeset with a local file path image URL attribute" do
+     person = insert(:person)
+-    local_file_path = File.cwd!() <> "/test/fixtures/avatar600x600.png"
++    local_file_path = fixtures_path("/images/avatar600x600.png")
+     attrs = Map.put(@valid_attrs, :avatar, local_file_path)
+ 
+     changeset = Person.admin_update_changeset(person, attrs)
+diff --git a/test/changelog_web/controllers/episode_controller_test.exs b/test/changelog_web/controllers/episode_controller_test.exs
+index e4cd9264ed..660a2c4223 100644
+--- a/test/changelog_web/controllers/episode_controller_test.exs
++++ b/test/changelog_web/controllers/episode_controller_test.exs
+@@ -151,6 +151,68 @@ defmodule ChangelogWeb.EpisodeControllerTest do
+     end
+   end
+ 
++  describe "chapters" do
++    test "returns chapters list as json", %{conn: conn} do
++      c1 = build(:episode_chapter, starts_at: 0, ends_at: 60, image_url: "img")
++      c2 = build(:episode_chapter, starts_at: 60, ends_at: 600)
++      c3 = build(:episode_chapter, starts_at: 600, ends_at: 6000, link_url: "link")
++
++      p = insert(:podcast)
++      e = insert(:published_episode, podcast: p, audio_chapters: [c1, c2, c3])
++
++      conn = get(conn, Routes.episode_path(conn, :chapters, p.slug, e.slug))
++
++      assert json_response(conn, 200) == %{
++        "version" => "1.2.0",
++        "chapters" => [
++          %{"title" => c1.title, "startTime" => c1.starts_at, "endTime" => c1.ends_at, "img" => c1.image_url},
++          %{"title" => c2.title, "startTime" => c2.starts_at, "endTime" => c2.ends_at},
++          %{"title" => c3.title, "startTime" => c3.starts_at, "endTime" => c3.ends_at, "url" => c3.link_url}
++        ]
++      }
++    end
++
++    test "returns empty set when episode has no chapters", %{conn: conn} do
++      p = insert(:podcast)
++      e = insert(:published_episode, podcast: p)
++
++      conn = get(conn, Routes.episode_path(conn, :chapters, p.slug, e.slug))
++
++      assert json_response(conn, 200) == %{
++        "version" => "1.2.0",
++        "chapters" => []
++      }
++    end
++
++    test "returns plusplus chapters list as json when specified", %{conn: conn} do
++      c1 = build(:episode_chapter, starts_at: 0, ends_at: 60)
++
++      p = insert(:podcast)
++      e = insert(:published_episode, podcast: p, plusplus_chapters: [c1])
++
++      conn = get(conn, Routes.episode_path(conn, :chapters, p.slug, e.slug, pp: true))
++
++      assert json_response(conn, 200) == %{
++        "version" => "1.2.0",
++        "chapters" => [
++          %{"title" => c1.title, "startTime" => c1.starts_at, "endTime" => c1.ends_at}
++        ]
++      }
++    end
++
++    test "returns empty set when episode has no plusplus chapters", %{conn: conn} do
++      p = insert(:podcast)
++      e = insert(:published_episode, podcast: p)
++
++      conn = get(conn, Routes.episode_path(conn, :chapters, p.slug, e.slug, pp: true))
++
++      assert json_response(conn, 200) == %{
++        "version" => "1.2.0",
++        "chapters" => []
++      }
++    end
++  end
++
+   describe "live" do
+     test "404 when episode is not recorded live", %{conn: conn} do
+       p = insert(:podcast)
+diff --git a/test/fixtures/avatar600x600.png b/test/fixtures/images/avatar600x600.png
+similarity index 100%
+rename from test/fixtures/avatar600x600.png
+rename to test/fixtures/images/avatar600x600.png
+diff --git a/test/fixtures/images/this-is-a-gif b/test/fixtures/images/this-is-a-gif
+new file mode 100644
+index 0000000000..6c3eaabd24
+Binary files /dev/null and b/test/fixtures/images/this-is-a-gif differ
+diff --git a/test/fixtures/images/this-is-an-svg b/test/fixtures/images/this-is-an-svg
+new file mode 100644
+index 0000000000..1705b12117
+--- /dev/null
++++ b/test/fixtures/images/this-is-an-svg
+@@ -0,0 +1 @@
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 315.93 316.25"><defs><style>.cls-1{fill:#9f968c;}</style></defs><title>the-changelog-abstract</title><g id="Layer_2" data-name="Layer 2"><g id="Layer_1-2" data-name="Layer 1"><path class="cls-1" d="M297.35,100.28v-.09L269.78,46.43a.62.62,0,0,0-.27-.27L215.73,18.62h-.09L158.15,0a.61.61,0,0,0-.38,0L100.29,18.58l0,0h-.06L46.42,46.15a.62.62,0,0,0-.27.27L18.62,100.2v.07h0L0,157.77a.62.62,0,0,0,0,.38l18.55,57.48v0l0,.05v0l27.53,53.77a.62.62,0,0,0,.27.27l53.44,27.37a.62.62,0,0,0,.42.53l57.48,18.55a.62.62,0,0,0,.38,0l57.49-18.55a.62.62,0,0,0,.42-.52l53.44-27.37a.62.62,0,0,0,.27-.27l27.54-53.77v0s0,0,0,0v0l18.55-57.48a.62.62,0,0,0,0-.38Zm-42,95.64-.73.85-16.1-36.1-.93-2.08h49.8ZM59,121.82l2.28-2.66,17,38.14,0,0H28.53Zm7.86,128.12,20.62-20.61,14.6-14.6,15,39ZM118,63.16,128.71,89l12.64,30.5-16.67,4.32-10.12-10.12-11.49-11.49L107.33,91Zm131,2.84L228.44,86.62l-14.6,14.6-15-39ZM192.14,191.26l4.32-16.67,10.4,4.31,5.26,2.18.37,14.21.44,16.76L196,195.12Zm4.8-17.83,8.73-14.84h29.4L212.6,179.92l-5.26-2.18Zm.55-30,35.82,13.91H205.68Zm-2.06-1.08a.62.62,0,0,0,.06.11s0,0,0,.05L204.6,158l-9.09,15.45a.61.61,0,0,0,0,.08.6.6,0,0,0,0,.08l-4.5,17.36-17.36,4.5-.11.06h-.05L158,204.6l-15.45-9.09-.08,0-.08,0L125,190.94l-4.5-17.36a.62.62,0,0,0-.06-.11s0,0,0-.05L111.34,158l9.09-15.45a.61.61,0,0,0,0-.08.6.6,0,0,0,0-.08L125,125l17.36-4.5.1-.05.06,0L158,111.34l15.45,9.09.06,0,.1.05,17.36,4.5Zm-70.77,49.79,16.67,4.32L137,206.86l-2.18,5.26-14.21.37-16.76.44L120.81,196Zm17.83,4.8,14.84,8.73v29.4L136,212.6l2.18-5.26Zm30,.55-13.91,35.81V205.68ZM103.23,214.2l31.79-.83,21.88,23.07-38.56,17.19-12-31.43ZM93.74,106.3l8-3.06.83,31.79L79.5,156.9,62.31,118.35Zm30,18.37-4.32,16.67L109.07,137l-5.26-2.18-.37-14.21L103,103.88l16.93,16.93ZM119,142.5l-8.73,14.84H80.86L103.34,136l5.26,2.18Zm-.55,30L82.62,158.59h27.63Zm59.3-63.91L173.43,119l-14.84-8.73V80.86l21.33,22.48Zm-34.31,9.85,13.91-35.82v27.63Zm47.83,5.35-16.67-4.32,4.31-10.4,2.18-5.26,14.21-.37L212,103l-16.93,16.93ZM229.32,87.5l20.62-20.61,3.83,50.17-39-15ZM212.7,101.73l-31.79.83L159,79.5l38.56-17.19,12,31.43Zm-111.49.36-39,15L66,66.88,86.61,87.5Zm18.25,72.49,4.32,16.67-10.12,10.12-11.49,11.49L91,208.57l-27.8-10.66,26.1-10.81Zm-18.26,39.25-14.6,14.6L66,249l-3.83-50.17Zm73.38-17.37,16.67-4.32,10.12,10.12,11.49,11.49L208.57,225l-10.66,27.8-10.81-26.1ZM214.2,212.7l-.83-31.79L236.43,159l17.19,38.56-31.43,12Zm-17.73-71.36-4.32-16.67,10.12-10.12,11.49-11.49,11.13,4.27L252.77,118,227,128.71ZM157.34,28.53V79.17l-15.16,39L122.94,71.78l-4.2-10.13,3.68-3.16ZM102.1,101.21,87.5,86.61,66.88,66l50.17-3.83ZM28.53,158.59H79.17l39,15.16L71.85,193l-10.2,4.23-3.83-4.46Zm90.63,96,37.46-16.7.72-.32v49.8l-37.33-32Zm39.44,32.78V236.76l15.16-39L193,244.08l4.23,10.2-5,4.28Zm40.28-33.64,15-39,14.6,14.6L249,249.94Zm15.85-39.92,39-15-3.83,50.18-20.61-20.62Zm72.69-56.5H236.76l-39-15.16,46.43-19.23,10.13-4.2,3.75,4.36ZM215.61,20.42l33.51,44.33-50.28-3.84L215,21.8ZM196.78,61.3,160.09,77.66l-1.5.67V28.53L194.12,59Zm-176.36,39L64.75,66.81l-3.84,50.28-39.12-16.2Zm7.18,59.1,33.18,38.66.09.1,3.88,50.93-44.9-33.94Zm72.73,136.09L66.81,251.18,117.09,255l-16.2,39.12Zm1.72-.9,16.2-39.12,38.26,32.84-55,7.65Zm96.14-39.55,50.93-3.88-33.94,44.9-55.75-7.75Zm97.32-39.46-44.33,33.51L255,198.84,294.14,215ZM255.25,118l-.18-.22-3.88-50.93,44.9,33.94-7.75,55.75Zm-40.8-98-.57,1.37-16.2,39.12L159.42,27.6l14.73-2ZM156.51,27.6l-38,32.57-.81.7L66.81,64.75l33.94-44.9L152.39,27ZM19.95,101.48l1.37.57,39.12,16.2L27.59,156.51l-.88-6.34Zm276,113-1.37-.57-39.12-16.2,32.84-38.26,4.53,32.6ZM268.76,47.17,295,98.33,271.49,80.6,250.9,65,217.59,21ZM158,1.28l54.7,17.65-43.47,6L158,26.54l-6-.83-48.69-6.77ZM47.17,47.17,98.33,21,80.6,44.44,65,65,21,98.34Zm-28.24,56.1,7.31,52.54.3,2.16-7.61,54.69L1.28,158ZM47.17,268.76,21,217.6l23.46,17.73L65,250.9,98.34,295ZM158,315l-54.69-17.65L158,289.71l54.7,7.6Zm110.8-46.21L217.6,295l17.73-23.46L250.9,250.9,295,217.59ZM297,212.66l-3.17-22.8L289.4,158l4.48-32.25L297,103.26,314.65,158Z"/></g></g></svg>
+\ No newline at end of file
+diff --git a/test/support/test_case.ex b/test/support/test_case.ex
+index 03e137fdd1..cd30980fb1 100644
+--- a/test/support/test_case.ex
++++ b/test/support/test_case.ex
+@@ -2,10 +2,14 @@ defmodule Changelog.TestCase do
+   @moduledoc """
+   Functions in this module are imported in all test modules
+   """
+-  def fixtures_path() do
++  def fixtures_path do
+     Path.dirname(__ENV__.file) <> "/../fixtures"
+   end
+ 
++  def fixtures_path(file_path) when is_binary(file_path) do
++    fixtures_path() <> file_path
++  end
++
+   def stub_audio_file(episode) do
+     %Changelog.Episode{episode | audio_file: %{file_name: "test.mp3"}}
+   end

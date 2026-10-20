@@ -1,0 +1,451 @@
+diff --git a/.formatter.exs b/.formatter.exs
+index a784c746f..b4c367925 100644
+--- a/.formatter.exs
++++ b/.formatter.exs
+@@ -1,6 +1,7 @@
+ locals_without_parens = [
+   beacon_site: 1,
+-  beacon_site: 2
++  beacon_site: 2,
++  beacon_sitemap_index: 1
+ ]
+ 
+ [
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1eb5d25eb..9423b6311 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,8 @@
+ ## Unreleased
+ 
+ ### Enhancements
++  - Beacon will now automatically generate a `sitemap.xml` for each `beacon_site` defined in the Router
++  - Add macro `beacon_sitemap_index` for use in the Router to serve a sitemap index
+   - Added support for user-defined JS Hooks
+   - Added `--host` option for `mix beacon.gen.site` to serve your site at an alternative domain
+ 
+@@ -10,7 +12,6 @@
+   - Fixed a bug where MediaLibrary could check for file contents on the wrong node in multi-node deployments
+ 
+ ### Breaking Changes
+-
+   - `beacon.install` - removed command aliases `-s` and `-p`
+   - `beacon.gen.site` - removed command aliases `-s` and `-p`
+   - `beacon.gen.tailwind_config` - removed command alias `-s`
+diff --git a/config/test.exs b/config/test.exs
+index 74a1de426..66a9826e6 100644
+--- a/config/test.exs
++++ b/config/test.exs
+@@ -35,8 +35,8 @@ config :beacon, Beacon.BeaconTest.Endpoint,
+   check_origin: false,
+   debug_errors: true
+ 
+-config :beacon, Beacon.BeaconTest.EndpointSite,
+-  url: [host: "localhost", port: 4000],
++config :beacon, Beacon.BeaconTest.EndpointB,
++  url: [host: "site_b.com", port: 4000],
+   secret_key_base: "dVxFbSNspBVvkHPN5m6FE6iqNtMnhrmPNw7mO57CJ6beUADllH0ux3nhAI1ic65X",
+   live_view: [signing_salt: "LKBurgGF"],
+   render_errors: [view: Beacon.BeaconTest.ErrorView],
+diff --git a/lib/beacon/loader/routes.ex b/lib/beacon/loader/routes.ex
+index 0d2ca06a7..50e6f9238 100644
+--- a/lib/beacon/loader/routes.ex
++++ b/lib/beacon/loader/routes.ex
+@@ -49,6 +49,19 @@ defmodule Beacon.Loader.Routes do
+           @endpoint.url() <> beacon_media_path(file_name)
+         end
+ 
++        def beacon_page_url(conn, %{path: path} = page) do
++          prefix = @router.__beacon_scoped_prefix_for_site__(@site)
++          path = Path.join([@endpoint.url(), prefix, path])
++          Phoenix.VerifiedRoutes.unverified_path(conn, conn.private.phoenix_router, path)
++        end
++
++        def beacon_sitemap_url(conn) do
++          if prefix = @router.__beacon_scoped_prefix_for_site__(@site) do
++            path = Path.join([@endpoint.url(), prefix, "sitemap.xml"])
++            Phoenix.VerifiedRoutes.unverified_path(conn, conn.private.phoenix_router, path)
++          end
++        end
++
+         defp sanitize_path(path) do
+           String.replace(path, "//", "/")
+         end
+diff --git a/lib/beacon/router.ex b/lib/beacon/router.ex
+index 9fe845c59..41636a2bd 100644
+--- a/lib/beacon/router.ex
++++ b/lib/beacon/router.ex
+@@ -91,7 +91,7 @@ defmodule Beacon.Router do
+   defp prelude do
+     quote do
+       Module.register_attribute(__MODULE__, :beacon_sites, accumulate: true)
+-      import Beacon.Router, only: [beacon_site: 2]
++      import Beacon.Router, only: [beacon_site: 2, beacon_sitemap_index: 1]
+       @before_compile unquote(__MODULE__)
+     end
+   end
+@@ -111,25 +111,28 @@ defmodule Beacon.Router do
+       @doc false
+       def __beacon_sites__, do: unquote(Macro.escape(sites))
+       unquote(prefixes)
++      def __beacon_scoped_prefix_for_site__(_), do: nil
+     end
+   end
+ 
+   @doc """
+   Mounts a site in the `prefix` in your host application router.
+ 
++  This will automatically serve a `sitemap.xml` file from the `prefix` path defined for this site.
++
+   ## Options
+ 
+     * `:site` (required) `t:Beacon.Types.Site.t/0` - register your site with a unique name.
+       Note that the name has to match the one used in your site configuration.
+       See the module doc and `Beacon.Config` for more info.
+     * `:root_layout` - override the default root layout for the site. Defaults to `{Beacon.Web.Layouts, :runtime}`.
+-    See `Beacon.Web.Layouts` and `Phoenix.LiveView.Router.live_session/3` for more info.
+-    Use with caution.
++      See `Beacon.Web.Layouts` and `Phoenix.LiveView.Router.live_session/3` for more info.
++      Use with caution.
+ 
+   """
+   defmacro beacon_site(prefix, opts) do
+     # TODO: raise on duplicated sites defined on the same prefix
+-    quote bind_quoted: binding(), location: :keep do
++    quote bind_quoted: binding(), location: :keep, generated: true do
+       import Phoenix.Router, only: [scope: 3, get: 3, get: 4]
+       import Phoenix.LiveView.Router, only: [live: 3, live_session: 3]
+ 
+@@ -145,6 +148,8 @@ defmodule Beacon.Router do
+           get "/__beacon_assets__/css-:md5", Beacon.Web.AssetsController, :css, assigns: %{site: opts[:site]}
+           get "/__beacon_assets__/js-:md5", Beacon.Web.AssetsController, :js, assigns: %{site: opts[:site]}
+ 
++          get "/sitemap.xml", Beacon.Web.SitemapController, :show, as: :beacon_sitemap, assigns: %{site: opts[:site]}
++
+           # simulate a beacon page inside site prefix so we can check this site is reachable?/2
+           get "/__beacon_check__", Beacon.Web.CheckController, :check, metadata: %{site: opts[:site]}
+ 
+@@ -156,6 +161,64 @@ defmodule Beacon.Router do
+     end
+   end
+ 
++  @doc """
++  Creates a sitemap index at the given path (including the filename and extension).
++
++  ## Example
++
++    defmodule MyApp.Router do
++      ...
++      scope "/" do
++        pipe_through :browser
++
++        beacon_sitemap_index "/sitemap_index.xml"
++
++        beacon_site "/other", site: :other
++        beacon_site "/", site: :home
++      end
++    end
++
++  In the above example, there are two Beacon sites, so Beacon will serve two sitemaps:
++    * `my_domain.com/sitemap.xml` for site `:home`
++    * `my_domain.com/other/sitemap.xml` for site `:other`
++
++  Then Beacon will reference both of those sitemaps in the top-level index:
++    * `my_domain.com/sitemap_index.xml`
++
++  ## Requirements
++
++  Note that your sitemap index cannot have a path which is "deeper" in the directory structure than
++  your Beacon sites (which will be contained in the index).
++
++  For example, the following is NOT allowed:
++
++    scope "/" do
++      ...
++      beacon_sitemap_index "/root/nested/sitemap_index.xml"
++
++      beacon_site "/root", site: :root
++    end
++
++  However, the opposite case (nesting the sites deeper than the index) is perfectly fine:
++
++    scope "/" do
++      ...
++      beacon_sitemap_index "/sitemap_index.xml"
++
++      beacon_site "/nested/path/to/site", site: :nested
++    end
++
++  """
++  defmacro beacon_sitemap_index(path_with_filename) do
++    quote bind_quoted: binding(), location: :keep, generated: true do
++      import Phoenix.Router, only: [scope: 3, get: 4]
++
++      scope "/", alias: false, as: false do
++        get path_with_filename, Beacon.Web.SitemapController, :index, as: :beacon_sitemap
++      end
++    end
++  end
++
+   @doc false
+   @spec __options__(keyword()) :: {atom(), atom(), keyword()}
+   def __options__(opts) do
+diff --git a/lib/beacon/web/controllers/sitemap_controller.ex b/lib/beacon/web/controllers/sitemap_controller.ex
+new file mode 100644
+index 000000000..d47036bfa
+--- /dev/null
++++ b/lib/beacon/web/controllers/sitemap_controller.ex
+@@ -0,0 +1,47 @@
++defmodule Beacon.Web.SitemapController do
++  @moduledoc false
++  use Beacon.Web, :controller
++
++  def init(action) when action in [:index, :show], do: action
++
++  def call(conn, :index) do
++    conn
++    |> accepts(["xml"])
++    |> put_view(Beacon.Web.SitemapXML)
++    |> put_resp_content_type("text/xml")
++    |> put_resp_header("cache-control", "public max-age=300")
++    |> render(:sitemap_index, urls: get_sitemap_urls(conn))
++  end
++
++  def call(%{assigns: %{site: site}} = conn, :show) do
++    conn
++    |> accepts(["xml"])
++    |> put_view(Beacon.Web.SitemapXML)
++    |> put_resp_content_type("text/xml")
++    |> put_resp_header("cache-control", "public max-age=300")
++    |> render(:sitemap, pages: get_pages(conn, site))
++  end
++
++  defp get_sitemap_urls(conn) do
++    Beacon.Registry.running_sites()
++    |> Enum.map(fn site ->
++      routes_module = Beacon.Loader.fetch_routes_module(site)
++      Beacon.apply_mfa(site, routes_module, :beacon_sitemap_url, [conn])
++    end)
++    |> Enum.reject(&is_nil/1)
++    |> Enum.sort()
++  end
++
++  defp get_pages(conn, site) do
++    routes_module = Beacon.Loader.fetch_routes_module(site)
++
++    site
++    |> Beacon.Content.list_published_pages()
++    |> Enum.map(fn page ->
++      %{
++        loc: Beacon.apply_mfa(site, routes_module, :beacon_page_url, [conn, page]),
++        lastmod: DateTime.to_iso8601(page.updated_at)
++      }
++    end)
++  end
++end
+diff --git a/lib/beacon/web/sitemap/sitemap.xml.eex b/lib/beacon/web/sitemap/sitemap.xml.eex
+new file mode 100644
+index 000000000..a1cff3610
+--- /dev/null
++++ b/lib/beacon/web/sitemap/sitemap.xml.eex
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
++    <%= for page <- @pages do %><url>
++        <loc><%= page.loc %></loc>
++        <lastmod><%= page.lastmod %></lastmod>
++    </url><% end %>
++</urlset>
+diff --git a/lib/beacon/web/sitemap/sitemap_index.xml.eex b/lib/beacon/web/sitemap/sitemap_index.xml.eex
+new file mode 100644
+index 000000000..4dd8ce7fa
+--- /dev/null
++++ b/lib/beacon/web/sitemap/sitemap_index.xml.eex
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
++  <%= for url <- @urls do %><sitemap>
++    <loc><%= url %></loc>
++  </sitemap><% end %>
++</sitemapindex>
+diff --git a/lib/beacon/web/sitemap_xml.ex b/lib/beacon/web/sitemap_xml.ex
+new file mode 100644
+index 000000000..74c4cff86
+--- /dev/null
++++ b/lib/beacon/web/sitemap_xml.ex
+@@ -0,0 +1,4 @@
++defmodule Beacon.Web.SitemapXML do
++  import Phoenix.Template, only: [embed_templates: 1]
++  embed_templates "sitemap/*.xml"
++end
+diff --git a/test/beacon_web/controllers/media_library_controller_test.exs b/test/beacon_web/controllers/media_library_controller_test.exs
+index 6060de8dc..269d6baa2 100644
+--- a/test/beacon_web/controllers/media_library_controller_test.exs
++++ b/test/beacon_web/controllers/media_library_controller_test.exs
+@@ -1,12 +1,6 @@
+ defmodule Beacon.Web.Controllers.MediaLibraryControllerTest do
+   use Beacon.Web.ConnCase, async: true
+ 
+-  setup do
+-    Process.flag(:error_handler, Beacon.ErrorHandler)
+-    Process.put(:__beacon_site__, :my_site)
+-    :ok
+-  end
+-
+   test "show", %{conn: conn} do
+     %{file_name: file_name} = Beacon.Test.Fixtures.beacon_media_library_asset_fixture(site: :my_site)
+     routes = Beacon.Loader.fetch_routes_module(:my_site)
+diff --git a/test/beacon_web/controllers/sitemap_controller_test.exs b/test/beacon_web/controllers/sitemap_controller_test.exs
+new file mode 100644
+index 000000000..d260aedd8
+--- /dev/null
++++ b/test/beacon_web/controllers/sitemap_controller_test.exs
+@@ -0,0 +1,60 @@
++defmodule Beacon.Web.SitemapControllerTest do
++  use Beacon.Web.ConnCase, async: false
++
++  setup do
++    site = :my_site
++
++    layout =
++      beacon_published_layout_fixture(
++        site: site,
++        template: """
++        <header>Page header</header>
++        <%= @inner_content %>
++        <footer>Page footer</footer>
++        """
++      )
++
++    page = beacon_published_page_fixture(site: site, path: "/foo", layout_id: layout.id)
++
++    routes = Beacon.Loader.fetch_routes_module(site)
++
++    [site: site, layout: layout, page: page, routes: routes]
++  end
++
++  test "index", %{conn: conn} do
++    conn = get(conn, "/sitemap_index.xml")
++
++    assert response(conn, 200) == """
++           <?xml version="1.0" encoding="UTF-8"?>
++           <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
++             <sitemap>
++               <loc>http://localhost:4000/nested/media/sitemap.xml</loc>
++             </sitemap><sitemap>
++               <loc>http://localhost:4000/nested/site/sitemap.xml</loc>
++             </sitemap><sitemap>
++               <loc>http://localhost:4000/other/sitemap.xml</loc>
++             </sitemap><sitemap>
++               <loc>http://localhost:4000/sitemap.xml</loc>
++             </sitemap><sitemap>
++               <loc>http://site_b.com:4000/sitemap.xml</loc>
++             </sitemap>
++           </sitemapindex>
++           """
++  end
++
++  test "show", %{conn: conn, page: page, routes: routes} do
++    conn = get(conn, "/sitemap.xml")
++
++    assert response(conn, 200) == """
++           <?xml version="1.0" encoding="UTF-8"?>
++           <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
++               <url>
++                   <loc>#{routes.beacon_page_url(conn, page)}</loc>
++                   <lastmod>#{DateTime.to_iso8601(page.updated_at)}</lastmod>
++               </url>
++           </urlset>
++           """
++
++    assert response_content_type(conn, :xml) =~ "charset=utf-8"
++  end
++end
+diff --git a/test/mix/tasks/install_test.exs b/test/mix/tasks/install_test.exs
+index c8bee466e..0e92469ef 100644
+--- a/test/mix/tasks/install_test.exs
++++ b/test/mix/tasks/install_test.exs
+@@ -10,8 +10,8 @@ defmodule Mix.Tasks.Beacon.InstallTest do
+     project
+     |> Igniter.compose_task("beacon.install")
+     |> assert_has_patch(".formatter.exs", """
+-    7    - |  import_deps: [:ecto, :ecto_sql, :phoenix],
+-       7 + |  import_deps: [:beacon, :ecto, :ecto_sql, :phoenix],
++    8    - |  import_deps: [:ecto, :ecto_sql, :phoenix],
++       8 + |  import_deps: [:beacon, :ecto, :ecto_sql, :phoenix],
+     """)
+   end
+ 
+diff --git a/test/support/endpoint_b.ex b/test/support/endpoint_b.ex
+new file mode 100644
+index 000000000..acb901bc9
+--- /dev/null
++++ b/test/support/endpoint_b.ex
+@@ -0,0 +1,9 @@
++defmodule Beacon.BeaconTest.EndpointB do
++  # The otp app needs to be beacon otherwise Phoenix LiveView will not be
++  # able to build the static path since it tries to get from `Application.app_dir`
++  # which expects that a real "application" is settled.
++  use Phoenix.Endpoint, otp_app: :beacon
++
++  plug Plug.Session, Application.compile_env!(:beacon, :session_options)
++  plug Beacon.BeaconTest.Router
++end
+diff --git a/test/support/routers.ex b/test/support/routers.ex
+index a23befc3e..57fb22333 100644
+--- a/test/support/routers.ex
++++ b/test/support/routers.ex
+@@ -1,5 +1,6 @@
+ defmodule Beacon.BeaconTest.NoRoutesRouter do
+   use Beacon.BeaconTest.Web, :router
++  use Beacon.Router
+ end
+ 
+ defmodule Beacon.BeaconTest.ReachTestRouter do
+@@ -47,6 +48,16 @@ defmodule Beacon.BeaconTest.Router do
+     plug :put_secure_browser_headers
+   end
+ 
++  scope "/" do
++    pipe_through :browser
++    beacon_sitemap_index "/sitemap_index.xml"
++  end
++
++  scope host: "site_b.com" do
++    pipe_through :browser
++    beacon_site "/", site: :host_test
++  end
++
+   scope "/nested" do
+     pipe_through :browser
+     beacon_site "/site", site: :booted
+@@ -56,6 +67,7 @@ defmodule Beacon.BeaconTest.Router do
+   # `alias` is not really used but is present here to verify that `beacon_site` has no conflicts with custom aliases
+   scope path: "/", alias: AnyAlias do
+     pipe_through :browser
++
+     beacon_site "/other", site: :not_booted
+     beacon_site "/", site: :my_site
+   end
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index 6cf01cc88..98fdd34bb 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -6,7 +6,7 @@ Supervisor.start_link(
+   [
+     {Phoenix.PubSub, name: Beacon.BeaconTest.PubSub},
+     Beacon.BeaconTest.Endpoint,
+-    Beacon.BeaconTest.EndpointSite,
++    Beacon.BeaconTest.EndpointB,
+     Beacon.BeaconTest.ProxyEndpoint,
+     {Beacon,
+      sites: [
+@@ -39,7 +39,7 @@ Supervisor.start_link(
+        [
+          site: :host_test,
+          mode: :testing,
+-         endpoint: Beacon.BeaconTest.EndpointSite,
++         endpoint: Beacon.BeaconTest.EndpointB,
+          router: Beacon.BeaconTest.Router,
+          repo: Beacon.BeaconTest.Repo
+        ],

@@ -1,0 +1,73 @@
+diff --git a/lib/ecto/schema.ex b/lib/ecto/schema.ex
+index b8bdd26938..57e1a42cf4 100644
+--- a/lib/ecto/schema.ex
++++ b/lib/ecto/schema.ex
+@@ -183,6 +183,10 @@ defmodule Ecto.Schema do
+       option for the [`field`](`field/3`) macro. It defaults to `fn x -> x end`,
+       where no field transformation is done;
+ 
++    * `@on_writable_violation` - configures the default value of `:on_writable_violation`
++      for all fields in the schema. The value set here can be changed per field through
++      the `:on_writable_violation` option.
++
+   The advantage of configuring the schema via those attributes is
+   that they can be set with a macro to configure application wide
+   defaults.
+@@ -2022,9 +2026,12 @@ defmodule Ecto.Schema do
+     virtual? = opts[:virtual] || false
+     pk? = opts[:primary_key] || false
+     writable = opts[:writable] || :always
+-    on_writable_violation = opts[:on_writable_violation] || :nothing
+     put_struct_field(mod, name, Keyword.get(opts, :default))
+ 
++    on_writable_violation = Keyword.get_lazy(opts, :on_writable_violation, fn ->
++      Module.get_attribute(mod, :on_writable_violation, :nothing)
++    end)
++
+     redact_field? =
+       Keyword.get_lazy(opts, :redact, fn ->
+         case Module.get_attribute(mod, :schema_redact, false) do
+diff --git a/test/ecto/schema_test.exs b/test/ecto/schema_test.exs
+index 6c68168285..f107ab5304 100644
+--- a/test/ecto/schema_test.exs
++++ b/test/ecto/schema_test.exs
+@@ -516,6 +516,39 @@ defmodule Ecto.SchemaTest do
+     assert Ecto.primary_key!(sc) == [student_id: 1, course_ref_id: 2]
+   end
+ 
++  ## Default on_writable_violation
++
++  defmodule SchemaWithOnWritableViolation do
++    use Ecto.Schema
++
++    @on_writable_violation :raise
++    schema "on_writable_violation" do
++      field :a, :string, writable: :insert
++      field :b, :string, writable: :insert
++      field :c, :string, writable: :insert, on_writable_violation: :nothing
++      field :d, :string, writable: :insert, on_writable_violation: :warn
++    end
++  end
++
++  defmodule SchemaWithoutOnWritableViolation do
++    use Ecto.Schema
++
++    schema "on_writable_violation" do
++      field :a, :string, writable: :insert
++      field :b, :string, writable: :insert
++      field :c, :string, writable: :insert, on_writable_violation: :warn
++      field :d, :string, writable: :insert, on_writable_violation: :raise
++    end
++  end
++
++  test "schema with @on_writable_violation defaults :on_writable_violation" do
++    %{a: :raise, b: :raise, c: :nothing, d: :warn} = SchemaWithOnWritableViolation.__schema__(:on_writable_violation)
++  end
++
++  test "schema without @on_writable_violation uses the field-level default (:nothing)" do
++    %{a: :nothing, b: :nothing, c: :warn, d: :raise} = SchemaWithoutOnWritableViolation.__schema__(:on_writable_violation)
++  end
++
+   ## Errors
+ 
+   test "field name clash" do

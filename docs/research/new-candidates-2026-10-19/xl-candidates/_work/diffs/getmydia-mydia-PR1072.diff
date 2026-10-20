@@ -1,0 +1,877 @@
+diff --git a/assets/js/app.js b/assets/js/app.js
+index 87b1fda48..8be5427c4 100644
+--- a/assets/js/app.js
++++ b/assets/js/app.js
+@@ -502,6 +502,21 @@ window.addEventListener("phx:download_export", (e) => {
+   URL.revokeObjectURL(url);
+ });
+ 
++// Copy a link's absolute URL. Stream links are relative hrefs, so a.href is
++// the browser-resolved URL including the host the user is on. The Clipboard
++// API needs a secure context; on plain-HTTP LAN installs fall back to a
++// prompt the user can copy from.
++window.addEventListener("mydia:copy-href", (e) => {
++  const href = e.target.href;
++  if (navigator.clipboard && window.isSecureContext) {
++    navigator.clipboard
++      .writeText(href)
++      .catch(() => window.prompt("Copy this link", href));
++  } else {
++    window.prompt("Copy this link", href);
++  }
++});
++
+ // Shift+click range selection for batch edit checkboxes
+ const BatchSelect = {
+   mounted() {
+diff --git a/lib/mydia_web/controllers/api/range_helper.ex b/lib/mydia_web/controllers/api/range_helper.ex
+index a9b3a390c..58ff9c53c 100644
+--- a/lib/mydia_web/controllers/api/range_helper.ex
++++ b/lib/mydia_web/controllers/api/range_helper.ex
+@@ -6,11 +6,21 @@ defmodule MydiaWeb.Api.RangeHelper do
+   for HTTP 206 Partial Content responses.
+   """
+ 
++  import Plug.Conn,
++    only: [get_req_header: 2, put_resp_header: 3, put_status: 2, send_file: 3, send_file: 5]
++
+   @doc """
+-  Parses an HTTP Range header value.
++  Parses an HTTP Range header value (RFC 9110 section 14.1.2).
++
++  Returns `{:ok, start, end_pos}` for a satisfiable range or `:error`
++  otherwise. Only a single byte range is supported:
++
++    * `bytes=START-END` (END is clamped to the last byte of the file)
++    * `bytes=START-` (to the end of the file)
++    * `bytes=-N` (the last N bytes; the whole file when N exceeds its size)
+ 
+-  Returns {:ok, start, end_pos} for valid ranges or :error for invalid ones.
+-  Only supports single byte ranges in the format "bytes=START-END" or "bytes=START-".
++  Unsatisfiable or malformed ranges, multi-range headers, and any range on an
++  empty file return `:error`.
+ 
+   ## Examples
+ 
+@@ -20,11 +30,21 @@ defmodule MydiaWeb.Api.RangeHelper do
+       iex> parse_range_header("bytes=500-", 1000)
+       {:ok, 500, 999}
+ 
++      iex> parse_range_header("bytes=0-65535", 1000)
++      {:ok, 0, 999}
++
++      iex> parse_range_header("bytes=-500", 1000)
++      {:ok, 500, 999}
++
++      iex> parse_range_header("bytes=-0", 1000)
++      :error
++
+       iex> parse_range_header("bytes=invalid", 1000)
+       :error
+   """
+   def parse_range_header(nil, _file_size), do: :error
+   def parse_range_header("", _file_size), do: :error
++  def parse_range_header(_range_header, file_size) when file_size <= 0, do: :error
+ 
+   def parse_range_header(range_header, file_size) do
+     # Only support single byte range requests
+@@ -39,6 +59,15 @@ defmodule MydiaWeb.Api.RangeHelper do
+ 
+   defp parse_range_spec(spec, file_size) do
+     case String.split(spec, "-") do
++      ["", length_str] ->
++        # Suffix range like "bytes=-500" (the last N bytes)
++        with {length, ""} <- Integer.parse(length_str),
++             true <- length > 0 do
++          {:ok, max(file_size - length, 0), file_size - 1}
++        else
++          _ -> :error
++        end
++
+       [start_str, ""] ->
+         # Range like "bytes=500-" (from position to end)
+         with {start, ""} <- Integer.parse(start_str),
+@@ -49,11 +78,11 @@ defmodule MydiaWeb.Api.RangeHelper do
+         end
+ 
+       [start_str, end_str] ->
+-        # Range like "bytes=0-499"
++        # Range like "bytes=0-499"; an end past EOF is clamped
+         with {start, ""} <- Integer.parse(start_str),
+              {end_pos, ""} <- Integer.parse(end_str),
+-             true <- start >= 0 and start <= end_pos and end_pos < file_size do
+-          {:ok, start, end_pos}
++             true <- start >= 0 and start <= end_pos and start < file_size do
++          {:ok, start, min(end_pos, file_size - 1)}
+         else
+           _ -> :error
+         end
+@@ -127,4 +156,47 @@ defmodule MydiaWeb.Api.RangeHelper do
+       _ -> "video/mp4"
+     end
+   end
++
++  @doc """
++  Sends `file_path` honouring a single-range `Range` header.
++
++  Answers 206 for a valid range, 200 with the whole file when there is no
++  Range header, and 416 when the header is present but unusable. The caller
++  must have checked that the file exists.
++  """
++  @spec send_file_ranged(Plug.Conn.t(), Path.t()) :: Plug.Conn.t()
++  def send_file_ranged(conn, file_path) do
++    file_size = File.stat!(file_path).size
++    mime_type = get_mime_type(file_path)
++    range_header = conn |> get_req_header("range") |> List.first()
++
++    case parse_range_header(range_header, file_size) do
++      {:ok, start, end_pos} ->
++        {offset, length} = calculate_range(start, end_pos)
++
++        conn
++        |> put_status(:partial_content)
++        |> put_resp_header("accept-ranges", "bytes")
++        |> put_resp_header("content-type", mime_type)
++        |> put_resp_header("content-range", format_content_range(start, end_pos, file_size))
++        |> put_resp_header("content-length", to_string(length))
++        |> put_resp_header("x-streaming-mode", "direct")
++        |> send_file(:partial_content, file_path, offset, length)
++
++      :error when is_nil(range_header) ->
++        conn
++        |> put_status(:ok)
++        |> put_resp_header("accept-ranges", "bytes")
++        |> put_resp_header("content-type", mime_type)
++        |> put_resp_header("content-length", to_string(file_size))
++        |> put_resp_header("x-streaming-mode", "direct")
++        |> send_file(:ok, file_path)
++
++      :error ->
++        conn
++        |> put_status(:requested_range_not_satisfiable)
++        |> put_resp_header("content-range", "bytes */#{file_size}")
++        |> Phoenix.Controller.json(%{error: "Invalid range request"})
++    end
++  end
+ end
+diff --git a/lib/mydia_web/controllers/api/stream_controller.ex b/lib/mydia_web/controllers/api/stream_controller.ex
+index bf4d2299f..b8d39bbda 100644
+--- a/lib/mydia_web/controllers/api/stream_controller.ex
++++ b/lib/mydia_web/controllers/api/stream_controller.ex
+@@ -477,47 +477,7 @@ defmodule MydiaWeb.Api.StreamController do
+         :ok
+     end
+ 
+-    file_stat = File.stat!(file_path)
+-    file_size = file_stat.size
+-
+-    # Get MIME type from file extension
+-    mime_type = RangeHelper.get_mime_type(file_path)
+-
+-    # Parse Range header if present
+-    range_header = get_req_header(conn, "range") |> List.first()
+-
+-    case RangeHelper.parse_range_header(range_header, file_size) do
+-      {:ok, start, end_pos} ->
+-        # Partial content response (206)
+-        {offset, length} = RangeHelper.calculate_range(start, end_pos)
+-        content_range = RangeHelper.format_content_range(start, end_pos, file_size)
+-
+-        conn
+-        |> put_status(:partial_content)
+-        |> put_resp_header("accept-ranges", "bytes")
+-        |> put_resp_header("content-type", mime_type)
+-        |> put_resp_header("content-range", content_range)
+-        |> put_resp_header("content-length", to_string(length))
+-        |> put_resp_header("x-streaming-mode", "direct")
+-        |> send_file(:partial_content, file_path, offset, length)
+-
+-      :error when is_nil(range_header) ->
+-        # No range header - send full file (200)
+-        conn
+-        |> put_status(:ok)
+-        |> put_resp_header("accept-ranges", "bytes")
+-        |> put_resp_header("content-type", mime_type)
+-        |> put_resp_header("content-length", to_string(file_size))
+-        |> put_resp_header("x-streaming-mode", "direct")
+-        |> send_file(:ok, file_path)
+-
+-      :error ->
+-        # Invalid range header - return 416 Range Not Satisfiable
+-        conn
+-        |> put_status(:requested_range_not_satisfiable)
+-        |> put_resp_header("content-range", "bytes */#{file_size}")
+-        |> json(%{error: "Invalid range request"})
+-    end
++    RangeHelper.send_file_ranged(conn, file_path)
+   end
+ 
+   # Stream file via fMP4 remuxing (for files with compatible codecs but incompatible container)
+diff --git a/lib/mydia_web/controllers/stream_link_controller.ex b/lib/mydia_web/controllers/stream_link_controller.ex
+new file mode 100644
+index 000000000..95e2b276f
+--- /dev/null
++++ b/lib/mydia_web/controllers/stream_link_controller.ex
+@@ -0,0 +1,65 @@
++defmodule MydiaWeb.StreamLinkController do
++  @moduledoc """
++  Serves the raw file behind a `MydiaWeb.StreamLink` to an external player.
++
++  Every failure is the same bare 404, so a caller holding a link cannot tell a
++  bad token from a revoked permission or a deleted file.
++  """
++
++  use MydiaWeb, :controller
++
++  import Ecto.Query, only: [from: 2]
++
++  alias Mydia.Accounts
++  alias Mydia.Accounts.Scope
++  alias Mydia.Library.MediaFile
++  alias Mydia.Repo
++  alias MydiaWeb.Api.RangeHelper
++  alias MydiaWeb.MediaAccess
++  alias MydiaWeb.StreamLink
++
++  require Logger
++
++  def show(conn, %{"token" => token}) do
++    with {:ok, {user_id, file_id}} <- StreamLink.verify(token),
++         %Accounts.User{} = user <- Accounts.get_user_by_id(user_id),
++         %MediaFile{} = file <- get_active_file(file_id),
++         :ok <- MediaAccess.authorize_media_file_for_scope(Scope.for_user(user), file),
++         {:ok, path} <- on_disk_path(file) do
++      # The URL is a per-user bearer credential; keep shared caches away from it.
++      conn
++      |> put_resp_header("cache-control", "private, no-store")
++      |> RangeHelper.send_file_ranged(path)
++    else
++      _ -> send_resp(conn, 404, "Not found")
++    end
++  end
++
++  # Same preloads as StreamController.stream/2: a TV file reaches its show only
++  # through the episode, which FileAccess needs to apply restrictions.
++  defp get_active_file(file_id) do
++    with {:ok, uuid} <- Ecto.UUID.cast(file_id) do
++      Repo.one(
++        from(mf in MediaFile,
++          where: mf.id == ^uuid and is_nil(mf.trashed_at),
++          preload: [:media_item, :library_path, episode: :media_item]
++        )
++      )
++    end
++  end
++
++  defp on_disk_path(file) do
++    case MediaFile.absolute_path(file) do
++      nil ->
++        :error
++
++      path ->
++        if File.exists?(path) do
++          {:ok, path}
++        else
++          Logger.warning("Stream link for media_file #{file.id}: not on disk at #{path}")
++          :error
++        end
++    end
++  end
++end
+diff --git a/lib/mydia_web/live/media_live/show.html.heex b/lib/mydia_web/live/media_live/show.html.heex
+index 2cb8721bc..c7c741ceb 100644
+--- a/lib/mydia_web/live/media_live/show.html.heex
++++ b/lib/mydia_web/live/media_live/show.html.heex
+@@ -296,6 +296,7 @@
+             fetching_season_subtitles={@fetching_season_subtitles}
+             auto_searching_episode={@auto_searching_episode}
+             player_enabled={@player_enabled}
++            current_user_id={@current_user.id}
+             transcode_jobs={@transcode_jobs}
+             media_file_subtitle_tracks={@media_file_subtitle_tracks}
+             segment_statuses={@segment_statuses}
+@@ -400,7 +401,11 @@
+     />
+   <% end %>
+   <%= if @show_file_details_modal && @file_details do %>
+-    <Modals.file_details_modal file_details={@file_details} file_origin={@file_origin} />
++    <Modals.file_details_modal
++      file_details={@file_details}
++      file_origin={@file_origin}
++      current_user_id={@current_user.id}
++    />
+   <% end %>
+   <%= if @show_download_cancel_confirm && @download_to_cancel do %>
+     <Modals.download_cancel_confirm_modal download_to_cancel={@download_to_cancel} />
+diff --git a/lib/mydia_web/live/media_live/show/components.ex b/lib/mydia_web/live/media_live/show/components.ex
+index d09667ae4..39af623f7 100644
+--- a/lib/mydia_web/live/media_live/show/components.ex
++++ b/lib/mydia_web/live/media_live/show/components.ex
+@@ -435,6 +435,7 @@ defmodule MydiaWeb.MediaLive.Show.Components do
+   attr :fetching_season_subtitles, :any, default: nil
+   attr :auto_searching_episode, :any, default: nil
+   attr :player_enabled, :boolean, required: true
++  attr :current_user_id, :string, default: nil
+   attr :transcode_jobs, :map, default: %{}
+   attr :media_file_subtitle_tracks, :map, default: %{}
+   attr :segment_statuses, :map, default: %{}
+@@ -549,6 +550,7 @@ defmodule MydiaWeb.MediaLive.Show.Components do
+               fetching_season_subtitles={@fetching_season_subtitles}
+               auto_searching_episode={@auto_searching_episode}
+               player_enabled={@player_enabled}
++              current_user_id={@current_user_id}
+               transcode_jobs={@transcode_jobs}
+               media_file_subtitle_tracks={@media_file_subtitle_tracks}
+               segment_statuses={@segment_statuses}
+@@ -567,6 +569,7 @@ defmodule MydiaWeb.MediaLive.Show.Components do
+   attr :file, :map, required: true
+   attr :episode, :map, required: true
+   attr :player_enabled, :boolean, required: true
++  attr :current_user_id, :string, default: nil
+   attr :transcode_jobs, :list, default: []
+   attr :subtitle_tracks, :list, default: []
+ 
+@@ -582,7 +585,7 @@ defmodule MydiaWeb.MediaLive.Show.Components do
+           of a 92-character name and wrapped the badge line underneath onto
+           four lines.
+ 
+-          With every action present the strip is six 40px squares, 260px, which is
++          With every action present the strip is seven 40px squares, 300px, which is
+           wider than that same 245px row, so it wraps rather than overflowing to the
+           left; justify-end keeps the wrapped button on the right. --%>
+     <div
+@@ -681,6 +684,18 @@ defmodule MydiaWeb.MediaLive.Show.Components do
+             <.icon name="hero-play-solid" class="w-4 h-4" />
+           </a>
+         <% end %>
++        <a
++          :if={@current_user_id}
++          id={"stream-link-#{@file.id}"}
++          href={MydiaWeb.StreamLink.path(@current_user_id, @file)}
++          target="_blank"
++          rel="noopener"
++          class="btn btn-ghost btn-square @md/eprow:btn-xs"
++          aria-label="Stream link (open in external player)"
++          title="Stream link (open in external player)"
++        >
++          <.icon name="hero-link" class="w-4 h-4" />
++        </a>
+         <button
+           type="button"
+           phx-click="mark_file_preferred"
+diff --git a/lib/mydia_web/live/media_live/show/modals.ex b/lib/mydia_web/live/media_live/show/modals.ex
+index f242650da..fd2d84727 100644
+--- a/lib/mydia_web/live/media_live/show/modals.ex
++++ b/lib/mydia_web/live/media_live/show/modals.ex
+@@ -362,6 +362,7 @@ defmodule MydiaWeb.MediaLive.Show.Modals do
+   """
+   attr :file_details, :map, required: true
+   attr :file_origin, :map, default: nil
++  attr :current_user_id, :string, default: nil
+ 
+   def file_details_modal(assigns) do
+     ~H"""
+@@ -381,6 +382,37 @@ defmodule MydiaWeb.MediaLive.Show.Modals do
+                 Mydia.Library.MediaFile.display_name(@file_details)}
+             </p>
+           </div>
++          <%!-- Stash-style stream link: opens in the OS video app or pastes
++                into VLC, mpv or Infuse. Relative href, so the browser
++                resolves the host and Copy yields an absolute URL. --%>
++          <div :if={@current_user_id}>
++            <h4 class="text-sm font-semibold text-base-content/70 mb-2">Stream Link</h4>
++            <div class="flex items-center gap-2 bg-base-200 p-3 rounded-box">
++              <a
++                id="file-details-stream-link"
++                href={MydiaWeb.StreamLink.path(@current_user_id, @file_details)}
++                target="_blank"
++                rel="noopener"
++                class="link link-primary text-sm font-mono truncate flex-1 min-w-0"
++              >
++                {Mydia.Library.MediaFile.display_name(@file_details)}
++              </a>
++              <button
++                id="file-details-copy-stream-link"
++                type="button"
++                class="btn btn-sm btn-ghost"
++                phx-click={
++                  Phoenix.LiveView.JS.dispatch("mydia:copy-href", to: "#file-details-stream-link")
++                }
++              >
++                <.icon name="hero-clipboard-document" class="w-4 h-4" /> Copy
++              </button>
++            </div>
++            <p class="text-xs text-base-content/60 mt-1">
++              Opens in your default video app, or paste it into VLC, mpv or Infuse.
++              Anyone with this link can stream the file, so share it like a password.
++            </p>
++          </div>
+           <%!-- Quality Information --%>
+           <div class="grid grid-cols-2 gap-4">
+             <div>
+diff --git a/lib/mydia_web/live/media_live/show/season_components.ex b/lib/mydia_web/live/media_live/show/season_components.ex
+index 92404c56c..5bb745731 100644
+--- a/lib/mydia_web/live/media_live/show/season_components.ex
++++ b/lib/mydia_web/live/media_live/show/season_components.ex
+@@ -27,6 +27,7 @@ defmodule MydiaWeb.MediaLive.Show.SeasonComponents do
+   attr :fetching_season_subtitles, :any, default: nil
+   attr :auto_searching_episode, :any, default: nil
+   attr :player_enabled, :boolean, required: true
++  attr :current_user_id, :string, default: nil
+   attr :transcode_jobs, :map, default: %{}
+   attr :media_file_subtitle_tracks, :map, default: %{}
+   attr :segment_statuses, :map, default: %{}
+@@ -63,6 +64,7 @@ defmodule MydiaWeb.MediaLive.Show.SeasonComponents do
+                   expanded_episodes={@expanded_episodes}
+                   auto_searching_episode={@auto_searching_episode}
+                   player_enabled={@player_enabled}
++                  current_user_id={@current_user_id}
+                   transcode_jobs={@transcode_jobs}
+                   media_file_subtitle_tracks={@media_file_subtitle_tracks}
+                 />
+@@ -97,6 +99,7 @@ defmodule MydiaWeb.MediaLive.Show.SeasonComponents do
+                   expanded_episodes={@expanded_episodes}
+                   auto_searching_episode={@auto_searching_episode}
+                   player_enabled={@player_enabled}
++                  current_user_id={@current_user_id}
+                   transcode_jobs={@transcode_jobs}
+                   media_file_subtitle_tracks={@media_file_subtitle_tracks}
+                 />
+@@ -130,6 +133,7 @@ defmodule MydiaWeb.MediaLive.Show.SeasonComponents do
+   attr :expanded_episodes, :any, required: true
+   attr :auto_searching_episode, :any, default: nil
+   attr :player_enabled, :boolean, required: true
++  attr :current_user_id, :string, default: nil
+   attr :transcode_jobs, :map, default: %{}
+   attr :media_file_subtitle_tracks, :map, default: %{}
+ 
+@@ -375,6 +379,7 @@ defmodule MydiaWeb.MediaLive.Show.SeasonComponents do
+                   file={file}
+                   episode={episode}
+                   player_enabled={@player_enabled}
++                  current_user_id={@current_user_id}
+                   transcode_jobs={Map.get(@transcode_jobs, file.id, [])}
+                   subtitle_tracks={Map.get(@media_file_subtitle_tracks, file.id, [])}
+                 />
+diff --git a/lib/mydia_web/router.ex b/lib/mydia_web/router.ex
+index 2a1eade79..266629444 100644
+--- a/lib/mydia_web/router.ex
++++ b/lib/mydia_web/router.ex
+@@ -113,6 +113,15 @@ defmodule MydiaWeb.Router do
+     plug MydiaWeb.Plugs.LibraryApiContext
+   end
+ 
++  # External-player stream links (see MydiaWeb.StreamLink). No pipeline on
++  # purpose: VLC, mpv and the OS video app send no cookie and no
++  # Authorization header, and this is a web UI feature, so neither the
++  # :player gate nor MediaAuth applies. The signed token in the path is the
++  # credential, and the controller re-authorizes on every request.
++  scope "/", MydiaWeb do
++    get "/stream/:token/:filename", StreamLinkController, :show
++  end
++
+   # Health check endpoint (no authentication required)
+   scope "/", MydiaWeb do
+     pipe_through :api
+diff --git a/lib/mydia_web/stream_link.ex b/lib/mydia_web/stream_link.ex
+new file mode 100644
+index 000000000..35088c4c7
+--- /dev/null
++++ b/lib/mydia_web/stream_link.ex
+@@ -0,0 +1,38 @@
++defmodule MydiaWeb.StreamLink do
++  @moduledoc """
++  Stream links: per-file URLs an external player can open without a session.
++
++  The path carries a `Phoenix.Token` over `{user_id, media_file_id}`. Links
++  never expire, so rotating `secret_key_base` is the only way to revoke them
++  all at once. That is acceptable because the token is not the whole check:
++  `MydiaWeb.StreamLinkController` re-authorizes the user against the file on
++  every request, so a deleted user, a new restriction or a trashed file stops
++  the link immediately.
++
++  The trailing filename is cosmetic. Players show it as a title and use the
++  extension to guess the container; the server ignores it.
++  """
++
++  use MydiaWeb, :verified_routes
++
++  alias Mydia.Library.MediaFile
++
++  @salt "external stream"
++
++  @spec path(String.t(), MediaFile.t()) :: String.t()
++  def path(user_id, %MediaFile{id: file_id} = file) when is_binary(user_id) do
++    token = Phoenix.Token.sign(MydiaWeb.Endpoint, @salt, {user_id, file_id})
++    ~p"/stream/#{token}/#{MediaFile.display_name(file)}"
++  end
++
++  @spec verify(String.t()) :: {:ok, {String.t(), String.t()}} | :error
++  def verify(token) when is_binary(token) do
++    case Phoenix.Token.verify(MydiaWeb.Endpoint, @salt, token, max_age: :infinity) do
++      {:ok, {user_id, file_id}} when is_binary(user_id) and is_binary(file_id) ->
++        {:ok, {user_id, file_id}}
++
++      _ ->
++        :error
++    end
++  end
++end
+diff --git a/test/mydia_web/controllers/api/range_helper_test.exs b/test/mydia_web/controllers/api/range_helper_test.exs
+new file mode 100644
+index 000000000..4653d1150
+--- /dev/null
++++ b/test/mydia_web/controllers/api/range_helper_test.exs
+@@ -0,0 +1,59 @@
++defmodule MydiaWeb.Api.RangeHelperTest do
++  use ExUnit.Case, async: true
++
++  alias MydiaWeb.Api.RangeHelper
++
++  describe "parse_range_header/2" do
++    test "explicit range" do
++      assert RangeHelper.parse_range_header("bytes=0-499", 1000) == {:ok, 0, 499}
++    end
++
++    test "open-ended range" do
++      assert RangeHelper.parse_range_header("bytes=100-", 1000) == {:ok, 100, 999}
++    end
++
++    test "clamps an end past EOF" do
++      assert RangeHelper.parse_range_header("bytes=0-65535", 10_240) == {:ok, 0, 10_239}
++    end
++
++    test "suffix range returns the last N bytes" do
++      assert RangeHelper.parse_range_header("bytes=-500", 1000) == {:ok, 500, 999}
++    end
++
++    test "suffix larger than the file returns the whole file" do
++      assert RangeHelper.parse_range_header("bytes=-99999", 1000) == {:ok, 0, 999}
++    end
++
++    test "zero-length suffix is unsatisfiable" do
++      assert RangeHelper.parse_range_header("bytes=-0", 1000) == :error
++    end
++
++    test "start beyond EOF is unsatisfiable" do
++      assert RangeHelper.parse_range_header("bytes=1000-", 1000) == :error
++      assert RangeHelper.parse_range_header("bytes=5000-6000", 1000) == :error
++    end
++
++    test "start after end is unsatisfiable" do
++      assert RangeHelper.parse_range_header("bytes=500-100", 1000) == :error
++    end
++
++    test "empty file is unsatisfiable for any range" do
++      assert RangeHelper.parse_range_header("bytes=0-", 0) == :error
++      assert RangeHelper.parse_range_header("bytes=0-10", 0) == :error
++      assert RangeHelper.parse_range_header("bytes=-5", 0) == :error
++    end
++
++    test "garbage is rejected" do
++      assert RangeHelper.parse_range_header("bytes=invalid", 1000) == :error
++      assert RangeHelper.parse_range_header("bytes=-", 1000) == :error
++      assert RangeHelper.parse_range_header("bytes=a-b", 1000) == :error
++      assert RangeHelper.parse_range_header("items=0-5", 1000) == :error
++      assert RangeHelper.parse_range_header("bytes=0-5,10-20", 1000) == :error
++    end
++
++    test "nil and empty are rejected" do
++      assert RangeHelper.parse_range_header(nil, 1000) == :error
++      assert RangeHelper.parse_range_header("", 1000) == :error
++    end
++  end
++end
+diff --git a/test/mydia_web/controllers/stream_link_controller_test.exs b/test/mydia_web/controllers/stream_link_controller_test.exs
+new file mode 100644
+index 000000000..1de2a3eb9
+--- /dev/null
++++ b/test/mydia_web/controllers/stream_link_controller_test.exs
+@@ -0,0 +1,124 @@
++defmodule MydiaWeb.StreamLinkControllerTest do
++  # async: false because disable_player/0 writes application env.
++  use MydiaWeb.ConnCase, async: false
++
++  import Ecto.Query
++  import Mydia.AccountsFixtures
++  import Mydia.MediaFixtures
++  import Mydia.PlayerHelpers
++  import Mydia.SettingsFixtures
++
++  alias Mydia.Library.MediaFile
++  alias Mydia.Media.MediaItem
++  alias Mydia.Repo
++  alias MydiaWeb.StreamLink
++
++  @size 10 * 1024
++
++  setup do
++    user = MydiaWeb.AuthHelpers.create_test_user()
++    library_path = library_path_fixture()
++    File.mkdir_p!(library_path.path)
++
++    name = "Zephyr.Station.2030.#{System.unique_integer([:positive])}.mp4"
++    disk_path = Path.join(library_path.path, name)
++    File.write!(disk_path, :crypto.strong_rand_bytes(@size))
++    on_exit(fn -> File.rm(disk_path) end)
++
++    media_file =
++      media_file_fixture(%{library_path_id: library_path.id, relative_path: name})
++      |> Repo.preload(:library_path)
++
++    %{user: user, media_file: media_file}
++  end
++
++  test "serves the whole file with no Range header", %{conn: conn, user: user, media_file: file} do
++    conn = get(conn, StreamLink.path(user.id, file))
++
++    assert conn.status == 200
++    assert get_resp_header(conn, "accept-ranges") == ["bytes"]
++    assert get_resp_header(conn, "content-length") == ["#{@size}"]
++    assert get_resp_header(conn, "cache-control") == ["private, no-store"]
++  end
++
++  test "serves a byte range", %{conn: conn, user: user, media_file: file} do
++    conn =
++      conn
++      |> put_req_header("range", "bytes=0-9")
++      |> get(StreamLink.path(user.id, file))
++
++    assert conn.status == 206
++    assert get_resp_header(conn, "content-range") == ["bytes 0-9/#{@size}"]
++    assert get_resp_header(conn, "content-length") == ["10"]
++  end
++
++  test "clamps a range end past EOF", %{conn: conn, user: user, media_file: file} do
++    conn =
++      conn
++      |> put_req_header("range", "bytes=0-999999")
++      |> get(StreamLink.path(user.id, file))
++
++    assert conn.status == 206
++    assert get_resp_header(conn, "content-range") == ["bytes 0-#{@size - 1}/#{@size}"]
++    assert get_resp_header(conn, "content-length") == ["#{@size}"]
++  end
++
++  test "answers HEAD with headers and no body", %{conn: conn, user: user, media_file: file} do
++    conn = head(conn, StreamLink.path(user.id, file))
++
++    # Plug.Head rewrites HEAD to GET before the router, and the real server
++    # drops the body; the test adapter does not, so assert headers only.
++    assert conn.status == 200
++    assert get_resp_header(conn, "content-length") == ["#{@size}"]
++  end
++
++  test "ignores the filename segment", %{conn: conn, user: user, media_file: file} do
++    ["", "stream", token, _name] = String.split(StreamLink.path(user.id, file), "/")
++
++    assert get(conn, "/stream/#{token}/anything.mkv").status == 200
++  end
++
++  test "a tampered token is not found", %{conn: conn, user: user, media_file: file} do
++    ["", "stream", token, name] = String.split(StreamLink.path(user.id, file), "/")
++
++    assert response(get(conn, "/stream/#{token}x/#{name}"), 404) == "Not found"
++  end
++
++  test "a trashed file is not found", %{conn: conn, user: user, media_file: file} do
++    Repo.update_all(from(f in MediaFile, where: f.id == ^file.id),
++      set: [trashed_at: DateTime.utc_now(:second)]
++    )
++
++    assert response(get(conn, StreamLink.path(user.id, file)), 404) == "Not found"
++  end
++
++  test "a deleted user's link is not found", %{conn: conn, user: user, media_file: file} do
++    path = StreamLink.path(user.id, file)
++    Repo.delete!(user)
++
++    assert response(get(conn, path), 404) == "Not found"
++  end
++
++  test "a user restricted away from the file is not found", %{conn: conn, media_file: file} do
++    Repo.update_all(from(m in MediaItem, where: m.id == ^file.media_item_id),
++      set: [category: "movie"]
++    )
++
++    restricted = restricted_user_fixture(%{allowed_categories: ["cartoon_movie"]})
++
++    assert response(get(conn, StreamLink.path(restricted.id, file)), 404) == "Not found"
++  end
++
++  @tag :capture_log
++  test "a file missing on disk is not found", %{conn: conn, user: user, media_file: file} do
++    File.rm!(MediaFile.absolute_path(file))
++
++    assert response(get(conn, StreamLink.path(user.id, file)), 404) == "Not found"
++  end
++
++  test "works with the player disabled", %{conn: conn, user: user, media_file: file} do
++    disable_player()
++
++    assert get(conn, StreamLink.path(user.id, file)).status == 200
++  end
++end
+diff --git a/test/mydia_web/live/media_live/show/stream_link_test.exs b/test/mydia_web/live/media_live/show/stream_link_test.exs
+new file mode 100644
+index 000000000..e246ff7a4
+--- /dev/null
++++ b/test/mydia_web/live/media_live/show/stream_link_test.exs
+@@ -0,0 +1,102 @@
++defmodule MydiaWeb.MediaLive.Show.StreamLinkTest do
++  # Connected LiveView tests cannot be async under the PostgreSQL sandbox.
++  use MydiaWeb.ConnCase, async: false
++
++  import Phoenix.LiveViewTest
++  import Mydia.Factory
++
++  alias Mydia.Library.MediaFile
++  alias Mydia.Media.Episode
++  alias MydiaWeb.MediaLive.Show.SeasonComponents
++  alias MydiaWeb.StreamLink
++
++  defp verified(href) do
++    ["", "stream", token, _name] = String.split(href, "/")
++    StreamLink.verify(token)
++  end
++
++  defp href_of(html, selector) do
++    [href] =
++      html |> LazyHTML.from_fragment() |> LazyHTML.query(selector) |> LazyHTML.attribute("href")
++
++    href
++  end
++
++  describe "movie page" do
++    setup %{conn: conn} do
++      {conn, user} = register_and_log_in_user(conn)
++      library_path = insert(:library_path)
++      item = insert(:media_item, %{type: "movie", title: "Zephyr Station", year: 2030})
++
++      file =
++        insert(:media_file, %{
++          media_item_id: item.id,
++          episode: nil,
++          library_path_id: library_path.id,
++          relative_path: "Zephyr Station (2030)/Zephyr.Station.2030.1080p.mkv"
++        })
++
++      %{conn: conn, user: user, item: item, media_file: file}
++    end
++
++    test "movie rows leave the link to the file details modal", %{
++      conn: conn,
++      item: item,
++      media_file: file
++    } do
++      {:ok, view, _html} = live(conn, ~p"/media/#{item.id}")
++
++      refute has_element?(view, "#stream-link-#{file.id}")
++    end
++
++    test "the file details modal shows the link and a copy button", %{
++      conn: conn,
++      user: user,
++      item: item,
++      media_file: file
++    } do
++      {:ok, view, _html} = live(conn, ~p"/media/#{item.id}")
++      render_click(view, "show_file_details", %{"file-id" => file.id})
++
++      assert has_element?(view, "#file-details-copy-stream-link")
++      href = href_of(render(view), "#file-details-stream-link")
++      assert verified(href) == {:ok, {user.id, file.id}}
++    end
++  end
++
++  test "the episode file row links to its stream" do
++    user_id = Ecto.UUID.generate()
++    file_id = Ecto.UUID.generate()
++
++    file = %MediaFile{
++      id: file_id,
++      resolution: "1080p",
++      library_path: nil,
++      relative_path: "Ashvale.Hollow.S01E01.1080p.mkv"
++    }
++
++    episode = %Episode{
++      id: "ep-1",
++      season_number: 1,
++      episode_number: 1,
++      title: "The Salt Lantern",
++      monitored: true,
++      air_date: ~D[2024-01-01],
++      media_files: [file],
++      downloads: []
++    }
++
++    html =
++      render_component(&SeasonComponents.season_section/1,
++        season_number: 1,
++        episodes: [episode],
++        expanded?: true,
++        expanded_episodes: MapSet.new(["ep-1"]),
++        player_enabled: false,
++        segment_detection_available: false,
++        current_user_id: user_id
++      )
++
++    assert verified(href_of(html, "#stream-link-#{file_id}")) == {:ok, {user_id, file_id}}
++  end
++end
+diff --git a/test/mydia_web/stream_link_test.exs b/test/mydia_web/stream_link_test.exs
+new file mode 100644
+index 000000000..5a7ddc50c
+--- /dev/null
++++ b/test/mydia_web/stream_link_test.exs
+@@ -0,0 +1,37 @@
++defmodule MydiaWeb.StreamLinkTest do
++  use ExUnit.Case, async: true
++
++  alias Mydia.Library.MediaFile
++  alias MydiaWeb.StreamLink
++
++  @file_id "6f1c1b7e-0000-4000-8000-000000000001"
++  @user_id "6f1c1b7e-0000-4000-8000-000000000002"
++
++  defp media_file(relative_path) do
++    %MediaFile{id: @file_id, library_path: nil, relative_path: relative_path}
++  end
++
++  defp token_of(path) do
++    ["", "stream", token, _name] = String.split(path, "/")
++    token
++  end
++
++  test "path round-trips through verify to the user and file" do
++    path = StreamLink.path(@user_id, media_file("Zephyr Station (2030)/Zephyr.Station.2030.mkv"))
++
++    assert {:ok, {@user_id, @file_id}} = path |> token_of() |> StreamLink.verify()
++  end
++
++  test "path ends in the encoded basename" do
++    path = StreamLink.path(@user_id, media_file("Emberline (2029)/Emberline 2029 [1080p].mkv"))
++
++    assert String.ends_with?(path, "/Emberline%202029%20%5B1080p%5D.mkv")
++  end
++
++  test "a tampered token does not verify" do
++    token = StreamLink.path(@user_id, media_file("a.mkv")) |> token_of()
++
++    assert StreamLink.verify(token <> "x") == :error
++    assert StreamLink.verify("garbage") == :error
++  end
++end
+diff --git a/test/mydia_web/unrestricted_route_crawl_test.exs b/test/mydia_web/unrestricted_route_crawl_test.exs
+index 69a4d2129..470536239 100644
+--- a/test/mydia_web/unrestricted_route_crawl_test.exs
++++ b/test/mydia_web/unrestricted_route_crawl_test.exs
+@@ -113,6 +113,7 @@ defmodule MydiaWeb.UnrestrictedRouteCrawlTest do
+       "/api/v1/stream/episode/:id" => "/api/v1/stream/episode/#{s.episode.id}",
+       "/api/v1/stream/file/:id" => "/api/v1/stream/file/#{s.movie_file.id}",
+       "/api/v1/stream/:id" => "/api/v1/stream/#{s.movie_file.id}",
++      "/stream/:token/:filename" => MydiaWeb.StreamLink.path(s.user.id, s.movie_file),
+       "/api/v1/stream/:content_type/:id/candidates" =>
+         "/api/v1/stream/episode/#{s.episode.id}/candidates",
+       "/api/player/v1/subtitles/:type/:id" => "/api/player/v1/subtitles/episode/#{s.episode.id}",

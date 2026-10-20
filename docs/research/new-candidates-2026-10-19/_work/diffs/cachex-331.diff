@@ -1,0 +1,135 @@
+diff --git a/lib/cachex.ex b/lib/cachex.ex
+index f7279ad0..c678dcfb 100644
+--- a/lib/cachex.ex
++++ b/lib/cachex.ex
+@@ -292,6 +292,17 @@ defmodule Cachex do
+           iex> Cachex.start_link(:my_cache, [ transactions: true ])
+           { :ok, _pid }
+ 
++    * `:ordered`
++
++      This option will specify whether this cache should use the ETS table type,
++      of `:ordered_set` which can improve performance if ordered traversal of the
++      cache is required. When `:ordered` is `false` insert and lookup times are
++      constant, regardless of the table size. When `:ordered` is `true`  insert
++      and lookup times are proportional to the logarithm of the number of objects in
++      the table. This option defaults to `false`.
++
++          iex> Cachex.start_link(:my_cache, [ ordered: true ])
++          { :ok, _pid }
+   """
+   @spec start_link(atom | Keyword.t()) :: {atom, pid}
+   def start_link(options) when is_list(options) do
+diff --git a/lib/cachex/options.ex b/lib/cachex/options.ex
+index 449be977..86803eb6 100644
+--- a/lib/cachex/options.ex
++++ b/lib/cachex/options.ex
+@@ -25,7 +25,8 @@ defmodule Cachex.Options do
+     :compressed,
+     :expiration,
+     :transactional,
+-    :warmers
++    :warmers,
++    :ordered
+   ]
+ 
+   ##############
+@@ -341,6 +342,16 @@ defmodule Cachex.Options do
+     end
+   end
+ 
++  # Configures a cache based on `ordered` flag
++  #
++  # This will simply configure the `:ordered` field in the cache
++  # record and return the modified record with the flag attached.
++  defp parse_type(:ordered, cache, options),
++    do:
++      cache(cache,
++        ordered: get(options, :ordered, &is_boolean/1, false)
++      )
++
+   # Shorthand validation of a record type.
+   #
+   # This just iterates and ensures all elements in the provided enum
+diff --git a/lib/cachex/services.ex b/lib/cachex/services.ex
+index c1e44b17..4e861a57 100644
+--- a/lib/cachex/services.ex
++++ b/lib/cachex/services.ex
+@@ -165,9 +165,10 @@ defmodule Cachex.Services do
+   # This specification should be included in a cache tree before any others
+   # are started as we should provide the guarantee that the table exists
+   # before any other services are started (to avoid race conditions).
+-  defp table_spec(cache(name: name, compressed: compressed)) do
++  defp table_spec(cache(name: name, compressed: compressed, ordered: ordered)) do
+     server_opts = [name: name(name, :eternal), quiet: true]
+-    tables_opts = (compressed && [:compressed]) || []
++    compressed_opt = (compressed && [:compressed]) || []
++    ordered_opt = (ordered && [:ordered_set]) || []
+ 
+     [
+       %{
+@@ -176,7 +177,7 @@ defmodule Cachex.Services do
+           {Eternal, :start_link,
+            [
+              name,
+-             tables_opts ++ const(:table_options),
++             compressed_opt ++ ordered_opt ++ const(:table_options),
+              server_opts
+            ]},
+         type: :supervisor
+diff --git a/lib/cachex/spec.ex b/lib/cachex/spec.ex
+index aeb228c8..081a1767 100644
+--- a/lib/cachex/spec.ex
++++ b/lib/cachex/spec.ex
+@@ -35,7 +35,8 @@ defmodule Cachex.Spec do
+             limit: limit,
+             nodes: [atom],
+             transactional: boolean,
+-            warmers: [warmer]
++            warmers: [warmer],
++            ordered: boolean
+           )
+ 
+   # Record specification for a command instance
+@@ -125,7 +126,8 @@ defmodule Cachex.Spec do
+     limit: nil,
+     nodes: [],
+     transactional: false,
+-    warmers: []
++    warmers: [],
++    ordered: false
+ 
+   @doc """
+   Creates a command record from the provided values.
+diff --git a/test/cachex/options_test.exs b/test/cachex/options_test.exs
+index 4231009c..4e00dab5 100644
+--- a/test/cachex/options_test.exs
++++ b/test/cachex/options_test.exs
+@@ -135,6 +135,27 @@ defmodule Cachex.OptionsTest do
+     refute comp3
+   end
+ 
++  # This test will verify the parsing of compression flags to determine whether
++  # a cache has them enabled or disabled. This is simply checking whether the flag
++  # is set to true or false, and the default.
++  test "parsing :ordered flags" do
++    # grab a cache name
++    name = Helper.create_name()
++
++    # parse our values as options
++    {:ok, cache(ordered: ordered1)} =
++      Cachex.Options.parse(name, ordered: true)
++
++    {:ok, cache(ordered: ordered2)} =
++      Cachex.Options.parse(name, ordered: false)
++
++    {:ok, cache(ordered: ordered3)} = Cachex.Options.parse(name, [])
++
++    assert ordered1
++    refute ordered2
++    refute ordered3
++  end
++
+   # This test verifies the parsing of TTL related flags. We have to test various
+   # combinations of :ttl_interval and :default_ttl to verify each state correctly.
+   test "parsing :expiration flags" do

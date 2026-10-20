@@ -1,0 +1,139 @@
+diff --git a/lib/phoenix_html/form.ex b/lib/phoenix_html/form.ex
+index 63f1a8a..b95f1e9 100644
+--- a/lib/phoenix_html/form.ex
++++ b/lib/phoenix_html/form.ex
+@@ -289,7 +289,7 @@ defmodule Phoenix.HTML.Form do
+       an atom, string or integer to be used as the option value
+     * simple atom, string or integer - which will be used as both label and value
+       for the generated select
+-    
++
+   ## Option groups
+ 
+   If `options` is map or keyword list where the first element is a string,
+@@ -320,6 +320,12 @@ defmodule Phoenix.HTML.Form do
+       #=>   <option>France</option>
+       #=> </optgroup>
+ 
++  Custom option tags:
++
++      options_for_select(["Admin": "admin", "User": "user"], nil, tag: "opt")
++      #=> <opt value="admin">Admin</opt>
++      #=> <opt value="user">User</opt>
++
+   Horizontal separators can be added:
+ 
+       options_for_select(["Admin", "User", :hr, "New"], nil)
+@@ -336,21 +342,22 @@ defmodule Phoenix.HTML.Form do
+ 
+ 
+   """
+-  def options_for_select(options, selected_values) do
++  def options_for_select(options, selected_values, extra \\ []) do
+     {:safe,
+      escaped_options_for_select(
+        options,
+-       selected_values |> List.wrap() |> Enum.map(&html_escape/1)
++       selected_values |> List.wrap() |> Enum.map(&html_escape/1),
++       extra
+      )}
+   end
+ 
+-  defp escaped_options_for_select(options, selected_values) do
++  defp escaped_options_for_select(options, selected_values, extra) do
+     Enum.reduce(options, [], fn
+       {:hr, nil}, acc ->
+         [acc | hr_tag()]
+ 
+       {option_key, option_value}, acc ->
+-        [acc | option(option_key, option_value, [], selected_values)]
++        [acc | option(option_key, option_value, extra, selected_values)]
+ 
+       options, acc when is_list(options) ->
+         {option_key, options} =
+@@ -373,19 +380,19 @@ defmodule Phoenix.HTML.Form do
+               {value, options}
+           end
+ 
+-        [acc | option(option_key, option_value, options, selected_values)]
++        [acc | option(option_key, option_value, extra ++ options, selected_values)]
+ 
+       :hr, acc ->
+         [acc | hr_tag()]
+ 
+       option, acc ->
+-        [acc | option(option, option, [], selected_values)]
++        [acc | option(option, option, extra, selected_values)]
+     end)
+   end
+ 
+-  defp option(group_label, group_values, [], value)
++  defp option(group_label, group_values, extra, value)
+        when is_list(group_values) or is_map(group_values) do
+-    section_options = escaped_options_for_select(group_values, value)
++    section_options = escaped_options_for_select(group_values, value, extra)
+     option_tag("optgroup", [label: group_label], {:safe, section_options})
+   end
+ 
+@@ -393,7 +400,8 @@ defmodule Phoenix.HTML.Form do
+     option_key = html_escape(option_key)
+     option_value = html_escape(option_value)
+     attrs = extra ++ [selected: option_value in value, value: option_value]
+-    option_tag("option", attrs, option_key)
++    {tag, attrs} = Keyword.pop(attrs, :tag, "option")
++    option_tag(tag, attrs, option_key)
+   end
+ 
+   defp option_tag(name, attrs, {:safe, body}) when is_binary(name) and is_list(attrs) do
+diff --git a/test/phoenix_html/form_test.exs b/test/phoenix_html/form_test.exs
+index b8b2921..87e7416 100644
+--- a/test/phoenix_html/form_test.exs
++++ b/test/phoenix_html/form_test.exs
+@@ -295,6 +295,47 @@ defmodule Phoenix.HTML.FormTest do
+                  ~s(<option value="new">New</option>)
+     end
+ 
++    test "with custom option tag" do
++      assert options_for_select(["value", "novalue", nil], "novalue", tag: "el-option")
++             |> safe_to_string() ==
++               ~s(<el-option value="value">value</el-option>) <>
++                 ~s(<el-option selected value="novalue">novalue</el-option>) <>
++                 ~s(<el-option value=""></el-option>)
++
++      assert options_for_select(["value", :hr, "novalue"], "novalue", tag: "el-option")
++             |> safe_to_string() ==
++               ~s(<el-option value="value">value</el-option>) <>
++                 ~s(<hr/>) <>
++                 ~s(<el-option selected value="novalue">novalue</el-option>)
++
++      assert options_for_select(
++               [
++                 [value: "value", key: "Value", disabled: true],
++                 :hr,
++                 [value: "novalue", key: "No Value"],
++                 [value: nil, key: nil]
++               ],
++               "novalue",
++               tag: "el-option"
++             )
++             |> safe_to_string() ==
++               ~s(<el-option disabled value="value">Value</el-option>) <>
++                 ~s(<hr/>) <>
++                 ~s(<el-option selected value="novalue">No Value</el-option>) <>
++                 ~s(<el-option value=""></el-option>)
++
++      assert options_for_select(~w(value novalue), ["value", "novalue"], tag: "el-option")
++             |> safe_to_string() ==
++               ~s(<el-option selected value="value">value</el-option>) <>
++                 ~s(<el-option selected value="novalue">novalue</el-option>)
++
++      assert options_for_select([Label: "value", hr: nil, New: "new"], nil, tag: "el-option")
++             |> safe_to_string() ==
++               ~s(<el-option value="value">Label</el-option>) <>
++                 ~s(<hr/>) <>
++                 ~s(<el-option value="new">New</el-option>)
++    end
++
+     test "with groups" do
+       assert options_for_select([{"foo", ["bar", :hr, "baz"]}, {"qux", ~w(qux quz)}], "qux")
+              |> safe_to_string() ==

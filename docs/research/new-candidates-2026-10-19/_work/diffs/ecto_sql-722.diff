@@ -1,0 +1,43 @@
+diff --git a/lib/ecto/adapters/postgres/connection.ex b/lib/ecto/adapters/postgres/connection.ex
+index c7f6282b..f5d3faf6 100644
+--- a/lib/ecto/adapters/postgres/connection.ex
++++ b/lib/ecto/adapters/postgres/connection.ex
+@@ -1204,6 +1204,9 @@ if Code.ensure_loaded?(Postgrex) do
+     defp returning([]),
+       do: []
+ 
++    defp returning({:unsafe_fragment, fragment}),
++      do: [" RETURNING ", fragment]
++
+     defp returning(returning),
+       do: [" RETURNING " | quote_names(returning)]
+ 
+diff --git a/lib/ecto/adapters/tds/connection.ex b/lib/ecto/adapters/tds/connection.ex
+index 1c397f8e..be1cf229 100644
+--- a/lib/ecto/adapters/tds/connection.ex
++++ b/lib/ecto/adapters/tds/connection.ex
+@@ -1027,6 +1027,9 @@ if Code.ensure_loaded?(Tds) do
+ 
+     defp returning([], _verb), do: []
+ 
++    defp returning({:unsafe_fragment, fragment}, _verb),
++      do: [" OUTPUT ", fragment]
++
+     defp returning(returning, verb) when is_list(returning) do
+       [" OUTPUT ", Enum.map_intersperse(returning, ", ", &[verb, ?., quote_name(&1)])]
+     end
+diff --git a/test/ecto/adapters/postgres_test.exs b/test/ecto/adapters/postgres_test.exs
+index cea992a3..a9dd03bf 100644
+--- a/test/ecto/adapters/postgres_test.exs
++++ b/test/ecto/adapters/postgres_test.exs
+@@ -1877,6 +1877,10 @@ defmodule Ecto.Adapters.PostgresTest do
+ 
+     query = insert("prefix", "schema", [], [[]], {:raise, [], []}, [])
+     assert query == ~s{INSERT INTO "prefix"."schema" VALUES (DEFAULT)}
++
++    # With unsafe_fragment in returning
++    query = insert(nil, "schema", [:x, :y], [[:x, :y]], {:raise, [], []}, {:unsafe_fragment, ~s{"id", ("x" = "y") AS "was_equal"}})
++    assert query == ~s{INSERT INTO "schema" ("x","y") VALUES ($1,$2) RETURNING "id", ("x" = "y") AS "was_equal"}
+   end
+ 
+   test "insert with on conflict" do

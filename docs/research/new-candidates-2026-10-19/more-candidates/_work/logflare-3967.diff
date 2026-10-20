@@ -1,0 +1,939 @@
+diff --git a/bench/ingest_byte_accounting.exs b/bench/ingest_byte_accounting.exs
+new file mode 100644
+index 0000000000..92c60f723c
+--- /dev/null
++++ b/bench/ingest_byte_accounting.exs
+@@ -0,0 +1,89 @@
++# Snapshot the pre-feedback transformer, then run without starting the application:
++# jj file show -r 2dc251d0 lib/logflare/logs/ingest_transformers.ex > /tmp/byte-accounting-baseline.ex
++# BYTE_ACCOUNTING_BASELINE=/tmp/byte-accounting-baseline.ex ../bin/x mix run --no-start bench/ingest_byte_accounting.exs
++
++alias Logflare.LogEvent
++alias Logflare.Logs.IngestTransformers
++
++baseline_path = System.fetch_env!("BYTE_ACCOUNTING_BASELINE")
++
++baseline_path
++|> File.read!()
++|> String.replace(
++  "defmodule Logflare.Logs.IngestTransformers do",
++  "defmodule ByteAccountingBaseline do"
++)
++|> Code.compile_string()
++
++inputs = %{
++  "small log" => %{
++    "event_message" => "request completed",
++    "timestamp" => 1_790_000_000_000_000,
++    "metadata" => %{"status" => 200, "cached" => false}
++  },
++  "key-heavy edge log (synthetic)" => %{
++    "event_message" => "GET /rest/v1/example",
++    "timestamp" => 1_790_000_000_000_000,
++    "metadata" =>
++      Map.new(1..80, fn n ->
++        {"CloudflareRequestAttribute_#{n}", if(rem(n, 3) == 0, do: n, else: "value-#{n}")}
++      end)
++  },
++  "nested log" => %{
++    "metadata" =>
++      Enum.map(1..20, fn n ->
++        %{"request" => %{"status-code" => 200, "path" => "/path/#{n}", "empty" => nil}}
++      end)
++  },
++  "numeric histogram" => %{
++    "metric_name" => "request_latency",
++    "bucket_counts" => Enum.to_list(1..1024),
++    "explicit_bounds" => Enum.map(1..1024, &(&1 / 10))
++  }
++}
++
++baseline = fn input -> ByteAccountingBaseline.transform(input, :clean_to_bigquery_column_spec) end
++
++for {name, input} <- inputs do
++  body = baseline.(input)
++  {fused_body, accounted_bytes} = IngestTransformers.transform_with_byte_size(input)
++  true = body == fused_body
++  true = accounted_bytes == LogEvent.body_byte_size(body)
++  IO.puts("#{name}: batch=#{:erlang.external_size(body)} accounted=#{accounted_bytes}")
++end
++
++time = System.get_env("BYTE_ACCOUNTING_BENCH_TIME", "2") |> String.to_integer()
++
++Benchee.run(
++  %{
++    "existing transform + batch estimate" => fn input ->
++      body = baseline.(input)
++      {body, :erlang.external_size(body)}
++    end,
++    "separate accounting + batch estimate" => fn input ->
++      body = baseline.(input)
++      {body, :erlang.external_size(body), LogEvent.body_byte_size(body)}
++    end,
++    "fused accounting + batch estimate" => fn input ->
++      {body, bytes} = IngestTransformers.transform_with_byte_size(input)
++      {body, :erlang.external_size(body), bytes}
++    end,
++    "separate accounting + three queue calculations" => fn input ->
++      body = baseline.(input)
++      for _ <- 1..3, do: {:erlang.external_size(body), LogEvent.body_byte_size(body)}
++    end,
++    "fused accounting + three cached queue reads" => fn input ->
++      {body, bytes} = IngestTransformers.transform_with_byte_size(input)
++      event = LogEvent.cache_sizes(%LogEvent{body: body, accounted_bytes: bytes})
++      for _ <- 1..3, do: {LogEvent.batch_byte_size(event), LogEvent.accounted_byte_size(event)}
++    end
++  },
++  inputs: inputs,
++  time: time,
++  warmup: 1,
++  memory_time: 1,
++  reduction_time: 1,
++  parallel: 1,
++  print: [configuration: true, benchmarking: false],
++  formatters: [{Benchee.Formatters.Console, extended_statistics: false}]
++)
+diff --git a/bench/ingest_byte_accounting.md b/bench/ingest_byte_accounting.md
+new file mode 100644
+index 0000000000..ff9e2ed6d7
+--- /dev/null
++++ b/bench/ingest_byte_accounting.md
+@@ -0,0 +1,63 @@
++# Values-only ingestion accounting (O11Y-2541)
++
++Ingestion accounting excludes field names and structural overhead. Strings use
++byte length, integers decimal text length, floats `Float.to_string/1` length,
++booleans one byte, and nil zero bytes. This is an accounting policy, not a
++ClickHouse storage or transport measurement.
++
++The existing batch estimate remains `:erlang.external_size(event.body)`. Normal
++ingestion accumulates accounting during the existing cleaning/key-normalization
++pass, adjusts it for generated fields and duplicate messages, and caches both
++measurements after source transformations and custom-message generation, before
++backend fanout. Queue insertion, retries, S3 batching and ingestion telemetry
++reuse the applicable cached measurement.
++
++Body changes must invalidate the caches via `LogEvent.replace_body/2` or update
++them explicitly. Custom messages update accounting by a value delta; copy,
++enrichment, drop-field and Datadog body changes invalidate the caches. Spool
++records intentionally do not persist counters. Reconstructed/uncached events and
++normalized-key collisions have a correct full-traversal fallback.
++
++## Reproduce
++
++From a provisioned workspace:
++
++```sh
++jj file show -r 2dc251d0 lib/logflare/logs/ingest_transformers.ex > /tmp/byte-accounting-baseline.ex
++BYTE_ACCOUNTING_BASELINE=/tmp/byte-accounting-baseline.ex \
++  ../bin/x mix run --no-start bench/ingest_byte_accounting.exs
++```
++
++The script compiles the pre-feedback transformer under a separate module name,
++checks output equivalence, and compares existing sizing, a separate accounting
++pass, fused accounting, and three-queue reuse. It measures transformation and
++sizing only: not complete ingestion, ETS copying, network calls or compression.
++
++## Local results
++
++Recorded 2026-10-07 on Linux, Elixir 1.19.5/OTP 27, Benchee 1.5.0, one benchmark
++worker, two seconds timing plus one second each of warmup, memory and reductions.
++Inputs are synthetic; the histogram has 1,024 integers and 1,024 floats. Timing is
++noisy, especially for sub-microsecond small logs; these are directional results,
++not production throughput guarantees.
++
++Median transformation plus one batch estimate:
++
++| Input | Existing (no values-only accounting) | Separate accounting | Fused accounting |
++| --- | ---: | ---: | ---: |
++| Small log | 0.208 µs | 0.250 µs | 0.209 µs |
++| Key-heavy edge log | 10.21 µs | 10.50 µs | 10.17 µs |
++| Nested log | 5.38 µs | 6.00 µs | 5.63 µs |
++| Numeric histogram | 13.13 µs | 47.58 µs | 40.71 µs |
++
++For the histogram, fused accounting used 81.45 KiB of allocated memory versus
++53.04 KiB without accounting and 77.16 KiB with a separate accounting pass. A
++separate scalar-argument list accumulator and integer digit counting without
++temporary strings reduced the first fused prototype from 160.67 KiB to 81.45 KiB. Float
++text sizing still allocates; fusion does not make numeric accounting free.
++
++Three-queue histogram sizing took a median 116.42 µs when recalculating both
++measurements per queue versus 40.79 µs when fusing accounting and caching both
++measurements once. The equivalent key-heavy-log medians were 12.71 µs and
++10.33 µs. Those comparisons illustrate avoided recomputation, not the overall
++performance delta against today's complete ingestion path.
+diff --git a/lib/logflare/backends.ex b/lib/logflare/backends.ex
+index 1dff44a8f4..f42ebcd272 100644
+--- a/lib/logflare/backends.ex
++++ b/lib/logflare/backends.ex
+@@ -792,7 +792,7 @@ defmodule Logflare.Backends do
+               {events, errors, total + 1, bump(tally, :drop_future)}
+ 
+             le ->
+-              {[le | events], errors, total + 1, tally}
++              {[LogEvent.cache_sizes(le) | events], errors, total + 1, tally}
+           end
+       end
+ 
+diff --git a/lib/logflare/backends/adaptor/datadog_adaptor.ex b/lib/logflare/backends/adaptor/datadog_adaptor.ex
+index 46eb3b7e98..7379f4ff9d 100644
+--- a/lib/logflare/backends/adaptor/datadog_adaptor.ex
++++ b/lib/logflare/backends/adaptor/datadog_adaptor.ex
+@@ -106,14 +106,11 @@ defmodule Logflare.Backends.Adaptor.DatadogAdaptor do
+ 
+     formatted_message = "#{formatted_ts} #{le.body["message"] || le.body["event_message"] || ""}"
+ 
+-    %Logflare.LogEvent{
+-      le
+-      | body: %{
+-          "message" => formatted_message,
+-          "ddsource" => "Supabase",
+-          "service" => source.service_name || source.name,
+-          "data" => le.body
+-        }
+-    }
++    Logflare.LogEvent.replace_body(le, %{
++      "message" => formatted_message,
++      "ddsource" => "Supabase",
++      "service" => source.service_name || source.name,
++      "data" => le.body
++    })
+   end
+ end
+diff --git a/lib/logflare/backends/adaptor/s3_adaptor/pipeline.ex b/lib/logflare/backends/adaptor/s3_adaptor/pipeline.ex
+index 3e515f2c40..3503702bab 100644
+--- a/lib/logflare/backends/adaptor/s3_adaptor/pipeline.ex
++++ b/lib/logflare/backends/adaptor/s3_adaptor/pipeline.ex
+@@ -163,7 +163,7 @@ defmodule Logflare.Backends.Adaptor.S3Adaptor.Pipeline do
+ 
+         # check content length
+         message, {count, len} ->
+-          length = message_size(message.data.body)
++          length = message_size(message.data)
+ 
+           if len - length <= 0 do
+             # below max batch count, but reach max batch length
+@@ -176,8 +176,6 @@ defmodule Logflare.Backends.Adaptor.S3Adaptor.Pipeline do
+     }
+   end
+ 
+-  @spec message_size(any()) :: non_neg_integer()
+-  defp message_size(data) do
+-    :erlang.external_size(data)
+-  end
++  @spec message_size(LogEvent.t()) :: non_neg_integer()
++  defp message_size(event), do: LogEvent.batch_byte_size(event)
+ end
+diff --git a/lib/logflare/backends/ingest_event_queue.ex b/lib/logflare/backends/ingest_event_queue.ex
+index abb41b2026..27222f4364 100644
+--- a/lib/logflare/backends/ingest_event_queue.ex
++++ b/lib/logflare/backends/ingest_event_queue.ex
+@@ -768,7 +768,7 @@ defmodule Logflare.Backends.IngestEventQueue do
+     gen_event_id = make_ref()
+ 
+     row =
+-      {id, gen_tid, gen_event_id, :erlang.external_size(event.body), event.retries || 0,
++      {id, gen_tid, gen_event_id, LogEvent.batch_byte_size(event), event.retries || 0,
+        event.event_type, event.day_bucket, handle}
+ 
+     try do
+diff --git a/lib/logflare/logs/ingest_transformers.ex b/lib/logflare/logs/ingest_transformers.ex
+index 07ee66ed34..eb4d910c6b 100644
+--- a/lib/logflare/logs/ingest_transformers.ex
++++ b/lib/logflare/logs/ingest_transformers.ex
+@@ -2,6 +2,7 @@ defmodule Logflare.Logs.IngestTransformers do
+   @moduledoc false
+   import Logflare.EnumDeepUpdate, only: [update_all_keys_deep: 2]
+ 
++  alias Logflare.LogEvent.Size
+   alias Logflare.Logs.Ingest.MetadataCleaner
+ 
+   @alphanumeric_regex ~r/\W/
+@@ -22,12 +23,8 @@ defmodule Logflare.Logs.IngestTransformers do
+ 
+   @spec transform(map(), direct_transform() | [transform_rule()]) :: map()
+   def transform(log_params, :clean_to_bigquery_column_spec) when is_map(log_params) do
+-    clean_and_to_bigquery_column_spec(log_params)
+-  catch
+-    :throw, :normalized_bigquery_column_collision ->
+-      log_params
+-      |> MetadataCleaner.deep_reject_nil_and_empty()
+-      |> transform(:to_bigquery_column_spec)
++    {body, _bytes} = transform_with_byte_size(log_params)
++    body
+   end
+ 
+   def transform(log_params, :to_bigquery_column_spec) when is_map(log_params) do
+@@ -38,45 +35,64 @@ defmodule Logflare.Logs.IngestTransformers do
+     Enum.reduce(rules, log_params, &do_transform(&2, &1))
+   end
+ 
++  @doc """
++  Cleans and normalizes an ingestion body while counting its retained values.
++  """
++  @spec transform_with_byte_size(map()) :: {map(), non_neg_integer()}
++  def transform_with_byte_size(log_params) when is_map(log_params) do
++    clean_and_to_bigquery_column_spec(log_params)
++  catch
++    :throw, :normalized_bigquery_column_collision ->
++      body =
++        log_params
++        |> MetadataCleaner.deep_reject_nil_and_empty()
++        |> transform(:to_bigquery_column_spec)
++
++      {body, Size.body_byte_size(body)}
++  end
++
+   defp clean_and_to_bigquery_column_spec(data) when is_map(data) do
+     :maps.fold(
+       fn
+         _k, v, acc when is_nil_or_empty(v) ->
+           acc
+ 
+-        k, v, acc when is_map(v) or is_list(v) ->
+-          cleaned = clean_and_to_bigquery_column_spec(v)
++        k, v, {body, bytes} when is_map(v) or is_list(v) ->
++          {cleaned, value_bytes} = clean_and_to_bigquery_column_spec(v)
+ 
+           if is_nil_or_empty(cleaned) do
+-            acc
++            {body, bytes}
+           else
+-            put_bigquery_column(acc, k, cleaned)
++            {put_bigquery_column(body, k, cleaned), bytes + value_bytes}
+           end
+ 
+-        k, v, acc ->
+-          put_bigquery_column(acc, k, v)
++        k, v, {body, bytes} ->
++          {put_bigquery_column(body, k, v), bytes + Size.body_byte_size(v)}
+       end,
+-      %{},
++      {%{}, 0},
+       data
+     )
+   end
+ 
+-  defp clean_and_to_bigquery_column_spec(data) when is_list(data) do
+-    data
+-    |> Enum.reduce([], fn
+-      x, acc when is_nil_or_empty(x) ->
+-        acc
++  defp clean_and_to_bigquery_column_spec(data) when is_list(data),
++    do: clean_bigquery_list(data, [], 0)
+ 
+-      x, acc when is_map(x) or is_list(x) ->
+-        cleaned = clean_and_to_bigquery_column_spec(x)
+-        if is_nil_or_empty(cleaned), do: acc, else: [cleaned | acc]
++  defp clean_bigquery_list([], items, bytes), do: {Enum.reverse(items), bytes}
+ 
+-      x, acc ->
+-        [x | acc]
+-    end)
+-    |> Enum.reverse()
++  defp clean_bigquery_list([x | rest], items, bytes) when is_nil_or_empty(x),
++    do: clean_bigquery_list(rest, items, bytes)
++
++  defp clean_bigquery_list([x | rest], items, bytes) when is_map(x) or is_list(x) do
++    {cleaned, value_bytes} = clean_and_to_bigquery_column_spec(x)
++
++    if is_nil_or_empty(cleaned),
++      do: clean_bigquery_list(rest, items, bytes),
++      else: clean_bigquery_list(rest, [cleaned | items], bytes + value_bytes)
+   end
+ 
++  defp clean_bigquery_list([x | rest], items, bytes),
++    do: clean_bigquery_list(rest, [x | items], bytes + Size.body_byte_size(x))
++
+   @compile {:inline, put_bigquery_column: 3}
+   @spec put_bigquery_column(map(), term(), term()) :: map()
+   defp put_bigquery_column(acc, key, value) do
+diff --git a/lib/logflare/logs/log_event.ex b/lib/logflare/logs/log_event.ex
+index 58d50177b3..f8c2256ad5 100644
+--- a/lib/logflare/logs/log_event.ex
++++ b/lib/logflare/logs/log_event.ex
+@@ -8,6 +8,7 @@ defmodule Logflare.LogEvent do
+ 
+   alias __MODULE__, as: LE
+   alias __MODULE__.DayBucket
++  alias __MODULE__.Size
+   alias __MODULE__.TypeDetection
+   alias Logflare.KeyValues
+   alias Logflare.Logs.Ingest.MetadataCleaner
+@@ -32,6 +33,8 @@ defmodule Logflare.LogEvent do
+     field :event_type, Ecto.Enum, values: [:log, :metric, :trace], default: :log
+     field :source_id, :integer, default: nil
+     field :day_bucket, :integer
++    field :accounted_bytes, :integer, virtual: true
++    field :batch_bytes, :integer, virtual: true
+     # Indicates if the event was removed from ets during ingest
+     field :is_popped, :boolean, virtual: true, default: false
+     field :spool_handle, :any, virtual: true, default: nil
+@@ -143,6 +146,7 @@ defmodule Logflare.LogEvent do
+ 
+     %{
+       "body" => %{"id" => id, "timestamp" => timestamp} = body,
++      "accounted_bytes" => accounted_bytes,
+       "timestamp_inferred" => timestamp_inferred
+     } = mapper_for_ingest(params, event_type)
+ 
+@@ -150,6 +154,7 @@ defmodule Logflare.LogEvent do
+ 
+     %__MODULE__{
+       body: body,
++      accounted_bytes: accounted_bytes,
+       source_id: source_id,
+       source_uuid: source_uuid,
+       source_name: source_name,
+@@ -165,14 +170,18 @@ defmodule Logflare.LogEvent do
+   end
+ 
+   @spec mapper_from_db(map(), TypeDetection.event_type()) :: %{String.t() => term}
+-  defp mapper_from_db(params, event_type),
+-    do: mapper(params, event_type, &MetadataCleaner.deep_reject_nil_and_empty/1)
++  defp mapper_from_db(params, event_type) do
++    mapper(params, event_type, fn body ->
++      {MetadataCleaner.deep_reject_nil_and_empty(body), nil}
++    end)
++  end
+ 
+   @spec mapper_for_ingest(map(), TypeDetection.event_type()) :: %{String.t() => term}
+   defp mapper_for_ingest(params, event_type),
+     do: mapper(params, event_type, &clean_ingest_body/1)
+ 
+-  @spec mapper(map(), TypeDetection.event_type(), (map() -> map())) :: %{String.t() => term}
++  @spec mapper(map(), TypeDetection.event_type(), (map() -> {map(), non_neg_integer() | nil})) ::
++          %{String.t() => term}
+   defp mapper(params, event_type, clean_body) do
+     # TODO: deprecate and remove `message`
+     event_message = params["message"] || params["event_message"]
+@@ -192,20 +201,23 @@ defmodule Logflare.LogEvent do
+         base_merge
+       end
+ 
+-    body =
+-      params
+-      |> clean_body.()
+-      |> Map.merge(base_merge)
+-      |> case do
+-        %{"message" => m, "event_message" => em} = map when m == em ->
+-          Map.delete(map, "message")
+-
+-        other ->
+-          other
++    {body, accounted_bytes} =
++      Enum.reduce(base_merge, clean_body.(params), fn {key, value}, {body, bytes} ->
++        {Map.put(body, key, value), adjust_byte_size(bytes, Map.get(body, key), value)}
++      end)
++
++    {body, accounted_bytes} =
++      case body do
++        %{"message" => m, "event_message" => em} when m == em ->
++          {Map.delete(body, "message"), adjust_byte_size(accounted_bytes, m, nil)}
++
++        _ ->
++          {body, accounted_bytes}
+       end
+ 
+     %{
+       "body" => body,
++      "accounted_bytes" => accounted_bytes,
+       "id" => id,
+       "timestamp_inferred" => timestamp_inferred
+     }
+@@ -234,9 +246,8 @@ defmodule Logflare.LogEvent do
+     end)
+   end
+ 
+-  @spec clean_ingest_body(map()) :: map()
+-  defp clean_ingest_body(params),
+-    do: IngestTransformers.transform(params, :clean_to_bigquery_column_spec)
++  @spec clean_ingest_body(map()) :: {map(), non_neg_integer()}
++  defp clean_ingest_body(params), do: IngestTransformers.transform_with_byte_size(params)
+ 
+   @spec transform(LE.t(), Source.t()) :: LE.t()
+   defp transform(%LE{} = le, %Source{} = source) do
+@@ -267,7 +278,7 @@ defmodule Logflare.LogEvent do
+         end
+       end)
+ 
+-    {:ok, %{le | body: new_body}}
++    {:ok, replace_body(le, new_body)}
+   end
+ 
+   defp copy_fields(%LE{} = le, %Source{} = source) do
+@@ -287,7 +298,7 @@ defmodule Logflare.LogEvent do
+         apply_kv_instruction(acc, instruction, user_id)
+       end)
+ 
+-    {:ok, %{le | body: new_body}}
++    {:ok, replace_body(le, new_body)}
+   end
+ 
+   # Fallback: parse at ingestion time when parsed field is not populated
+@@ -335,7 +346,7 @@ defmodule Logflare.LogEvent do
+   defp drop_fields(%LE{} = le, %Source{transform_drop_fields_parsed: parsed})
+        when is_list(parsed) do
+     new_body = Enum.reduce(parsed, le.body, fn keys, acc -> drop_field_at(acc, keys) end)
+-    {:ok, %{le | body: new_body}}
++    {:ok, replace_body(le, new_body)}
+   end
+ 
+   defp drop_fields(%LE{} = le, %Source{} = source) do
+@@ -367,8 +378,19 @@ defmodule Logflare.LogEvent do
+   def apply_custom_event_message(%LE{} = le, %Source{} = source) do
+     message = make_message(le, source)
+ 
+-    le
+-    |> Kernel.put_in([Access.key(:body), "event_message"], message)
++    body = Map.put(le.body, "event_message", message)
++
++    if body === le.body do
++      le
++    else
++      %{
++        le
++        | body: body,
++          accounted_bytes:
++            adjust_byte_size(le.accounted_bytes, le.body["event_message"], message),
++          batch_bytes: nil
++      }
++    end
+   end
+ 
+   @doc """
+@@ -422,6 +444,48 @@ defmodule Logflare.LogEvent do
+     log_event.body["message"] || log_event.body["event_message"]
+   end
+ 
++  @doc """
++  Values-only ingestion bytes, excluding map keys and structural overhead.
++  See `Logflare.LogEvent.Size` for scalar accounting rules.
++  """
++  @spec body_byte_size(term()) :: non_neg_integer()
++  defdelegate body_byte_size(value), to: Size
++
++  @doc """
++  Replaces a body and invalidates its cached sizes. Body mutations must use this
++  function or maintain both size fields explicitly.
++  """
++  @spec replace_body(LE.t(), map()) :: LE.t()
++  def replace_body(%LE{body: body} = le, new_body) when body === new_body, do: le
++
++  def replace_body(%LE{} = le, body),
++    do: %{le | body: body, accounted_bytes: nil, batch_bytes: nil}
++
++  @doc """
++  Caches both measurements for reuse across dispatch, queue insertion and retries.
++  The batch estimate retains Erlang external-format sizing, including map keys.
++  """
++  @spec cache_sizes(LE.t()) :: LE.t()
++  def cache_sizes(%LE{} = le) do
++    %{le | accounted_bytes: accounted_byte_size(le), batch_bytes: batch_byte_size(le)}
++  end
++
++  @spec accounted_byte_size(LE.t()) :: non_neg_integer()
++  def accounted_byte_size(%LE{accounted_bytes: bytes}) when is_non_negative_integer(bytes),
++    do: bytes
++
++  def accounted_byte_size(%LE{body: body}), do: body_byte_size(body)
++
++  @spec batch_byte_size(LE.t()) :: non_neg_integer()
++  def batch_byte_size(%LE{batch_bytes: bytes}) when is_non_negative_integer(bytes), do: bytes
++  def batch_byte_size(%LE{body: body}), do: :erlang.external_size(body)
++
++  @spec adjust_byte_size(non_neg_integer() | nil, term(), term()) :: non_neg_integer() | nil
++  defp adjust_byte_size(nil, _old_value, _new_value), do: nil
++
++  defp adjust_byte_size(bytes, old_value, new_value),
++    do: bytes - body_byte_size(old_value) + body_byte_size(new_value)
++
+   @spec query_json(map(), String.t()) :: String.t()
+   defp query_json(metadata, query) do
+     case Warpath.query(metadata, query) do
+diff --git a/lib/logflare/logs/log_event/size.ex b/lib/logflare/logs/log_event/size.ex
+new file mode 100644
+index 0000000000..0b80a2b8e8
+--- /dev/null
++++ b/lib/logflare/logs/log_event/size.ex
+@@ -0,0 +1,35 @@
++defmodule Logflare.LogEvent.Size do
++  @moduledoc """
++  Values-only ingestion accounting, independent of transport and storage encoding.
++
++  Strings contribute their byte length, numbers their Elixir textual length,
++  booleans one byte, and nil zero bytes. Maps exclude keys and lists exclude
++  structural overhead. Other atoms use their name's byte length; remaining
++  non-JSON leaves retain Erlang external-format sizing.
++  """
++
++  @spec body_byte_size(term()) :: non_neg_integer()
++  def body_byte_size(value) when is_binary(value), do: byte_size(value)
++  def body_byte_size(value) when is_integer(value) and value < 0, do: 1 + integer_digits(-value)
++  def body_byte_size(value) when is_integer(value), do: integer_digits(value)
++  def body_byte_size(value) when is_float(value), do: byte_size(Float.to_string(value))
++  def body_byte_size(value) when is_boolean(value), do: 1
++  def body_byte_size(nil), do: 0
++  def body_byte_size(value) when is_atom(value), do: byte_size(Atom.to_string(value))
++
++  def body_byte_size(value) when is_map(value) and not is_struct(value) do
++    :maps.fold(fn _key, value, bytes -> bytes + body_byte_size(value) end, 0, value)
++  end
++
++  def body_byte_size(value) when is_list(value) do
++    Enum.reduce(value, 0, fn value, bytes -> bytes + body_byte_size(value) end)
++  end
++
++  def body_byte_size(value), do: :erlang.external_size(value)
++
++  @spec integer_digits(non_neg_integer()) :: pos_integer()
++  defp integer_digits(value) when value < 10, do: 1
++  defp integer_digits(value) when value < 100, do: 2
++  defp integer_digits(value) when value < 1000, do: 3
++  defp integer_digits(value), do: 3 + integer_digits(div(value, 1000))
++end
+diff --git a/lib/logflare/sources/source/bigquery/pipeline.ex b/lib/logflare/sources/source/bigquery/pipeline.ex
+index 4fdf216d42..0e31f9e704 100644
+--- a/lib/logflare/sources/source/bigquery/pipeline.ex
++++ b/lib/logflare/sources/source/bigquery/pipeline.ex
+@@ -664,9 +664,10 @@ defmodule Logflare.Sources.Source.BigQuery.Pipeline do
+     backend_metadata = backend_metadata(context.backend_id)
+     queue = {context.source_id, context.backend_id, nil}
+ 
+-    for {_msg, le, size} <- triples do
++    for {_msg, le, _batch_bytes} <- triples do
+       event_labels = Sources.extract_labels(label_mapping, le)
+-      emit_event_telemetry(queue, source, event_labels, size, backend_metadata)
++      accounted_bytes = LE.accounted_byte_size(le)
++      emit_event_telemetry(queue, source, event_labels, accounted_bytes, backend_metadata)
+     end
+   end
+ 
+diff --git a/test/logflare/backends/adaptor/datadog_adaptor_test.exs b/test/logflare/backends/adaptor/datadog_adaptor_test.exs
+index 122e42f5c7..fae052f5fb 100644
+--- a/test/logflare/backends/adaptor/datadog_adaptor_test.exs
++++ b/test/logflare/backends/adaptor/datadog_adaptor_test.exs
+@@ -18,6 +18,20 @@ defmodule Logflare.Backends.Adaptor.DatadogAdaptorTest do
+     :ok
+   end
+ 
++  test "pre_ingest invalidates size caches when translating the event body" do
++    source = build(:source)
++    backend = build(:backend, type: :datadog)
++    event = build(:log_event, source: source) |> Logflare.LogEvent.cache_sizes()
++
++    assert [translated] = @subject.pre_ingest(source, backend, [event])
++    assert translated.body["data"] == event.body
++    assert translated.accounted_bytes == nil
++    assert translated.batch_bytes == nil
++    cached = Logflare.LogEvent.cache_sizes(translated)
++    assert cached.accounted_bytes == Logflare.LogEvent.body_byte_size(translated.body)
++    assert cached.batch_bytes == :erlang.external_size(translated.body)
++  end
++
+   describe "cast and validate" do
+     test "API key is required and region only accepts valid regions" do
+       changeset = Adaptor.cast_and_validate_config(@subject, %{})
+diff --git a/test/logflare/backends/ingest_event_queue_test.exs b/test/logflare/backends/ingest_event_queue_test.exs
+index 5bdd37039f..6235e19af0 100644
+--- a/test/logflare/backends/ingest_event_queue_test.exs
++++ b/test/logflare/backends/ingest_event_queue_test.exs
+@@ -707,6 +707,30 @@ defmodule Logflare.Backends.IngestEventQueueTest do
+       assert IngestEventQueue.total_pending(key) == 0
+     end
+ 
++    test "cached sizes survive queue insertion and retry without changing the batch estimate", %{
++      source: source,
++      sbp: sbp
++    } do
++      event =
++        build(:log_event, source: source, metadata: %{"a-long-attribute-name" => "x"})
++        |> LogEvent.cache_sizes()
++
++      assert :ok = IngestEventQueue.add_to_table(sbp, [event])
++      assert {:ok, [pointer], _tid} = IngestEventQueue.pop_pending_pointers(sbp, 1)
++      assert pointer.size == :erlang.external_size(event.body)
++      assert pointer.size > event.accounted_bytes
++      assert IngestEventQueue.lookup_event(pointer.tid, pointer.gen_event_id) == event
++
++      retried = %{event | retries: 1}
++      assert :ok = IngestEventQueue.add_to_table(sbp, [retried])
++      assert {:ok, [retry_pointer], _tid} = IngestEventQueue.pop_pending_pointers(sbp, 1)
++      assert retry_pointer.size == pointer.size
++      assert retry_pointer.retries == 1
++
++      assert IngestEventQueue.lookup_event(retry_pointer.tid, retry_pointer.gen_event_id) ==
++               retried
++    end
++
+     test "pointers carry routing metadata and can resolve the full event via lookup_event/2",
+          %{source: source, sbp: sbp} do
+       log_ev =
+diff --git a/test/logflare/backends_test.exs b/test/logflare/backends_test.exs
+index 950cb67c2c..4327921485 100644
+--- a/test/logflare/backends_test.exs
++++ b/test/logflare/backends_test.exs
+@@ -1607,6 +1607,16 @@ defmodule Logflare.BackendsTest do
+ 
+       {:ok, system_events} = IngestEventQueue.fetch_events({source.id, nil}, 10)
+       assert length(system_events) == 1
++
++      [consolidated_event] = consolidated_events
++      [system_event] = system_events
++
++      assert consolidated_event.accounted_bytes ==
++               LogEvent.body_byte_size(consolidated_event.body)
++
++      assert consolidated_event.batch_bytes == :erlang.external_size(consolidated_event.body)
++      assert system_event.accounted_bytes == consolidated_event.accounted_bytes
++      assert system_event.batch_bytes == consolidated_event.batch_bytes
+     end
+ 
+     test "route to backend", %{user: user} do
+diff --git a/test/logflare/bigquery/pipeline_test.exs b/test/logflare/bigquery/pipeline_test.exs
+index e6fec37ac2..198165ce53 100644
+--- a/test/logflare/bigquery/pipeline_test.exs
++++ b/test/logflare/bigquery/pipeline_test.exs
+@@ -385,8 +385,12 @@ defmodule Logflare.BigQuery.PipelineTest do
+         {:ok, %GoogleApi.BigQuery.V2.Model.TableDataInsertAllResponse{insertErrors: nil}}
+       end)
+ 
+-      le = build(:log_event, source: source, metadata: %{"level" => "error"})
++      le =
++        build(:log_event, source: source, metadata: %{"level" => "error"})
++        |> LogEvent.cache_sizes()
++
+       {messages, _tid} = setup_queue(source, [le])
++      assert hd(messages).data.size == :erlang.external_size(le.body)
+ 
+       test_pid = self()
+       handler = "test-ingest-labels-#{inspect(make_ref())}"
+@@ -405,7 +409,9 @@ defmodule Logflare.BigQuery.PipelineTest do
+       Pipeline.handle_batch(:bq, messages, batch_info, context)
+ 
+       assert_receive {:ingest, %{ingested_bytes: bytes}, metadata}
+-      assert bytes > 0
++      assert bytes == le.accounted_bytes
++      assert bytes == LogEvent.body_byte_size(le.body)
++      assert bytes < hd(messages).data.size
+       # labels resolved from the event body, no per-event ETS lookup in ack
+       assert metadata["lvl"] == "error"
+     end
+@@ -420,7 +426,7 @@ defmodule Logflare.BigQuery.PipelineTest do
+         {:ok, %GoogleApi.BigQuery.V2.Model.TableDataInsertAllResponse{insertErrors: nil}}
+       end)
+ 
+-      le = build(:log_event, source: source)
++      le = %{build(:log_event, source: source) | accounted_bytes: nil, batch_bytes: nil}
+       {messages, _tid} = setup_queue(source, [le])
+ 
+       test_pid = self()
+@@ -441,7 +447,8 @@ defmodule Logflare.BigQuery.PipelineTest do
+ 
+       source_id = source.id
+       assert_receive {:ingest, %{ingested_bytes: bytes}, %{"source_id" => ^source_id}}
+-      assert bytes > 0
++      assert bytes == LogEvent.body_byte_size(le.body)
++      assert bytes < hd(messages).data.size
+     end
+ 
+     test "le_to_bq_row/1 generates TableDataInsertAllRequestRows struct correctly", %{
+diff --git a/test/logflare/log_event_test.exs b/test/logflare/log_event_test.exs
+index cd49904269..afd756318d 100644
+--- a/test/logflare/log_event_test.exs
++++ b/test/logflare/log_event_test.exs
+@@ -945,6 +945,158 @@ defmodule Logflare.LogEventTest do
+     end
+   end
+ 
++  describe "values-only byte accounting" do
++    property "allocation-free integer sizing matches decimal text" do
++      check all value <- integer() do
++        assert LogEvent.body_byte_size(value) == byte_size(Integer.to_string(value))
++      end
++
++      for value <- [Integer.pow(10, 200) - 1, Integer.pow(10, 200), -Integer.pow(10, 200)] do
++        assert LogEvent.body_byte_size(value) == byte_size(Integer.to_string(value))
++      end
++    end
++
++    test "uses explicit scalar sizes without Erlang serialization overhead" do
++      for {value, bytes} <- [
++            {"hello", 5},
++            {"hé🌍", 7},
++            {<<0, 255>>, 2},
++            {0, 1},
++            {-123, 4},
++            {1_000_000_000_000_000_000, 19},
++            {1.0, 3},
++            {-1.5, 4},
++            {true, 1},
++            {false, 1},
++            {nil, 0},
++            {:info, 4}
++          ] do
++        assert LogEvent.body_byte_size(value) == bytes
++      end
++
++      assert LogEvent.body_byte_size({:unsupported, 1}) ==
++               :erlang.external_size({:unsupported, 1})
++    end
++
++    test "excludes keys and container overhead, including integer-list encoding" do
++      assert LogEvent.body_byte_size(%{}) == 0
++      assert LogEvent.body_byte_size([]) == 0
++      assert LogEvent.body_byte_size(Enum.to_list(1..100)) == 192
++
++      assert LogEvent.body_byte_size(%{"short" => [%{"key" => "hello"}, true, nil, -12]}) == 9
++
++      assert LogEvent.body_byte_size(%{
++               "a much longer key" => [%{"a different key" => "hello"}, true, nil, -12]
++             }) == 9
++    end
++
++    test "fused count includes generated fields and removes duplicate messages", %{source: source} do
++      params = %{
++        "message" => "hello",
++        "id" => "fixed-id",
++        "timestamp" => "2026-09-01T00:00:00Z",
++        "metadata" => %{"long-key" => [1, 2, "hé"]}
++      }
++
++      le = LogEvent.make(params, %{source: source})
++      assert le.body["message"] == nil
++      assert le.body["event_message"] == "hello"
++      assert is_integer(le.body["timestamp"])
++      assert le.accounted_bytes == LogEvent.body_byte_size(le.body)
++      assert le.batch_bytes == nil
++
++      cached = LogEvent.cache_sizes(le)
++      assert cached.accounted_bytes == le.accounted_bytes
++      assert cached.batch_bytes == :erlang.external_size(le.body)
++      assert LogEvent.cache_sizes(cached) == cached
++    end
++
++    test "body replacement invalidates both caches, including zero-sized bodies" do
++      le = LogEvent.cache_sizes(%LogEvent{body: %{}})
++      assert le.accounted_bytes == 0
++      assert LogEvent.replace_body(le, %{}) == le
++
++      changed = LogEvent.replace_body(le, %{"long-key" => "hello"})
++      assert changed.accounted_bytes == nil
++      assert changed.batch_bytes == nil
++      assert LogEvent.accounted_byte_size(changed) == 5
++      assert LogEvent.batch_byte_size(changed) == :erlang.external_size(changed.body)
++    end
++
++    test "custom messages update the value count without recounting the body", %{source: source} do
++      le =
++        LogEvent.make(%{"event_message" => "old", "metadata" => %{"extra" => "new"}}, %{
++          source: source
++        })
++        |> LogEvent.cache_sizes()
++
++      assert LogEvent.apply_custom_event_message(le, source) == le
++
++      changed =
++        LogEvent.apply_custom_event_message(le, %{source | custom_event_message_keys: "m.extra"})
++
++      assert changed.accounted_bytes ==
++               le.accounted_bytes - 3 + byte_size(changed.body["event_message"])
++
++      assert changed.accounted_bytes == LogEvent.body_byte_size(changed.body)
++      assert changed.batch_bytes == nil
++    end
++
++    test "copy, enrichment and drop transformations invalidate the fused count", %{
++      source: source,
++      user: user
++    } do
++      insert(:key_value, user: user, key: "router", value: %{"org_id" => "acme"})
++
++      source =
++        %{
++          source
++          | transform_copy_fields: "service:metadata.original",
++            transform_key_values: "service:enriched",
++            transform_drop_fields: "service"
++        }
++        |> Source.parse_copy_fields_config()
++        |> Source.parse_key_values_config()
++        |> Source.parse_drop_fields_config()
++
++      le = LogEvent.make(%{"service" => "router"}, %{source: source})
++      assert le.body["metadata"]["original"] == "router"
++      assert le.body["enriched"] == %{"org_id" => "acme"}
++      refute Map.has_key?(le.body, "service")
++      assert le.accounted_bytes == nil
++      cached = LogEvent.cache_sizes(le)
++      assert cached.accounted_bytes == LogEvent.body_byte_size(le.body)
++      assert cached.batch_bytes == :erlang.external_size(le.body)
++    end
++
++    test "spool reconstruction ignores stale persisted counters", %{source: source} do
++      for record <- [
++            %{
++              id: "spooled",
++              body: %{"long-key" => "hello"},
++              event_type: :log,
++              ingested_at: System.system_time(:microsecond),
++              accounted_bytes: 999,
++              batch_bytes: 999
++            },
++            %{
++              "id" => "spooled",
++              "body" => %{"long-key" => "hello"},
++              "event_type" => "log",
++              "ingested_at" => DateTime.to_iso8601(DateTime.utc_now()),
++              "accounted_bytes" => 999,
++              "batch_bytes" => 999
++            }
++          ] do
++        le = LogEvent.make_from_spool(record, source)
++        assert le.accounted_bytes == nil
++        assert le.batch_bytes == nil
++        assert LogEvent.cache_sizes(le).accounted_bytes == 5
++        assert LogEvent.cache_sizes(le).batch_bytes == :erlang.external_size(le.body)
++      end
++    end
++  end
++
+   describe "make_from_spool/2" do
+     test "preserves via_rule_id from an etf-decoded (atom-key) spool record", %{source: source} do
+       record = %{
+diff --git a/test/logflare/logs/ingest/ingest_transformer_test.exs b/test/logflare/logs/ingest/ingest_transformer_test.exs
+index 547a0d849d..a90ea80bcc 100644
+--- a/test/logflare/logs/ingest/ingest_transformer_test.exs
++++ b/test/logflare/logs/ingest/ingest_transformer_test.exs
+@@ -427,6 +427,31 @@ defmodule Logflare.Logs.IngestTransformerTest do
+       end
+     end
+ 
++    property "counts exactly the retained values during transformation" do
++      check all input <- log_params_generator() do
++        {body, bytes} = transform_with_byte_size(input)
++        assert body == transform(input, :clean_to_bigquery_column_spec)
++        assert bytes == Logflare.LogEvent.body_byte_size(body)
++      end
++    end
++
++    test "counts nested arrays and removes empty values without counting keys" do
++      input = %{
++        "ignored-long-key" => nil,
++        "nested" => [%{"bad-key" => "hé", "empty" => []}, [1, -12, true, false, nil]]
++      }
++
++      assert {%{"nested" => [%{"_bad_key" => "hé"}, [1, -12, true, false]]}, 9} =
++               transform_with_byte_size(input)
++    end
++
++    test "counts the surviving values after normalized keys collide" do
++      input = %{"a!b" => "short", "a?b" => "a much longer value"}
++      expected = transform(input, :to_bigquery_column_spec)
++      assert {^expected, bytes} = transform_with_byte_size(input)
++      assert bytes == Logflare.LogEvent.body_byte_size(expected)
++    end
++
+     test "preserves sequential behavior when cleaned keys collide" do
+       input =
+         1..33

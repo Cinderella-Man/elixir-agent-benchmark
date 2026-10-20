@@ -1,0 +1,325 @@
+diff --git a/lib/cachex.ex b/lib/cachex.ex
+index 273ff0fd..9edb5f0a 100644
+--- a/lib/cachex.ex
++++ b/lib/cachex.ex
+@@ -65,7 +65,6 @@ defmodule Cachex do
+   # generate unsafe definitions
+   @unsafe [
+     clear: [1, 2],
+-    count: [1, 2],
+     decr: [2, 3, 4],
+     del: [2, 3],
+     empty?: [1, 2],
+@@ -339,27 +338,6 @@ defmodule Cachex do
+   def clear(cache, options \\ []) when is_list(options),
+     do: Router.route(cache, {:clear, [options]})
+ 
+-  @doc """
+-  Retrieves the number of unexpired records in a cache.
+-
+-  Unlike `Cachex.size/2`, this ignores keys which should have expired. Due
+-  to this taking potentially expired keys into account, it is far more
+-  expensive than simply calling `Cachex.size/2` and should only be used when
+-  the distinction is completely necessary.
+-
+-  ## Examples
+-
+-      iex> Cachex.put(:my_cache, "key1", "value1")
+-      iex> Cachex.put(:my_cache, "key2", "value2")
+-      iex> Cachex.put(:my_cache, "key3", "value3")
+-      iex> Cachex.count(:my_cache)
+-      { :ok, 3 }
+-
+-  """
+-  @spec count(Cachex.t(), Keyword.t()) :: {status, number}
+-  def count(cache, options \\ []) when is_list(options),
+-    do: Router.route(cache, {:count, [options]})
+-
+   @doc """
+   Decrements an entry in the cache.
+ 
+@@ -1135,19 +1113,29 @@ defmodule Cachex do
+   @doc """
+   Retrieves the total size of a cache.
+ 
+-  This does not take into account the expiration time of any entries
+-  inside the cache. Due to this, this call is O(1) rather than the more
+-  expensive O(n) algorithm used by `count/3`. Which you use depends on
+-  exactly what you want the returned number to represent.
++  By default this does not take expiration time of entries inside the
++  cache into account, making it an `O(1)` call. This behaviour can be
++  modified by passing `expired: false` to account for expirations, but
++  please note that this is a much more involved calculation.
++
++  ## Options
++
++    * `:expired`
++
++      Whether or not to include expired records in the returned total. This
++      is a boolean value which defaults to `true`.
+ 
+   ## Examples
+ 
+       iex> Cachex.put(:my_cache, "key1", "value1")
+       iex> Cachex.put(:my_cache, "key2", "value2")
+-      iex> Cachex.put(:my_cache, "key3", "value3")
++      iex> Cachex.put(:my_cache, "key3", "value3", expire: 1)
+       iex> Cachex.size(:my_cache)
+       { :ok, 3 }
+ 
++      iex> Cachex.size(:my_cache, expired: false)
++      { :ok, 2 }
++
+   """
+   @spec size(Cachex.t(), Keyword.t()) :: {status, number}
+   def size(cache, options \\ []) when is_list(options),
+diff --git a/lib/cachex/actions/count.ex b/lib/cachex/actions/count.ex
+deleted file mode 100644
+index 8fb16a40..00000000
+--- a/lib/cachex/actions/count.ex
++++ /dev/null
+@@ -1,29 +0,0 @@
+-defmodule Cachex.Actions.Count do
+-  @moduledoc false
+-  # Command module to allow the counting of a cache.
+-  #
+-  # Counting a cache will make sure to take the expiration time of items into
+-  # consideration, making the semantics different to those of the `size()` calls.
+-  alias Cachex.Query
+-
+-  # import needed macros
+-  import Cachex.Spec
+-
+-  ##############
+-  # Public API #
+-  ##############
+-
+-  @doc """
+-  Counts the number of items in a cache.
+-
+-  This will only return the number of items which have not yet expired; this
+-  means that any items set to be removed in the next purge will not be added
+-  to the count. Lazy expiration does not apply to this call.
+-  """
+-  def execute(cache(name: name), _options) do
+-    filter = Query.unexpired()
+-    clause = Query.build(where: filter, output: true)
+-
+-    {:ok, :ets.select_count(name, clause)}
+-  end
+-end
+diff --git a/lib/cachex/actions/size.ex b/lib/cachex/actions/size.ex
+index 6e5a5a53..25c3488f 100644
+--- a/lib/cachex/actions/size.ex
++++ b/lib/cachex/actions/size.ex
+@@ -5,11 +5,15 @@ defmodule Cachex.Actions.Size do
+   # This command uses the built in ETS utilities to retrieve the number of
+   # entries currently in the backing cache table.
+   #
+-  # Retrieving the size of the cache won't take expiration times into account;
+-  # if this is desired the `count()` command should be used instead. The main
+-  # advantage here is that this is O(1) at the cost of accuracy.
++  # A cache's size does not take expiration times into account by default,
++  # as the true size can hold records which haven't been purged yet. This
++  # can be controlled via options to this action.
+   import Cachex.Spec
+ 
++  # add some aliases
++  alias Cachex.Options
++  alias Cachex.Query
++
+   ##############
+   # Public API #
+   ##############
+@@ -17,11 +21,29 @@ defmodule Cachex.Actions.Size do
+   @doc """
+   Retrieves the size of the cache.
+ 
+-  The size represents the total size of the internal keyspace, ignoring any
+-  expirations set on entries. As such, this call is O(1) rather than the
+-  more expensive O(N) used by `count()`. Which you use depends on exactly
+-  what you want the returned number to represent.
++  You can use the `:expired` option to determine whether record expirations
++  should be taken into account. The default value of this is `:true` as it's
++  a much cheaper operation.
+   """
+-  def execute(cache(name: name), _options),
++  def execute(cache(name: name), options) do
++    options
++    |> Options.get(:expired, &is_boolean/1, true)
++    |> retrieve_count(name)
++  end
++
++  ###############
++  # Private API #
++  ###############
++
++  # Retrieve the full table count.
++  defp retrieve_count(true, name),
+     do: {:ok, :ets.info(name, :size)}
++
++  # Retrieve only the unexpired table count.
++  defp retrieve_count(false, name) do
++    filter = Query.unexpired()
++    clause = Query.build(where: filter, output: true)
++
++    {:ok, :ets.select_count(name, clause)}
++  end
+ end
+diff --git a/test/cachex/actions/count_test.exs b/test/cachex/actions/count_test.exs
+deleted file mode 100644
+index b5885f0e..00000000
+--- a/test/cachex/actions/count_test.exs
++++ /dev/null
+@@ -1,61 +0,0 @@
+-defmodule Cachex.Actions.CountTest do
+-  use Cachex.Test.Case
+-
+-  # This test verifies that a cache can be successfully counted. Counting a cache
+-  # will return the size of the cache, but ignoring the number of expired entries.
+-  test "counting items in a cache" do
+-    # create a forwarding hook
+-    hook = ForwardHook.create()
+-
+-    # create a test cache
+-    cache = TestUtils.create_cache(hooks: [hook])
+-
+-    # fill with some items
+-    {:ok, true} = Cachex.put(cache, 1, 1)
+-    {:ok, true} = Cachex.put(cache, 2, 2)
+-    {:ok, true} = Cachex.put(cache, 3, 3)
+-
+-    # add some expired items
+-    {:ok, true} = Cachex.put(cache, 4, 4, expire: 1)
+-    {:ok, true} = Cachex.put(cache, 5, 5, expire: 1)
+-    {:ok, true} = Cachex.put(cache, 6, 6, expire: 1)
+-
+-    # let entries expire
+-    :timer.sleep(2)
+-
+-    # clear all hook
+-    TestUtils.flush()
+-
+-    # count the cache
+-    result = Cachex.count(cache)
+-
+-    # only 3 items should come back
+-    assert(result == {:ok, 3})
+-
+-    # verify the hooks were updated with the count
+-    assert_receive({{:count, [[]]}, ^result})
+-  end
+-
+-  # This test verifies that the distributed router correctly controls
+-  # the count/2 action in such a way that it can count the records
+-  # in both a local node as well as a remote node. We don't have to
+-  # check functionality of the entire action; just the actual routing
+-  # of the action to the target node(s) is of interest here.
+-  @tag distributed: true
+-  test "counting items in a cache cluster" do
+-    # create a new cache cluster for cleaning
+-    {cache, _nodes, _cluster} = TestUtils.create_cache_cluster(2)
+-
+-    # we know that 1 & 2 hash to different nodes
+-    {:ok, true} = Cachex.put(cache, 1, 1)
+-    {:ok, true} = Cachex.put(cache, 2, 2)
+-
+-    # retrieve both the local and remote counts
+-    count1 = Cachex.count(cache, local: true)
+-    count2 = Cachex.count(cache, local: false)
+-
+-    # check each node has 1
+-    assert(count1 == {:ok, 1})
+-    assert(count2 == {:ok, 2})
+-  end
+-end
+diff --git a/test/cachex/actions/size_test.exs b/test/cachex/actions/size_test.exs
+index 245820a9..a7233944 100644
+--- a/test/cachex/actions/size_test.exs
++++ b/test/cachex/actions/size_test.exs
+@@ -1,16 +1,11 @@
+ defmodule Cachex.Actions.SizeTest do
+   use Cachex.Test.Case
+ 
+-  # This test verifies the size of a cache. It should be noted that size is the
+-  # total size of the cache, regardless of any evictions (unlike count). We make
+-  # sure that evictions aren't taken into account, and that size increments as
+-  # new keys are added to the cache.
++  # This test verifies the size of a cache, by checking both with
++  # and without expired records. This is controlled by `:expired`.
+   test "checking the total size of a cache" do
+-    # create a forwarding hook
+-    hook = ForwardHook.create()
+-
+     # create a test cache
+-    cache = TestUtils.create_cache(hooks: [hook])
++    cache = TestUtils.create_cache()
+ 
+     # retrieve the cache size
+     result1 = Cachex.size(cache)
+@@ -18,35 +13,20 @@ defmodule Cachex.Actions.SizeTest do
+     # it should be empty
+     assert(result1 == {:ok, 0})
+ 
+-    # verify the hooks were updated with the message
+-    assert_receive({{:size, [[]]}, ^result1})
+-
+     # add some cache entries
+     {:ok, true} = Cachex.put(cache, 1, 1)
+-
+-    # retrieve the cache size
+-    result2 = Cachex.size(cache)
+-
+-    # it should show the new key
+-    assert(result2 == {:ok, 1})
+-
+-    # verify the hooks were updated with the message
+-    assert_receive({{:size, [[]]}, ^result2})
+-
+-    # add a final entry
+     {:ok, true} = Cachex.put(cache, 2, 2, expire: 1)
+ 
+-    # let it expire
++    # wait 2 ms to expire
+     :timer.sleep(2)
+ 
+     # retrieve the cache size
+-    result3 = Cachex.size(cache)
+-
+-    # it shouldn't care about TTL
+-    assert(result3 == {:ok, 2})
++    result2 = Cachex.size(cache)
++    result3 = Cachex.size(cache, expired: false)
+ 
+-    # verify the hooks were updated with the message
+-    assert_receive({{:size, [[]]}, ^result3})
++    # it should show the new key
++    assert(result2 == {:ok, 2})
++    assert(result3 == {:ok, 1})
+   end
+ 
+   # This test verifies that the distributed router correctly controls
+diff --git a/test/cachex_test.exs b/test/cachex_test.exs
+index d7ab0b6e..58d2da3f 100644
+--- a/test/cachex_test.exs
++++ b/test/cachex_test.exs
+@@ -1,6 +1,5 @@
+ defmodule CachexTest do
+   use Cachex.Test.Case
+-  import Integer
+ 
+   # Ensures that we're able to start a cache and link it to the current process.
+   # We verify the link by spawning a cache from inside another thread and making
+@@ -163,10 +162,10 @@ defmodule CachexTest do
+       |> Keyword.drop([:child_spec, :init, :start, :start_link])
+ 
+     # it has to always be even (one signature creates ! versions)
+-    assert(is_even(length(definitions)))
++    assert(rem(length(definitions), 2) == 0)
+ 
+     # verify the size to cause errors on addition/removal
+-    assert(length(definitions) == 150)
++    assert(length(definitions) == 146)
+ 
+     # validate all definitions
+     for {name, arity} <- definitions do

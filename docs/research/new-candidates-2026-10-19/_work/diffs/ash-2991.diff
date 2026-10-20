@@ -1,0 +1,388 @@
+diff --git a/documentation/topics/actions/actions.md b/documentation/topics/actions/actions.md
+index 182dbf83f..76378104d 100644
+--- a/documentation/topics/actions/actions.md
++++ b/documentation/topics/actions/actions.md
+@@ -593,6 +593,21 @@ graph TD
+   - Webhook calls
+ - **Transaction Context**: Outside transaction
+ 
++- **Custom notifications from hooks**: `before_action` and `after_action` hooks
++  may return custom notifications as a single notification, a list of
++  notifications, a map containing a `:notifications` key, or `nil`:
++
++```elixir
++  Ash.Changeset.after_action(changeset, fn changeset, result ->
++    notification = %Ash.Notifier.Notification{
++      resource: changeset.resource,
++      metadata: %{event: :created}
++    }
++
++    {:ok, result, [notification]}
++  end)
++```
++
+ ##### 18. Return Result
+ - **Success**: Returns data with metadata
+ - **Error**: Returns error details and context
+diff --git a/lib/ash/action_input.ex b/lib/ash/action_input.ex
+index 96ee0ee94..43cfa09f5 100644
+--- a/lib/ash/action_input.ex
++++ b/lib/ash/action_input.ex
+@@ -42,7 +42,7 @@ defmodule Ash.ActionInput do
+ 
+   Receives an action input and returns a modified action input, optionally with notifications.
+   """
+-  @type before_action_fun :: (t -> t | {t, %{notifications: [Ash.Notifier.Notification.t()]}})
++  @type before_action_fun :: (t -> t | {t, Ash.Notifier.Notification.input()})
+ 
+   @typedoc """
+   Function type for after action hooks.
+@@ -53,9 +53,9 @@ defmodule Ash.ActionInput do
+   @type after_action_fun ::
+           (t, term ->
+              :ok
+-             | {:ok, [Ash.Notifier.Notification.t()]}
++             | {:ok, Ash.Notifier.Notification.input()}
+              | {:ok, term}
+-             | {:ok, term, [Ash.Notifier.Notification.t()]}
++             | {:ok, term, Ash.Notifier.Notification.input()}
+              | {:error, any})
+ 
+   @typedoc """
+@@ -1102,9 +1102,18 @@ defmodule Ash.ActionInput do
+       ...>     action: input.action,
+       ...>     data: %{audit: "before_action"}
+       ...>   }
+-      ...>   {input, %{notifications: [notification]}}
++      ...>   {input, [notification]}
+       ...> end)
+ 
++  A `before_action` hook may return notifications in any of these forms:
++
++    {input, notification}
++    {input, [notification]}
++    {input, %{notifications: [notification]}}
++    {input, nil}
++
++  Returning `input` without a tuple is equivalent to returning no notifications.
++
+   ## Options
+ 
+   - `prepend?` - If `true`, adds the hook to the beginning of the list instead of the end
+@@ -1141,7 +1150,7 @@ defmodule Ash.ActionInput do
+   > After action hooks will work for generic actions without a return type,
+   > however they will receive `nil` as their `result` argument and are
+   > expected to return
+-  > `:ok | {:ok, [Ash.Notifier.Notification.t()]} | {:error, term}`.
++  > `:ok | {:ok, Ash.Notifier.Notification.input()} | {:error, term}`.
+ 
+   ## Examples
+ 
+@@ -1173,6 +1182,14 @@ defmodule Ash.ActionInput do
+       ...>   {:ok, result, [notification]}
+       ...> end)
+ 
++    The notification value may also be returned as a single notification,
++    a map containing a `:notifications` key, or `nil`:
++
++        {:ok, result, notification}
++        {:ok, result, [notification]}
++        {:ok, result, %{notifications: [notification]}}
++        {:ok, result, nil}
++
+       # Handle errors
+       iex> MyApp.Post
+       ...> |> Ash.ActionInput.for_action(:risky_action, %{})
+@@ -1623,7 +1640,9 @@ defmodule Ash.ActionInput do
+           {:error, error} ->
+             {:halt, {:error, error}}
+ 
+-          {input, %{notifications: notifications}} ->
++          {%Ash.ActionInput{} = input, notification_input} ->
++            notifications = Ash.Notifier.Notification.normalize(notification_input)
++
+             cont =
+               if input.valid? do
+                 :cont
+@@ -1635,7 +1654,7 @@ defmodule Ash.ActionInput do
+              {input,
+               %{
+                 instructions
+-                | notifications: List.wrap(instructions.notifications) ++ List.wrap(notifications)
++                | notifications: List.wrap(instructions.notifications) ++ notifications
+               }}}
+ 
+           %Ash.ActionInput{} = input ->
+@@ -1653,7 +1672,10 @@ defmodule Ash.ActionInput do
+             Invalid return value from before_action hook. Expected one of:
+ 
+             * %Ash.ActionInput{}
+-            * {%Ash.ActionInput{}, %{notifications: [...]}}
++            * {%Ash.ActionInput{}, notification}
++            * {%Ash.ActionInput{}, [notification]}
++            * {%Ash.ActionInput{}, %{notifications: notifications}}
++            * {%Ash.ActionInput{}, nil}
+             * {:error, error}
+ 
+             Got:
+@@ -1776,7 +1798,7 @@ defmodule Ash.ActionInput do
+ 
+   defp merge_after_action_notifications(input, result, old_notifications, new_notifications) do
+     Enum.map(
+-      List.wrap(old_notifications) ++ List.wrap(new_notifications),
++      List.wrap(old_notifications) ++ Ash.Notifier.Notification.normalize(new_notifications),
+       fn notification ->
+         %{
+           notification
+diff --git a/lib/ash/changeset/changeset.ex b/lib/ash/changeset/changeset.ex
+index 06a8e51a9..7f4dc32c9 100644
+--- a/lib/ash/changeset/changeset.ex
++++ b/lib/ash/changeset/changeset.ex
+@@ -239,7 +239,7 @@ defmodule Ash.Changeset do
+   @type after_action_fun ::
+           (t, Ash.Resource.Record.t() ->
+              {:ok, Ash.Resource.Record.t()}
+-             | {:ok, Ash.Resource.Record.t(), [Ash.Notifier.Notification.t()]}
++             | {:ok, Ash.Resource.Record.t(), Ash.Notifier.Notification.input()}
+              | {:error, any})
+ 
+   @typedoc """
+@@ -257,7 +257,7 @@ defmodule Ash.Changeset do
+ 
+   Receives a changeset and returns a modified changeset, optionally with notifications.
+   """
+-  @type before_action_fun :: (t -> t | {t, %{notifications: [Ash.Notifier.Notification.t()]}})
++  @type before_action_fun :: (t -> t | {t, Ash.Notifier.Notification.input()})
+ 
+   @typedoc """
+   Function type for before transaction hooks.
+@@ -5152,7 +5152,9 @@ defmodule Ash.Changeset do
+           {:error, error} ->
+             {:halt, {:error, error}}
+ 
+-          {changeset, %{notifications: notifications}} ->
++          {%Ash.Changeset{} = changeset, notification_input} ->
++            notifications = Ash.Notifier.Notification.normalize(notification_input)
++
+             cont =
+               if changeset.valid? do
+                 :cont
+@@ -5341,7 +5343,7 @@ defmodule Ash.Changeset do
+           {:ok, new_result, new_notifications} ->
+             all_notifications =
+               Enum.map(
+-                List.wrap(notifications) ++ List.wrap(new_notifications),
++                List.wrap(notifications) ++ Ash.Notifier.Notification.normalize(new_notifications),
+                 fn notification ->
+                   %{
+                     notification
+@@ -7310,6 +7312,15 @@ defmodule Ash.Changeset do
+       ...>   end
+       ...> end)
+ 
++    A `before_action` hook may return notifications in any of these forms:
++
++      {changeset, notification}
++      {changeset, [notification]}
++      {changeset, %{notifications: [notification]}}
++      {changeset, nil}
++
++    Returning `changeset` without a tuple is equivalent to returning no notifications.
++
+   ## See also
+ 
+   - `after_action/3` for hooks that run after the action succeeds
+@@ -7457,6 +7468,13 @@ defmodule Ash.Changeset do
+       ...>   {:ok, post}
+       ...> end)
+ 
++    The notification value may also be returned as a single notification, a map containing a `:notifications` key, or `nil`:
++
++      {:ok, result, notification}
++      {:ok, result, [notification]}
++      {:ok, result, %{notifications: [notification]}}
++      {:ok, result, nil}
++
+   ## See also
+ 
+   - `before_action/3` for hooks that run before the data layer action
+diff --git a/lib/ash/notifier/notification.ex b/lib/ash/notifier/notification.ex
+index 974ba5d98..bc4676ac4 100644
+--- a/lib/ash/notifier/notification.ex
++++ b/lib/ash/notifier/notification.ex
+@@ -23,6 +23,21 @@ defmodule Ash.Notifier.Notification do
+ 
+   @type t :: %__MODULE__{}
+ 
++  @typedoc """
++  Any of the shapes a notification-producing hook may return: a single
++  notification, a list of them, a map with a `:notifications` key, or nil.
++  """
++  @type input :: t() | [t()] | %{optional(:notifications) => t() | [t()]} | nil
++
++  @doc """
++  Normalizes any accepted notification return shape into a flat list.
++  """
++  @spec normalize(input()) :: [t()]
++  def normalize(nil), do: []
++  def normalize(%{notifications: notifications}), do: normalize(notifications)
++  def normalize(%__MODULE__{} = notification), do: [notification]
++  def normalize(notifications) when is_list(notifications), do: notifications
++
+   def new(resource, opts) do
+     struct(%__MODULE__{resource: resource}, opts)
+   end
+diff --git a/test/actions/generic_actions_test.exs b/test/actions/generic_actions_test.exs
+index 9f263dda2..0b0cb4802 100644
+--- a/test/actions/generic_actions_test.exs
++++ b/test/actions/generic_actions_test.exs
+@@ -659,6 +659,32 @@ defmodule Ash.Test.Actions.GenericActionsTest do
+       assert result == "Processed: World"
+     end
+ 
++    test "before_action hooks can return notifications as a bare list" do
++      result =
++        Post
++        |> Ash.ActionInput.for_action(:with_lifecycle_hooks, %{message: "World"})
++        |> Ash.ActionInput.before_action(fn input ->
++          notification = %Ash.Notifier.Notification{resource: Post}
++          {input, [notification]}
++        end)
++        |> Ash.run_action!()
++
++      assert result == "Processed: World"
++    end
++
++    test "after_action hooks can return notifications as a map" do
++      result =
++        Post
++        |> Ash.ActionInput.for_action(:with_lifecycle_hooks, %{message: "World"})
++        |> Ash.ActionInput.after_action(fn _input, result ->
++          notification = %Ash.Notifier.Notification{resource: Post}
++          {:ok, result, %{notifications: [notification]}}
++        end)
++        |> Ash.run_action!()
++
++      assert result == "Processed: World"
++    end
++
+     test "multiple before_action hooks run in order" do
+       result =
+         Post
+diff --git a/test/notifier/notifier_test.exs b/test/notifier/notifier_test.exs
+index e1bb5df7f..a1915f798 100644
+--- a/test/notifier/notifier_test.exs
++++ b/test/notifier/notifier_test.exs
+@@ -434,6 +434,112 @@ defmodule Ash.Test.NotifierTest do
+       assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{custom?: true}}}
+       assert_receive {:telemetry_metadata, %{action: nil, resource: Comment}}
+     end
++
++    test "a custom notification can be returned as a bare list from an after_action hook" do
++      Comment
++      |> Ash.Changeset.for_create(:create, %{})
++      |> Ash.Changeset.after_action(fn changeset, result ->
++        {:ok, result,
++         [
++           %Ash.Notifier.Notification{
++             resource: changeset.resource,
++             domain: Ash.Resource.Info.domain(changeset.resource),
++             metadata: %{custom?: true}
++           }
++         ]}
++      end)
++      |> Ash.create!()
++
++      assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{custom?: true}}}
++    end
++
++    test "a custom notification can be returned as a map from an after_action hook" do
++      Comment
++      |> Ash.Changeset.for_create(:create, %{})
++      |> Ash.Changeset.after_action(fn changeset, result ->
++        {:ok, result,
++         %{
++           notifications: [
++             %Ash.Notifier.Notification{
++               resource: changeset.resource,
++               domain: Ash.Resource.Info.domain(changeset.resource),
++               metadata: %{custom?: true}
++             }
++           ]
++         }}
++      end)
++      |> Ash.create!()
++
++      assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{custom?: true}}}
++    end
++
++    test "notifications from before and after action hooks are both delivered" do
++      Comment
++      |> Ash.Changeset.for_create(:create, %{})
++      |> Ash.Changeset.before_action(fn changeset ->
++        {changeset,
++         [
++           %Ash.Notifier.Notification{
++             resource: changeset.resource,
++             domain: Ash.Resource.Info.domain(changeset.resource),
++             metadata: %{phase: :before}
++           }
++         ]}
++      end)
++      |> Ash.Changeset.after_action(fn changeset, result ->
++        {:ok, result,
++         [
++           %Ash.Notifier.Notification{
++             resource: changeset.resource,
++             domain: Ash.Resource.Info.domain(changeset.resource),
++             metadata: %{phase: :after}
++           }
++         ]}
++      end)
++      |> Ash.create!()
++
++      assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{phase: :before}}}
++      assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{phase: :after}}}
++    end
++
++    test "all notifications returned from an after_action hook are delivered" do
++      Comment
++      |> Ash.Changeset.for_create(:create, %{})
++      |> Ash.Changeset.after_action(fn changeset, result ->
++        notifications =
++          for phase <- [:first, :second] do
++            %Ash.Notifier.Notification{
++              resource: changeset.resource,
++              domain: Ash.Resource.Info.domain(changeset.resource),
++              metadata: %{phase: phase}
++            }
++          end
++
++        {:ok, result, notifications}
++      end)
++      |> Ash.create!()
++
++      assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{phase: :first}}}
++      assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{phase: :second}}}
++    end
++
++    test "a custom notification can be returned as a bare list from a before_action hook" do
++      Comment
++      |> Ash.Changeset.for_create(:create, %{})
++      |> Ash.Changeset.before_action(fn changeset ->
++        {changeset,
++         [
++           %Ash.Notifier.Notification{
++             resource: changeset.resource,
++             domain: Ash.Resource.Info.domain(changeset.resource),
++             metadata: %{custom?: true}
++           }
++         ]}
++      end)
++      |> Ash.create!()
++
++      assert_receive {:notification, %Ash.Notifier.Notification{metadata: %{custom?: true}}}
++    end
+   end
+ 
+   test "a nested notification is sent automatically" do

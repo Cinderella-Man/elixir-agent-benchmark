@@ -1,0 +1,332 @@
+diff --git a/integration_test/cases/joins.exs b/integration_test/cases/joins.exs
+index c90f397128..072bf3fb48 100644
+--- a/integration_test/cases/joins.exs
++++ b/integration_test/cases/joins.exs
+@@ -170,7 +170,7 @@ defmodule Ecto.Integration.JoinsTest do
+         on: f1.num == f2.visits,
+         select: {f1, struct(f2, [:visits])}
+ 
+-    assert {%Barebone{num: 1} = b1, %Post{visits: 1} = b2} = TestRepo.one(query)
++    assert {%Barebone{num: 1}, %Post{visits: 1}} = TestRepo.one(query)
+   end
+ 
+   ## Associations joins
+diff --git a/lib/ecto/query/api.ex b/lib/ecto/query/api.ex
+index 3dfb349507..2cb258d579 100644
+--- a/lib/ecto/query/api.ex
++++ b/lib/ecto/query/api.ex
+@@ -519,16 +519,49 @@ defmodule Ecto.Query.API do
+   @doc """
+   Allows a list argument to be spliced into a fragment.
+ 
++  Dynamic lists can be spliced into a query using interpolation
++
+       from p in Post, where: fragment("? in (?)", p.id, splice(^[1, 2, 3]))
+ 
+-  The example above will be transformed at runtime into the following:
++  Note that each element of the list will be treated as a separate query parameter.
++  The example above will be transformed at runtime into the following
+ 
+       from p in Post, where: fragment("? in (?,?,?)", p.id, ^1, ^2, ^3)
+ 
+-  You may only splice runtime values. For example, this would not work because
+-  query bindings are compile-time constructs:
++  You may also splice compile-time lists. This allows you to combine query parameters
++  with literals and constructs like query bindings
++
++      sep = " "
++      from p in Post, select: fragment("concat(?)", splice([p.count, ^sep, "count"]))
++
++  The above example will be transformed into
++
++      sep = " "
++      from p in Post, select: fragment("concat(?,?,?)", p.count, ^sep, "count")
++
++  This is especially useful if you would like to create re-usable macros to inject
++  variadic database functions into queries. For example, you may create a macro for
++  the Postgres function `concat_ws` like below
++
++      defmacro concat_ws(sep, args) do
++        quote do
++          fragment("concat_ws(?,?)", unquote(sep), splice(unquote(args)))
++        end
++      end
++
++  Then you may call it from your application with argument lists of any size
++
++      from p in Post, select: concat_ws(":", [p.author, ^year, p.title])
++      from s in Sequences, select: concat_ws(".", ["public", s.relname])
++
++  You may nest others splices and fragment modifiers such as `identifier/1` and
++  `constant/1` inside of compile-time splices
++
++      from p in Post, where: fragment("? in (?)", p.id, splice([constant(^1), splice(^[2, 3])]))
++
++  This would be transformed into
+ 
+-      from p in Post, where: fragment("concat(?)", splice(^[p.count, " ", "count"]))
++      from p in Post, where: fragment(? in (?,?,?), p.id, constant(1), ^2, ^3)
+   """
+   def splice(list), do: doc!([list])
+ 
+diff --git a/lib/ecto/query/builder.ex b/lib/ecto/query/builder.ex
+index 2bc0a5e9e3..699aafe520 100644
+--- a/lib/ecto/query/builder.ex
++++ b/lib/ecto/query/builder.ex
+@@ -215,7 +215,7 @@ defmodule Ecto.Query.Builder do
+     end
+ 
+     {frags, params_acc} = Enum.map_reduce(frags, params_acc, &escape_fragment(&1, &2, vars, env))
+-    {{:{}, [], [:fragment, [], merge_fragments(pieces, frags)]}, params_acc}
++    {{:{}, [], [:fragment, [], merge_fragments(pieces, frags, [])]}, params_acc}
+   end
+ 
+   # subqueries
+@@ -638,7 +638,7 @@ defmodule Ecto.Query.Builder do
+   def fragment_pieces(frag, args) do
+     frag
+     |> split_fragment("")
+-    |> merge_fragments(args)
++    |> merge_fragments(args, [])
+   end
+ 
+   defp escape_window_description([], params_acc, _vars, _env),
+@@ -791,31 +791,49 @@ defmodule Ecto.Query.Builder do
+     end
+   end
+ 
+-  defp escape_fragment({:splice, _meta, [splice]}, params_acc, vars, env) do
+-    case splice do
+-      {:^, _, [value]} = expr ->
+-        checked = quote do: Ecto.Query.Builder.splice!(unquote(value))
+-        length = quote do: length(unquote(checked))
+-        {expr, params_acc} = escape(expr, {:splice, :any}, params_acc, vars, env)
+-        escaped = {:{}, [], [:splice, [], [expr, length]]}
+-        {escaped, params_acc}
++  defp escape_fragment({:splice, _meta, [{:^, _, [value]} = expr]}, params_acc, vars, env) do
++    checked = quote do: Ecto.Query.Builder.splice!(unquote(value))
++    length = quote do: length(unquote(checked))
++    {expr, params_acc} = escape(expr, {:splice, :any}, params_acc, vars, env)
++    escaped = {:{}, [], [:splice, [], [expr, length]]}
++    {escaped, params_acc}
++  end
+ 
+-      _ ->
+-        error!(
+-          "splice/1 in fragment expects an interpolated value, such as splice(^value), got `#{Macro.to_string(splice)}`"
+-        )
+-    end
++  defp escape_fragment({:splice, _meta, [exprs]}, params_acc, vars, env) when is_list(exprs) do
++    {escaped, params_acc} =
++      Enum.map_reduce(exprs, params_acc, &escape_fragment(&1, &2, vars, env))
++
++    {{:splice, escaped}, params_acc}
++  end
++
++  defp escape_fragment({:splice, _meta, [other]}, _params_acc, _vars, _env) do
++    error!(
++      "splice/1 in fragment expects a compile-time list or interpolated value, got `#{Macro.to_string(other)}`"
++    )
+   end
+ 
+   defp escape_fragment(expr, params_acc, vars, env) do
+     escape(expr, :any, params_acc, vars, env)
+   end
+ 
+-  defp merge_fragments([h1 | t1], [h2 | t2]),
+-    do: [{:raw, h1}, {:expr, h2} | merge_fragments(t1, t2)]
++  defp merge_fragments([raw_h | raw_t], [{:splice, exprs} | expr_t], []),
++    do: [{:raw, raw_h} | merge_fragments(raw_t, expr_t, exprs)]
++
++  defp merge_fragments([raw_h | raw_t], [expr_h | expr_t], []),
++    do: [{:raw, raw_h}, {:expr, expr_h} | merge_fragments(raw_t, expr_t, [])]
++
++  defp merge_fragments([raw_h], [], []),
++    do: [{:raw, raw_h}]
++
++  defp merge_fragments(raw, expr, [{:splice, exprs} | splice_t]),
++    do: merge_fragments(raw, expr, exprs ++ splice_t)
++
++  defp merge_fragments(raw, expr, [splice_h]),
++    do: [{:expr, splice_h} | merge_fragments(raw, expr, [])]
++
++  defp merge_fragments(raw, expr, [splice_h | splice_t]),
++    do: [{:expr, splice_h}, {:raw, ","} | merge_fragments(raw, expr, splice_t)]
+ 
+-  defp merge_fragments([h1], []),
+-    do: [{:raw, h1}]
+ 
+   for {agg, arity} <- @dynamic_aggregates do
+     defp call_type(unquote(agg), unquote(arity)), do: {:any, :any}
+diff --git a/test/ecto/query/planner_test.exs b/test/ecto/query/planner_test.exs
+index 1d02db869c..e6cd3ab28c 100644
+--- a/test/ecto/query/planner_test.exs
++++ b/test/ecto/query/planner_test.exs
+@@ -1919,6 +1919,35 @@ defmodule Ecto.Query.PlannerTest do
+     assert length == 3
+   end
+ 
++  test "normalize: fragment with nested splicing" do
++    list = [3, 4]
++
++    {query, cast_params, dump_params, _} =
++      from(c in Comment)
++      |> where([c], c.id in fragment("(?, ?, ?)", ^1, splice([2, splice(^list)]), ^5))
++      |> normalize_with_params()
++
++    assert cast_params == [1, 3, 4, 5]
++    assert dump_params == [1, 3, 4, 5]
++
++    {:in, _, [_, {:fragment, _, parts}]} = hd(query.wheres).expr
++
++    assert [
++             _,
++            {:expr, {:^, _, [0]}},
++             _,
++             {:expr, 2},
++             _,
++             {:expr, {:splice, _, [{:^, _, [start_ix, length]}]}},
++             _,
++             {:expr, {:^, _, [3]}},
++             _
++           ] = parts
++
++    assert start_ix == 1
++    assert length == 2
++  end
++
+   test "normalize: from values list" do
+     uuid = Ecto.UUID.generate()
+     values = [%{bid: uuid, num: 1}, %{bid: uuid, num: 2}]
+diff --git a/test/ecto/query_test.exs b/test/ecto/query_test.exs
+index 5d6ca49eff..3dcf86a8e9 100644
+--- a/test/ecto/query_test.exs
++++ b/test/ecto/query_test.exs
+@@ -1068,6 +1068,12 @@ defmodule Ecto.QueryTest do
+   end
+ 
+   describe "fragment/1" do
++    defmacro concat_ws(sep, args) do
++      quote do
++        fragment("concat_ws(?,?)", unquote(sep), splice(unquote(args)))
++      end
++    end
++
+     test "raises at runtime when interpolation is not a keyword list" do
+       assert_raise ArgumentError,
+                    ~r/fragment\(...\) does not allow strings to be interpolated/s,
+@@ -1123,7 +1129,7 @@ defmodule Ecto.QueryTest do
+       end
+     end
+ 
+-    test "supports list splicing" do
++    test "supports interpolated list splicing" do
+       two = 2
+       three = 3
+ 
+@@ -1147,6 +1153,105 @@ defmodule Ecto.QueryTest do
+       end
+     end
+ 
++    test "supports compile-time list splicing" do
++      query =
++        from p in "posts", where: p.id in fragment("(?,?,?)", ^1, splice([2, p.id, p.id + ^3]), ^5)
++
++      assert {:in, _, [_, {:fragment, _, parts}]} = hd(query.wheres).expr
++
++      assert [
++               raw: "(",
++               expr: {:^, _, [0]},
++               raw: ",",
++               expr: 2,
++               raw: ",",
++               expr: {{:., _, [{:&, _, [0]}, :id]}, _, _},
++               raw: ",",
++               expr: {:+, _, [{{:., _, [{:&, _, [0]}, :id]}, _, _}, {:^, _, [1]}]},
++               raw: ",",
++               expr: {:^, _, [2]},
++               raw: ")"
++             ] = parts
++    end
++
++    test "supports compile-time list splicing with fragment modifiers" do
++      query =
++        from p in "posts", where: p.id in fragment("(?,?,?)", ^1, splice([2, constant(^3)]), ^5)
++
++      assert {:in, _, [_, {:fragment, _, parts}]} = hd(query.wheres).expr
++
++      assert [
++               raw: "(",
++               expr: {:^, _, [0]},
++               raw: ",",
++               expr: 2,
++               raw: ",",
++               expr: {:constant, _, [3]},
++               raw: ",",
++               expr: {:^, _, [1]},
++               raw: ")"
++             ] = parts
++    end
++
++    test "supports compile-time list splicing with nested splicing" do
++      # nested runtime splice
++      list = [3, 4]
++
++      query =
++        from p in "posts", where: p.id in fragment("(?,?,?)", ^1, splice([2, splice(^list)]), ^5)
++
++      assert {:in, _, [_, {:fragment, _, parts}]} = hd(query.wheres).expr
++
++      assert [
++               raw: "(",
++               expr: {:^, _, [0]},
++               raw: ",",
++               expr: 2,
++               raw: ",",
++               expr: {:splice, _, [{:^, _, [1]}, 2]},
++               raw: ",",
++               expr: {:^, _, [2]},
++               raw: ")"
++             ] = parts
++
++      # nested compile-time splice
++      query =
++        from p in "posts", where: p.id in fragment("(?,?,?)", ^1, splice([2, splice([3, 4]), 5]), ^6)
++
++      assert {:in, _, [_, {:fragment, _, parts}]} = hd(query.wheres).expr
++
++      assert [
++               raw: "(",
++               expr: {:^, _, [0]},
++               raw: ",",
++               expr: 2,
++               raw: ",",
++               expr: 3,
++               raw: ",",
++               expr: 4,
++               raw: ",",
++               expr: 5,
++               raw: ",",
++               expr: {:^, _, [1]},
++               raw: ")"
++             ] = parts
++    end
++
++    test "supports compile-time splicing with macro" do
++      query = from p in "posts", select: concat_ws(":", [p.author, ^2000])
++      assert {:fragment, _, parts} = query.select.expr
++
++      assert [
++               raw: "concat_ws(",
++               expr: ":",
++               raw: ",",
++               expr: {{:., _, [{:&, _, [0]}, :author]}, _, _},
++               raw: ",",
++               expr: {:^, _, [0]},
++               raw: ")"
++             ] = parts
++    end
++
+     test "keeps UTF-8 encoding" do
+       assert inspect(from p in "posts", where: fragment("héllò")) ==
+                ~s[#Ecto.Query<from p0 in \"posts\", where: fragment("héllò")>]

@@ -1,0 +1,1464 @@
+diff --git a/config/config.exs b/config/config.exs
+index cb1b7d11a..e1f5e1db2 100644
+--- a/config/config.exs
++++ b/config/config.exs
+@@ -48,7 +48,8 @@ config :pinchflat, Oban,
+     media_indexing: 2,
+     media_collection_indexing: 2,
+     media_fetching: 2,
+-    media_local_metadata: 8
++    local_metadata: 8,
++    remote_metadata: 4
+   ]
+ 
+ # Configures the mailer
+diff --git a/lib/pinchflat/boot/data_backfill_worker.ex b/lib/pinchflat/boot/data_backfill_worker.ex
+index 6c863e35e..c7a1a7b2d 100644
+--- a/lib/pinchflat/boot/data_backfill_worker.ex
++++ b/lib/pinchflat/boot/data_backfill_worker.ex
+@@ -2,7 +2,7 @@ defmodule Pinchflat.Boot.DataBackfillWorker do
+   @moduledoc false
+ 
+   use Oban.Worker,
+-    queue: :media_local_metadata,
++    queue: :local_metadata,
+     unique: [period: :infinity, states: [:available, :scheduled, :retryable]],
+     tags: ["media_item", "media_metadata", "local_metadata", "data_backfill"]
+ 
+diff --git a/lib/pinchflat/downloading/download_option_builder.ex b/lib/pinchflat/downloading/download_option_builder.ex
+index dabf407f4..2c4a77ee5 100644
+--- a/lib/pinchflat/downloading/download_option_builder.ex
++++ b/lib/pinchflat/downloading/download_option_builder.ex
+@@ -18,7 +18,7 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+     built_options =
+       default_options() ++
+         subtitle_options(media_profile) ++
+-        thumbnail_options(media_profile) ++
++        thumbnail_options(media_item_with_preloads) ++
+         metadata_options(media_profile) ++
+         quality_options(media_profile) ++
+         output_options(media_item_with_preloads)
+@@ -57,13 +57,16 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+     end)
+   end
+ 
+-  defp thumbnail_options(media_profile) do
++  defp thumbnail_options(media_item_with_preloads) do
++    media_profile = media_item_with_preloads.source.media_profile
+     mapped_struct = Map.from_struct(media_profile)
+ 
+     Enum.reduce(mapped_struct, [], fn attr, acc ->
+       case attr do
+         {:download_thumbnail, true} ->
+-          acc ++ [:write_thumbnail, convert_thumbnail: "jpg"]
++          thumbnail_save_location = determine_thumbnail_location(media_item_with_preloads)
++
++          acc ++ [:write_thumbnail, convert_thumbnail: "jpg", output: "thumbnail:#{thumbnail_save_location}"]
+ 
+         {:embed_thumbnail, true} ->
+           acc ++ [:embed_thumbnail, convert_thumbnail: "jpg"]
+@@ -102,15 +105,20 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+   end
+ 
+   defp output_options(media_item_with_preloads) do
+-    media_profile = media_item_with_preloads.source.media_profile
+-    additional_options_map = output_options_map(media_item_with_preloads)
+-    {:ok, output_path} = OutputPathBuilder.build(media_profile.output_path_template, additional_options_map)
++    output_path_template = media_item_with_preloads.source.media_profile.output_path_template
+ 
+     [
+-      output: Path.join(base_directory(), output_path)
++      output: build_output_path(output_path_template, media_item_with_preloads)
+     ]
+   end
+ 
++  defp build_output_path(string, media_item_with_preloads) do
++    additional_options_map = output_options_map(media_item_with_preloads)
++    {:ok, output_path} = OutputPathBuilder.build(string, additional_options_map)
++
++    Path.join(base_directory(), output_path)
++  end
++
+   defp output_options_map(media_item_with_preloads) do
+     source = media_item_with_preloads.source
+ 
+@@ -120,6 +128,19 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+     }
+   end
+ 
++  # I don't love the string manipulation here, but what can ya' do.
++  # It's dependent on the output_path_template being a string ending `.{{ ext }}`
++  # (or equivalent), but that's validated by the MediaProfile schema.
++  defp determine_thumbnail_location(media_item_with_preloads) do
++    output_path_template = media_item_with_preloads.source.media_profile.output_path_template
++
++    output_path_template
++    |> String.split(~r{\.}, include_captures: true)
++    |> List.insert_at(-3, "-thumb")
++    |> Enum.join()
++    |> build_output_path(media_item_with_preloads)
++  end
++
+   defp base_directory do
+     Application.get_env(:pinchflat, :media_directory)
+   end
+diff --git a/lib/pinchflat/downloading/output_path_builder.ex b/lib/pinchflat/downloading/output_path_builder.ex
+index 6364da05b..374d57f6d 100644
+--- a/lib/pinchflat/downloading/output_path_builder.ex
++++ b/lib/pinchflat/downloading/output_path_builder.ex
+@@ -40,7 +40,9 @@ defmodule Pinchflat.Downloading.OutputPathBuilder do
+       "upload_year" => "%(upload_date>%Y)S",
+       "upload_month" => "%(upload_date>%m)S",
+       "upload_day" => "%(upload_date>%d)S",
+-      "upload_yyyy_mm_dd" => "%(upload_date>%Y-%m-%d)S"
++      "upload_yyyy_mm_dd" => "%(upload_date>%Y-%m-%d)S",
++      "season_from_date" => "%(upload_date>%Y)S",
++      "season_episode_from_date" => "s%(upload_date>%Y)Se%(upload_date>%m%d)S"
+     }
+   end
+ end
+diff --git a/lib/pinchflat/filesystem/filesystem_data_worker.ex b/lib/pinchflat/filesystem/filesystem_data_worker.ex
+index 0941a8882..2b36d3726 100644
+--- a/lib/pinchflat/filesystem/filesystem_data_worker.ex
++++ b/lib/pinchflat/filesystem/filesystem_data_worker.ex
+@@ -2,7 +2,7 @@ defmodule Pinchflat.Filesystem.FilesystemDataWorker do
+   @moduledoc false
+ 
+   use Oban.Worker,
+-    queue: :media_local_metadata,
++    queue: :local_metadata,
+     tags: ["media_item", "media_metadata", "local_metadata"],
+     max_attempts: 1
+ 
+@@ -13,6 +13,10 @@ defmodule Pinchflat.Filesystem.FilesystemDataWorker do
+   @doc """
+   For a given media item, compute and save metadata about the file on-disk.
+ 
++  IDEA: does this have to be a standalone job? I originally split it out
++  so a failure here wouldn't cause a downloader job retry, but I can match
++  for failures so it doesn't retry.
++
+   Returns :ok
+   """
+   def perform(%Oban.Job{args: %{"id" => media_item_id}}) do
+diff --git a/lib/pinchflat/media/media.ex b/lib/pinchflat/media/media.ex
+index ae21988da..500866f44 100644
+--- a/lib/pinchflat/media/media.ex
++++ b/lib/pinchflat/media/media.ex
+@@ -144,6 +144,8 @@ defmodule Pinchflat.Media do
+   @doc """
+   Produces a flat list of the filesystem paths for a media_item's downloaded files
+ 
++  NOTE: this can almost certainly be made private
++
+   Returns [binary()]
+   """
+   def media_filepaths(media_item) do
+@@ -162,6 +164,8 @@ defmodule Pinchflat.Media do
+   Produces a flat list of the filesystem paths for a media_item's metadata files.
+   Returns an empty list if the media_item has no metadata.
+ 
++  NOTE: this can almost certainly be made private
++
+   Returns [binary()] | []
+   """
+   def metadata_filepaths(media_item) do
+@@ -227,6 +231,7 @@ defmodule Pinchflat.Media do
+   def delete_media_item(%MediaItem{} = media_item, opts \\ []) do
+     delete_files = Keyword.get(opts, :delete_files, false)
+ 
++    # NOTE: this should delete metadata no matter what
+     if delete_files do
+       {:ok, _} = delete_all_attachments(media_item)
+     end
+@@ -242,6 +247,7 @@ defmodule Pinchflat.Media do
+     MediaItem.changeset(media_item, attrs)
+   end
+ 
++  # NOTE: refactor this
+   defp delete_all_attachments(media_item) do
+     media_item = Repo.preload(media_item, :metadata)
+ 
+diff --git a/lib/pinchflat/metadata/metadata_parser.ex b/lib/pinchflat/metadata/metadata_parser.ex
+index 7aa2ed062..ee6e8c582 100644
+--- a/lib/pinchflat/metadata/metadata_parser.ex
++++ b/lib/pinchflat/metadata/metadata_parser.ex
+@@ -54,9 +54,22 @@ defmodule Pinchflat.Metadata.MetadataParser do
+       |> Enum.reverse()
+       |> Enum.find_value(fn attrs -> attrs["filepath"] end)
+ 
+-    %{
+-      thumbnail_filepath: thumbnail_filepath
+-    }
++    if thumbnail_filepath do
++      # NOTE: whole ordeal needed due to a bug I found in yt-dlp
++      # https://github.com/yt-dlp/yt-dlp/issues/9445
++      # Can be reverted to remove this entire conditional once fixed
++      %{
++        thumbnail_filepath:
++          thumbnail_filepath
++          |> String.split(~r{\.}, include_captures: true)
++          |> List.insert_at(-3, "-thumb")
++          |> Enum.join()
++      }
++    else
++      %{
++        thumbnail_filepath: thumbnail_filepath
++      }
++    end
+   end
+ 
+   defp parse_infojson_metadata(metadata) do
+diff --git a/lib/pinchflat/metadata/source_metadata.ex b/lib/pinchflat/metadata/source_metadata.ex
+new file mode 100644
+index 000000000..cd4aabdbc
+--- /dev/null
++++ b/lib/pinchflat/metadata/source_metadata.ex
+@@ -0,0 +1,36 @@
++defmodule Pinchflat.Metadata.SourceMetadata do
++  @moduledoc """
++  The SourceMetadata schema.
++
++  Look. Don't @ me about Metadata vs. Metadatum. I'm very sensitive.
++  """
++
++  use Ecto.Schema
++  import Ecto.Changeset
++
++  alias Pinchflat.Sources.Source
++
++  @allowed_fields ~w(metadata_filepath)a
++  @required_fields ~w(metadata_filepath)a
++
++  schema "source_metadata" do
++    field :metadata_filepath, :string
++
++    belongs_to :source, Source
++
++    timestamps(type: :utc_datetime)
++  end
++
++  @doc false
++  def changeset(source_metadata, attrs) do
++    source_metadata
++    |> cast(attrs, @allowed_fields)
++    |> validate_required(@required_fields)
++    |> unique_constraint([:source_id])
++  end
++
++  @doc false
++  def filepath_attributes do
++    ~w(metadata_filepath)a
++  end
++end
+diff --git a/lib/pinchflat/metadata/source_metadata_storage_worker.ex b/lib/pinchflat/metadata/source_metadata_storage_worker.ex
+new file mode 100644
+index 000000000..bdc81b106
+--- /dev/null
++++ b/lib/pinchflat/metadata/source_metadata_storage_worker.ex
+@@ -0,0 +1,48 @@
++defmodule Pinchflat.Metadata.SourceMetadataStorageWorker do
++  @moduledoc false
++
++  use Oban.Worker,
++    queue: :remote_metadata,
++    tags: ["media_source", "source_metadata", "remote_metadata"],
++    max_attempts: 1
++
++  alias __MODULE__
++  alias Pinchflat.Repo
++  alias Pinchflat.Tasks
++  alias Pinchflat.Sources
++  alias Pinchflat.YtDlp.MediaCollection
++  alias Pinchflat.Metadata.MetadataFileHelpers
++
++  @doc """
++  Starts the source metadata storage worker and creates a task for the source.
++
++  IDEA: testing out this method of handling job kickoff. I think I like it, so
++  I may use it in other places. Just testing it for now
++
++  Returns {:ok, %Task{}} | {:error, :duplicate_job} | {:error, %Ecto.Changeset{}}
++  """
++  def kickoff_with_task(source) do
++    %{id: source.id}
++    |> SourceMetadataStorageWorker.new()
++    |> Tasks.create_job_with_task(source)
++  end
++
++  @impl Oban.Worker
++  @doc """
++  Fetches and stores metadata for a source in the secret metadata location.
++
++  Returns :ok
++  """
++  def perform(%Oban.Job{args: %{"id" => source_id}}) do
++    source = Repo.preload(Sources.get_source!(source_id), :metadata)
++    {:ok, metadata} = MediaCollection.get_source_metadata(source.original_url)
++
++    Sources.update_source(source, %{
++      metadata: %{
++        metadata_filepath: MetadataFileHelpers.compress_and_store_metadata_for(source, metadata)
++      }
++    })
++
++    :ok
++  end
++end
+diff --git a/lib/pinchflat/profiles/media_profile.ex b/lib/pinchflat/profiles/media_profile.ex
+index 0655e06bb..ef60b02f7 100644
+--- a/lib/pinchflat/profiles/media_profile.ex
++++ b/lib/pinchflat/profiles/media_profile.ex
+@@ -35,14 +35,14 @@ defmodule Pinchflat.Profiles.MediaProfile do
+ 
+     field :download_subs, :boolean, default: false
+     field :download_auto_subs, :boolean, default: false
+-    field :embed_subs, :boolean, default: true
++    field :embed_subs, :boolean, default: false
+     field :sub_langs, :string, default: "en"
+ 
+     field :download_thumbnail, :boolean, default: false
+-    field :embed_thumbnail, :boolean, default: true
++    field :embed_thumbnail, :boolean, default: false
+ 
+     field :download_metadata, :boolean, default: false
+-    field :embed_metadata, :boolean, default: true
++    field :embed_metadata, :boolean, default: false
+ 
+     field :download_nfo, :boolean, default: false
+     # NOTE: these do NOT speed up indexing - the indexer still has to go
+@@ -67,6 +67,12 @@ defmodule Pinchflat.Profiles.MediaProfile do
+     media_profile
+     |> cast(attrs, @allowed_fields)
+     |> validate_required(@required_fields)
++    # Ensures it ends with `.{{ ext }}` or `.%(ext)s` or similar (with a little wiggle room)
++    |> validate_format(:output_path_template, ext_regex(), message: "must end with .{{ ext }}")
+     |> unique_constraint(:name)
+   end
++
++  defp ext_regex do
++    ~r/\.({{ ?ext ?}}|%\( ?ext ?\)[sS])$/
++  end
+ end
+diff --git a/lib/pinchflat/sources/source.ex b/lib/pinchflat/sources/source.ex
+index 3022a7d66..6a39e5e4a 100644
+--- a/lib/pinchflat/sources/source.ex
++++ b/lib/pinchflat/sources/source.ex
+@@ -10,6 +10,7 @@ defmodule Pinchflat.Sources.Source do
+   alias Pinchflat.Tasks.Task
+   alias Pinchflat.Media.MediaItem
+   alias Pinchflat.Profiles.MediaProfile
++  alias Pinchflat.Metadata.SourceMetadata
+ 
+   @allowed_fields ~w(
+     collection_name
+@@ -28,7 +29,8 @@ defmodule Pinchflat.Sources.Source do
+   # Expensive API calls are made when a source is inserted/updated so
+   # we want to ensure that the source is valid before making the call.
+   # This way, we check that the other attributes are valid before ensuring
+-  # that all fields are valid.
++  # that all fields are valid. This is still only one DB insert but it's
++  # a two-stage validation process to fail fast before the API call.
+   @initially_required_fields ~w(
+     index_frequency_minutes
+     fast_index
+@@ -60,6 +62,8 @@ defmodule Pinchflat.Sources.Source do
+ 
+     belongs_to :media_profile, MediaProfile
+ 
++    has_one :metadata, SourceMetadata, on_replace: :update
++
+     has_many :tasks, Task
+     has_many :media_items, MediaItem, foreign_key: :source_id
+ 
+@@ -80,6 +84,7 @@ defmodule Pinchflat.Sources.Source do
+     |> cast(attrs, @allowed_fields)
+     |> dynamic_default(:custom_name, fn cs -> get_field(cs, :collection_name) end)
+     |> validate_required(required_fields)
++    |> cast_assoc(:metadata, with: &SourceMetadata.changeset/2, required: false)
+     |> unique_constraint([:collection_id, :media_profile_id])
+   end
+ 
+diff --git a/lib/pinchflat/sources/sources.ex b/lib/pinchflat/sources/sources.ex
+index 72cbfd645..974a94da5 100644
+--- a/lib/pinchflat/sources/sources.ex
++++ b/lib/pinchflat/sources/sources.ex
+@@ -11,9 +11,11 @@ defmodule Pinchflat.Sources do
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.Profiles.MediaProfile
+   alias Pinchflat.YtDlp.MediaCollection
++  alias Pinchflat.Metadata.SourceMetadata
+   alias Pinchflat.Downloading.DownloadingHelpers
+   alias Pinchflat.FastIndexing.FastIndexingHelpers
+   alias Pinchflat.SlowIndexing.SlowIndexingHelpers
++  alias Pinchflat.Metadata.SourceMetadataStorageWorker
+ 
+   @doc """
+   Returns the list of sources. Returns [%Source{}, ...]
+@@ -54,7 +56,7 @@ defmodule Pinchflat.Sources do
+     case change_source(%Source{}, attrs, :initial) do
+       %Ecto.Changeset{valid?: true} ->
+         %Source{}
+-        |> change_source_from_url(attrs)
++        |> maybe_change_source_from_url(attrs)
+         |> maybe_change_indexing_frequency()
+         |> commit_and_handle_tasks()
+ 
+@@ -82,7 +84,7 @@ defmodule Pinchflat.Sources do
+     case change_source(source, attrs, :initial) do
+       %Ecto.Changeset{valid?: true} ->
+         source
+-        |> change_source_from_url(attrs)
++        |> maybe_change_source_from_url(attrs)
+         |> maybe_change_indexing_frequency()
+         |> commit_and_handle_tasks()
+ 
+@@ -107,6 +109,7 @@ defmodule Pinchflat.Sources do
+     end)
+ 
+     Tasks.delete_tasks_for(source)
++    delete_source_metadata_files(source)
+     Repo.delete(source)
+   end
+ 
+@@ -122,14 +125,12 @@ defmodule Pinchflat.Sources do
+   fetches source details from the original_url (if provided). If the source
+   details cannot be fetched, an error is added to the changeset.
+ 
+-  Note that this fetches source details as long as the `original_url` is present.
+-  This means that it'll go for it even if a changeset is otherwise invalid. This
+-  is pretty easy to change, but for MVP I'm not concerned.
+-
+   NOTE: When operating in the ideal path, this effectively adds an API call
+   to the source creation/update process. Should be used only when needed.
++
++  NOTE: this can almost certainly be made private now
+   """
+-  def change_source_from_url(%Source{} = source, attrs) do
++  def maybe_change_source_from_url(%Source{} = source, attrs) do
+     case change_source(source, attrs) do
+       %Ecto.Changeset{changes: %{original_url: _}} = changeset ->
+         add_source_details_to_changeset(source, changeset)
+@@ -139,6 +140,18 @@ defmodule Pinchflat.Sources do
+     end
+   end
+ 
++  defp delete_source_metadata_files(source) do
++    metadata = Repo.preload(source, :metadata).metadata || %SourceMetadata{}
++    mapped_struct = Map.from_struct(metadata)
++
++    filepaths =
++      SourceMetadata.filepath_attributes()
++      |> Enum.map(fn field -> mapped_struct[field] end)
++      |> Enum.filter(&is_binary/1)
++
++    Enum.each(filepaths, &File.rm/1)
++  end
++
+   defp add_source_details_to_changeset(source, changeset) do
+     %Ecto.Changeset{changes: changes} = changeset
+ 
+@@ -196,6 +209,9 @@ defmodule Pinchflat.Sources do
+       {:ok, %Source{} = source} ->
+         maybe_handle_media_tasks(changeset, source)
+         maybe_run_indexing_task(changeset, source)
++        run_metadata_storage_task(source)
++
++        {:ok, source}
+ 
+       err ->
+         err
+@@ -215,8 +231,6 @@ defmodule Pinchflat.Sources do
+       _ ->
+         :ok
+     end
+-
+-    {:ok, source}
+   end
+ 
+   defp maybe_run_indexing_task(changeset, source) do
+@@ -231,8 +245,11 @@ defmodule Pinchflat.Sources do
+         maybe_update_slow_indexing_task(changeset, source)
+         maybe_update_fast_indexing_task(changeset, source)
+     end
++  end
+ 
+-    {:ok, source}
++  # This runs every time to pick up any changes to the metadata
++  defp run_metadata_storage_task(source) do
++    SourceMetadataStorageWorker.kickoff_with_task(source)
+   end
+ 
+   defp maybe_update_slow_indexing_task(changeset, source) do
+diff --git a/lib/pinchflat/tasks/tasks.ex b/lib/pinchflat/tasks/tasks.ex
+index 6426450f2..35f0461e6 100644
+--- a/lib/pinchflat/tasks/tasks.ex
++++ b/lib/pinchflat/tasks/tasks.ex
+@@ -20,6 +20,8 @@ defmodule Pinchflat.Tasks do
+   Returns the list of tasks for a given record type and ID. Optionally allows you to specify
+   which worker or job states to include.
+ 
++  IDEA: this should be updated to take a struct instead of a record type and ID
++
+   Returns [%Task{}, ...]
+   """
+   def list_tasks_for(attached_record_type, attached_record_id, worker_name \\ nil, job_states \\ Oban.Job.states()) do
+diff --git a/lib/pinchflat/yt_dlp/media_collection.ex b/lib/pinchflat/yt_dlp/media_collection.ex
+index 5fb957c2d..465437b3d 100644
+--- a/lib/pinchflat/yt_dlp/media_collection.ex
++++ b/lib/pinchflat/yt_dlp/media_collection.ex
+@@ -50,8 +50,8 @@ defmodule Pinchflat.YtDlp.MediaCollection do
+   @doc """
+   Gets a source's ID and name from its URL.
+ 
+-  yt-dlp does not _really_ have source-specific functions, so
+-  instead we're fetching just the first video (using playlist_end: 1)
++  yt-dlp does not _really_ have source-specific functions that return what
++  we need, so instead we're fetching just the first video (using playlist_end: 1)
+   and parsing the source ID and name from _its_ metadata
+ 
+   Returns {:ok, map()} | {:error, any, ...}.
+@@ -71,7 +71,35 @@ defmodule Pinchflat.YtDlp.MediaCollection do
+     end
+   end
+ 
++  @doc """
++  Gets a source's metadata from its URL.
++
++  This is mostly for things like getting the source's avatar and banner image
++  (if applicable). However, this yt-dlp call doesn't have enough overlap with
++  `get_source_details/1` to allow combining them - this one has _almost_ everything
++  we need, but it doesn't contain enough information to tell 100% if the url is a channel
++  or a playlist.
++
++  The main purpose of this (past using as a fetcher for _other_ metadata) is to live
++  as a compressed blob for possible future use. That's why it's not getting formatted like
++  `get_source_details/1`
++
++  Returns {:ok, map()} | {:error, any, ...}.
++  """
++  def get_source_metadata(source_url) do
++    opts = [playlist_items: 0]
++    output_template = "playlist:%()j"
++
++    with {:ok, output} <- backend_runner().run(source_url, opts, output_template),
++         {:ok, parsed_json} <- Phoenix.json_library().decode(output) do
++      {:ok, parsed_json}
++    else
++      err -> err
++    end
++  end
++
+   defp format_source_details(response) do
++    # NOTE: I should probably make this a struct some day
+     %{
+       channel_id: response["channel_id"],
+       channel_name: response["channel"],
+diff --git a/lib/pinchflat_web/components/core_components.ex b/lib/pinchflat_web/components/core_components.ex
+index 314dbf9c6..52295d075 100644
+--- a/lib/pinchflat_web/components/core_components.ex
++++ b/lib/pinchflat_web/components/core_components.ex
+@@ -317,17 +317,7 @@ defmodule PinchflatWeb.CoreComponents do
+         <span :if={@label_suffix} class="text-xs text-bodydark"><%= @label_suffix %></span>
+       </.label>
+       <div class="relative">
+-        <input type="hidden" name={@name} value="false" />
+-        <input
+-          type="checkbox"
+-          id={@id}
+-          name={@name}
+-          value="true"
+-          x-bind:checked="enabled"
+-          class="sr-only"
+-          @change="enabled = !enabled"
+-          {@rest}
+-        />
++        <input type="hidden" id={@id} name={@name} x-bind:value="enabled" {@rest} />
+         <div class="inline-block cursor-pointer" @click="enabled = !enabled">
+           <div x-bind:class="enabled && '!bg-primary'" class="block h-8 w-14 rounded-full bg-black"></div>
+           <div
+@@ -349,23 +339,26 @@ defmodule PinchflatWeb.CoreComponents do
+   def input(%{type: "select"} = assigns) do
+     ~H"""
+     <div phx-feedback-for={@name}>
+-      <.label for={@id}>
++      <.label :if={@label} for={@id}>
+         <%= @label %><span :if={@label_suffix} class="text-xs text-bodydark"><%= @label_suffix %></span>
+       </.label>
+-      <select
+-        id={@id}
+-        name={@name}
+-        class={[
+-          "relative z-20 w-full appearance-none rounded border border-stroke bg-transparent py-3 pl-5 pr-12 outline-none transition",
+-          "focus:border-primary active:border-primary dark:border-form-strokedark dark:bg-form-input text-black dark:text-white",
+-          @inputclass
+-        ]}
+-        multiple={@multiple}
+-        {@rest}
+-      >
+-        <option :if={@prompt} value=""><%= @prompt %></option>
+-        <%= Phoenix.HTML.Form.options_for_select(@options, @value) %>
+-      </select>
++      <div class="flex">
++        <select
++          id={@id}
++          name={@name}
++          class={[
++            "relative z-20 w-full appearance-none rounded border border-stroke bg-transparent py-3 pl-5 pr-12 outline-none transition",
++            "focus:border-primary active:border-primary dark:border-form-strokedark dark:bg-form-input text-black dark:text-white",
++            @inputclass
++          ]}
++          multiple={@multiple}
++          {@rest}
++        >
++          <option :if={@prompt} value=""><%= @prompt %></option>
++          <%= Phoenix.HTML.Form.options_for_select(@options, @value) %>
++        </select>
++        <%= render_slot(@inner_block) %>
++      </div>
+       <.help :if={@help}><%= @help %></.help>
+       <.error :for={msg <- @errors}><%= msg %></.error>
+     </div>
+diff --git a/lib/pinchflat_web/components/custom_components/button_components.ex b/lib/pinchflat_web/components/custom_components/button_components.ex
+index 304e2803b..c6f6e012f 100644
+--- a/lib/pinchflat_web/components/custom_components/button_components.ex
++++ b/lib/pinchflat_web/components/custom_components/button_components.ex
+@@ -28,9 +28,10 @@ defmodule PinchflatWeb.CustomComponents.ButtonComponents do
+         "#{@rounding} inline-flex items-center justify-center px-8 py-4",
+         "#{@color}",
+         "hover:bg-opacity-90 lg:px-8 xl:px-10",
+-        "disabled:bg-opacity-50 disabled:cursor-not-allowed disabled:text-gray-2",
++        "disabled:bg-opacity-50 disabled:cursor-not-allowed disabled:text-grey-5",
+         @class
+       ]}
++      type={@type}
+       disabled={@disabled}
+       {@rest}
+     >
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html.ex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html.ex
+index 85990a4c2..8f847000b 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html.ex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html.ex
+@@ -1,6 +1,8 @@
+ defmodule PinchflatWeb.MediaProfiles.MediaProfileHTML do
+   use PinchflatWeb, :html
+ 
++  alias Pinchflat.Profiles.MediaProfile
++
+   embed_templates "media_profile_html/*"
+ 
+   @doc """
+@@ -53,4 +55,25 @@ defmodule PinchflatWeb.MediaProfiles.MediaProfileHTML do
+       duration_string
+     )a
+   end
++
++  def preset_options do
++    [
++      {"Default", "default"},
++      {"Media Center (Plex, Jellyfin, Kodi, etc.)", "media_center"},
++      {"Music", "audio"},
++      {"Archiving", "archiving"}
++    ]
++  end
++
++  defp default_output_template do
++    %MediaProfile{}.output_path_template
++  end
++
++  defp media_center_output_template do
++    "/shows/{{ source_custom_name }}/{{ season_from_date }}/{{ season_episode_from_date }} - {{ title }}.{{ ext }}"
++  end
++
++  defp audio_output_template do
++    "/music/{{ source_custom_name }}/{{ title }}.{{ ext }}"
++  end
+ end
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
+index bed943ee5..3eba72836 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
+@@ -3,123 +3,218 @@
+     Oops, something went wrong! Please check the errors below.
+   </.error>
+ 
+-  <h3 class="my-4 text-2xl text-black dark:text-white">
+-    General Options
+-  </h3>
+-  <.input
+-    field={f[:name]}
+-    type="text"
+-    label="Name"
+-    placeholder="New Profile"
+-    help="Something descriptive. Does not impact indexing or downloading (required)"
+-  />
+-
+-  <.input
+-    field={f[:output_path_template]}
+-    type="text"
+-    inputclass="font-mono"
+-    label="Output path template"
+-    help="Must end with .{{ ext }}. See below for more details. The default is good for most cases (required)"
+-  />
+-
+-  <h3 class="mt-8 text-2xl text-black dark:text-white">
+-    Subtitle Options
+-  </h3>
+-  <.input
+-    field={f[:download_subs]}
+-    type="toggle"
+-    label="Download Subtitles"
+-    help="Downloads subtitle files alongside media file"
+-  />
+-  <.input
+-    field={f[:download_auto_subs]}
+-    type="toggle"
+-    label="Download Autogenerated Subtitles"
+-    help="Prefers normal subs but will download autogenerated if needed. Requires 'Download Subtitles' to be enabled"
+-  />
+-  <.input
+-    field={f[:embed_subs]}
+-    type="toggle"
+-    label="Embed Subtitles"
+-    help="Downloads and embeds subtitles in the media file itself, if supported. Uneffected by 'Download Subtitles' (recommended)"
+-  />
+-  <.input
+-    field={f[:sub_langs]}
+-    type="text"
+-    label="Subtitle Languages"
+-    help="Use commas for multiple languages (eg: en,de)"
+-  />
+-
+-  <h3 class="mt-8 text-2xl text-black dark:text-white">
+-    Thumbnail Options
+-  </h3>
+-  <.input
+-    field={f[:download_thumbnail]}
+-    type="toggle"
+-    label="Download Thumbnail"
+-    help="Downloads thumbnail alongside media file"
+-  />
+-  <.input
+-    field={f[:embed_thumbnail]}
+-    type="toggle"
+-    label="Embed Thumbnail"
+-    help="Downloads and embeds thumbnail in the media file itself, if supported. Uneffected by 'Download Thumbnail' (recommended)"
+-  />
+-
+-  <h3 class="mt-8 text-2xl text-black dark:text-white">
+-    Metadata Options
+-  </h3>
+-  <.input
+-    field={f[:download_metadata]}
+-    type="toggle"
+-    label="Download Metadata"
+-    help="Downloads metadata file alongside media file"
+-  />
+-  <.input
+-    field={f[:embed_metadata]}
+-    type="toggle"
+-    label="Embed Metadata"
+-    help="Downloads and embeds metadata in the media file itself, if supported. Uneffected by 'Download Metadata' (recommended)"
+-  />
+-  <.input
+-    field={f[:download_nfo]}
+-    type="toggle"
+-    label="Download NFO data"
+-    help="Downloads NFO data alongside media file for use with Jellyfin, Kodi, etc."
+-  />
+-
+-  <h3 class="mt-8 text-2xl text-black dark:text-white">
+-    Release Format Options
+-  </h3>
+-
+-  <.input
+-    field={f[:shorts_behaviour]}
+-    options={friendly_format_type_options()}
+-    type="select"
+-    label="Include Shorts?"
+-    help="Experimental. Please report any issues on GitHub"
+-  />
+-  <.input
+-    field={f[:livestream_behaviour]}
+-    options={friendly_format_type_options()}
+-    type="select"
+-    label="Include Livestreams?"
+-    help="Excludes media that comes from a past livestream"
+-  />
+-
+-  <h3 class="mt-8 text-2xl text-black dark:text-white">
+-    Quality Options
+-  </h3>
+-
+-  <.input
+-    field={f[:preferred_resolution]}
+-    options={friendly_resolution_options()}
+-    type="select"
+-    label="Preferred Resolution"
+-    help="Will grab the closest available resolution if your preferred is not available. 'Audio Only' grabs the highest quality m4a"
+-  />
+-
+-  <.button class="my-10 sm:mb-7.5 w-full sm:w-auto">Save Media profile</.button>
++  <section x-data="{ selectedPreset: null }">
++    <h3 class="my-4 text-2xl text-black dark:text-white">
++      Use a Preset
++    </h3>
++    <section x-data="{ selection: null }">
++      <.input
++        prompt="Select preset"
++        name="media_profile_preset"
++        value=""
++        options={preset_options()}
++        type="select"
++        x-model="selection"
++        inputclass="w-full"
++        help="You can further customize the settings after selecting a preset. This is just a starting point"
++      >
++        <.button
++          class="h-13 w-2/5 lg:w-1/5 ml-2 md:ml-4"
++          rounding="rounded"
++          type="button"
++          x-on:click="selectedPreset = selection; selection = null"
++          x-bind:disabled="!selection"
++        >
++          <span x-text="selection ? 'Load' : 'Select'">Select</span><span class="hidden lg:inline ml-1">Preset</span>
++        </.button>
++      </.input>
++    </section>
++
++    <h3 class="mt-8 text-2xl text-black dark:text-white">
++      General Options
++    </h3>
++
++    <section x-data="{ 
++        presets: { 
++          default: 'Default',
++          media_center: 'TV Shows',
++          audio: 'Audio',
++          archiving: 'Archiving'
++        }
++    }">
++      <.input
++        field={f[:name]}
++        type="text"
++        label="Name"
++        placeholder="New Profile"
++        help="Something descriptive. Does not impact indexing or downloading (required)"
++        x-init="$watch('selectedPreset', p => p && ($el.value = presets[p]))"
++      />
++    </section>
++
++    <section x-data={"{ 
++        presets: { 
++          default: '#{default_output_template()}',
++          media_center: '#{media_center_output_template()}',
++          audio: '#{audio_output_template()}',
++          archiving: '#{default_output_template()}'
++        }
++    }"}>
++      <.input
++        field={f[:output_path_template]}
++        type="text"
++        inputclass="font-mono"
++        label="Output path template"
++        help="Must end with .{{ ext }}. See below for more details. The default is good for most cases (required)"
++        x-init="$watch('selectedPreset', p => p && ($el.value = presets[p]))"
++      />
++    </section>
++
++    <h3 class="mt-10 text-2xl text-black dark:text-white">
++      Subtitle Options
++    </h3>
++
++    <section x-data="{ presets: { default: true, media_center: true, audio: false, archiving: true } }">
++      <.input
++        field={f[:download_subs]}
++        type="toggle"
++        label="Download Subtitles"
++        help="Downloads subtitle files alongside media file"
++        x-init="$watch('selectedPreset', p => p && (enabled = presets[p]))"
++      />
++    </section>
++
++    <section x-data="{ presets: { default: false, media_center: false, audio: false, archiving: false } }">
++      <.input
++        field={f[:download_auto_subs]}
++        type="toggle"
++        label="Download Autogenerated Subtitles"
++        help="Prefers normal subs but will download autogenerated if needed. Requires 'Download Subtitles' to be enabled"
++        x-init="$watch('selectedPreset', p => p && (enabled = presets[p]))"
++      />
++    </section>
++
++    <section x-data="{ presets: { default: true, media_center: true, audio: false, archiving: true } }">
++      <.input
++        field={f[:embed_subs]}
++        type="toggle"
++        label="Embed Subtitles"
++        help="Downloads and embeds subtitles in the media file itself, if supported. Uneffected by 'Download Subtitles' (recommended)"
++        x-init="$watch('selectedPreset', p => p && (enabled = presets[p]))"
++      />
++    </section>
++
++    <section x-data="{ presets: { default: 'en', media_center: 'en', audio: '', archiving: 'all' } }">
++      <.input
++        field={f[:sub_langs]}
++        type="text"
++        label="Subtitle Languages"
++        help="Use commas for multiple languages (eg: en,de)"
++        x-init="$watch('selectedPreset', p => p && ($el.value = presets[p]))"
++      />
++    </section>
++
++    <h3 class="mt-10 text-2xl text-black dark:text-white">
++      Thumbnail Options
++    </h3>
++
++    <section x-data="{ presets: { default: true, media_center: true, audio: false, archiving: true } }">
++      <.input
++        field={f[:download_thumbnail]}
++        type="toggle"
++        label="Download Thumbnail"
++        help="Downloads thumbnail alongside media file"
++        x-init="$watch('selectedPreset', p => p && (enabled = presets[p]))"
++      />
++    </section>
++
++    <section x-data="{ presets: { default: true, media_center: true, audio: true, archiving: true } }">
++      <.input
++        field={f[:embed_thumbnail]}
++        type="toggle"
++        label="Embed Thumbnail"
++        help="Downloads and embeds thumbnail in the media file itself, if supported. Uneffected by 'Download Thumbnail' (recommended)"
++        x-init="$watch('selectedPreset', p => p && (enabled = presets[p]))"
++      />
++    </section>
++
++    <h3 class="mt-10 text-2xl text-black dark:text-white">
++      Metadata Options
++    </h3>
++
++    <section x-data="{ presets: { default: false, media_center: false, audio: false, archiving: true } }">
++      <.input
++        field={f[:download_metadata]}
++        type="toggle"
++        label="Download Metadata"
++        help="Downloads metadata file alongside media file"
++        x-init="$watch('selectedPreset', p => p && (enabled = presets[p]))"
++      />
++    </section>
++
++    <section x-data="{ presets: { default: true, media_center: true, audio: true, archiving: true } }">
++      <.input
++        field={f[:embed_metadata]}
++        type="toggle"
++        label="Embed Metadata"
++        help="Downloads and embeds metadata in the media file itself, if supported. Uneffected by 'Download Metadata' (recommended)"
++        x-init="$watch('selectedPreset', p => p && (enabled = presets[p]))"
++      />
++    </section>
++
++    <section x-data="{ presets: { default: false, media_center: true, audio: false, archiving: true } }">
++      <.input
++        field={f[:download_nfo]}
++        type="toggle"
++        label="Download NFO data"
++        help="Downloads NFO data alongside media file for use with Jellyfin, Kodi, etc."
++        x-init="$watch('selectedPreset', p => p && (enabled = presets[p]))"
++      />
++    </section>
++
++    <h3 class="mt-10 text-2xl text-black dark:text-white">
++      Release Format Options
++    </h3>
++
++    <section x-data="{ presets: { default: 'include', media_center: 'exclude', audio: 'exclude', archiving: 'include' } }">
++      <.input
++        field={f[:shorts_behaviour]}
++        options={friendly_format_type_options()}
++        type="select"
++        label="Include Shorts?"
++        help="Experimental. Please report any issues on GitHub"
++        x-init="$watch('selectedPreset', p => p && ($el.value = presets[p]))"
++      />
++    </section>
++
++    <section x-data="{ presets: { default: 'exclude', media_center: 'exclude', audio: 'exclude', archiving: 'include' } }">
++      <.input
++        field={f[:livestream_behaviour]}
++        options={friendly_format_type_options()}
++        type="select"
++        label="Include Livestreams?"
++        help="Excludes media that comes from a past livestream"
++        x-init="$watch('selectedPreset', p => p && ($el.value = presets[p]))"
++      />
++    </section>
++
++    <h3 class="mt-10 text-2xl text-black dark:text-white">
++      Quality Options
++    </h3>
++
++    <section x-data="{ presets: { default: '1080p', media_center: '1080p', audio: 'audio', archiving: '2160p' } }">
++      <.input
++        field={f[:preferred_resolution]}
++        options={friendly_resolution_options()}
++        type="select"
++        label="Preferred Resolution"
++        help="Will grab the closest available resolution if your preferred is not available. 'Audio Only' grabs the highest quality m4a"
++        x-init="$watch('selectedPreset', p => p && ($el.value = presets[p]))"
++      />
++    </section>
++
++    <.button class="my-10 sm:mb-7.5 w-full sm:w-auto">Save Media profile</.button>
++  </section>
+ 
+   <div class="rounded-sm dark:bg-meta-4 p-4 md:p-6 mb-5">
+     <.output_template_help />
+diff --git a/priv/repo/migrations/20240314174731_create_source_metadata.exs b/priv/repo/migrations/20240314174731_create_source_metadata.exs
+new file mode 100644
+index 000000000..2acd3b05a
+--- /dev/null
++++ b/priv/repo/migrations/20240314174731_create_source_metadata.exs
+@@ -0,0 +1,14 @@
++defmodule Pinchflat.Repo.Migrations.CreateSourceMetadata do
++  use Ecto.Migration
++
++  def change do
++    create table(:source_metadata) do
++      add :metadata_filepath, :string, null: false
++      add :source_id, references(:sources, on_delete: :delete_all), null: false
++
++      timestamps(type: :utc_datetime)
++    end
++
++    create unique_index(:source_metadata, [:source_id])
++  end
++end
+diff --git a/test/pinchflat/downloading/download_option_builder_test.exs b/test/pinchflat/downloading/download_option_builder_test.exs
+index 22fba78d3..bd88236fa 100644
+--- a/test/pinchflat/downloading/download_option_builder_test.exs
++++ b/test/pinchflat/downloading/download_option_builder_test.exs
+@@ -125,7 +125,15 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilderTest do
+       assert :write_thumbnail in res
+     end
+ 
+-    test "convertes thumbnail to jpg when download_thumbnail is true", %{media_item: media_item} do
++    test "appends -thumb to the thumbnail name when download_thumbnail is true", %{media_item: media_item} do
++      media_item = update_media_profile_attribute(media_item, %{download_thumbnail: true})
++
++      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
++
++      assert {:output, "thumbnail:/tmp/test/media/%(title)S-thumb.%(ext)s"} in res
++    end
++
++    test "converts thumbnail to jpg when download_thumbnail is true", %{media_item: media_item} do
+       media_item = update_media_profile_attribute(media_item, %{download_thumbnail: true})
+ 
+       assert {:ok, res} = DownloadOptionBuilder.build(media_item)
+diff --git a/test/pinchflat/metadata/metadata_parser_test.exs b/test/pinchflat/metadata/metadata_parser_test.exs
+index a3ef8e600..0f2184ce4 100644
+--- a/test/pinchflat/metadata/metadata_parser_test.exs
++++ b/test/pinchflat/metadata/metadata_parser_test.exs
+@@ -94,6 +94,15 @@ defmodule Pinchflat.Metadata.MetadataParserTest do
+       assert String.ends_with?(result.thumbnail_filepath, ".webp")
+     end
+ 
++    # NOTE: this can be removed once this bug is fixed
++    # https://github.com/yt-dlp/yt-dlp/issues/9445
++    # and the associated conditional in the parser is removed
++    test "automatically appends `-thumb` to the thumbnail filename", %{metadata: metadata} do
++      result = Parser.parse_for_media_item(metadata)
++
++      assert String.contains?(result.thumbnail_filepath, "-thumb.webp")
++    end
++
+     test "doesn't freak out if the media has no thumbnails", %{metadata: metadata} do
+       metadata = Map.put(metadata, "thumbnails", %{})
+ 
+diff --git a/test/pinchflat/metadata/source_metadata_storage_worker_test.exs b/test/pinchflat/metadata/source_metadata_storage_worker_test.exs
+new file mode 100644
+index 000000000..c3a4d2b93
+--- /dev/null
++++ b/test/pinchflat/metadata/source_metadata_storage_worker_test.exs
+@@ -0,0 +1,55 @@
++defmodule Pinchflat.Metadata.SourceMetadataStorageWorkerTest do
++  use Pinchflat.DataCase
++  import Mox
++  import Pinchflat.SourcesFixtures
++
++  alias Pinchflat.Metadata.MetadataFileHelpers
++  alias Pinchflat.Metadata.SourceMetadataStorageWorker
++
++  setup :verify_on_exit!
++
++  describe "kickoff_with_task/1" do
++    test "enqueues a new worker for the source" do
++      source = source_fixture()
++
++      assert {:ok, _} = SourceMetadataStorageWorker.kickoff_with_task(source)
++
++      assert_enqueued(worker: SourceMetadataStorageWorker, args: %{"id" => source.id})
++    end
++
++    test "creates a new task for the source" do
++      source = source_fixture()
++
++      assert {:ok, task} = SourceMetadataStorageWorker.kickoff_with_task(source)
++
++      assert task.source_id == source.id
++    end
++  end
++
++  describe "perform/1" do
++    test "sets metadata location for source" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot -> {:ok, "{}"} end)
++      source = Repo.preload(source_fixture(), :metadata)
++
++      refute source.metadata
++      perform_job(SourceMetadataStorageWorker, %{id: source.id})
++      source = Repo.preload(Repo.reload(source), :metadata)
++
++      assert source.metadata.metadata_filepath
++
++      File.rm!(source.metadata.metadata_filepath)
++    end
++
++    test "fetches and stores returned metadata for source" do
++      source = source_fixture()
++      file_contents = Phoenix.json_library().encode!(%{"title" => "test"})
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot -> {:ok, file_contents} end)
++
++      perform_job(SourceMetadataStorageWorker, %{id: source.id})
++      source = Repo.preload(Repo.reload(source), :metadata)
++      {:ok, metadata} = MetadataFileHelpers.read_compressed_metadata(source.metadata.metadata_filepath)
++
++      assert metadata == %{"title" => "test"}
++    end
++  end
++end
+diff --git a/test/pinchflat/profiles_test.exs b/test/pinchflat/profiles_test.exs
+index ea127c659..6bb597ea7 100644
+--- a/test/pinchflat/profiles_test.exs
++++ b/test/pinchflat/profiles_test.exs
+@@ -26,11 +26,11 @@ defmodule Pinchflat.ProfilesTest do
+ 
+   describe "create_media_profile/1" do
+     test "creation with valid data creates a media_profile" do
+-      valid_attrs = %{name: "some name", output_path_template: "some output_path_template"}
++      valid_attrs = %{name: "some name", output_path_template: "output_template.{{ ext }}"}
+ 
+       assert {:ok, %MediaProfile{} = media_profile} = Profiles.create_media_profile(valid_attrs)
+       assert media_profile.name == "some name"
+-      assert media_profile.output_path_template == "some output_path_template"
++      assert media_profile.output_path_template == "output_template.{{ ext }}"
+     end
+ 
+     test "creation with invalid data returns error changeset" do
+@@ -44,14 +44,14 @@ defmodule Pinchflat.ProfilesTest do
+ 
+       update_attrs = %{
+         name: "some updated name",
+-        output_path_template: "some updated output_path_template"
++        output_path_template: "new_output_template.{{ ext }}"
+       }
+ 
+       assert {:ok, %MediaProfile{} = media_profile} =
+                Profiles.update_media_profile(media_profile, update_attrs)
+ 
+       assert media_profile.name == "some updated name"
+-      assert media_profile.output_path_template == "some updated output_path_template"
++      assert media_profile.output_path_template == "new_output_template.{{ ext }}"
+     end
+ 
+     test "updating with invalid data returns error changeset" do
+@@ -132,5 +132,41 @@ defmodule Pinchflat.ProfilesTest do
+       media_profile = media_profile_fixture()
+       assert %Ecto.Changeset{} = Profiles.change_media_profile(media_profile)
+     end
++
++    test "it ensures the media profile's output template ends with an extension" do
++      valid_templates = [
++        "output_template.{{ ext }}",
++        "output_template.{{ext}}",
++        "output_template.%(ext)s",
++        "output_template.%(ext)S",
++        "output_template.%( ext )s",
++        "output_template.%( ext )S"
++      ]
++
++      for template <- valid_templates do
++        cs = Profiles.change_media_profile(%MediaProfile{}, %{name: "a", output_path_template: template})
++
++        assert cs.valid?
++      end
++    end
++
++    test "it does not allow invalid output templates" do
++      invalid_templates = [
++        "output_template.{{ ext }}.something",
++        "output_template.{{   ext   }}",
++        "output_template{{ ext }}",
++        "output_template.%(ext)s.something",
++        "output_template.txt",
++        "output_template%(ext)s",
++        "output_template.%(nope)s",
++        "output_template"
++      ]
++
++      for template <- invalid_templates do
++        cs = Profiles.change_media_profile(%MediaProfile{}, %{name: "a", output_path_template: template})
++
++        refute cs.valid?
++      end
++    end
+   end
+ end
+diff --git a/test/pinchflat/slow_indexing/media_collection_indexing_worker_test.exs b/test/pinchflat/slow_indexing/media_collection_indexing_worker_test.exs
+index 9d1f1ce05..3f91de7cf 100644
+--- a/test/pinchflat/slow_indexing/media_collection_indexing_worker_test.exs
++++ b/test/pinchflat/slow_indexing/media_collection_indexing_worker_test.exs
+@@ -101,7 +101,10 @@ defmodule Pinchflat.SlowIndexing.MediaCollectionIndexingWorkerTest do
+       expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl_opts -> {:ok, ""} end)
+ 
+       source = source_fixture(index_frequency_minutes: 10)
+-      task_count_fetcher = fn -> Enum.count(Tasks.list_tasks()) end
++
++      task_count_fetcher = fn ->
++        Enum.count(Tasks.list_tasks_for(:source_id, source.id, "MediaCollectionIndexingWorker"))
++      end
+ 
+       assert_changed([from: 0, to: 1], task_count_fetcher, fn ->
+         perform_job(MediaCollectionIndexingWorker, %{id: source.id})
+diff --git a/test/pinchflat/sources_test.exs b/test/pinchflat/sources_test.exs
+index 406265c89..59f9a8483 100644
+--- a/test/pinchflat/sources_test.exs
++++ b/test/pinchflat/sources_test.exs
+@@ -8,16 +8,32 @@ defmodule Pinchflat.SourcesTest do
+ 
+   alias Pinchflat.Sources
+   alias Pinchflat.Sources.Source
++  alias Pinchflat.Metadata.MetadataFileHelpers
+   alias Pinchflat.Downloading.DownloadingHelpers
+   alias Pinchflat.FastIndexing.FastIndexingWorker
+   alias Pinchflat.Downloading.MediaDownloadWorker
+   alias Pinchflat.FastIndexing.MediaIndexingWorker
++  alias Pinchflat.Metadata.SourceMetadataStorageWorker
+   alias Pinchflat.SlowIndexing.MediaCollectionIndexingWorker
+ 
+   @invalid_source_attrs %{name: nil, collection_id: nil}
+ 
+   setup :verify_on_exit!
+ 
++  describe "schema" do
++    test "source_metadata is deleted when the source is deleted" do
++      source =
++        source_fixture(%{metadata: %{metadata_filepath: "/metadata.json.gz"}})
++
++      metadata = source.metadata
++      assert {:ok, %Source{}} = Sources.delete_source(source)
++
++      assert_raise Ecto.NoResultsError, fn ->
++        Repo.reload!(metadata)
++      end
++    end
++  end
++
+   describe "list_sources/0" do
+     test "it returns all sources" do
+       source = source_fixture()
+@@ -220,6 +236,21 @@ defmodule Pinchflat.SourcesTest do
+ 
+       assert source.index_frequency_minutes == 0
+     end
++
++    test "creating will kickoff a metadata storage worker" do
++      expect(YtDlpRunnerMock, :run, &channel_mock/3)
++
++      valid_attrs = %{
++        media_profile_id: media_profile_fixture().id,
++        original_url: "https://www.youtube.com/channel/abc123",
++        fast_index: false,
++        index_frequency_minutes: 0
++      }
++
++      assert {:ok, %Source{} = source} = Sources.create_source(valid_attrs)
++
++      assert_enqueued(worker: SourceMetadataStorageWorker, args: %{"id" => source.id})
++    end
+   end
+ 
+   describe "update_source/2" do
+@@ -384,6 +415,15 @@ defmodule Pinchflat.SourcesTest do
+ 
+       assert source.index_frequency_minutes == 0
+     end
++
++    test "updating will kickoff a metadata storage worker" do
++      source = source_fixture()
++      update_attrs = %{name: "some updated name"}
++
++      assert {:ok, %Source{} = source} = Sources.update_source(source, update_attrs)
++
++      assert_enqueued(worker: SourceMetadataStorageWorker, args: %{"id" => source.id})
++    end
+   end
+ 
+   describe "delete_source/2" do
+@@ -421,6 +461,22 @@ defmodule Pinchflat.SourcesTest do
+       assert {:ok, %Source{}} = Sources.delete_source(source)
+       assert File.exists?(media_item.media_filepath)
+     end
++
++    test "deletes the source's metadata files" do
++      stub(HTTPClientMock, :get, fn _url, _headers, _opts -> {:ok, ""} end)
++      source = Repo.preload(source_fixture(), :metadata)
++
++      update_attrs = %{
++        metadata: %{
++          metadata_filepath: MetadataFileHelpers.compress_and_store_metadata_for(source, %{})
++        }
++      }
++
++      {:ok, updated_source} = Sources.update_source(source, update_attrs)
++
++      assert {:ok, _} = Sources.delete_source(updated_source, delete_files: true)
++      refute File.exists?(updated_source.metadata.metadata_filepath)
++    end
+   end
+ 
+   describe "delete_source/2 when deleting files" do
+@@ -452,18 +508,18 @@ defmodule Pinchflat.SourcesTest do
+     end
+   end
+ 
+-  describe "change_source_from_url/2" do
++  describe "maybe_change_source_from_url/2" do
+     test "it returns a changeset" do
+       stub(YtDlpRunnerMock, :run, &channel_mock/3)
+       source = source_fixture()
+ 
+-      assert %Ecto.Changeset{} = Sources.change_source_from_url(source, %{})
++      assert %Ecto.Changeset{} = Sources.maybe_change_source_from_url(source, %{})
+     end
+ 
+     test "it does not fetch source details if the original_url isn't in the changeset" do
+       expect(YtDlpRunnerMock, :run, 0, &channel_mock/3)
+ 
+-      changeset = Sources.change_source_from_url(%Source{}, %{name: "some updated name"})
++      changeset = Sources.maybe_change_source_from_url(%Source{}, %{name: "some updated name"})
+ 
+       assert %Ecto.Changeset{} = changeset
+     end
+@@ -472,7 +528,7 @@ defmodule Pinchflat.SourcesTest do
+       expect(YtDlpRunnerMock, :run, &channel_mock/3)
+ 
+       changeset =
+-        Sources.change_source_from_url(%Source{}, %{
++        Sources.maybe_change_source_from_url(%Source{}, %{
+           original_url: "https://www.youtube.com/channel/abc123"
+         })
+ 
+@@ -486,7 +542,7 @@ defmodule Pinchflat.SourcesTest do
+       media_profile_id = media_profile.id
+ 
+       changeset =
+-        Sources.change_source_from_url(%Source{}, %{
++        Sources.maybe_change_source_from_url(%Source{}, %{
+           original_url: "https://www.youtube.com/channel/abc123",
+           media_profile_id: media_profile.id
+         })
+@@ -507,7 +563,7 @@ defmodule Pinchflat.SourcesTest do
+       end)
+ 
+       changeset =
+-        Sources.change_source_from_url(%Source{}, %{
++        Sources.maybe_change_source_from_url(%Source{}, %{
+           original_url: "https://www.youtube.com/channel/abc123"
+         })
+ 
+diff --git a/test/pinchflat/yt_dlp/media_collection_test.exs b/test/pinchflat/yt_dlp/media_collection_test.exs
+index 286795484..0a2670838 100644
+--- a/test/pinchflat/yt_dlp/media_collection_test.exs
++++ b/test/pinchflat/yt_dlp/media_collection_test.exs
+@@ -108,4 +108,39 @@ defmodule Pinchflat.YtDlp.MediaCollectionTest do
+       assert {:error, %Jason.DecodeError{}} = MediaCollection.get_source_details(@channel_url)
+     end
+   end
++
++  describe "get_source_metadata/1" do
++    test "it returns a map with data on success" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot ->
++        Phoenix.json_library().encode(%{channel: "TheUselessTrials"})
++      end)
++
++      assert {:ok, res} = MediaCollection.get_source_metadata(@channel_url)
++
++      assert %{"channel" => "TheUselessTrials"} = res
++    end
++
++    test "it passes the expected args to the backend runner" do
++      expect(YtDlpRunnerMock, :run, fn @channel_url, opts, ot ->
++        assert opts == [playlist_items: 0]
++        assert ot == "playlist:%()j"
++
++        {:ok, "{}"}
++      end)
++
++      assert {:ok, _} = MediaCollection.get_source_metadata(@channel_url)
++    end
++
++    test "it returns an error if the runner returns an error" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot -> {:error, "Big issue", 1} end)
++
++      assert {:error, "Big issue", 1} = MediaCollection.get_source_metadata(@channel_url)
++    end
++
++    test "it returns an error if the output is not JSON" do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot -> {:ok, "Not JSON"} end)
++
++      assert {:error, %Jason.DecodeError{}} = MediaCollection.get_source_metadata(@channel_url)
++    end
++  end
+ end
+diff --git a/test/pinchflat_web/controllers/media_profile_controller_test.exs b/test/pinchflat_web/controllers/media_profile_controller_test.exs
+index 1a2387bb7..8a707eb50 100644
+--- a/test/pinchflat_web/controllers/media_profile_controller_test.exs
++++ b/test/pinchflat_web/controllers/media_profile_controller_test.exs
+@@ -8,10 +8,10 @@ defmodule PinchflatWeb.MediaProfileControllerTest do
+   alias Pinchflat.Repo
+   alias Pinchflat.Settings
+ 
+-  @create_attrs %{name: "some name", output_path_template: "some output_path_template"}
++  @create_attrs %{name: "some name", output_path_template: "output_template.{{ ext }}"}
+   @update_attrs %{
+     name: "some updated name",
+-    output_path_template: "some updated output_path_template"
++    output_path_template: "new_output_template.{{ ext }}"
+   }
+   @invalid_attrs %{name: nil, output_path_template: nil}
+ 
+diff --git a/test/support/fixtures/sources_fixtures.ex b/test/support/fixtures/sources_fixtures.ex
+index f6fda5a76..7966eddd9 100644
+--- a/test/support/fixtures/sources_fixtures.ex
++++ b/test/support/fixtures/sources_fixtures.ex
+@@ -34,6 +34,20 @@ defmodule Pinchflat.SourcesFixtures do
+     source
+   end
+ 
++  @doc """
++  Generate a source with metadata.
++  """
++  def source_with_metadata(attrs \\ %{}) do
++    merged_attrs =
++      Map.merge(attrs, %{
++        metadata: %{
++          metadata_filepath: Application.get_env(:pinchflat, :metadata_directory) <> "/metadata.json.gz"
++        }
++      })
++
++    source_fixture(merged_attrs)
++  end
++
+   def source_attributes_return_fixture do
+     source_attributes = [
+       %{

@@ -1,0 +1,3260 @@
+diff --git a/.formatter.exs b/.formatter.exs
+index eddc77a449..c43c0231c9 100644
+--- a/.formatter.exs
++++ b/.formatter.exs
+@@ -1,6 +1,9 @@
+ locals_without_parens = [
+   attr: 2,
+-  attr: 3
++  attr: 3,
++  slot: 1,
++  slot: 2,
++  slot: 3
+ ]
+ 
+ [
+diff --git a/lib/mix/tasks/compile/phoenix_live_view.ex b/lib/mix/tasks/compile/phoenix_live_view.ex
+index bf241b5128..2058c21537 100644
+--- a/lib/mix/tasks/compile/phoenix_live_view.ex
++++ b/lib/mix/tasks/compile/phoenix_live_view.ex
+@@ -92,55 +92,187 @@ defmodule Mix.Tasks.Compile.PhoenixLiveView do
+         do: diagnostic
+   end
+ 
+-  defp diagnostics(caller_module, %{attrs: attrs, root: root} = call, %{attrs: attrs_defs}) do
+-    {warnings, {attrs, has_global?}} =
++  defp diagnostics(
++         caller_module,
++         %{slots: slots, attrs: attrs, root: root} = call,
++         %{slots: slots_defs, attrs: attrs_defs}
++       ) do
++    {attrs_warnings, {attrs, has_global?}} =
+       Enum.flat_map_reduce(attrs_defs, {attrs, false}, fn attr_def, {attrs, has_global?} ->
+         %{name: name, required: required, type: type} = attr_def
+         {value, attrs} = Map.pop(attrs, name)
+ 
+         warnings =
+-          case value do
+-            nil when not root and required ->
+-              message = "missing required attribute \"#{name}\" for component #{component(call)}"
++          case {type, value} do
++            # missing required attr
++            {_type, nil} when not root and required ->
++              message = """
++              missing required attribute \"#{name}\" \
++              for component #{component(call)}\
++              """
++
+               [error(message, call.file, call.line)]
+ 
+-            {line, _column, _val} when type == :global ->
+-              message =
+-                "global attribute \"#{name}\" in component #{component(call)} may not be provided directly"
++            # missing optional attr, or dynamic attr
++            {_type, nil} when root or not required ->
++              []
++
++            # global attrs cannot be directly used
++            {:global, {line, _column, _type_value}} ->
++              message = """
++              global attribute \"#{name}\" \
++              in component #{component(call)} \
++              may not be provided directly\
++              """
+ 
+               [error(message, call.file, line)]
+ 
+-            {line, _column, string} when is_binary(string) and type not in [:any, :string] ->
+-              message =
+-                "attribute \"#{name}\" in component #{component(call)} must be a #{inspect(type)}, " <>
+-                  "got string: #{inspect(string)}"
++            {type, {line, _column, type_value}} ->
++              if value_ast_to_string = invalid_type(type, type_value) do
++                message = """
++                attribute \"#{name}\" \
++                in component #{component(call)} \
++                must be #{type_with_article(type)}, \
++                got: #{value_ast_to_string}\
++                """
++
++                [error(message, call.file, line)]
++              else
++                []
++              end
++          end
+ 
+-              [error(message, call.file, line)]
++        {warnings, {attrs, has_global? || type == :global}}
++      end)
+ 
+-            {line, _column, nil} when type not in [:any, :boolean] ->
+-              message =
+-                "attribute \"#{name}\" in component #{component(call)} must be a #{inspect(type)}, " <>
+-                  "got boolean: true"
++    attrs_undefined =
++      for {name, {line, _column, _type_value}} <- attrs,
++          not (has_global? and valid_global?(caller_module, name)) do
++        message = """
++        undefined attribute \"#{name}\" \
++        for component #{component(call)}\
++        """
+ 
+-              [error(message, call.file, line)]
++        error(message, call.file, line)
++      end
++
++    {slots_warnings, slots} =
++      Enum.flat_map_reduce(slots_defs, slots, fn slot_def, slots ->
++        %{name: slot_name, required: required, attrs: attrs} = slot_def
++        has_global? = Enum.any?(attrs, &(&1.type == :global))
++        slot_attr_defs = Enum.into(attrs, %{}, &{&1.name, &1})
++        {slot_values, slots} = Map.pop(slots, slot_name)
+ 
+-            _ ->
++        warnings =
++          case slot_values do
++            # missing required slot
++            nil when required ->
++              message = """
++              missing required slot \"#{slot_name}\" \
++              for component #{component(call)}\
++              """
++
++              [error(message, call.file, call.line)]
++
++            # missing optional slot
++            nil ->
+               []
++
++            # slot with attributes
++            slot_values ->
++              missing_slot_attrs =
++                for slot_value <- slot_values,
++                    {attr_name, %{required: true}} <- slot_attr_defs,
++                    {line, _, _} = Map.fetch!(slot_value, :inner_block),
++                    not Map.has_key?(slot_value, attr_name) do
++                  message = """
++                  missing required attribute \"#{attr_name}\" \
++                  in slot \"#{slot_name}\" \
++                  for component #{component(call)}\
++                  """
++
++                  error(message, call.file, line)
++                end
++
++              slot_attrs_errors =
++                for slot_value <- slot_values,
++                    {attr_name, {line, _column, type_value}} <- slot_value,
++                    attr_def = Map.get(slot_attr_defs, attr_name, :undef),
++                    reduce: [] do
++                  errors ->
++                    case attr_def do
++                      # undefined attribute
++                      :undef ->
++                        if attr_name == :inner_block or
++                             (has_global? and valid_global?(caller_module, attr_name)) do
++                          errors
++                        else
++                          message = """
++                          undefined attribute \"#{attr_name}\" \
++                          in slot \"#{slot_name}\" \
++                          for component #{component(call)}\
++                          """
++
++                          [error(message, call.file, line) | errors]
++                        end
++
++                      %{type: :global} ->
++                        message = """
++                        global attribute \"#{attr_name}\" \
++                        in slot \"#{slot_name}\" \
++                        for component #{component(call)} \
++                        may not be provided directly\
++                        """
++
++                        [error(message, call.file, line) | errors]
++
++                      %{type: type} ->
++                        if value_ast_to_string = invalid_type(type, type_value) do
++                          message = """
++                          attribute \"#{attr_name}\" \
++                          in slot \"#{slot_name}\" \
++                          for component #{component(call)} \
++                          must be #{type_with_article(type)}, \
++                          got: #{value_ast_to_string}\
++                          """
++
++                          [error(message, call.file, line) | errors]
++                        else
++                          errors
++                        end
++                    end
++                end
++
++              missing_slot_attrs ++ slot_attrs_errors
+           end
+ 
+-        {warnings, {attrs, has_global? || type == :global}}
++        {warnings, slots}
+       end)
+ 
+-    missing =
+-      for {name, {line, _column, _value}} <- attrs,
+-          not (has_global? and Phoenix.Component.__global__?(caller_module, Atom.to_string(name))) do
+-        message = "undefined attribute \"#{name}\" for component #{component(call)}"
++    slots_undefined =
++      for {slot_name, slot_values} <- slots,
++          slot_name != :inner_block,
++          %{inner_block: {line, _column, _type_value}} <- slot_values do
++        message = "undefined slot \"#{slot_name}\" for component #{component(call)}"
+         error(message, call.file, line)
+       end
+ 
+-    warnings ++ missing
++    slots_warnings ++ slots_undefined ++ attrs_warnings ++ attrs_undefined
++  end
++
++  defp valid_global?(caller_module, attr_name) do
++    Phoenix.Component.__global__?(caller_module, Atom.to_string(attr_name))
+   end
+ 
++  defp invalid_type(:any, _type_value), do: nil
++  defp invalid_type(_type, :any), do: nil
++  defp invalid_type(type, {type, _value}), do: nil
++  defp invalid_type(:atom, {:boolean, _value}), do: nil
++  defp invalid_type(_type, {_, value}), do: Macro.to_string(value)
++
++  defp type_with_article(type) when type in [:atom, :integer], do: "an #{inspect(type)}"
++  defp type_with_article(type), do: "a #{inspect(type)}"
++
+   defp component(%{component: {mod, fun}}) do
+     "#{inspect(mod)}.#{fun}/1"
+   end
+@@ -159,7 +291,7 @@ defmodule Mix.Tasks.Compile.PhoenixLiveView do
+   defp print_diagnostics(diagnostics) do
+     for %Diagnostic{file: file, position: line, message: message} <- diagnostics do
+       rel_file = file |> Path.relative_to_cwd() |> to_charlist()
+-      # Use IO.warn(message, file: ..., line: ...) on Elixir v1.14+
++      # TODO: Use IO.warn(message, file: ..., line: ...) on Elixir v1.14+
+       IO.warn(message, [{nil, :__FILE__, 1, [file: rel_file, line: line]}])
+     end
+   end
+diff --git a/lib/phoenix_component.ex b/lib/phoenix_component.ex
+index e8c28f8063..aebbb1028a 100644
+--- a/lib/phoenix_component.ex
++++ b/lib/phoenix_component.ex
+@@ -12,7 +12,7 @@ defmodule Phoenix.Component do
+         use Phoenix.Component
+ 
+         # Optionally also bring the HTML helpers
+-        # use Phoenix.HTML
++        # import Phoenix.LiveView.Helpers
+ 
+         def greet(assigns) do
+           ~H"""
+@@ -512,6 +512,9 @@ defmodule Phoenix.Component do
+     end
+ 
+     Module.register_attribute(module, :__attrs__, accumulate: true)
++    Module.register_attribute(module, :__slot_attrs__, accumulate: true)
++    Module.register_attribute(module, :__slots__, accumulate: true)
++    Module.register_attribute(module, :__slot__, accumulate: false)
+     Module.register_attribute(module, :__components_calls__, accumulate: true)
+     Module.put_attribute(module, :__components__, %{})
+     Module.put_attribute(module, :on_definition, __MODULE__)
+@@ -520,6 +523,74 @@ defmodule Phoenix.Component do
+     prefixes
+   end
+ 
++  defmacro slot(name, opts, do: block) when is_atom(name) and is_list(opts) do
++    quote do
++      Phoenix.Component.__slot__!(
++        __MODULE__,
++        unquote(name),
++        unquote(opts),
++        __ENV__.line,
++        __ENV__.file,
++        fn -> unquote(block) end
++      )
++    end
++  end
++
++  @doc false
++  def __slot__!(module, name, opts, line, file, block_fun) do
++    {doc, opts} = Keyword.pop(opts, :doc, nil)
++
++    unless is_binary(doc) or is_nil(doc) or doc == false do
++      compile_error!(line, file, ":doc must be a string or false, got: #{inspect(doc)}")
++    end
++
++    {required, opts} = Keyword.pop(opts, :required, false)
++
++    unless is_boolean(required) do
++      compile_error!(line, file, ":required must be a boolean, got: #{inspect(required)}")
++    end
++
++    Module.put_attribute(module, :__slot__, name)
++
++    slot_attrs =
++      try do
++        block_fun.()
++        module |> Module.get_attribute(:__slot_attrs__) |> Enum.reverse()
++      after
++        Module.put_attribute(module, :__slot__, nil)
++        Module.delete_attribute(module, :__slot_attrs__)
++      end
++
++    slot = %{
++      name: name,
++      required: required,
++      opts: opts,
++      doc: doc,
++      line: line,
++      attrs: slot_attrs
++    }
++
++    validate_slot!(module, slot, line, file)
++    Module.put_attribute(module, :__slots__, slot)
++    :ok
++  end
++
++  defp validate_slot!(module, slot, line, file) do
++    slots = Module.get_attribute(module, :__slots__) || []
++
++    if Enum.find(slots, &(&1.name == slot.name)) do
++      compile_error!(line, file, """
++      a duplicate slot with name #{inspect(slot.name)} already exists\
++      """)
++    end
++
++    if slot.name == :inner_block and slot.attrs != [] do
++      compile_error!(line, file, """
++      cannot define attributes in slot #{inspect(slot.name)}
++      """)
++    end
++  end
++
+   @doc ~S'''
+   Declares attributes for a HEEx function components with compile-time verification and documentation generation.
+ 
+@@ -585,7 +656,7 @@ defmodule Phoenix.Component do
+   value of the `@doc` module attribute:
+ 
+     * if `@doc` is a string, the attribute docs are injected into that string.
+-      The optional placeholder `[[INJECT ATTRDOCS]]` can be used to specify where
++      The optional placeholder `[[INJECT LVDOCS]]` can be used to specify where
+       in the string the docs are injected. Otherwise, the docs are appended
+       to the end of the `@doc` string.
+ 
+@@ -618,28 +689,24 @@ defmodule Phoenix.Component do
+         """
+       end
+   '''
+-  defmacro attr(name, type, opts \\ []) do
++  defmacro attr(name, type, opts \\ []) when is_atom(name) and is_list(opts) do
+     quote bind_quoted: [name: name, type: type, opts: opts] do
+-      Phoenix.Component.__attr__!(__MODULE__, name, type, opts, __ENV__.line, __ENV__.file)
++      Phoenix.Component.__attr__!(
++        __MODULE__,
++        @__slot__,
++        name,
++        type,
++        opts,
++        __ENV__.line,
++        __ENV__.file
++      )
+     end
+   end
+ 
+   @doc false
+-  def __attr__!(module, name, type, opts, line, file) do
+-    cond do
+-      not is_atom(name) ->
+-        compile_error!(line, file, "attribute names must be atoms, got: #{inspect(name)}")
+-
+-      not is_list(opts) ->
+-        compile_error!(line, file, """
+-        expected attr/3 to receive keyword list of options, but got #{inspect(opts)}\
+-        """)
+-
+-      type == :global and Keyword.has_key?(opts, :required) ->
+-        compile_error!(line, file, "global attributes do not support the :required option")
+-
+-      true ->
+-        :ok
++  def __attr__!(module, slot, name, type, opts, line, file) do
++    if type == :global and Keyword.has_key?(opts, :required) do
++      compile_error!(line, file, "global attributes do not support the :required option")
+     end
+ 
+     {doc, opts} = Keyword.pop(opts, :doc, nil)
+@@ -658,36 +725,45 @@ defmodule Phoenix.Component do
+       compile_error!(line, file, "only one of :required or :default must be given")
+     end
+ 
+-    type = validate_attr_type!(module, name, type, line, file)
+-    validate_attr_opts!(name, opts, line, file)
++    key = if slot, do: :__slot_attrs__, else: :__attrs__
++    type = validate_attr_type!(module, key, slot, name, type, line, file)
++    validate_attr_opts!(slot, name, opts, line, file)
+ 
+-    Module.put_attribute(module, :__attrs__, %{
++    if Keyword.has_key?(opts, :default) do
++      validate_attr_default!(slot, name, type, opts[:default], line, file)
++    end
++
++    attr = %{
++      slot: slot,
+       name: name,
+       type: type,
+       required: required,
+       opts: opts,
+       doc: doc,
+       line: line
+-    })
++    }
++
++    Module.put_attribute(module, key, attr)
++    :ok
+   end
+ 
+   @builtin_types [:boolean, :integer, :float, :string, :atom, :list, :map, :global]
+   @valid_types [:any] ++ @builtin_types
+ 
+-  defp validate_attr_type!(module, name, type, line, file) when is_atom(type) do
+-    attrs = get_attrs(module)
++  defp validate_attr_type!(module, key, slot, name, type, line, file) when is_atom(type) do
++    attrs = Module.get_attribute(module, key) || []
+ 
+     cond do
+       Enum.find(attrs, fn attr -> attr.name == name end) ->
+         compile_error!(line, file, """
+-        a duplicate attribute with name #{inspect(name)} already exists\
++        a duplicate attribute with name #{attr_slot(name, slot)} already exists\
+         """)
+ 
+       existing = type == :global && Enum.find(attrs, fn attr -> attr.type == :global end) ->
+         compile_error!(line, file, """
+-        cannot define global attribute #{inspect(name)} because one is already defined under #{inspect(existing.name)}.
+-
+-        Only a single global attribute may be defined.
++        cannot define :global attribute #{inspect(name)} because one \
++        is already defined as #{attr_slot(existing.name, slot)}. \
++        Only a single :global attribute may be defined
+         """)
+ 
+       true ->
+@@ -697,21 +773,17 @@ defmodule Phoenix.Component do
+     case Atom.to_string(type) do
+       "Elixir." <> _ -> {:struct, type}
+       _ when type in @valid_types -> type
+-      _ -> bad_type!(name, type, line, file)
++      _ -> bad_type!(slot, name, type, line, file)
+     end
+   end
+ 
+-  defp validate_attr_type!(_module, name, type, line, file) do
+-    bad_type!(name, type, line, file)
++  defp validate_attr_type!(_module, _key, slot, name, type, line, file) do
++    bad_type!(slot, name, type, line, file)
+   end
+ 
+-  defp compile_error!(line, file, msg) do
+-    raise CompileError, line: line, file: file, description: msg
+-  end
+-
+-  defp bad_type!(name, type, line, file) do
++  defp bad_type!(slot, name, type, line, file) do
+     compile_error!(line, file, """
+-    invalid type #{inspect(type)} for attr #{inspect(name)}. \
++    invalid type #{inspect(type)} for attr #{attr_slot(name, slot)}. \
+     The following types are supported:
+ 
+       * any Elixir struct, such as URI, MyApp.User, etc
+@@ -720,16 +792,76 @@ defmodule Phoenix.Component do
+     """)
+   end
+ 
+-  @valid_opts [:required, :default]
+-  defp validate_attr_opts!(name, opts, line, file) do
+-    for {key, _} <- opts, key not in @valid_opts do
++  defp attr_slot(name, nil), do: "#{inspect(name)}"
++  defp attr_slot(name, slot), do: "#{inspect(name)} in slot #{inspect(slot)}"
++
++  defp validate_attr_default!(slot, name, type, default, line, file) do
++    case {type, default} do
++      {_type, nil} ->
++        :ok
++
++      {:any, _default} ->
++        :ok
++
++      {:string, default} when not is_binary(default) ->
++        bad_default!(slot, name, type, default, line, file)
++
++      {:atom, default} when not is_atom(default) ->
++        bad_default!(slot, name, type, default, line, file)
++
++      {:boolean, default} when not is_boolean(default) ->
++        bad_default!(slot, name, type, default, line, file)
++
++      {:integer, default} when not is_integer(default) ->
++        bad_default!(slot, name, type, default, line, file)
++
++      {:float, default} when not is_float(default) ->
++        bad_default!(slot, name, type, default, line, file)
++
++      {:list, default} when not is_list(default) ->
++        bad_default!(slot, name, type, default, line, file)
++
++      {{:struct, mod}, default} when not is_struct(default) ->
++        bad_default!(slot, name, mod, default, line, file)
++
++      {_type, _default} ->
++        :ok
++    end
++  end
++
++  defp bad_default!(slot, name, type, default, line, file) do
++    compile_error!(line, file, """
++    expected the default value for attr #{attr_slot(name, slot)} to be #{type_with_article(type)}, \
++    got: #{inspect(default)}
++    """)
++  end
++
++  defp type_with_article(type) when type in [:atom, :integer], do: "an #{inspect(type)}"
++  defp type_with_article(type), do: "a #{inspect(type)}"
++
++  defp validate_attr_opts!(slot, name, opts, line, file) do
++    for {key, _} <- opts, message = invalid_attr_message(key, slot) do
+       compile_error!(line, file, """
+-      invalid option #{inspect(key)} for attr #{inspect(name)}. \
+-      The supported options are: #{inspect(@valid_opts)}
++      invalid option #{inspect(key)} for attr #{attr_slot(name, slot)}. #{message}
+       """)
+     end
+   end
+ 
++  defp invalid_attr_message(:default, nil), do: nil
++
++  defp invalid_attr_message(:default, _),
++    do:
++      ":default is not supported inside slot attributes, " <>
++        "instead use Map.get/3 with a default value when accessing a slot attribute"
++
++  defp invalid_attr_message(:required, _), do: nil
++  defp invalid_attr_message(_key, nil), do: "The supported options are: [:required, :default]"
++  defp invalid_attr_message(_key, _slot), do: "The supported options are: [:required]"
++
++  defp compile_error!(line, file, msg) do
++    raise CompileError, line: line, file: file, description: msg
++  end
++
+   @doc false
+   defmacro def(expr, body) do
+     quote do
+@@ -761,7 +893,7 @@ defmodule Phoenix.Component do
+ 
+   defmacro __pattern__!(kind, arg) do
+     {name, 1} = __CALLER__.function
+-    attrs = register_component!(kind, __CALLER__, name, true)
++    {_slots, attrs} = register_component!(kind, __CALLER__, name, true)
+ 
+     fields =
+       for %{name: name, required: true, type: {:struct, struct}} <- attrs do
+@@ -794,6 +926,19 @@ defmodule Phoenix.Component do
+               "cannot declare attributes for function #{name}/#{arity}. Components must be functions with arity 1"
+           end
+         end)
++
++        slots = pop_slots(env)
++
++        validate_misplaced_slots!(slots, env.file, fn ->
++          case length(args) do
++            1 ->
++              "could not define slots for function #{name}/1. " <>
++                "Components cannot be dynamically defined or have default arguments"
++
++            arity ->
++              "cannot declare slots for function #{name}/#{arity}. Components must be functions with arity 1"
++          end
++        end)
+     end
+   end
+ 
+@@ -805,6 +950,12 @@ defmodule Phoenix.Component do
+       "cannot define attributes without a related function component"
+     end)
+ 
++    slots = pop_slots(env)
++
++    validate_misplaced_slots!(slots, env.file, fn ->
++      "cannot define slots without a related function component"
++    end)
++
+     components = Module.get_attribute(env.module, :__components__)
+     components_calls = Module.get_attribute(env.module, :__components_calls__) |> Enum.reverse()
+ 
+@@ -830,9 +981,9 @@ defmodule Phoenix.Component do
+               {assigns, caller_globals} = Map.split(assigns, unquote(known_keys))
+ 
+               globals =
+-                case Map.fetch(assigns, unquote(global_name)) do
+-                  {:ok, explicit_global_assign} -> explicit_global_assign
+-                  :error -> Map.merge(unquote(global_default), caller_globals)
++                case assigns do
++                  %{unquote(global_name) => explicit_global_assign} -> explicit_global_assign
++                  %{} -> Map.merge(unquote(global_default), caller_globals)
+                 end
+ 
+               merged = Map.merge(%{unquote_splicing(defaults)}, assigns)
+@@ -883,55 +1034,61 @@ defmodule Phoenix.Component do
+   end
+ 
+   defp register_component!(kind, env, name, check_if_defined?) do
++    slots = pop_slots(env)
+     attrs = pop_attrs(env)
+ 
+     cond do
+-      attrs != [] ->
+-        check_if_defined? and raise_if_function_already_defined!(env, name, attrs)
++      slots != [] or attrs != [] ->
++        check_if_defined? and raise_if_function_already_defined!(env, name, slots, attrs)
+ 
+-        register_component_doc(env, kind, attrs)
++        register_component_doc(env, kind, slots, attrs)
+ 
+         components =
+           env.module
+           |> Module.get_attribute(:__components__)
+           # Sort by name as this is used when they are validated
+-          |> Map.put(name, %{kind: kind, attrs: Enum.sort_by(attrs, & &1.name)})
++          |> Map.put(name, %{
++            kind: kind,
++            attrs: Enum.sort_by(attrs, & &1.name),
++            slots: Enum.sort_by(slots, & &1.name)
++          })
+ 
+         Module.put_attribute(env.module, :__components__, components)
+         Module.put_attribute(env.module, :__last_component__, name)
+-        attrs
++        {slots, attrs}
+ 
+       Module.get_attribute(env.module, :__last_component__) == name ->
+-        Module.get_attribute(env.module, :__components__)[name].attrs
++        %{slots: slots, attrs: attrs} = Module.get_attribute(env.module, :__components__)[name]
++        {slots, attrs}
+ 
+       true ->
+-        []
++        {[], []}
+     end
+   end
+ 
+-  defp register_component_doc(env, :def, attrs) do
++  defp register_component_doc(env, :def, slots, attrs) do
+     case Module.get_attribute(env.module, :doc) do
+       {_line, false} ->
+         :ok
+ 
+       {line, doc} ->
+-        Module.put_attribute(env.module, :doc, {line, build_component_doc(doc, attrs)})
++        Module.put_attribute(env.module, :doc, {line, build_component_doc(doc, slots, attrs)})
+ 
+       nil ->
+-        Module.put_attribute(env.module, :doc, {env.line, build_component_doc(attrs)})
++        Module.put_attribute(env.module, :doc, {env.line, build_component_doc(slots, attrs)})
+     end
+   end
+ 
+-  defp register_component_doc(_env, :defp, _attrs) do
++  defp register_component_doc(_env, :defp, _slots, _attrs) do
+     :ok
+   end
+ 
+-  defp build_component_doc(doc \\ "", attrs) do
+-    [left | right] = String.split(doc, "[[INSERT ATTRDOCS]]")
++  defp build_component_doc(doc \\ "", slots, attrs) do
++    [left | right] = String.split(doc, "[[INSERT LVDOCS]]")
+ 
+     IO.iodata_to_binary([
+       build_left_doc(left),
+-      build_attr_docs(attrs),
++      build_component_docs(slots, attrs),
+       build_right_doc(right)
+     ])
+   end
+@@ -944,7 +1101,45 @@ defmodule Phoenix.Component do
+     [left, ?\n]
+   end
+ 
+-  defp build_attr_docs(attrs) do
++  defp build_component_docs(slots, attrs) do
++    case {slots, attrs} do
++      {[], []} ->
++        []
++
++      {slots, [] = _attrs} ->
++        [build_slots_docs(slots)]
++
++      {[] = _slots, attrs} ->
++        [build_attrs_docs(attrs)]
++
++      {slots, attrs} ->
++        [build_attrs_docs(attrs), ?\n, build_slots_docs(slots)]
++    end
++  end
++
++  defp build_slots_docs(slots) do
++    [
++      "## Slots",
++      ?\n,
++      for slot <- slots, slot.doc != false, into: [] do
++        slot_attrs =
++          for slot_attr <- slot.attrs,
++              slot_attr.doc != false,
++              slot_attr.slot == slot.name,
++              do: slot_attr
++
++        [
++          ?\n,
++          "* ",
++          build_slot_name(slot),
++          build_slot_required(slot),
++          build_slot_doc(slot, slot_attrs)
++        ]
++      end
++    ]
++  end
++
++  defp build_attrs_docs(attrs) do
+     [
+       "## Attributes",
+       ?\n,
+@@ -961,6 +1156,48 @@ defmodule Phoenix.Component do
+     ]
+   end
+ 
++  defp build_slot_name(%{name: name}) do
++    ["`", Atom.to_string(name), "`"]
++  end
++
++  defp build_slot_doc(%{doc: nil}, []) do
++    []
++  end
++
++  defp build_slot_doc(%{doc: doc}, []) do
++    [" - ", doc]
++  end
++
++  defp build_slot_doc(%{doc: nil}, slot_attrs) do
++    ["Accepts attributes: ", build_slot_attrs_docs(slot_attrs)]
++  end
++
++  defp build_slot_doc(%{doc: doc}, slot_attrs) do
++    [" - ", doc, ". Accepts attributes: ", build_slot_attrs_docs(slot_attrs)]
++  end
++
++  defp build_slot_attrs_docs(slot_attrs) do
++    for slot_attr <- slot_attrs do
++      [
++        ?\n,
++        ?\t,
++        "* ",
++        build_attr_name(slot_attr),
++        build_attr_type(slot_attr),
++        build_attr_required(slot_attr),
++        build_attr_doc_and_default(slot_attr)
++      ]
++    end
++  end
++
++  defp build_slot_required(%{required: true}) do
++    [" (required)"]
++  end
++
++  defp build_slot_required(_slot) do
++    []
++  end
++
+   defp build_attr_name(%{name: name}) do
+     ["`", Atom.to_string(name), "` "]
+   end
+@@ -986,7 +1223,7 @@ defmodule Phoenix.Component do
+   end
+ 
+   defp build_attr_doc_and_default(%{doc: doc, opts: [default: default]}) do
+-    [" - ", doc, " Defaults to `", inspect(default), "`."]
++    [" - ", doc, ". Defaults to `", inspect(default), "`."]
+   end
+ 
+   defp build_attr_doc_and_default(%{doc: nil}) do
+@@ -1011,28 +1248,52 @@ defmodule Phoenix.Component do
+     end
+   end
+ 
+-  defp get_attrs(module) do
+-    Module.get_attribute(module, :__attrs__) || []
++  defp validate_misplaced_slots!(slots, file, message_fun) do
++    with [%{line: first_slot_line} | _] <- slots do
++      compile_error!(first_slot_line, file, message_fun.())
++    end
+   end
+ 
+   defp pop_attrs(env) do
+-    attrs =
+-      env.module
+-      |> get_attrs()
+-      |> Enum.reverse()
++    slots = Module.delete_attribute(env.module, :__attrs__) || []
++    Enum.reverse(slots)
++  end
+ 
+-    Module.delete_attribute(env.module, :__attrs__)
+-    attrs
++  defp pop_slots(env) do
++    slots = Module.delete_attribute(env.module, :__slots__) || []
++    Enum.reverse(slots)
+   end
+ 
+-  defp raise_if_function_already_defined!(env, name, attrs) do
++  defp raise_if_function_already_defined!(env, name, slots, attrs) do
+     if Module.defines?(env.module, {name, 1}) do
+       {:v1, _, meta, _} = Module.get_definition(env.module, {name, 1})
+-      [%{line: first_attr_line} | _] = attrs
+ 
+-      compile_error!(first_attr_line, env.file, """
+-      attributes must be defined before the first function clause at line #{meta[:line]}
+-      """)
++      with [%{line: first_attr_line} | _] <- attrs do
++        compile_error!(first_attr_line, env.file, """
++        attributes must be defined before the first function clause at line #{meta[:line]}
++        """)
++      end
++
++      with [%{line: first_slot_line} | _] <- slots do
++        compile_error!(first_slot_line, env.file, """
++        slots must be defined before the first function clause at line #{meta[:line]}
++        """)
++      end
++    end
++  end
++
++  defmacro slot(name, opts \\ []) when is_atom(name) and is_list(opts) do
++    {block, opts} = Keyword.pop(opts, :do, nil)
++
++    quote do
++      Phoenix.Component.__slot__!(
++        __MODULE__,
++        unquote(name),
++        unquote(opts),
++        __ENV__.line,
++        __ENV__.file,
++        fn -> unquote(block) end
++      )
+     end
+   end
+ end
+diff --git a/lib/phoenix_live_view/helpers.ex b/lib/phoenix_live_view/helpers.ex
+index d8b3397cdf..ca621b4111 100644
+--- a/lib/phoenix_live_view/helpers.ex
++++ b/lib/phoenix_live_view/helpers.ex
+@@ -889,12 +889,12 @@ defmodule Phoenix.LiveView.Helpers do
+       <.live_title suffix="- MyApp"><%= assigns[:page_title] || "Welcome" %></.live_title>
+ 
+   """
+-  attr :prefix, :string, default: false
+-  attr :suffix, :string, default: false
++  attr :prefix, :string, default: nil
++  attr :suffix, :string, default: nil
+ 
+   def live_title(assigns) do
+     ~H"""
+-    <title data-prefix={@prefix} data-suffix={@suffix}><%= @prefix || "" %><%= render_slot(@inner_block) %><%= @suffix || "" %></title>
++    <title data-prefix={@prefix} data-suffix={@suffix}><%= @prefix %><%= render_slot(@inner_block) %><%= @suffix %></title>
+     """
+   end
+ 
+@@ -1110,7 +1110,6 @@ defmodule Phoenix.LiveView.Helpers do
+     * `:csrf_token` - a custom token to use for links with a method
+       other than `:get`.
+ 
+-
+      * `:replace` - when using `:patch` or `:navigate`, whether to replace the
+        browser's pushState history. Default false.
+ 
+@@ -1198,8 +1197,8 @@ defmodule Phoenix.LiveView.Helpers do
+   attr :navigate, :string
+   attr :patch, :string
+   attr :href, :any
+-  attr :replace, :string, default: false
+-  attr :method, :atom, default: "get"
++  attr :replace, :boolean, default: false
++  attr :method, :string, default: "get"
+   attr :csrf_token, :string
+   attr :rest, :global
+ 
+@@ -1240,8 +1239,6 @@ defmodule Phoenix.LiveView.Helpers do
+           assign(assigns, :href, href)
+       end
+ 
+-    assigns = assign(assigns, :method, to_string(assigns.method))
+-
+     ~H"""
+     <a
+       href={if @method == "get", do: @href, else: "#"}
+diff --git a/lib/phoenix_live_view/html_engine.ex b/lib/phoenix_live_view/html_engine.ex
+index a47ece3eec..fba22dd46a 100644
+--- a/lib/phoenix_live_view/html_engine.ex
++++ b/lib/phoenix_live_view/html_engine.ex
+@@ -265,32 +265,54 @@ defmodule Phoenix.LiveView.HTMLEngine do
+   defp add_slot!(
+          %{slots: [slots | other_slots], tags: [{:tag_open, <<first, _::binary>>, _, _} | _]} =
+            state,
+-         slot,
+-         _meta
++         slot_name,
++         slot_ast,
++         tag_meta
+        )
+        when first in ?A..?Z or first == ?. do
++    slot = {slot_name, slot_ast, tag_meta}
+     %{state | slots: [[slot | slots] | other_slots], previous_token_slot?: true}
+   end
+ 
+-  defp add_slot!(state, slot, meta) do
+-    %{line: line, column: column} = meta
+-    {slot_name, _} = slot
+-    file = state.file
+-
++  defp add_slot!(
++         %{file: file} = _state,
++         slot_name,
++         _slot_ast,
++         %{line: line, column: column} = _tag_meta
++       ) do
+     message =
+       "invalid slot entry <:#{slot_name}>. A slot entry must be a direct child of a component"
+ 
+     raise ParseError, line: line, column: column, file: file, description: message
+   end
+ 
+-  defp pop_slots(%{slots: [slots | other_slots]} = state) do
+-    grouped =
++  defp merge_default_slot(slots, {_, _, asts}, tag_meta) when is_list(asts) do
++    slot_ast = asts[:inner_block]
++
++    if slot_ast do
++      Keyword.put(slots, :inner_block, [{hd(slot_ast), tag_meta}])
++    else
+       slots
+-      |> Enum.reverse()
+-      |> Enum.group_by(&elem(&1, 0), fn {_name, slot_ast} -> slot_ast end)
+-      |> Map.to_list()
++    end
++  end
+ 
+-    {grouped, %{state | slots: other_slots}}
++  defp merge_default_slot(slots, _, _) do
++    slots
++  end
++
++  defp get_slots(%{slots: [slots | _other_slots]} = _state) do
++    group_slots(slots)
++  end
++
++  defp pop_slots(%{slots: [slots | other_slots]} = state) do
++    {group_slots(slots), %{state | slots: other_slots}}
++  end
++
++  defp group_slots(slots) do
++    slots
++    |> Enum.reverse()
++    |> Enum.group_by(&elem(&1, 0), fn {_slot_name, slot_ast, tag_meta} -> {slot_ast, tag_meta} end)
++    |> Map.to_list()
+   end
+ 
+   defp push_tag(state, token) do
+@@ -365,12 +387,13 @@ defmodule Phoenix.LiveView.HTMLEngine do
+        )
+        when first in ?A..?Z do
+     attrs = remove_phx_no_break(attrs)
++    slots = %{}
+     file = state.file
+     {mod_ast, fun} = decompose_remote_component_tag!(tag_name, tag_meta, file)
+     {assigns, state} = build_self_close_component_assigns(attrs, tag_meta.line, state)
+ 
+     mod = Macro.expand(mod_ast, state.caller)
+-    store_component_call(state.module, {mod, fun}, attrs, state.file, line)
++    store_component_call(state.module, {mod, fun}, slots, attrs, state.file, line, state.caller)
+ 
+     ast =
+       quote line: tag_meta.line do
+@@ -401,16 +424,26 @@ defmodule Phoenix.LiveView.HTMLEngine do
+     |> update_subengine(:handle_begin, [])
+   end
+ 
+-  defp handle_token({:tag_close, <<first, _::binary>>, _tag_close_meta} = token, state)
++  defp handle_token({:tag_close, <<first, _::binary>>, tag_close_meta} = token, state)
+        when first in ?A..?Z do
+     {{:tag_open, _name, attrs, %{mod_fun: {mod_ast, fun}, line: line}}, state} =
+       pop_tag!(state, token)
+ 
+-    attrs = remove_phx_no_break(attrs)
+-    {assigns, state} = build_component_assigns(attrs, line, state)
+-
+     mod = Macro.expand(mod_ast, state.caller)
+-    store_component_call(state.module, {mod, fun}, attrs, state.file, line)
++    named_slots = get_slots(state)
++    attrs = remove_phx_no_break(attrs)
++    {assigns, state} = build_component_assigns(mod, fun, attrs, line, state)
++    all_slots = merge_default_slot(named_slots, assigns, tag_close_meta)
++
++    store_component_call(
++      state.module,
++      {mod, fun},
++      all_slots,
++      attrs,
++      state.file,
++      line,
++      state.caller
++    )
+ 
+     ast =
+       quote line: line do
+@@ -433,11 +466,12 @@ defmodule Phoenix.LiveView.HTMLEngine do
+          state
+        ) do
+     attrs = remove_phx_no_break(attrs)
++    slots = %{}
+     fun = String.to_atom(name)
+     {assigns, state} = build_self_close_component_assigns(attrs, line, state)
+ 
+     mod = actual_component_module(state.caller, fun)
+-    store_component_call(state.module, {mod, fun}, attrs, state.file, line)
++    store_component_call(state.module, {mod, fun}, slots, attrs, state.file, line, state.caller)
+ 
+     ast =
+       quote line: line do
+@@ -468,7 +502,7 @@ defmodule Phoenix.LiveView.HTMLEngine do
+   defp handle_token({:tag_open, ":" <> slot_name, attrs, %{self_close: true} = tag_meta}, state) do
+     attrs = remove_phx_no_break(attrs)
+     %{line: line} = tag_meta
+-    slot_key = String.to_atom(slot_name)
++    slot_name = String.to_atom(slot_name)
+ 
+     {let, roots, attrs} = split_component_attrs(attrs, state.file)
+ 
+@@ -480,9 +514,9 @@ defmodule Phoenix.LiveView.HTMLEngine do
+         description: "cannot use :let on a slot without inner content"
+     end
+ 
+-    attrs = [__slot__: slot_key, inner_block: nil] ++ attrs
++    attrs = [__slot__: slot_name, inner_block: nil] ++ attrs
+     assigns = merge_component_attrs(roots, attrs, line)
+-    add_slot!(state, {slot_key, assigns}, tag_meta)
++    add_slot!(state, slot_name, assigns, tag_meta)
+   end
+ 
+   # Slot (with inner content)
+@@ -497,21 +531,21 @@ defmodule Phoenix.LiveView.HTMLEngine do
+   defp handle_token({:tag_close, ":" <> slot_name, _tag_close_meta} = token, state) do
+     {{:tag_open, _name, attrs, %{line: line} = tag_meta}, state} = pop_tag!(state, token)
+     attrs = remove_phx_no_break(attrs)
+-    slot_key = String.to_atom(slot_name)
++    slot_name = String.to_atom(slot_name)
+ 
+     {let, roots, attrs} = split_component_attrs(attrs, state.file)
+     clauses = build_component_clauses(let, state)
+ 
+     ast =
+       quote line: line do
+-        Phoenix.LiveView.HTMLEngine.inner_block(unquote(slot_key), do: unquote(clauses))
++        Phoenix.LiveView.HTMLEngine.inner_block(unquote(slot_name), do: unquote(clauses))
+       end
+ 
+-    attrs = [__slot__: slot_key, inner_block: ast] ++ attrs
++    attrs = [__slot__: slot_name, inner_block: ast] ++ attrs
+     assigns = merge_component_attrs(roots, attrs, line)
+ 
+     state
+-    |> add_slot!({slot_key, assigns}, tag_meta)
++    |> add_slot!(slot_name, assigns, tag_meta)
+     |> pop_substate_from_stack()
+   end
+ 
+@@ -526,14 +560,24 @@ defmodule Phoenix.LiveView.HTMLEngine do
+     |> update_subengine(:handle_begin, [])
+   end
+ 
+-  defp handle_token({:tag_close, "." <> fun_name, _tag_close_meta} = token, state) do
++  defp handle_token({:tag_close, "." <> fun_name, tag_close_meta} = token, state) do
+     {{:tag_open, _name, attrs, %{line: line}}, state} = pop_tag!(state, token)
+     attrs = remove_phx_no_break(attrs)
++    named_slots = get_slots(state)
+     fun = String.to_atom(fun_name)
+-    {assigns, state} = build_component_assigns(attrs, line, state)
+-
+     mod = actual_component_module(state.caller, fun)
+-    store_component_call(state.module, {mod, fun}, attrs, state.file, line)
++    {assigns, state} = build_component_assigns(mod, fun, attrs, line, state)
++    all_slots = merge_default_slot(named_slots, assigns, tag_close_meta)
++
++    store_component_call(
++      state.module,
++      {mod, fun},
++      all_slots,
++      attrs,
++      state.file,
++      line,
++      state.caller
++    )
+ 
+     ast =
+       quote line: line do
+@@ -867,7 +911,7 @@ defmodule Phoenix.LiveView.HTMLEngine do
+     {merge_component_attrs(roots, attrs, line), state}
+   end
+ 
+-  defp build_component_assigns(attrs, line, %{file: file} = state) do
++  defp build_component_assigns(_mod, _fun, attrs, line, %{file: file} = state) do
+     {let, roots, attrs} = split_component_attrs(attrs, file)
+     clauses = build_component_clauses(let, state)
+ 
+@@ -880,7 +924,13 @@ defmodule Phoenix.LiveView.HTMLEngine do
+       end
+ 
+     {slots, state} = pop_slots(state)
+-    attrs = attrs ++ [{:inner_block, [inner_block_assigns]} | slots]
++
++    slot_assigns =
++      for {slot_name, slot_values} <- slots do
++        {slot_name, Enum.map(slot_values, &elem(&1, 0))}
++      end
++
++    attrs = attrs ++ [{:inner_block, [inner_block_assigns]} | slot_assigns]
+     {merge_component_attrs(roots, attrs, line), state}
+   end
+ 
+@@ -1040,23 +1090,63 @@ defmodule Phoenix.LiveView.HTMLEngine do
+     end
+   end
+ 
+-  defp store_component_call(module, component, attrs, file, line) do
++  defp store_component_call(module, component, slots, attrs, file, line, env) do
+     if Module.open?(module) do
++      pruned_slots =
++        for {slot_name, slot_values} <- slots,
++            do: {slot_name, Enum.map(slot_values, &slot_call_value(&1, env))},
++            into: %{}
++
+       pruned_attrs =
+         for {attr, value, meta} <- attrs,
+             is_binary(attr) and not String.starts_with?(attr, ":"),
+-            do: {String.to_atom(attr), {meta[:line], meta[:column], component_call_value(value)}},
++            type_value = component_call_value(value, env),
++            do: {String.to_atom(attr), {meta[:line], meta[:column], type_value}},
+             into: %{}
+ 
+       root = List.keymember?(attrs, :root, 0)
+-      call = %{component: component, attrs: pruned_attrs, file: file, line: line, root: root}
++
++      call = %{
++        component: component,
++        slots: pruned_slots,
++        attrs: pruned_attrs,
++        file: file,
++        line: line,
++        root: root
++      }
++
+       Module.put_attribute(module, :__components_calls__, call)
+     end
+   end
+ 
+-  defp component_call_value({:expr, _, _}), do: :expr
+-  defp component_call_value({:string, string, _}), do: string
+-  defp component_call_value(nil), do: nil
++  defp component_call_value({:string, value, _meta}, _env) do
++    {:string, value}
++  end
++
++  defp component_call_value(nil, _env) do
++    {:boolean, true}
++  end
++
++  defp component_call_value({:expr, value, %{line: line, column: column}}, env) do
++    value
++    |> Code.string_to_quoted!(line: line, column: column, file: env.file)
++    |> attr_type()
++  end
++
++  defp slot_call_value({{_, _, slot_attrs}, %{line: line, column: column}}, _env) do
++    for {name, value} <- slot_attrs, name != :__slot__, into: %{} do
++      {name, {line, column, attr_type(value)}}
++    end
++  end
++
++  defp attr_type({:<<>>, _, _} = value), do: {:string, value}
++  defp attr_type(value) when is_list(value), do: {:list, value}
++  defp attr_type(value) when is_binary(value), do: {:string, value}
++  defp attr_type(value) when is_integer(value), do: {:integer, value}
++  defp attr_type(value) when is_float(value), do: {:float, value}
++  defp attr_type(value) when is_boolean(value), do: {:boolean, value}
++  defp attr_type(value) when is_atom(value), do: {:atom, value}
++  defp attr_type(_value), do: :any
+ 
+   ## Helpers
+ 
+diff --git a/test/mix/tasks/compile/phoenix_live_view_test.exs b/test/mix/tasks/compile/phoenix_live_view_test.exs
+index 8c5d909cbf..ff9c141560 100644
+--- a/test/mix/tasks/compile/phoenix_live_view_test.exs
++++ b/test/mix/tasks/compile/phoenix_live_view_test.exs
+@@ -96,16 +96,20 @@ defmodule Mix.Tasks.Compile.PhoenixLiveViewTest do
+                %Diagnostic{
+                  compiler_name: "phoenix_live_view",
+                  file: __ENV__.file,
+-                 message:
+-                   "undefined attribute \"size\" for component Mix.Tasks.Compile.PhoenixLiveViewTest.UndefinedAttrs.func/1",
++                 message: """
++                 undefined attribute \"size\" \
++                 for component Mix.Tasks.Compile.PhoenixLiveViewTest.UndefinedAttrs.func/1\
++                 """,
+                  position: line,
+                  severity: :warning
+                },
+                %Diagnostic{
+                  compiler_name: "phoenix_live_view",
+                  file: __ENV__.file,
+-                 message:
+-                   "undefined attribute \"width\" for component Mix.Tasks.Compile.PhoenixLiveViewTest.UndefinedAttrs.func/1",
++                 message: """
++                 undefined attribute \"width\" \
++                 for component Mix.Tasks.Compile.PhoenixLiveViewTest.UndefinedAttrs.func/1\
++                 """,
+                  position: line,
+                  severity: :warning
+                }
+@@ -115,103 +119,903 @@ defmodule Mix.Tasks.Compile.PhoenixLiveViewTest do
+     defmodule External do
+       use Phoenix.Component
+       attr :id, :string, required: true
+-      attr :rest, :global
+-      def button(assigns), do: ~H[<button id={@id} {@rest}/>]
+-    end
+ 
+-    defmodule TypeAttrs do
+-      use Phoenix.Component, global_prefixes: ~w(myprefix-)
++      slot :named do
++        attr :attr, :any, required: true
++      end
+ 
+-      attr :boolean, :boolean
+-      attr :string, :string
+-      def func(assigns), do: ~H[]
++      def render(assigns), do: ~H[]
++    end
+ 
+-      attr :id, :string, required: true
+-      attr :rest, :global
+-      def local_button(assigns), do: ~H[<button id={@id} {@rest}/>]
++    defmodule ExternalCalls do
++      use Phoenix.Component
+ 
+       def line, do: __ENV__.line + 4
+ 
+       def render(assigns) do
+         ~H"""
+-        <.func boolean="btn"/>
+-        <.func string/>
+-        <.func boolean string="string"/>
+-        <.func boolean={"can't validate"} string={:wont_validate}/>
+-        <.local_button id="foo" class="my-class" myprefix-thing="value"/>
+-        <.local_button id="foo" unknown-global="bad"/>
+-        <.local_button id="foo" rest="nope"/>
+-        <External.button id="foo" class="external" myprefix-external="value"/>
+-        <External.button id="foo" unknown-global-external="bad"/>
++        <External.render>
++          <:named />
++        </External.render>
+         """
+       end
+     end
+ 
+-    test "validate literal types" do
+-      line = get_line(TypeAttrs)
+-      diagnostics = Mix.Tasks.Compile.PhoenixLiveView.validate_components_calls([TypeAttrs])
++    test "validates attrs and slots for external function components" do
++      diagnostics = Mix.Tasks.Compile.PhoenixLiveView.validate_components_calls([ExternalCalls])
+ 
+       assert diagnostics == [
+                %Diagnostic{
+                  compiler_name: "phoenix_live_view",
+                  file: __ENV__.file,
+-                 message:
+-                   "attribute \"boolean\" in component Mix.Tasks.Compile.PhoenixLiveViewTest.TypeAttrs.func/1 must be a :boolean, got string: \"btn\"",
+-                 position: line,
++                 message: """
++                 missing required attribute \"attr\" \
++                 in slot \"named\" \
++                 for component Mix.Tasks.Compile.PhoenixLiveViewTest.External.render/1\
++                 """,
++                 position: ExternalCalls.line() + 1,
+                  severity: :warning
+                },
+                %Diagnostic{
+                  compiler_name: "phoenix_live_view",
+                  file: __ENV__.file,
+-                 message:
+-                   "attribute \"string\" in component Mix.Tasks.Compile.PhoenixLiveViewTest.TypeAttrs.func/1 must be a :string, got boolean: true",
+-                 position: line + 1,
++                 message: """
++                 missing required attribute \"id\" \
++                 for component Mix.Tasks.Compile.PhoenixLiveViewTest.External.render/1\
++                 """,
++                 position: ExternalCalls.line(),
+                  severity: :warning
+-               },
+-               %Mix.Task.Compiler.Diagnostic{
++               }
++             ]
++    end
++
++    defmodule TypeAttrs do
++      use Phoenix.Component, global_prefixes: ~w(myprefix-)
++
++      attr :any, :any
++      attr :string, :string
++      attr :atom, :atom
++      attr :boolean, :boolean
++      attr :integer, :integer
++      attr :float, :float
++      attr :list, :list
++      attr :global, :global
++
++      def func(assigns), do: ~H[]
++
++      def global_line, do: __ENV__.line + 4
++
++      def global_render(assigns) do
++        ~H"""
++        <.func global="global" />
++        <.func phx-click="click" id="id"/>
++        """
++      end
++
++      def any_line, do: __ENV__.line + 4
++
++      def any_render(assigns) do
++        ~H"""
++        <.func any="any" />
++        <.func any={:any} />
++        <.func any={true} />
++        <.func any={1} />
++        <.func any={1.0} />
++        <.func any={[]} />
++        <.func any={nil} />
++        """
++      end
++
++      def render_string_line, do: __ENV__.line + 4
++
++      def string_render(assigns) do
++        ~H"""
++        <.func string="string" />
++        <.func string={:string} />
++        <.func string={true} />
++        <.func string={1} />
++        <.func string={1.0} />
++        <.func string={[]} />
++        <.func string={nil} />
++        """
++      end
++
++      def render_atom_line, do: __ENV__.line + 4
++
++      def atom_render(assigns) do
++        ~H"""
++        <.func atom="atom" />
++        <.func atom={:atom} />
++        <.func atom={true} />
++        <.func atom={1} />
++        <.func atom={1.0} />
++        <.func atom={[]} />
++        <.func atom={nil} />
++        """
++      end
++
++      def render_boolean_line, do: __ENV__.line + 4
++
++      def boolean_render(assigns) do
++        ~H"""
++        <.func boolean="boolean" />
++        <.func boolean={:boolean} />
++        <.func boolean={true} />
++        <.func boolean={1} />
++        <.func boolean={1.0} />
++        <.func boolean={[]} />
++        <.func boolean={nil} />
++        """
++      end
++
++      def render_integer_line, do: __ENV__.line + 4
++
++      def integer_render(assigns) do
++        ~H"""
++        <.func integer="integer" />
++        <.func integer={:integer} />
++        <.func integer={true} />
++        <.func integer={1} />
++        <.func integer={1.0} />
++        <.func integer={[]} />
++        <.func integer={nil} />
++        """
++      end
++
++      def render_float_line, do: __ENV__.line + 4
++
++      def float_render(assigns) do
++        ~H"""
++        <.func float="float" />
++        <.func float={:float} />
++        <.func float={true} />
++        <.func float={1} />
++        <.func float={1.0} />
++        <.func float={[]} />
++        <.func float={nil} />
++        """
++      end
++
++      def render_list_line, do: __ENV__.line + 4
++
++      def list_render(assigns) do
++        ~H"""
++        <.func list="list" />
++        <.func list={:list} />
++        <.func list={true} />
++        <.func list={1} />
++        <.func list={1.0} />
++        <.func list={[]} />
++        <.func list={nil} />
++        """
++      end
++    end
++
++    test "validate literal types" do
++      diagnostics = Mix.Tasks.Compile.PhoenixLiveView.validate_components_calls([TypeAttrs])
++
++      global_warnings = [
++        %Diagnostic{
++          compiler_name: "phoenix_live_view",
++          details: nil,
++          file: __ENV__.file,
++          severity: :warning,
++          position: TypeAttrs.global_line(),
++          message: """
++          global attribute \"global\" \
++          in component Mix.Tasks.Compile.PhoenixLiveViewTest.TypeAttrs.func/1 \
++          may not be provided directly\
++          """
++        }
++      ]
++
++      string_warnings =
++        for {value, line} <- [
++              {:string, 1},
++              {true, 2},
++              {1, 3},
++              {1.0, 4},
++              {[], 5},
++              {nil, 6}
++            ] do
++          %Diagnostic{
++            compiler_name: "phoenix_live_view",
++            details: nil,
++            file: __ENV__.file,
++            severity: :warning,
++            position: TypeAttrs.render_string_line() + line,
++            message: """
++            attribute \"string\" \
++            in component Mix.Tasks.Compile.PhoenixLiveViewTest.TypeAttrs.func/1 \
++            must be a :string, \
++            got: #{inspect(value)}\
++            """
++          }
++        end
++
++      atom_warnings =
++        for {value, line} <- [
++              {"atom", 0},
++              {1, 3},
++              {1.0, 4},
++              {[], 5}
++            ] do
++          %Diagnostic{
++            compiler_name: "phoenix_live_view",
++            details: nil,
++            file: __ENV__.file,
++            severity: :warning,
++            position: TypeAttrs.render_atom_line() + line,
++            message: """
++            attribute \"atom\" \
++            in component Mix.Tasks.Compile.PhoenixLiveViewTest.TypeAttrs.func/1 \
++            must be an :atom, \
++            got: #{inspect(value)}\
++            """
++          }
++        end
++
++      boolean_warnings =
++        for {value, line} <- [
++              {"boolean", 0},
++              {:boolean, 1},
++              {1, 3},
++              {1.0, 4},
++              {[], 5},
++              {nil, 6}
++            ] do
++          %Diagnostic{
++            compiler_name: "phoenix_live_view",
++            details: nil,
++            file: __ENV__.file,
++            severity: :warning,
++            position: TypeAttrs.render_boolean_line() + line,
++            message: """
++            attribute \"boolean\" \
++            in component Mix.Tasks.Compile.PhoenixLiveViewTest.TypeAttrs.func/1 \
++            must be a :boolean, \
++            got: #{inspect(value)}\
++            """
++          }
++        end
++
++      integer_warnings =
++        for {value, line} <- [
++              {"integer", 0},
++              {:integer, 1},
++              {true, 2},
++              {1.0, 4},
++              {[], 5},
++              {nil, 6}
++            ] do
++          %Diagnostic{
++            compiler_name: "phoenix_live_view",
++            details: nil,
++            file: __ENV__.file,
++            severity: :warning,
++            position: TypeAttrs.render_integer_line() + line,
++            message: """
++            attribute \"integer\" \
++            in component Mix.Tasks.Compile.PhoenixLiveViewTest.TypeAttrs.func/1 \
++            must be an :integer, \
++            got: #{inspect(value)}\
++            """
++          }
++        end
++
++      float_warnings =
++        for {value, line} <- [
++              {"float", 0},
++              {:float, 1},
++              {true, 2},
++              {1, 3},
++              {[], 5},
++              {nil, 6}
++            ] do
++          %Diagnostic{
++            compiler_name: "phoenix_live_view",
++            details: nil,
++            file: __ENV__.file,
++            severity: :warning,
++            position: TypeAttrs.render_float_line() + line,
++            message: """
++            attribute \"float\" \
++            in component Mix.Tasks.Compile.PhoenixLiveViewTest.TypeAttrs.func/1 \
++            must be a :float, \
++            got: #{inspect(value)}\
++            """
++          }
++        end
++
++      list_warnings =
++        for {value, line} <- [
++              {"list", 0},
++              {:list, 1},
++              {true, 2},
++              {1, 3},
++              {1.0, 4},
++              {nil, 6}
++            ] do
++          %Diagnostic{
++            compiler_name: "phoenix_live_view",
++            details: nil,
++            file: __ENV__.file,
++            severity: :warning,
++            position: TypeAttrs.render_list_line() + line,
++            message: """
++            attribute \"list\" \
++            in component Mix.Tasks.Compile.PhoenixLiveViewTest.TypeAttrs.func/1 \
++            must be a :list, \
++            got: #{inspect(value)}\
++            """
++          }
++        end
++
++      assert diagnostics ==
++               List.flatten([
++                 global_warnings,
++                 string_warnings,
++                 atom_warnings,
++                 boolean_warnings,
++                 integer_warnings,
++                 float_warnings,
++                 list_warnings,
++               ])
++    end
++
++    defmodule NoAttrs do
++      use Phoenix.Component
++
++      def func(assigns), do: ~H[]
++
++      def render(assigns) do
++        ~H"""
++        <.func width="btn"/>
++        """
++      end
++    end
++
++    test "do not validate if component doesn't have any attr declared" do
++      diagnostics = Mix.Tasks.Compile.PhoenixLiveView.validate_components_calls([NoAttrs])
++
++      assert diagnostics == []
++    end
++
++    defmodule RequiredSlots do
++      use Phoenix.Component
++
++      slot :inner_block, required: true
++
++      def func(assigns), do: ~H[]
++
++      slot :named, required: true
++
++      def func_named_slot(assigns), do: ~H[]
++
++      def render_line, do: __ENV__.line + 2
++
++      def render(assigns) do
++        ~H"""
++        <!-- no default slot provided -->
++        <.func/>
++
++        <!-- with an empty default slot -->
++        <.func></.func>
++
++        <!-- with content in the default slot -->
++        <.func>Hello!</.func>
++
++        <!-- no named slots provided -->
++        <.func_named_slot/>
++
++        <!-- with an empty named slot -->
++        <.func_named_slot>
++          <:named />
++        </.func_named_slot>
++
++        <!-- with content in the named slots -->
++        <.func_named_slot>
++          <:named>
++            Hello!
++          </:named>
++        </.func_named_slot>
++
++        <!-- with entires for the named slot -->
++        <.func_named_slot>
++          <:named>
++            Hello,
++          </:named>
++          <:named>
++            World!
++          </:named>
++        </.func_named_slot>
++        """
++      end
++    end
++
++    test "validate required slots" do
++      line = RequiredSlots.render_line()
++      diagnostics = Mix.Tasks.Compile.PhoenixLiveView.validate_components_calls([RequiredSlots])
++
++      assert diagnostics == [
++               %Diagnostic{
+                  compiler_name: "phoenix_live_view",
++                 details: nil,
+                  file: __ENV__.file,
+-                 message:
+-                   "undefined attribute \"unknown-global\" for component Mix.Tasks.Compile.PhoenixLiveViewTest.TypeAttrs.local_button/1",
+-                 position: line + 5,
++                 message: """
++                 missing required slot \"inner_block\" \
++                 for component Mix.Tasks.Compile.PhoenixLiveViewTest.RequiredSlots.func/1\
++                 """,
++                 position: line + 3,
+                  severity: :warning
+                },
+-               %Mix.Task.Compiler.Diagnostic{
++               %Diagnostic{
+                  compiler_name: "phoenix_live_view",
++                 details: nil,
+                  file: __ENV__.file,
+-                 message:
+-                   "global attribute \"rest\" in component Mix.Tasks.Compile.PhoenixLiveViewTest.TypeAttrs.local_button/1 may not be provided directly",
+-                 position: line + 6,
++                 message: """
++                 missing required slot \"named\" \
++                 for component Mix.Tasks.Compile.PhoenixLiveViewTest.RequiredSlots.func_named_slot/1\
++                 """,
++                 position: line + 12,
+                  severity: :warning
++               }
++             ]
++    end
++
++    defmodule SlotAttrs do
++      use Phoenix.Component
++
++      slot :slot do
++        attr :any, :any
++        attr :string, :string
++        attr :atom, :atom
++        attr :boolean, :boolean
++        attr :integer, :integer
++        attr :float, :float
++        attr :list, :list
++        attr :global, :global
++      end
++
++      def func(assigns), do: ~H[]
++
++      def render_global_line, do: __ENV__.line + 5
++
++      def render_global(assigns) do
++        ~H"""
++        <.func>
++          <:slot global="global" />
++          <:slot phx-click="click" id="id" />
++        </.func>
++        """
++      end
++
++      def render_any_line, do: __ENV__.line + 5
++
++      def render_any(assigns) do
++        ~H"""
++        <.func>
++          <:slot any />
++          <:slot any="any" />
++          <:slot any={:any} />
++          <:slot any={true} />
++          <:slot any={1} />
++          <:slot any={1.0} />
++          <:slot any={[]} />
++        </.func>
++        """
++      end
++
++      def render_string_line, do: __ENV__.line + 5
++
++      def render_string(assigns) do
++        ~H"""
++        <.func>
++          <:slot string="string" />
++          <:slot string={:string} />
++          <:slot string={true} />
++          <:slot string={1} />
++          <:slot string={1.0} />
++          <:slot string={[]} />
++          <:slot string={nil} />
++        </.func>
++        """
++      end
++
++      def render_atom_line, do: __ENV__.line + 5
++
++      def render_atom(assigns) do
++        ~H"""
++        <.func>
++          <:slot atom="atom" />
++          <:slot atom={:atom} />
++          <:slot atom={true} />
++          <:slot atom={1} />
++          <:slot atom={1.0} />
++          <:slot atom={[]} />
++          <:slot atom={nil} />
++        </.func>
++        """
++      end
++
++      def render_boolean_line, do: __ENV__.line + 5
++
++      def render_boolean(assigns) do
++        ~H"""
++        <.func>
++          <:slot boolean="boolean" />
++          <:slot boolean={:boolean} />
++          <:slot boolean={true} />
++          <:slot boolean={1} />
++          <:slot boolean={1.0} />
++          <:slot boolean={[]} />
++          <:slot boolean={nil} />
++        </.func>
++        """
++      end
++
++      def render_integer_line, do: __ENV__.line + 5
++
++      def render_integer(assigns) do
++        ~H"""
++        <.func>
++          <:slot integer="integer" />
++          <:slot integer={:integer} />
++          <:slot integer={true} />
++          <:slot integer={1} />
++          <:slot integer={1.0} />
++          <:slot integer={[]} />
++          <:slot integer={nil} />
++        </.func>
++        """
++      end
++
++      def render_float_line, do: __ENV__.line + 5
++
++      def render_float(assigns) do
++        ~H"""
++        <.func>
++          <:slot float="float" />
++          <:slot float={:float} />
++          <:slot float={true} />
++          <:slot float={1} />
++          <:slot float={1.0} />
++          <:slot float={[]} />
++          <:slot float={nil} />
++        </.func>
++        """
++      end
++
++      def render_list_line, do: __ENV__.line + 5
++
++      def render_list(assigns) do
++        ~H"""
++        <.func>
++          <:slot list="list" />
++          <:slot list={:list} />
++          <:slot list={true} />
++          <:slot list={1} />
++          <:slot list={1.0} />
++          <:slot list={[]} />
++          <:slot list={nil} />
++        </.func>
++        """
++      end
++    end
++
++    test "validate slot attr types" do
++      diagnostics = Mix.Tasks.Compile.PhoenixLiveView.validate_components_calls([SlotAttrs])
++
++      global_warnings = [
++        %Diagnostic{
++          compiler_name: "phoenix_live_view",
++          details: nil,
++          file: __ENV__.file,
++          severity: :warning,
++          position: SlotAttrs.render_global_line(),
++          message: """
++          global attribute \"global\" \
++          in slot \"slot\" \
++          for component Mix.Tasks.Compile.PhoenixLiveViewTest.SlotAttrs.func/1 \
++          may not be provided directly\
++          """
++        }
++      ]
++
++      string_warnings =
++        for {value, line} <- [
++              {nil, 6},
++              {[], 5},
++              {1.0, 4},
++              {1, 3},
++              {true, 2},
++              {:string, 1}
++            ] do
++          %Diagnostic{
++            compiler_name: "phoenix_live_view",
++            details: nil,
++            file: __ENV__.file,
++            severity: :warning,
++            position: SlotAttrs.render_string_line() + line,
++            message: """
++            attribute \"string\" \
++            in slot \"slot\" \
++            for component Mix.Tasks.Compile.PhoenixLiveViewTest.SlotAttrs.func/1 \
++            must be a :string, \
++            got: #{inspect(value)}\
++            """
++          }
++        end
++
++      atom_warnings =
++        for {value, line} <- [
++              {[], 5},
++              {1.0, 4},
++              {1, 3},
++              {"atom", 0}
++            ] do
++          %Diagnostic{
++            compiler_name: "phoenix_live_view",
++            details: nil,
++            file: __ENV__.file,
++            severity: :warning,
++            position: SlotAttrs.render_atom_line() + line,
++            message: """
++            attribute \"atom\" \
++            in slot \"slot\" \
++            for component Mix.Tasks.Compile.PhoenixLiveViewTest.SlotAttrs.func/1 \
++            must be an :atom, \
++            got: #{inspect(value)}\
++            """
++          }
++        end
++
++      boolean_warnings =
++        for {value, line} <- [
++              {nil, 6},
++              {[], 5},
++              {1.0, 4},
++              {1, 3},
++              {:boolean, 1},
++              {"boolean", 0}
++            ] do
++          %Diagnostic{
++            compiler_name: "phoenix_live_view",
++            details: nil,
++            file: __ENV__.file,
++            severity: :warning,
++            position: SlotAttrs.render_boolean_line() + line,
++            message: """
++            attribute \"boolean\" \
++            in slot \"slot\" \
++            for component Mix.Tasks.Compile.PhoenixLiveViewTest.SlotAttrs.func/1 \
++            must be a :boolean, \
++            got: #{inspect(value)}\
++            """
++          }
++        end
++
++      integer_warnings =
++        for {value, line} <- [
++              {nil, 6},
++              {[], 5},
++              {1.0, 4},
++              {true, 2},
++              {:integer, 1},
++              {"integer", 0}
++            ] do
++          %Diagnostic{
++            compiler_name: "phoenix_live_view",
++            details: nil,
++            file: __ENV__.file,
++            severity: :warning,
++            position: SlotAttrs.render_integer_line() + line,
++            message: """
++            attribute \"integer\" \
++            in slot \"slot\" \
++            for component Mix.Tasks.Compile.PhoenixLiveViewTest.SlotAttrs.func/1 \
++            must be an :integer, \
++            got: #{inspect(value)}\
++            """
++          }
++        end
++
++      float_warnings =
++        for {value, line} <- [
++              {nil, 6},
++              {[], 5},
++              {1, 3},
++              {true, 2},
++              {:float, 1},
++              {"float", 0}
++            ] do
++          %Diagnostic{
++            compiler_name: "phoenix_live_view",
++            details: nil,
++            file: __ENV__.file,
++            severity: :warning,
++            position: SlotAttrs.render_float_line() + line,
++            message: """
++            attribute \"float\" \
++            in slot \"slot\" \
++            for component Mix.Tasks.Compile.PhoenixLiveViewTest.SlotAttrs.func/1 \
++            must be a :float, \
++            got: #{inspect(value)}\
++            """
++          }
++        end
++
++      list_warnings =
++        for {value, line} <- [
++              {nil, 6},
++              {1.0, 4},
++              {1, 3},
++              {true, 2},
++              {:list, 1},
++              {"list", 0}
++            ] do
++          %Diagnostic{
++            compiler_name: "phoenix_live_view",
++            details: nil,
++            file: __ENV__.file,
++            severity: :warning,
++            position: SlotAttrs.render_list_line() + line,
++            message: """
++            attribute \"list\" \
++            in slot \"slot\" \
++            for component Mix.Tasks.Compile.PhoenixLiveViewTest.SlotAttrs.func/1 \
++            must be a :list, \
++            got: #{inspect(value)}\
++            """
++          }
++        end
++
++      assert diagnostics ==
++               List.flatten([
++                 global_warnings,
++                 string_warnings,
++                 atom_warnings,
++                 boolean_warnings,
++                 integer_warnings,
++                 float_warnings,
++                 list_warnings
++               ])
++    end
++
++    defmodule RequiredSlotAttrs do
++      use Phoenix.Component
++
++      slot :slot do
++        attr :attr, :string, required: true
++      end
++
++      def func(assigns) do
++        ~H"""
++        <div>
++          <%= render_slot(@slot) %>
++        </div>
++        """
++      end
++
++      def render_line(), do: __ENV__.line + 4
++
++      def render(assigns) do
++        ~H"""
++        <.func>
++          <:slot />
++          <:slot attr="foo" />
++          <:slot>
++            foo
++          </:slot>
++          <:slot attr="bar">
++            bar
++          </:slot>
++        </.func>
++        """
++      end
++    end
++
++    test "validates required slot attrs" do
++      diagnostics =
++        Mix.Tasks.Compile.PhoenixLiveView.validate_components_calls([RequiredSlotAttrs])
++
++      assert diagnostics == [
++               %Diagnostic{
++                 compiler_name: "phoenix_live_view",
++                 details: nil,
++                 file: __ENV__.file,
++                 severity: :warning,
++                 position: RequiredSlotAttrs.render_line() + 1,
++                 message: """
++                 missing required attribute \"attr\" \
++                 in slot \"slot\" \
++                 for component Mix.Tasks.Compile.PhoenixLiveViewTest.RequiredSlotAttrs.func/1\
++                 """
+                },
+-               %Mix.Task.Compiler.Diagnostic{
++               %Diagnostic{
+                  compiler_name: "phoenix_live_view",
+                  details: nil,
+                  file: __ENV__.file,
+-                 message:
+-                   "undefined attribute \"unknown-global-external\" for component Mix.Tasks.Compile.PhoenixLiveViewTest.External.button/1",
+-                 position: line + 8,
+-                 severity: :warning
++                 severity: :warning,
++                 position: RequiredSlotAttrs.render_line() + 3,
++                 message: """
++                 missing required attribute \"attr\" \
++                 in slot \"slot\" \
++                 for component Mix.Tasks.Compile.PhoenixLiveViewTest.RequiredSlotAttrs.func/1\
++                 """
+                }
+              ]
+     end
+ 
+-    defmodule NoAttrs do
++    defmodule UndefinedSlots do
+       use Phoenix.Component
+ 
++      slot :inner_block
++
+       def func(assigns), do: ~H[]
+ 
++      slot :named
++
++      def func_undefined_slot_attrs(assigns), do: ~H[]
++
++      def render_line, do: __ENV__.line + 2
++
+       def render(assigns) do
+         ~H"""
+-        <.func width="btn"/>
++        <!-- undefined slot -->
++        <.func>
++          <:undefined />
++        </.func>
++
++        <!-- slot with undefined attrs -->
++        <.func_undefined_slot_attrs>
++          <:named undefined />
++          <:named undefined="undefined" />
++        </.func_undefined_slot_attrs>
+         """
+       end
+     end
+ 
+-    test "do not validate if component doesn't have any attr declared" do
+-      diagnostics = Mix.Tasks.Compile.PhoenixLiveView.validate_components_calls([NoAttrs])
++    test "validates undefined slots" do
++      line = UndefinedSlots.render_line()
++      diagnostics = Mix.Tasks.Compile.PhoenixLiveView.validate_components_calls([UndefinedSlots])
+ 
+-      assert diagnostics == []
++      assert diagnostics == [
++               %Diagnostic{
++                 compiler_name: "phoenix_live_view",
++                 details: nil,
++                 file: __ENV__.file,
++                 message: """
++                 undefined slot \"undefined\" \
++                 for component Mix.Tasks.Compile.PhoenixLiveViewTest.UndefinedSlots.func/1\
++                 """,
++                 position: line + 4,
++                 severity: :warning
++               },
++               %Diagnostic{
++                 compiler_name: "phoenix_live_view",
++                 details: nil,
++                 file: __ENV__.file,
++                 message: """
++                 undefined attribute \"undefined\" \
++                 in slot \"named\" \
++                 for component Mix.Tasks.Compile.PhoenixLiveViewTest.UndefinedSlots.func_undefined_slot_attrs/1\
++                 """,
++                 position: line + 10,
++                 severity: :warning
++               },
++               %Diagnostic{
++                 compiler_name: "phoenix_live_view",
++                 details: nil,
++                 file: __ENV__.file,
++                 message: """
++                 undefined attribute \"undefined\" \
++                 in slot \"named\" for component Mix.Tasks.Compile.PhoenixLiveViewTest.UndefinedSlots.func_undefined_slot_attrs/1\
++                 """,
++                 position: line + 9,
++                 severity: :warning
++               }
++             ]
+     end
+   end
+ 
+diff --git a/test/phoenix_component_test.exs b/test/phoenix_component_test.exs
+index 464dcd0aa9..671e96b3cb 100644
+--- a/test/phoenix_component_test.exs
++++ b/test/phoenix_component_test.exs
+@@ -1,6 +1,8 @@
+ defmodule Phoenix.ComponentTest do
+   use ExUnit.Case, async: true
+ 
++  import Phoenix.LiveViewTest
++
+   use Phoenix.Component
+ 
+   defp render(mod, func, assigns) do
+@@ -312,7 +314,7 @@ defmodule Phoenix.ComponentTest do
+ 
+       def func1_line, do: __ENV__.line
+       attr :id, :any, required: true
+-      attr :email, :any, default: nil
++      attr :email, :string, default: nil
+       def func1(assigns), do: ~H[]
+ 
+       def func2_line, do: __ENV__.line
+@@ -364,10 +366,11 @@ defmodule Phoenix.ComponentTest do
+                  attrs: [
+                    %{
+                      name: :email,
+-                     type: :any,
++                     type: :string,
+                      opts: [default: nil],
+                      required: false,
+                      doc: nil,
++                     slot: nil,
+                      line: func1_line + 2
+                    },
+                    %{
+@@ -376,9 +379,11 @@ defmodule Phoenix.ComponentTest do
+                      opts: [],
+                      required: true,
+                      doc: nil,
++                     slot: nil,
+                      line: func1_line + 1
+                    }
+-                 ]
++                 ],
++                 slots: []
+                },
+                func2: %{
+                  kind: :def,
+@@ -389,6 +394,7 @@ defmodule Phoenix.ComponentTest do
+                      opts: [default: 0],
+                      required: false,
+                      doc: nil,
++                     slot: nil,
+                      line: func2_line + 2
+                    },
+                    %{
+@@ -397,11 +403,14 @@ defmodule Phoenix.ComponentTest do
+                      opts: [],
+                      required: true,
+                      doc: nil,
++                     slot: nil,
+                      line: func2_line + 1
+                    }
+-                 ]
++                 ],
++                 slots: []
+                },
+                with_global: %{
++                 kind: :def,
+                  attrs: [
+                    %{
+                      line: with_global_line + 1,
+@@ -409,12 +418,14 @@ defmodule Phoenix.ComponentTest do
+                      opts: [default: "container"],
+                      required: false,
+                      doc: nil,
++                     slot: nil,
+                      type: :string
+                    }
+                  ],
+-                 kind: :def
++                 slots: []
+                },
+                button_with_defaults: %{
++                 kind: :def,
+                  attrs: [
+                    %{
+                      line: button_with_defaults_line + 1,
+@@ -422,12 +433,14 @@ defmodule Phoenix.ComponentTest do
+                      opts: [default: %{class: "primary"}],
+                      required: false,
+                      doc: nil,
++                     slot: nil,
+                      type: :global
+                    }
+                  ],
+-                 kind: :def
++                 slots: []
+                },
+                button: %{
++                 kind: :def,
+                  attrs: [
+                    %{
+                      line: with_global_line + 4,
+@@ -435,6 +448,7 @@ defmodule Phoenix.ComponentTest do
+                      opts: [],
+                      required: true,
+                      doc: nil,
++                     slot: nil,
+                      type: :string
+                    },
+                    %{
+@@ -443,10 +457,11 @@ defmodule Phoenix.ComponentTest do
+                      opts: [],
+                      required: false,
+                      doc: nil,
++                     slot: nil,
+                      type: :global
+                    }
+                  ],
+-                 kind: :def
++                 slots: []
+                }
+              }
+     end
+@@ -461,7 +476,8 @@ defmodule Phoenix.ComponentTest do
+ 
+       assert [
+                %{
+-                 attrs: %{id: {_, _, :expr}},
++                 slots: %{},
++                 attrs: %{id: {_, _, _}, "aria-hidden": {_, _, _}, class: {_, _, _}},
+                  component: {Phoenix.ComponentTest.FunctionComponentWithAttrs, :button},
+                  file: ^file,
+                  line: ^with_global_line,
+@@ -469,37 +485,282 @@ defmodule Phoenix.ComponentTest do
+                },
+                %{
+                  component: {FunctionComponentWithAttrs, :func1},
+-                 attrs: %{id: {_, _, "1"}},
++                 slots: %{},
++                 attrs: %{id: {_, _, {:string, "1"}}},
+                  file: ^file,
+                  line: ^call_1_line
+                },
+                %{
+                  component: {FunctionComponentWithAttrs, :func1},
+-                 attrs: %{id: {_, _, "2"}, email: {_, _, nil}}
++                 slots: %{},
++                 attrs: %{id: {_, _, {:string, "2"}}, email: {_, _, {:boolean, true}}}
+                },
+                %{
+-                 attrs: %{id: {_, _, "3"}},
++                 slots: %{},
++                 attrs: %{id: {_, _, {:string, "3"}}},
+                  component: {RemoteFunctionComponentWithAttrs, :remote},
+                  file: ^file,
+                  line: ^call_3_line
+                },
+                %{
+-                 attrs: %{id: {_, _, "4"}},
++                 slots: %{},
++                 attrs: %{id: {_, _, {:string, "4"}}},
+                  component: {RemoteFunctionComponentWithAttrs, :remote}
+                },
+                %{
+-                 attrs: %{id: {_, _, "5"}},
++                 slots: %{},
++                 attrs: %{id: {_, _, {:string, "5"}}},
+                  component: {RemoteFunctionComponentWithAttrs, :remote},
+                  root: false
+                },
+                %{
+-                 attrs: %{id: {_, _, "6"}},
++                 slots: %{},
++                 attrs: %{id: {_, _, {:string, "6"}}},
+                  component: {RemoteFunctionComponentWithAttrs, :remote},
+                  root: true
+                }
+              ] = FunctionComponentWithAttrs.__components_calls__()
+     end
+ 
++    defmodule FunctionComponentWithSlots do
++      use Phoenix.Component
++
++      def fun_with_slot_line, do: __ENV__.line + 3
++
++      slot :inner_block
++      def fun_with_slot(assigns), do: ~H[]
++
++      def fun_with_named_slots_line, do: __ENV__.line + 4
++
++      slot :header
++      slot :footer
++      def fun_with_named_slots(assigns), do: ~H[]
++
++      def fun_with_slot_attrs_line, do: __ENV__.line + 6
++
++      slot :slot, required: true do
++        attr :attr, :any
++      end
++
++      def fun_with_slot_attrs(assigns), do: ~H[]
++
++      def table_line, do: __ENV__.line + 8
++
++      slot :col do
++        attr :label, :string
++      end
++
++      attr :rows, :list
++
++      def table(assigns) do
++        ~H"""
++        <table>
++          <tr>
++            <%= for col <- @col do %>
++              <th><%= col.label %></th>
++            <% end %>
++          </tr>
++          <%= for row <- @rows do %>
++            <tr>
++              <%= for col <- @col do %>
++                <td><%= render_slot(col, row) %></td>
++              <% end %>
++            </tr>
++          <% end %>
++        </table>
++        """
++      end
++
++      def render_line, do: __ENV__.line + 2
++
++      def render(assigns) do
++        ~H"""
++        <.fun_with_slot>
++          Hello, World
++        </.fun_with_slot>
++
++        <.fun_with_named_slots>
++          <:header>
++            This is a header.
++          </:header>
++
++          Hello, World
++
++          <:footer>
++            This is a footer.
++          </:footer>
++        </.fun_with_named_slots>
++
++        <.fun_with_slot_attrs>
++          <:slot attr="1" />
++        </.fun_with_slot_attrs>
++
++        <.table rows={@users}>
++          <:col :let={user} label={@name}>
++            <%= user.name %>
++          </:col>
++
++          <:col :let={user} label="Address">
++            <%= user.address %>
++          </:col>
++        </.table>        
++        """
++      end
++    end
++
++    test "stores slots definitions" do
++      assert FunctionComponentWithSlots.__components__() == %{
++               fun_with_slot: %{
++                 attrs: [],
++                 kind: :def,
++                 slots: [
++                   %{
++                     doc: nil,
++                     line: FunctionComponentWithSlots.fun_with_slot_line() - 1,
++                     name: :inner_block,
++                     opts: [],
++                     attrs: [],
++                     required: false
++                   }
++                 ]
++               },
++               fun_with_named_slots: %{
++                 attrs: [],
++                 kind: :def,
++                 slots: [
++                   %{
++                     doc: nil,
++                     line: FunctionComponentWithSlots.fun_with_named_slots_line() - 1,
++                     name: :footer,
++                     opts: [],
++                     attrs: [],
++                     required: false
++                   },
++                   %{
++                     doc: nil,
++                     line: FunctionComponentWithSlots.fun_with_named_slots_line() - 2,
++                     name: :header,
++                     opts: [],
++                     attrs: [],
++                     required: false
++                   }
++                 ]
++               },
++               fun_with_slot_attrs: %{
++                 attrs: [],
++                 kind: :def,
++                 slots: [
++                   %{
++                     doc: nil,
++                     line: FunctionComponentWithSlots.fun_with_slot_attrs_line() - 4,
++                     name: :slot,
++                     opts: [],
++                     attrs: [
++                       %{
++                         doc: nil,
++                         line: FunctionComponentWithSlots.fun_with_slot_attrs_line() - 3,
++                         name: :attr,
++                         opts: [],
++                         required: false,
++                         slot: :slot,
++                         type: :any
++                       }
++                     ],
++                     required: true
++                   }
++                 ]
++               },
++               table: %{
++                 attrs: [
++                   %{
++                     doc: nil,
++                     line: FunctionComponentWithSlots.table_line() - 2,
++                     name: :rows,
++                     opts: [],
++                     required: false,
++                     slot: nil,
++                     type: :list
++                   }
++                 ],
++                 kind: :def,
++                 slots: [
++                   %{
++                     doc: nil,
++                     line: FunctionComponentWithSlots.table_line() - 6,
++                     name: :col,
++                     opts: [],
++                     attrs: [
++                       %{
++                         doc: nil,
++                         line: FunctionComponentWithSlots.table_line() - 5,
++                         name: :label,
++                         opts: [],
++                         required: false,
++                         slot: :col,
++                         type: :string
++                       }
++                     ],
++                     required: false
++                   }
++                 ]
++               }
++             }
++    end
++
++    test "stores component calls with slots" do
++      file = __ENV__.file
++
++      assert [
++               %{
++                 attrs: %{},
++                 component: {Phoenix.ComponentTest.FunctionComponentWithSlots, :fun_with_slot},
++                 file: ^file,
++                 line: 578,
++                 root: false,
++                 slots: %{inner_block: [%{inner_block: {580, 9, :any}}]}
++               },
++               %{
++                 attrs: %{},
++                 component:
++                   {Phoenix.ComponentTest.FunctionComponentWithSlots, :fun_with_named_slots},
++                 file: ^file,
++                 line: 582,
++                 root: false,
++                 slots: %{
++                   footer: [%{inner_block: {589, 11, :any}}],
++                   header: [%{inner_block: {583, 11, :any}}],
++                   inner_block: [%{inner_block: {592, 9, :any}}]
++                 }
++               },
++               %{
++                 attrs: %{},
++                 component:
++                   {Phoenix.ComponentTest.FunctionComponentWithSlots, :fun_with_slot_attrs},
++                 file: ^file,
++                 line: 594,
++                 root: false,
++                 slots: %{
++                   inner_block: [%{inner_block: {596, 9, :any}}],
++                   slot: [%{attr: {595, 11, {:string, "1"}}, inner_block: {595, 11, {:atom, nil}}}]
++                 }
++               },
++               %{
++                 attrs: %{rows: {598, 17, _type_value}},
++                 component: {Phoenix.ComponentTest.FunctionComponentWithSlots, :table},
++                 file: ^file,
++                 line: 598,
++                 root: false,
++                 slots: %{
++                   col: [
++                     %{inner_block: {599, 11, :any}, label: {599, 11, :any}},
++                     %{inner_block: {603, 11, :any}, label: {603, 11, {:string, "Address"}}}
++                   ],
++                   inner_block: [%{inner_block: {606, 9, :any}}]
++                 }
++               }
++             ] = FunctionComponentWithSlots.__components_calls__()
++    end
++
+     test "does not generate __components_calls__ if there's no call" do
+       refute function_exported?(RemoteFunctionComponentWithAttrs, :__components_calls__, 0)
+     end
+@@ -508,12 +769,23 @@ defmodule Phoenix.ComponentTest do
+       defmodule Bodyless do
+         use Phoenix.Component
+ 
++        def example_line, do: __ENV__.line + 2
++
+         attr :example, :any, required: true
+         def example(assigns)
+ 
+         def example(_assigns) do
+           "hello"
+         end
++
++        def example2_line, do: __ENV__.line + 2
++
++        slot :slot
++        def example2(assigns)
++
++        def example2(_assigns) do
++          "world"
++        end
+       end
+ 
+       assert Bodyless.__components__() == %{
+@@ -521,12 +793,28 @@ defmodule Phoenix.ComponentTest do
+                  kind: :def,
+                  attrs: [
+                    %{
+-                     line: __ENV__.line - 13,
++                     line: Bodyless.example_line(),
+                      name: :example,
+                      opts: [],
+                      doc: nil,
+                      required: true,
+-                     type: :any
++                     type: :any,
++                     slot: nil
++                   }
++                 ],
++                 slots: []
++               },
++               example2: %{
++                 kind: :def,
++                 attrs: [],
++                 slots: [
++                   %{
++                     doc: nil,
++                     line: Bodyless.example2_line(),
++                     name: :slot,
++                     opts: [],
++                     attrs: [],
++                     required: false
+                    }
+                  ]
+                }
+@@ -574,7 +862,7 @@ defmodule Phoenix.ComponentTest do
+       assert render(Defaults, :example, %{}) == "nil"
+       assert render(Defaults, :no_default, %{value: 123}) == "123"
+ 
+-      assert_raise KeyError, ~r/:value not found/, fn ->
++      assert_raise KeyError, ~r":value not found", fn ->
+         render(Defaults, :no_default, %{})
+       end
+     end
+@@ -607,72 +895,95 @@ defmodule Phoenix.ComponentTest do
+ 
+         @doc "my function component with attrs"
+         def func_with_attr_docs(assigns), do: ~H[]
++
++        slot :slot, doc: "a named slot" do
++          attr :attr, :any, doc: "a slot attr"
++        end
++
++        def func_with_slot_docs(assigns), do: ~H[]
+       end
+ 
+       line = AttrDocs.attr_line()
+ 
+       assert AttrDocs.__components__() == %{
+                func_with_attr_docs: %{
+-                 kind: :def,
+                  attrs: [
+                    %{
+                      line: line + 3,
++                     doc: "a description\n        with a line break",
++                     slot: nil,
+                      name: :break,
+                      opts: [],
+                      required: false,
+-                     type: :any,
+-                     doc: "a description\n        with a line break"
++                     type: :any
+                    },
+                    %{
+                      line: line + 6,
++                     doc: "a description\nthat spans\nmultiple lines\n",
++                     slot: nil,
+                      name: :multi,
+                      opts: [],
+                      required: false,
+-                     type: :any,
+-                     doc: "a description\nthat spans\nmultiple lines\n"
++                     type: :any
+                    },
+                    %{
+                      line: line + 20,
++                     doc: nil,
++                     slot: nil,
+                      name: :no_doc,
+                      opts: [],
+                      required: false,
+-                     type: :any,
+-                     doc: nil
++                     type: :any
+                    },
+                    %{
+                      line: line + 13,
++                     doc: "a description\nwithin a multi-line\nsigil\n",
++                     slot: nil,
+                      name: :sigil,
+                      opts: [],
+                      required: false,
+-                     type: :any,
+-                     doc: "a description\nwithin a multi-line\nsigil\n"
++                     type: :any
+                    },
+                    %{
+                      line: line + 1,
++                     doc: "a single line description",
++                     slot: nil,
+                      name: :single,
+                      opts: [],
+                      required: false,
+-                     type: :any,
+-                     doc: "a single line description"
++                     type: :any
++                   }
++                 ],
++                 kind: :def,
++                 slots: []
++               },
++               func_with_slot_docs: %{
++                 attrs: [],
++                 kind: :def,
++                 slots: [
++                   %{
++                     doc: "a named slot",
++                     line: line + 25,
++                     name: :slot,
++                     attrs: [
++                       %{
++                         doc: "a slot attr",
++                         line: line + 26,
++                         name: :attr,
++                         opts: [],
++                         required: false,
++                         slot: :slot,
++                         type: :any
++                       }
++                     ],
++                     opts: [],
++                     required: false
+                    }
+                  ]
+                }
+              }
+     end
+ 
+-    test "raise if :doc is not a string" do
+-      msg = ~r/doc must be a string or false, got: :foo/
+-
+-      assert_raise CompileError, msg, fn ->
+-        defmodule Phoenix.ComponentTest.AttrDocsInvalidType do
+-          use Elixir.Phoenix.Component
+-
+-          attr :invalid, :any, doc: :foo
+-          def func(assigns), do: ~H[]
+-        end
+-      end
+-    end
+-
+     test "injects attr docs to function component @doc string" do
+       {_, _, :elixir, "text/markdown", _, _, docs} =
+         Code.fetch_docs(Phoenix.LiveViewTest.FunctionComponentWithAttrs)
+@@ -695,7 +1006,12 @@ defmodule Phoenix.ComponentTest do
+         fun_multiple_attr: "## Attributes\n\n* `attr1` (`:any`)\n* `attr2` (`:any`)\n",
+         fun_with_attr_doc: "## Attributes\n\n* `attr` (`:any`) - attr docs\n",
+         fun_with_hidden_attr: "## Attributes\n\n* `attr1` (`:any`)\n",
+-        fun_with_doc: "fun docs\n## Attributes\n\n* `attr` (`:any`)\n"
++        fun_with_doc: "fun docs\n## Attributes\n\n* `attr` (`:any`)\n",
++        fun_slot: "## Slots\n\n* `inner_block`\n",
++        fun_slot_doc: "## Slots\n\n* `inner_block` - slot docs\n",
++        fun_slot_required: "## Slots\n\n* `inner_block` (required)\n",
++        fun_slot_with_attrs:
++          "## Slots\n\n* `named` (required) - a named slot. Accepts attributes: \n\t* `attr1` (`:any`) (required) - a slot attr doc\n\t* `attr2` (`:any`) - a slot attr doc\n"
+       }
+ 
+       for {{_, fun, _}, _, _, %{"en" => doc}, _} <- docs do
+@@ -703,8 +1019,74 @@ defmodule Phoenix.ComponentTest do
+       end
+     end
+ 
+-    test "raise if attr is not declared before the first function definition" do
+-      msg = ~r/attributes must be defined before the first function clause at line \d+/
++    test "raise if attr :doc is not a string" do
++      msg = ~r"doc must be a string or false, got: :foo"
++
++      assert_raise CompileError, msg, fn ->
++        defmodule Phoenix.ComponentTest.AttrDocsInvalidType do
++          use Elixir.Phoenix.Component
++
++          attr :invalid, :any, doc: :foo
++          def func(assigns), do: ~H[]
++        end
++      end
++    end
++
++    test "raise if slot :doc is not a string" do
++      msg = ~r"doc must be a string or false, got: :foo"
++
++      assert_raise CompileError, msg, fn ->
++        defmodule Phoenix.ComponentTest.SlotDocsInvalidType do
++          use Elixir.Phoenix.Component
++
++          slot :invalid, doc: :foo
++          def func(assigns), do: ~H[]
++        end
++      end
++    end
++
++    test "raise on invalid attr/2 args" do
++      assert_raise FunctionClauseError, fn ->
++        defmodule Phoenix.ComponentTest.AttrMacroInvalidName do
++          use Elixir.Phoenix.Component
++
++          attr "not an atom", :any
++          def func(assigns), do: ~H[]
++        end
++      end
++
++      assert_raise FunctionClauseError, fn ->
++        defmodule Phoenix.ComponentTest.AttrMacroInvalidOpts do
++          use Elixir.Phoenix.Component
++
++          attr :attr, :any, "not a list"
++          def func(assigns), do: ~H[]
++        end
++      end
++    end
++
++    test "raise on invalid slot/3 args" do
++      assert_raise FunctionClauseError, fn ->
++        defmodule Phoenix.ComponentTest.SlotMacroInvalidName do
++          use Elixir.Phoenix.Component
++
++          slot "not an atom"
++          def func(assigns), do: ~H[]
++        end
++      end
++
++      assert_raise FunctionClauseError, fn ->
++        defmodule Phoenix.ComponentTest.SlotMacroInvalidOpts do
++          use Elixir.Phoenix.Component
++
++          slot :slot, "not a list"
++          def func(assigns), do: ~H[]
++        end
++      end
++    end
++
++    test "raise if attr is declared between multiple function heads" do
++      msg = ~r"attributes must be defined before the first function clause at line \d+"
+ 
+       assert_raise CompileError, msg, fn ->
+         defmodule Phoenix.ComponentTest.MultiClauseWrong do
+@@ -720,9 +1102,26 @@ defmodule Phoenix.ComponentTest do
+       end
+     end
+ 
++    test "raise if slot is declared between multiple function heads" do
++      msg = ~r"slots must be defined before the first function clause at line \d+"
++
++      assert_raise CompileError, msg, fn ->
++        defmodule Phoenix.ComponentTest.MultiClauseWrong do
++          use Elixir.Phoenix.Component
++
++          slot :inner_block
++          def func(assigns = %{foo: _}), do: ~H[]
++          def func(assigns = %{bar: _}), do: ~H[]
++
++          slot :named
++          def func(assigns = %{baz: _}), do: ~H[]
++        end
++      end
++    end
++
+     test "raise if attr is declared on an invalid function" do
+       msg =
+-        ~r/cannot declare attributes for function func\/2\. Components must be functions with arity 1/
++        ~r"cannot declare attributes for function func\/2\. Components must be functions with arity 1"
+ 
+       assert_raise CompileError, msg, fn ->
+         defmodule Phoenix.ComponentTest.AttrOnInvalidFunction do
+@@ -734,8 +1133,22 @@ defmodule Phoenix.ComponentTest do
+       end
+     end
+ 
++    test "raise if slot is declared on an invalid function" do
++      msg =
++        ~r"cannot declare slots for function func\/2\. Components must be functions with arity 1"
++
++      assert_raise CompileError, msg, fn ->
++        defmodule Phoenix.ComponentTest.SlotOnInvalidFunction do
++          use Elixir.Phoenix.Component
++
++          slot :inner_block
++          def func(a, b), do: a + b
++        end
++      end
++    end
++
+     test "raise if attr is declared without a related function" do
+-      msg = ~r/cannot define attributes without a related function component/
++      msg = ~r"cannot define attributes without a related function component"
+ 
+       assert_raise CompileError, msg, fn ->
+         defmodule Phoenix.ComponentTest.AttrOnInvalidFunction do
+@@ -748,8 +1161,24 @@ defmodule Phoenix.ComponentTest do
+       end
+     end
+ 
++    test "raise if slot is declared without a related function" do
++      msg = ~r"cannot define slots without a related function component"
++
++      assert_raise CompileError, msg, fn ->
++        defmodule Phoenix.ComponentTest.SlotOnInvalidFunction do
++          use Elixir.Phoenix.Component
++
++          def func(assigns = %{baz: _}), do: ~H[]
++
++          slot :inner_block
++        end
++      end
++    end
++
+     test "raise if attr type is not supported" do
+-      assert_raise CompileError, ~r/invalid type :not_a_type for attr :foo/, fn ->
++      msg = ~r"invalid type :not_a_type for attr :foo"
++
++      assert_raise CompileError, msg, fn ->
+         defmodule Phoenix.ComponentTest.AttrTypeNotSupported do
+           use Elixir.Phoenix.Component
+ 
+@@ -759,8 +1188,70 @@ defmodule Phoenix.ComponentTest do
+       end
+     end
+ 
++    test "raise if slot attr type is not supported" do
++      msg = ~r"invalid type :not_a_type for attr :foo in slot :named"
++
++      assert_raise CompileError, msg, fn ->
++        defmodule Phoenix.ComponentTest.SlotAttrTypeNotSupported do
++          use Elixir.Phoenix.Component
++
++          slot :named do
++            attr :foo, :not_a_type
++          end
++
++          def func(assigns), do: ~H[]
++        end
++      end
++    end
++
++    test "reraise exceptions in slot/3 blocks" do
++      assert_raise RuntimeError, "boom!", fn ->
++        defmodule Phoenix.ComponentTest.SlotExceptionRaised do
++          use Elixir.Phoenix.Component
++
++          slot :named do
++            raise "boom!"
++          end
++
++          def func(assigns), do: ~H[]
++        end
++      end
++    end
++
++    test "raise if attr default does not match the type" do
++      msg = ~r"expected the default value for attr :foo to be a :string, got: :not_a_string"
++
++      assert_raise CompileError, msg, fn ->
++        defmodule Phoenix.ComponentTest.AttrDefaultTypeMismatch do
++          use Elixir.Phoenix.Component
++
++          attr :foo, :string, default: :not_a_string
++
++          def func(assigns), do: ~H[]
++        end
++      end
++    end
++
++    test "raise if slot attr has default" do
++      msg = ~r" invalid option :default for attr :foo in slot :named"
++
++      assert_raise CompileError, msg, fn ->
++        defmodule Phoenix.ComponentTest.SlotAttrDefault do
++          use Elixir.Phoenix.Component
++
++          slot :named do
++            attr :foo, :any, default: :whatever
++          end
++
++          def func(assigns), do: ~H[]
++        end
++      end
++    end
++
+     test "raise if attr option is not supported" do
+-      assert_raise CompileError, ~r"invalid option :not_an_opt for attr :foo", fn ->
++      msg = ~r"invalid option :not_an_opt for attr :foo"
++
++      assert_raise CompileError, msg, fn ->
+         defmodule Phoenix.ComponentTest.AttrOptionNotSupported do
+           use Elixir.Phoenix.Component
+ 
+@@ -770,8 +1261,26 @@ defmodule Phoenix.ComponentTest do
+       end
+     end
+ 
++    test "raise if slot attr option is not supported" do
++      msg = ~r"invalid option :not_an_opt for attr :foo in slot :named"
++
++      assert_raise CompileError, msg, fn ->
++        defmodule Phoenix.ComponentTest.SlotAttrOptionNotSupported do
++          use Elixir.Phoenix.Component
++
++          slot :named do
++            attr :foo, :any, not_an_opt: true
++          end
++
++          def func(assigns), do: ~H[]
++        end
++      end
++    end
++
+     test "raise if attr is duplicated" do
+-      assert_raise CompileError, ~r"a duplicate attribute with name :foo already exists", fn ->
++      msg = ~r"a duplicate attribute with name :foo already exists"
++
++      assert_raise CompileError, msg, fn ->
+         defmodule Phoenix.ComponentTest.AttrDup do
+           use Elixir.Phoenix.Component
+ 
+@@ -782,8 +1291,75 @@ defmodule Phoenix.ComponentTest do
+       end
+     end
+ 
++    test "raise if slot is duplicated" do
++      msg = ~r"a duplicate slot with name :foo already exists"
++
++      assert_raise CompileError, msg, fn ->
++        defmodule Phoenix.ComponentTest.SlotDup do
++          use Elixir.Phoenix.Component
++
++          slot :foo
++          slot :foo
++          def func(assigns), do: ~H[]
++        end
++      end
++    end
++
++    test "raise if slot attr is duplicated" do
++      msg = ~r"a duplicate attribute with name :foo in slot :named already exists"
++
++      assert_raise CompileError, msg, fn ->
++        defmodule Phoenix.ComponentTest.SlotAttrDup do
++          use Elixir.Phoenix.Component
++
++          slot :named do
++            attr :foo, :any, required: true
++            attr :foo, :string
++          end
++
++          def func(assigns), do: ~H[]
++        end
++      end
++    end
++
++    test "does not raise if multiple slots with different names share the same attr names" do
++      mod = fn ->
++        defmodule MultipleSlotAttrs do
++          use Phoenix.Component
++
++          slot :foo do
++            attr :attr, :any
++          end
++
++          slot :bar do
++            attr :attr, :any
++          end
++
++          def func(assigns), do: ~H[]
++        end
++      end
++
++      assert mod.()
++    end
++
++    test "raise if slot with name :inner_block has slot attrs" do
++      msg = ~r"cannot define attributes in slot :inner_block"
++
++      assert_raise CompileError, msg, fn ->
++        defmodule AttrsInDefaultSlot do
++          use Elixir.Phoenix.Component
++
++          slot :inner_block do
++            attr :attr, :any
++          end
++
++          def func(assigns), do: ~H[]
++        end
++      end
++    end
++
+     test "raise on more than one :global attr" do
+-      msg = ~r"cannot define global attribute :rest2 because one is already defined under :rest"
++      msg = ~r"cannot define :global attribute :rest2 because one is already defined as :rest"
+ 
+       assert_raise CompileError, msg, fn ->
+         defmodule Phoenix.ComponentTest.MultiGlobal do
+@@ -796,8 +1372,25 @@ defmodule Phoenix.ComponentTest do
+       end
+     end
+ 
++    test "raise on more than one :global slot attr" do
++      msg = ~r"cannot define :global attribute :rest2 because one is already defined as :rest in slot :named"
++
++      assert_raise CompileError, msg, fn ->
++        defmodule Phoenix.ComponentTest.MultiSlotGlobal do
++          use Elixir.Phoenix.Component
++
++          slot :named do
++            attr :rest, :global
++            attr :rest2, :global
++          end
++
++          def func(assigns), do: ~H[]
++        end
++      end
++    end
++
+     test "raise if global provides :required" do
+-      msg = ~r/global attributes do not support the :required option/
++      msg = ~r"global attributes do not support the :required option"
+ 
+       assert_raise CompileError, msg, fn ->
+         defmodule Phoenix.ComponentTest.GlobalOpts do
+@@ -841,7 +1434,7 @@ defmodule Phoenix.ComponentTest do
+     end
+ 
+     test "does not raise when there is a nested module" do
+-      Code.compile_string("""
++      mod = fn ->
+         defmodule NestedModules do
+           use Phoenix.Component
+ 
+@@ -849,7 +1442,9 @@ defmodule Phoenix.ComponentTest do
+             def fun(arg), do: arg
+           end
+         end
+-      """)
++      end
++
++      assert mod.()
+     end
+   end
+ end
+diff --git a/test/phoenix_live_view/helpers_test.exs b/test/phoenix_live_view/helpers_test.exs
+index d70eec0ce9..50bceb0188 100644
+--- a/test/phoenix_live_view/helpers_test.exs
++++ b/test/phoenix_live_view/helpers_test.exs
+@@ -89,13 +89,13 @@ defmodule Phoenix.LiveView.HelpersTest do
+       end
+     end
+ 
+-    test "csrf with :get method" do
++    test "csrf with get method" do
+       assigns = %{}
+ 
+-      assert render(~H|<.link href="/" method={:get}>text</.link>|) ==
++      assert render(~H|<.link href="/" method="get">text</.link>|) ==
+                ~s|<a href="/">text</a>|
+ 
+-      assert render(~H|<.link href="/" method={:get} csrf_token="123">text</.link>|) ==
++      assert render(~H|<.link href="/" method="get" csrf_token="123">text</.link>|) ==
+                ~s|<a href="/">text</a>|
+     end
+ 
+diff --git a/test/phoenix_live_view/integrations/live_components_test.exs b/test/phoenix_live_view/integrations/live_components_test.exs
+index 9dd204babe..ef4c007cdc 100644
+--- a/test/phoenix_live_view/integrations/live_components_test.exs
++++ b/test/phoenix_live_view/integrations/live_components_test.exs
+@@ -318,7 +318,7 @@ defmodule Phoenix.LiveView.LiveComponentsTest do
+       assert ExUnit.CaptureLog.capture_log(fn ->
+                send(view.pid, {:send_update, [{StatefulComponent, id: "nemo", name: "NEW-nemo"}]})
+                render(view)
+-               refute_received {:updated, _}
++               refute_receive {:updated, _}
+              end) =~
+                "send_update failed because component Phoenix.LiveViewTest.StatefulComponent with ID \"nemo\" does not exist or it has been removed"
+     end
+diff --git a/test/support/live_views/components.ex b/test/support/live_views/components.ex
+index 33c5f56a66..ac5efcee58 100644
+--- a/test/support/live_views/components.ex
++++ b/test/support/live_views/components.ex
+@@ -73,7 +73,7 @@ defmodule Phoenix.LiveViewTest.FunctionComponentWithAttrs do
+ 
+   @doc """
+   fun docs
+-  [[INSERT ATTRDOCS]]
++  [[INSERT LVDOCS]]
+   fun docs
+   """
+   def fun_doc_injection(assigns), do: ~H[]
+@@ -84,6 +84,22 @@ defmodule Phoenix.LiveViewTest.FunctionComponentWithAttrs do
+ 
+   attr :attr, :any
+   defp private_fun(assigns), do: ~H[]
++
++  slot :inner_block
++  def fun_slot(assigns), do: ~H[]
++
++  slot :inner_block, doc: "slot docs"
++  def fun_slot_doc(assigns), do: ~H[]
++
++  slot :inner_block, required: true
++  def fun_slot_required(assigns), do: ~H[]
++
++  slot :named, required: true, doc: "a named slot" do
++    attr :attr1, :any, required: true, doc: "a slot attr doc"
++    attr :attr2, :any, doc: "a slot attr doc"
++  end
++
++  def fun_slot_with_attrs(assigns), do: ~H[]
+ end
+ 
+ defmodule Phoenix.LiveViewTest.StatefulComponent do

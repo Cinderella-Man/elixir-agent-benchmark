@@ -1,0 +1,205 @@
+diff --git a/lib/ecto/query.ex b/lib/ecto/query.ex
+index 110331b23f..0037b34a4c 100644
+--- a/lib/ecto/query.ex
++++ b/lib/ecto/query.ex
+@@ -1088,7 +1088,7 @@ defmodule Ecto.Query do
+       from(f in fragment("my_table_valued_function(arg)"), select: f.x)
+ 
+       # Fragment with built-in function and undefined columns
+-      from(f in fragment("select generate_series(?::integer, ?::integer) as x", ^0, ^10), select: f.x)
++      from(f in fragment("generate_series(?::integer, ?::integer)", ^0, ^10, columns: [:x]), select: f.x)
+ 
+       # Fragment with schema
+       from(f in {fragment("my_table_valued_function(arg)"), Schema})
+diff --git a/lib/ecto/query/api.ex b/lib/ecto/query/api.ex
+index beced752f9..f161889a84 100644
+--- a/lib/ecto/query/api.ex
++++ b/lib/ecto/query/api.ex
+@@ -473,6 +473,42 @@ defmodule Ecto.Query.API do
+   inspecting the Elixir query.  Other than that, it should be
+   equivalent to a built-in Ecto query function.
+ 
++  ## Defining column names for fragment sources
++
++  When using a fragment as a query source, you are required to
++  define the column names so that they can be referenced in other
++  parts of the query. For example:
++
++      from(f in fragment("select generate_series(?::integer, ?::integer) as x", ^0, ^10), select: f.x)
++
++  In this fragment the column name `x` was hard-coded directly into the string.
++  This can become quite verbose, but more importantly it does not lend itself to
++  re-use.
++
++  The best way to define column names on a fragment source is to use the `:columns`
++  keyword as the last argument to the fragment:
++
++      from(f in fragment("generate_series(?, ?)", ^0, ^10, columns: [:x]))
++
++  where the column value is a non-empty list of atoms. This lends itself particularly
++  well to defining custom macros for complicated database functions. For example, the
++  variadic Postgres function `unnest` could be encapsulated into a macro as follows:
++
++    defmacro unnest(data, columns) do
++      quote do
++        fragment("unnest(?)", splice(unquote(data)), columns: unquote(columns))
++      end
++    end
++
++    nums = [1, 2, 3, 4, 5]
++    str = ["a", "b", "c", "d", "e"]
++
++    from u in unnest(
++          [type(^nums, {:array, :integer}), type(^str, {:array, :string})],
++          [:num, :text]
++        ),
++        select: {u.num, u.text}
++
+   ## Keyword fragments
+ 
+   In order to support databases that do not have string-based
+diff --git a/lib/ecto/query/builder.ex b/lib/ecto/query/builder.ex
+index db9d4e4701..f7a946308c 100644
+--- a/lib/ecto/query/builder.ex
++++ b/lib/ecto/query/builder.ex
+@@ -218,6 +218,12 @@ defmodule Ecto.Query.Builder do
+   def escape({:fragment, _, [query | frags]}, _type, {params, acc}, vars, env) do
+     pieces = expand_and_split_fragment(query, env)
+ 
++    {frags, meta} =
++      case Enum.reverse(frags) do
++        [[columns: cols] | rest] -> {Enum.reverse(rest), [column_names: columns!(cols)]}
++        _ -> {frags, []}
++      end
++
+     if length(pieces) != length(frags) + 1 do
+       error!(
+         "fragment(...) expects extra arguments in the same amount of question marks in string. " <>
+@@ -235,7 +241,7 @@ defmodule Ecto.Query.Builder do
+         quote do: Ecto.Query.Builder.merge_fragments(unquote(pieces), unquote(frags), [])
+       end
+ 
+-    {{:{}, [], [:fragment, [], merged]}, {params, acc}}
++    {{:{}, [], [:fragment, meta, merged]}, {params, acc}}
+   end
+ 
+   # subqueries
+@@ -1233,6 +1239,34 @@ defmodule Ecto.Query.Builder do
+     end
+   end
+ 
++  @doc """
++  Checks if the column names provided to a fragment
++  is a list of atoms.
++  """
++  def columns!({:^, _, [expr]}),
++    do: quote(do: Ecto.Query.Builder.columns!(unquote(expr)))
++
++  def columns!([]),
++    do: error!("fragment(...) columns expects a non-empty list")
++
++  def columns!(columns) when is_list(columns) do
++    if Enum.all?(columns, &is_atom/1) do
++      columns
++    else
++      error!(
++        "fragment(...) columns must be a list of atoms, got: " <>
++          "`#{Macro.to_string(columns)}`"
++      )
++    end
++  end
++
++  def columns!(other) do
++    error!(
++      "fragment(...) columns expects a list of atoms, got: " <>
++        "`#{Macro.to_string(other)}`"
++    )
++  end
++
+   defp escape_json_path(path, vars) when is_list(path) do
+     Enum.map(path, &quoted_json_path_element!(&1, vars))
+   end
+diff --git a/test/ecto/query/builder/from_test.exs b/test/ecto/query/builder/from_test.exs
+index cfd883b855..aa0342d598 100644
+--- a/test/ecto/query/builder/from_test.exs
++++ b/test/ecto/query/builder/from_test.exs
+@@ -1,6 +1,9 @@
++Code.require_file("../../../support/eval_helpers.exs", __DIR__)
++
+ defmodule Ecto.Query.Builder.FromTest do
+   use ExUnit.Case, async: true
+   import Ecto.Query.Builder.From
++  import Support.EvalHelpers
+   doctest Ecto.Query.Builder.From
+ 
+   import Ecto.Query
+@@ -20,6 +23,12 @@ defmodule Ecto.Query.Builder.FromTest do
+     end
+   end
+ 
++  defmacro generate_series(lower, upper, columns) do
++    quote do
++      fragment("generate_series(?, ?)", unquote(lower), unquote(upper), columns: unquote(columns))
++    end
++  end
++
+   test "expands macros as sources" do
+     right = "right"
+ 
+@@ -86,4 +95,27 @@ defmodule Ecto.Query.Builder.FromTest do
+       from(v in values(values, types))
+     end
+   end
++
++  test "add column names to fragment sources" do
++    lower = 0
++    upper = 10
++    q = from(j in generate_series(^lower, ^upper, [:x]))
++    assert %{source: {:fragment, [column_names: [:x]], _}} = q.from
++  end
++
++  test "add interpolated column names to fragment sources" do
++    columns = [:x]
++    lower = 0
++    upper = 10
++    q = from(j in generate_series(^lower, ^upper, ^columns))
++    assert %{source: {:fragment, [column_names: ^columns], _}} = q.from
++  end
++
++  test "fragment raises when columns are not a list of atoms" do
++    msg = ~r/columns must be a list of atoms/
++
++    assert_raise Ecto.Query.CompileError, msg, fn ->
++      quote_and_eval(from(j in generate_series(^0, ^10, ["x"])))
++    end
++  end
+ end
+diff --git a/test/ecto/query/builder/join_test.exs b/test/ecto/query/builder/join_test.exs
+index 0befddee1c..f39f65c767 100644
+--- a/test/ecto/query/builder/join_test.exs
++++ b/test/ecto/query/builder/join_test.exs
+@@ -15,6 +15,12 @@ defmodule Ecto.Query.Builder.JoinTest do
+     end
+   end
+ 
++  defmacro generate_series(lower, upper, columns) do
++    quote do
++      fragment("generate_series(?, ?)", unquote(lower), unquote(upper), columns: unquote(columns))
++    end
++  end
++
+   test "expands macros as sources" do
+     left = "left"
+     right = "right"
+@@ -237,4 +243,11 @@ defmodule Ecto.Query.Builder.JoinTest do
+ 
+     assert {:{}, _, [_, {{:., [], [{:&, [], [2]}, :id]}, [], []}]} = q.select.expr
+   end
++
++  test "add column names to fragment sources with with_columns/2" do
++    lower = 0
++    upper = 10
++    q = from p in "posts", join: j in generate_series(^lower, ^upper, [:x]), on: true
++    assert [%{source: {:fragment, [column_names: [:x]], _}}] = q.joins
++  end
+ end

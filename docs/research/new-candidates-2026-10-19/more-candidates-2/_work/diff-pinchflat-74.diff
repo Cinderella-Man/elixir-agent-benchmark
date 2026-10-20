@@ -1,0 +1,122 @@
+diff --git a/lib/pinchflat/yt_dlp/download_option_builder.ex b/lib/pinchflat/yt_dlp/download_option_builder.ex
+index c53b7311a..35f4aff22 100644
+--- a/lib/pinchflat/yt_dlp/download_option_builder.ex
++++ b/lib/pinchflat/yt_dlp/download_option_builder.ex
+@@ -61,11 +61,11 @@ defmodule Pinchflat.YtDlp.DownloadOptionBuilder do
+     mapped_struct = Map.from_struct(media_profile)
+ 
+     Enum.reduce(mapped_struct, [], fn attr, acc ->
+-      case {attr, media_profile} do
+-        {{:download_thumbnail, true}, _} ->
++      case attr do
++        {:download_thumbnail, true} ->
+           acc ++ [:write_thumbnail, convert_thumbnail: "jpg"]
+ 
+-        {{:embed_thumbnail, true}, %{preferred_resolution: pr}} when pr != :audio ->
++        {:embed_thumbnail, true} ->
+           acc ++ [:embed_thumbnail]
+ 
+         _ ->
+@@ -78,31 +78,26 @@ defmodule Pinchflat.YtDlp.DownloadOptionBuilder do
+     mapped_struct = Map.from_struct(media_profile)
+ 
+     Enum.reduce(mapped_struct, [], fn attr, acc ->
+-      case {attr, media_profile} do
+-        {{:download_metadata, true}, _} ->
+-          acc ++ [:write_info_json, :clean_info_json]
+-
+-        {{:embed_metadata, true}, %{preferred_resolution: pr}} when pr != :audio ->
+-          acc ++ [:embed_metadata]
+-
+-        _ ->
+-          acc
++      case attr do
++        {:download_metadata, true} -> acc ++ [:write_info_json, :clean_info_json]
++        {:embed_metadata, true} -> acc ++ [:embed_metadata]
++        _ -> acc
+       end
+     end)
+   end
+ 
+   defp quality_options(media_profile) do
+-    codec_options = "+codec:avc:m4a"
++    video_codec_options = "+codec:avc:m4a"
+ 
+     case media_profile.preferred_resolution do
+-      # Also be aware that :audio disabled all embedding options for thumbnails, subtitles, and metadata
+-      :audio -> [format_sort: "ext", format: "bestaudio"]
+-      :"360p" -> [format_sort: "res:360,#{codec_options}"]
+-      :"480p" -> [format_sort: "res:480,#{codec_options}"]
+-      :"720p" -> [format_sort: "res:720,#{codec_options}"]
+-      :"1080p" -> [format_sort: "res:1080,#{codec_options}"]
+-      :"1440p" -> [format_sort: "res:1440,#{codec_options}"]
+-      :"2160p" -> [format_sort: "res:2160,#{codec_options}"]
++      # Also be aware that :audio disabled all embedding options for subtitles
++      :audio -> [:extract_audio, format: "bestaudio[ext=m4a]"]
++      :"360p" -> [format_sort: "res:360,#{video_codec_options}"]
++      :"480p" -> [format_sort: "res:480,#{video_codec_options}"]
++      :"720p" -> [format_sort: "res:720,#{video_codec_options}"]
++      :"1080p" -> [format_sort: "res:1080,#{video_codec_options}"]
++      :"1440p" -> [format_sort: "res:1440,#{video_codec_options}"]
++      :"2160p" -> [format_sort: "res:2160,#{video_codec_options}"]
+     end
+   end
+ 
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
+index 7787a98e1..5bb104b72 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
+@@ -109,7 +109,7 @@
+     options={friendly_resolution_options()}
+     type="select"
+     label="Preferred Resolution"
+-    help="Will grab the closest available resolution if your preferred is not available. Setting to 'Audio Only' negates embedding options."
++    help="Will grab the closest available resolution if your preferred is not available"
+   />
+ 
+   <.button class="my-10 sm:mb-7.5 w-full sm:w-auto">Save Media profile</.button>
+diff --git a/test/pinchflat/yt_dlp/download_option_builder_test.exs b/test/pinchflat/yt_dlp/download_option_builder_test.exs
+index c17ff54ed..9896b5ae4 100644
+--- a/test/pinchflat/yt_dlp/download_option_builder_test.exs
++++ b/test/pinchflat/yt_dlp/download_option_builder_test.exs
+@@ -141,14 +141,6 @@ defmodule Pinchflat.YtDlp.DownloadOptionBuilderTest do
+       assert :embed_thumbnail in res
+     end
+ 
+-    test "doesn't include :embed_thumbnail option when preferred_resolution is :audio", %{media_item: media_item} do
+-      media_item = update_media_profile_attribute(media_item, %{embed_thumbnail: true, preferred_resolution: :audio})
+-
+-      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
+-
+-      refute :embed_thumbnail in res
+-    end
+-
+     test "doesn't include these options when not specified", %{media_item: media_item} do
+       media_item = update_media_profile_attribute(media_item, %{embed_thumbnail: false, download_thumbnail: false})
+ 
+@@ -177,14 +169,6 @@ defmodule Pinchflat.YtDlp.DownloadOptionBuilderTest do
+       assert :embed_metadata in res
+     end
+ 
+-    test "doesn't include :embed_metadata option when preferred_resolution is :audio", %{media_item: media_item} do
+-      media_item = update_media_profile_attribute(media_item, %{embed_metadata: true, preferred_resolution: :audio})
+-
+-      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
+-
+-      refute :embed_metadata in res
+-    end
+-
+     test "doesn't include these options when not specified", %{media_item: media_item} do
+       media_item = update_media_profile_attribute(media_item, %{embed_metadata: false, download_metadata: false})
+ 
+@@ -210,8 +194,8 @@ defmodule Pinchflat.YtDlp.DownloadOptionBuilderTest do
+ 
+       assert {:ok, res} = DownloadOptionBuilder.build(media_item)
+ 
+-      assert {:format, "bestaudio"} in res
+-      assert {:format_sort, "ext"} in res
++      assert :extract_audio in res
++      assert {:format, "bestaudio[ext=m4a]"} in res
+     end
+   end
+ 

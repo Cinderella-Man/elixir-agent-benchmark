@@ -69,11 +69,38 @@ defmodule Eab.MemoryMonitor do
   def start_link(args), do: GenServer.start_link(__MODULE__, args)
 
   def configuration(endpoint) do
+    case configuration_status(endpoint) do
+      {:configured, config} -> config
+      _ -> nil
+    end
+  end
+
+  def configuration_label(endpoint) do
+    case configuration_status(endpoint) do
+      {:configured, _} ->
+        "RAM/VRAM collection is configured. The collector must connect before the run can start."
+
+      :disabled ->
+        "RAM/VRAM will not be recorded: set EAB_MEMORY_SSH_TARGET and EAB_MEMORY_HOSTS."
+
+      {:unlisted_host, host} ->
+        "RAM/VRAM will not be recorded: add #{host} to EAB_MEMORY_HOSTS."
+
+      :unsupported ->
+        "RAM/VRAM collection is unavailable for this model source."
+    end
+  end
+
+  defp configuration_status(endpoint) do
     config = Application.get_env(:eab, :memory_monitor)
     host = URI.parse(endpoint["url"] || "").host
 
-    if config && endpoint["backend"] in ["strata", "llama_cpp"] && host in config[:hosts],
-      do: config
+    cond do
+      endpoint["backend"] not in ["strata", "llama_cpp"] -> :unsupported
+      is_nil(config) -> :disabled
+      host not in config[:hosts] -> {:unlisted_host, host}
+      true -> {:configured, config}
+    end
   end
 
   @impl true

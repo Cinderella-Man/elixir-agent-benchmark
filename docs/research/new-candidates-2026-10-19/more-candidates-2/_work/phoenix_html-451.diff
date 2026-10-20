@@ -1,0 +1,104 @@
+diff --git a/lib/phoenix_html/form.ex b/lib/phoenix_html/form.ex
+index 1ff839d..0699aeb 100644
+--- a/lib/phoenix_html/form.ex
++++ b/lib/phoenix_html/form.ex
+@@ -297,6 +297,21 @@ defmodule Phoenix.HTML.Form do
+       #=>   <option>France</option>
+       #=> </optgroup>
+ 
++  Horizontal separators can be added:
++
++      options_for_select(["Admin", "User", :hr, "New"], nil)
++      #=> <option>Admin</option>
++      #=> <option>User</option>
++      #=> <hr/>
++      #=> <option>New</option>
++
++      options_for_select(["Admin": "admin", "User": "user", hr: nil, "New": "new"], nil)
++      #=> <option value="admin" selected>Admin</option>
++      #=> <option value="user">User</option>
++      #=> <hr/>
++      #=> <option value="new">New</option>
++
++
+   """
+   def options_for_select(options, selected_values) do
+     {:safe,
+@@ -308,6 +323,9 @@ defmodule Phoenix.HTML.Form do
+ 
+   defp escaped_options_for_select(options, selected_values) do
+     Enum.reduce(options, [], fn
++      {:hr, nil}, acc ->
++        [acc | hr_tag()]
++
+       {option_key, option_value}, acc ->
+         [acc | option(option_key, option_value, [], selected_values)]
+ 
+@@ -326,6 +344,9 @@ defmodule Phoenix.HTML.Form do
+ 
+         [acc | option(option_key, option_value, options, selected_values)]
+ 
++      :hr, acc ->
++        [acc | hr_tag()]
++
+       option, acc ->
+         [acc | option(option, option, [], selected_values)]
+     end)
+@@ -349,6 +370,10 @@ defmodule Phoenix.HTML.Form do
+     [?<, name, attrs, ?>, body, ?<, ?/, name, ?>]
+   end
+ 
++  defp hr_tag() do
++    [?<, "hr", ?/, ?>]
++  end
++
+   # Helper for getting field errors, handling string fields
+   defp field_errors(errors, field)
+        when is_list(errors) and (is_atom(field) or is_binary(field)) do
+diff --git a/test/phoenix_html/form_test.exs b/test/phoenix_html/form_test.exs
+index 75fb40f..523b76f 100644
+--- a/test/phoenix_html/form_test.exs
++++ b/test/phoenix_html/form_test.exs
+@@ -252,31 +252,40 @@ defmodule Phoenix.HTML.FormTest do
+                ~s(<option value="value">value</option>) <>
+                  ~s(<option selected value="novalue">novalue</option>)
+ 
+-      assert options_for_select(~w(value novalue), "novalue") |> safe_to_string() ==
++      assert options_for_select(["value", :hr, "novalue"], "novalue") |> safe_to_string() ==
+                ~s(<option value="value">value</option>) <>
++                 ~s(<hr/>) <>
+                  ~s(<option selected value="novalue">novalue</option>)
+ 
+       assert options_for_select(
+                [
+                  [value: "value", key: "Value", disabled: true],
++                 :hr,
+                  [value: "novalue", key: "No Value"]
+                ],
+                "novalue"
+              )
+              |> safe_to_string() ==
+                ~s(<option disabled value="value">Value</option>) <>
++                 ~s(<hr/>) <>
+                  ~s(<option selected value="novalue">No Value</option>)
+ 
+       assert options_for_select(~w(value novalue), ["value", "novalue"]) |> safe_to_string() ==
+                ~s(<option selected value="value">value</option>) <>
+                  ~s(<option selected value="novalue">novalue</option>)
++
++      assert options_for_select([Label: "value", hr: nil, New: "new"], nil) |> safe_to_string() ==
++               ~s(<option value="value">Label</option>) <>
++                 ~s(<hr/>) <>
++                 ~s(<option value="new">New</option>)
+     end
+ 
+     test "with groups" do
+-      assert options_for_select([{"foo", ~w(bar baz)}, {"qux", ~w(qux quz)}], "qux")
++      assert options_for_select([{"foo", ["bar", :hr, "baz"]}, {"qux", ~w(qux quz)}], "qux")
+              |> safe_to_string() ==
+                ~s(<optgroup label="foo">) <>
+                  ~s(<option value="bar">bar</option>) <>
++                 ~s(<hr/>) <>
+                  ~s(<option value="baz">baz</option>) <>
+                  ~s(</optgroup>) <>
+                  ~s(<optgroup label="qux">) <>

@@ -1,0 +1,821 @@
+diff --git a/.iex.exs b/.iex.exs
+index 8a0ac7935..bf39442f4 100644
+--- a/.iex.exs
++++ b/.iex.exs
+@@ -1,3 +1,4 @@
++import Ecto.Query, warn: false
+ alias Pinchflat.Repo
+ 
+ alias Pinchflat.Tasks.Task
+@@ -35,6 +36,10 @@ defmodule IexHelpers do
+     "https://www.youtube.com/watch?v=bR52O78ZIUw"
+   end
+ 
++  def last_media_item do
++    Repo.one(from m in MediaItem, limit: 1)
++  end
++
+   def details(type) do
+     source =
+       case type do
+diff --git a/lib/pinchflat/media.ex b/lib/pinchflat/media.ex
+index a3127f618..28147b188 100644
+--- a/lib/pinchflat/media.ex
++++ b/lib/pinchflat/media.ex
+@@ -64,6 +64,7 @@ defmodule Pinchflat.Media do
+     MediaItem
+     |> where([mi], mi.source_id == ^source.id and is_nil(mi.media_filepath))
+     |> where(^build_format_clauses(media_profile))
++    |> where(^maybe_apply_cutoff_date(source))
+     |> Repo.maybe_limit(limit)
+     |> Repo.all()
+   end
+@@ -92,11 +93,12 @@ defmodule Pinchflat.Media do
+   Returns boolean()
+   """
+   def pending_download?(%MediaItem{} = media_item) do
+-    media_profile = Repo.preload(media_item, source: :media_profile).source.media_profile
++    media_item = Repo.preload(media_item, source: :media_profile)
+ 
+     MediaItem
+     |> where([mi], mi.id == ^media_item.id and is_nil(mi.media_filepath))
+-    |> where(^build_format_clauses(media_profile))
++    |> where(^build_format_clauses(media_item.source.media_profile))
++    |> where(^maybe_apply_cutoff_date(media_item.source))
+     |> Repo.exists?()
+   end
+ 
+@@ -184,14 +186,25 @@ defmodule Pinchflat.Media do
+ 
+   @doc """
+   Creates a media item from the attributes returned by the video backend
+-  (read: yt-dlp)
++  (read: yt-dlp).
++
++  Unlike `create_media_item`, this will attempt an update if the media_item
++  already exists. This is so that future indexing can pick up attributes that
++  we may not have asked for in the past (eg: upload_date)
+ 
+   Returns {:ok, %MediaItem{}} | {:error, %Ecto.Changeset{}}
+   """
+   def create_media_item_from_backend_attrs(source, media_attrs_struct) do
+-    %{source_id: source.id}
+-    |> Map.merge(Map.from_struct(media_attrs_struct))
+-    |> create_media_item()
++    attrs = Map.merge(%{source_id: source.id}, Map.from_struct(media_attrs_struct))
++
++    %MediaItem{}
++    |> MediaItem.changeset(attrs)
++    |> Repo.insert(
++      on_conflict: [
++        set: Map.to_list(attrs)
++      ],
++      conflict_target: [:source_id, :media_id]
++    )
+   end
+ 
+   @doc """
+@@ -249,6 +262,14 @@ defmodule Pinchflat.Media do
+     {:ok, media_item}
+   end
+ 
++  defp maybe_apply_cutoff_date(source) do
++    if source.download_cutoff_date do
++      dynamic([mi], mi.upload_date >= ^source.download_cutoff_date)
++    else
++      dynamic(true)
++    end
++  end
++
+   defp build_format_clauses(media_profile) do
+     mapped_struct = Map.from_struct(media_profile)
+ 
+diff --git a/lib/pinchflat/media/media_item.ex b/lib/pinchflat/media/media_item.ex
+index cd918124e..6b07cac8b 100644
+--- a/lib/pinchflat/media/media_item.ex
++++ b/lib/pinchflat/media/media_item.ex
+@@ -20,6 +20,7 @@ defmodule Pinchflat.Media.MediaItem do
+     :livestream,
+     :source_id,
+     :short_form_content,
++    :upload_date,
+     # these fields are captured only on download
+     :media_downloaded_at,
+     :media_filepath,
+@@ -28,7 +29,16 @@ defmodule Pinchflat.Media.MediaItem do
+     :thumbnail_filepath,
+     :metadata_filepath
+   ]
+-  @required_fields ~w(title original_url livestream media_id source_id short_form_content)a
++  # Pretty much all the fields captured at index are required.
++  @required_fields ~w(
++    title
++    original_url
++    livestream
++    media_id
++    source_id
++    upload_date
++    short_form_content
++    )a
+ 
+   schema "media_items" do
+     field :title, :string
+@@ -38,6 +48,7 @@ defmodule Pinchflat.Media.MediaItem do
+     field :livestream, :boolean, default: false
+     field :short_form_content, :boolean, default: false
+     field :media_downloaded_at, :utc_datetime
++    field :upload_date, :date
+ 
+     field :media_filepath, :string
+     field :media_size_bytes, :integer
+diff --git a/lib/pinchflat/sources.ex b/lib/pinchflat/sources.ex
+index eee7c64f6..dd5397180 100644
+--- a/lib/pinchflat/sources.ex
++++ b/lib/pinchflat/sources.ex
+@@ -41,13 +41,24 @@ defmodule Pinchflat.Sources do
+   original_url (if provided). Will attempt to start indexing the source's
+   media if successfully inserted.
+ 
++  Runs an initial `change_source` check to ensure most of the source is valid
++  before making an expensive API call. Runs it through `Repo.insert` even
++  though we know it's going to fail so it picks up any addl. database errors
++  and fulfills our return contract.
++
+   Returns {:ok, %Source{}} | {:error, %Ecto.Changeset{}}
+   """
+   def create_source(attrs) do
+-    %Source{}
+-    |> change_source_from_url(attrs)
+-    |> maybe_change_indexing_frequency()
+-    |> commit_and_handle_tasks()
++    case change_source(%Source{}, attrs, :initial) do
++      %Ecto.Changeset{valid?: true} ->
++        %Source{}
++        |> change_source_from_url(attrs)
++        |> maybe_change_indexing_frequency()
++        |> commit_and_handle_tasks()
++
++      changeset ->
++        Repo.insert(changeset)
++    end
+   end
+ 
+   @doc """
+@@ -58,13 +69,24 @@ defmodule Pinchflat.Sources do
+   Existing indexing tasks will be cancelled if the indexing frequency has been
+   changed (logic in `SourceTasks.kickoff_indexing_task`)
+ 
++  Runs an initial `change_source` check to ensure most of the source is valid
++  before making an expensive API call. Runs it through `Repo.update` even
++  though we know it's going to fail so it picks up any addl. database errors
++  and fulfills our return contract.
++
+   Returns {:ok, %Source{}} | {:error, %Ecto.Changeset{}}
+   """
+   def update_source(%Source{} = source, attrs) do
+-    source
+-    |> change_source_from_url(attrs)
+-    |> maybe_change_indexing_frequency()
+-    |> commit_and_handle_tasks()
++    case change_source(source, attrs, :initial) do
++      %Ecto.Changeset{valid?: true} ->
++        source
++        |> change_source_from_url(attrs)
++        |> maybe_change_indexing_frequency()
++        |> commit_and_handle_tasks()
++
++      changeset ->
++        Repo.update(changeset)
++    end
+   end
+ 
+   @doc """
+@@ -89,8 +111,8 @@ defmodule Pinchflat.Sources do
+   @doc """
+   Returns an `%Ecto.Changeset{}` for tracking source changes.
+   """
+-  def change_source(%Source{} = source, attrs \\ %{}) do
+-    Source.changeset(source, attrs)
++  def change_source(%Source{} = source, attrs \\ %{}, validation_stage \\ :pre_insert) do
++    Source.changeset(source, attrs, validation_stage)
+   end
+ 
+   @doc """
+diff --git a/lib/pinchflat/sources/source.ex b/lib/pinchflat/sources/source.ex
+index 0ed8aaab5..3022a7d66 100644
+--- a/lib/pinchflat/sources/source.ex
++++ b/lib/pinchflat/sources/source.ex
+@@ -21,14 +21,15 @@ defmodule Pinchflat.Sources.Source do
+     download_media
+     last_indexed_at
+     original_url
++    download_cutoff_date
+     media_profile_id
+   )a
+ 
+-  @required_fields ~w(
+-    collection_name
+-    collection_id
+-    collection_type
+-    custom_name
++  # Expensive API calls are made when a source is inserted/updated so
++  # we want to ensure that the source is valid before making the call.
++  # This way, we check that the other attributes are valid before ensuring
++  # that all fields are valid.
++  @initially_required_fields ~w(
+     index_frequency_minutes
+     fast_index
+     download_media
+@@ -36,6 +37,14 @@ defmodule Pinchflat.Sources.Source do
+     media_profile_id
+   )a
+ 
++  @pre_insert_required_fields @initially_required_fields ++
++                                ~w(
++                                  custom_name
++                                  collection_name
++                                  collection_id
++                                  collection_type
++                                )a
++
+   schema "sources" do
+     field :custom_name, :string
+     field :collection_name, :string
+@@ -45,8 +54,8 @@ defmodule Pinchflat.Sources.Source do
+     field :fast_index, :boolean, default: false
+     field :download_media, :boolean, default: true
+     field :last_indexed_at, :utc_datetime
+-    # This should only be used for user reference going forward
+-    # as the collection_id should be used for all API calls
++    # Only download media items that were published after this date
++    field :download_cutoff_date, :date
+     field :original_url, :string
+ 
+     belongs_to :media_profile, MediaProfile
+@@ -58,11 +67,19 @@ defmodule Pinchflat.Sources.Source do
+   end
+ 
+   @doc false
+-  def changeset(source, attrs) do
++  def changeset(source, attrs, validation_stage) do
++    # See above for rationale
++    required_fields =
++      if validation_stage == :initial do
++        @initially_required_fields
++      else
++        @pre_insert_required_fields
++      end
++
+     source
+     |> cast(attrs, @allowed_fields)
+     |> dynamic_default(:custom_name, fn cs -> get_field(cs, :collection_name) end)
+-    |> validate_required(@required_fields)
++    |> validate_required(required_fields)
+     |> unique_constraint([:collection_id, :media_profile_id])
+   end
+ 
+diff --git a/lib/pinchflat/tasks/source_tasks.ex b/lib/pinchflat/tasks/source_tasks.ex
+index 4c786eff6..86afb2608 100644
+--- a/lib/pinchflat/tasks/source_tasks.ex
++++ b/lib/pinchflat/tasks/source_tasks.ex
+@@ -96,12 +96,10 @@ defmodule Pinchflat.Tasks.SourceTasks do
+   job run. This should ensure that any stragglers are caught if, for some reason, they
+   weren't enqueued or somehow got de-queued.
+ 
+-  Since indexing returns all media data EVERY TIME, we rely on the unique index of the
+-  media_id to prevent duplicates. Due to both the file follower and the fact that future
+-  indexing will index a lot of existing data, this method will MOSTLY return error
+-  changesets (from the unique index violation) and not media items. This is intended.
++  Since indexing returns all media data EVERY TIME, we that that opportunity to update
++  indexing metadata for media items that have already been created.
+ 
+-  Returns [%MediaItem{}, ...] | [%Ecto.Changeset{}, ...]
++  Returns [%MediaItem{}, ...]
+   """
+   def index_and_enqueue_download_for_media_items(%Source{} = source) do
+     # See the method definition below for more info on how file watchers work
+diff --git a/lib/pinchflat/yt_dlp/backend/media.ex b/lib/pinchflat/yt_dlp/backend/media.ex
+index 1c9623706..09ad71920 100644
+--- a/lib/pinchflat/yt_dlp/backend/media.ex
++++ b/lib/pinchflat/yt_dlp/backend/media.ex
+@@ -9,7 +9,8 @@ defmodule Pinchflat.YtDlp.Backend.Media do
+     :description,
+     :original_url,
+     :livestream,
+-    :short_form_content
++    :short_form_content,
++    :upload_date
+   ]
+ 
+   defstruct [
+@@ -18,7 +19,8 @@ defmodule Pinchflat.YtDlp.Backend.Media do
+     :description,
+     :original_url,
+     :livestream,
+-    :short_form_content
++    :short_form_content,
++    :upload_date
+   ]
+ 
+   alias __MODULE__
+@@ -67,7 +69,7 @@ defmodule Pinchflat.YtDlp.Backend.Media do
+   Returns the output template for yt-dlp's indexing command.
+   """
+   def indexing_output_template do
+-    "%(.{id,title,was_live,webpage_url,description,aspect_ratio,duration})j"
++    "%(.{id,title,was_live,webpage_url,description,aspect_ratio,duration,upload_date})j"
+   end
+ 
+   @doc """
+@@ -83,7 +85,8 @@ defmodule Pinchflat.YtDlp.Backend.Media do
+       description: response["description"],
+       original_url: response["webpage_url"],
+       livestream: response["was_live"],
+-      short_form_content: short_form_content?(response)
++      short_form_content: short_form_content?(response),
++      upload_date: parse_upload_date(response["upload_date"])
+     }
+   end
+ 
+@@ -100,6 +103,12 @@ defmodule Pinchflat.YtDlp.Backend.Media do
+     end
+   end
+ 
++  defp parse_upload_date(upload_date) do
++    <<year::binary-size(4)>> <> <<month::binary-size(2)>> <> <<day::binary-size(2)>> = upload_date
++
++    Date.from_iso8601!("#{year}-#{month}-#{day}")
++  end
++
+   defp backend_runner do
+     # This approach lets us mock the command for testing
+     Application.get_env(:pinchflat, :yt_dlp_runner)
+diff --git a/lib/pinchflat_web/components/core_components.ex b/lib/pinchflat_web/components/core_components.ex
+index 3b81cdb20..314dbf9c6 100644
+--- a/lib/pinchflat_web/components/core_components.ex
++++ b/lib/pinchflat_web/components/core_components.ex
+@@ -598,9 +598,14 @@ defmodule PinchflatWeb.CoreComponents do
+   def list_items_from_map(assigns) do
+     attrs =
+       Enum.filter(assigns.map, fn
+-        {_, %{__struct__: _}} -> false
+-        {_, [%{__meta__: _} | _]} -> false
+-        _ -> true
++        {_, %{__struct__: s}} when s not in [Date, DateTime] ->
++          false
++
++        {_, [%{__meta__: _} | _]} ->
++          false
++
++        _ ->
++          true
+       end)
+ 
+     assigns = assign(assigns, iterable_attributes: attrs)
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex b/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
+index 5eff7c6bb..5c8957453 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
+@@ -57,6 +57,14 @@
+     help="Unchecking still indexes media but it won't be downloaded until you enable this option"
+   />
+ 
++  <.input
++    field={f[:download_cutoff_date]}
++    type="text"
++    label="Download Cutoff Date"
++    placeholder="YYYY-MM-DD"
++    help="Only download media uploaded after this date. Leave blank to download all media. Must be in YYYY-MM-DD format"
++  />
++
+   <.button class="my-10 sm:mb-7.5 w-full sm:w-auto">Save Source</.button>
+ 
+   <div class="rounded-sm dark:bg-meta-4 p-4 md:p-6 mb-5">
+diff --git a/priv/repo/migrations/20240310230713_add_uploaded_at_to_media_items.exs b/priv/repo/migrations/20240310230713_add_uploaded_at_to_media_items.exs
+new file mode 100644
+index 000000000..f18c23ed8
+--- /dev/null
++++ b/priv/repo/migrations/20240310230713_add_uploaded_at_to_media_items.exs
+@@ -0,0 +1,12 @@
++defmodule Pinchflat.Repo.Migrations.AddUploadedAtToMediaItems do
++  use Ecto.Migration
++
++  def change do
++    alter table(:media_items) do
++      # Setting default to unix epoch so I can enforce not null BUT also easily
++      # identify records that were created before this column was added.
++      # Not a DateTime because yt-dlp only returns the date
++      add :upload_date, :date, default: "1970-01-01", null: false
++    end
++  end
++end
+diff --git a/priv/repo/migrations/20240311033214_add_download_cutoff_date_to_sources.exs b/priv/repo/migrations/20240311033214_add_download_cutoff_date_to_sources.exs
+new file mode 100644
+index 000000000..df2350607
+--- /dev/null
++++ b/priv/repo/migrations/20240311033214_add_download_cutoff_date_to_sources.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddDownloadCutoffDateToSources do
++  use Ecto.Migration
++
++  def change do
++    alter table(:sources) do
++      add :download_cutoff_date, :date
++    end
++  end
++end
+diff --git a/test/pinchflat/media_test.exs b/test/pinchflat/media_test.exs
+index 870cef780..1437178d7 100644
+--- a/test/pinchflat/media_test.exs
++++ b/test/pinchflat/media_test.exs
+@@ -215,6 +215,30 @@ defmodule Pinchflat.MediaTest do
+     end
+   end
+ 
++  describe "list_pending_media_items_for/1 when testing cutoff dates" do
++    test "does not return media items with an upload date before the cutoff date" do
++      source = source_fixture(%{download_cutoff_date: now_minus(1, :day)})
++
++      _old_media_item =
++        media_item_fixture(%{source_id: source.id, media_filepath: nil, upload_date: now_minus(2, :days)})
++
++      new_media_item = media_item_fixture(%{source_id: source.id, media_filepath: nil, upload_date: now()})
++
++      assert Media.list_pending_media_items_for(source) == [new_media_item]
++    end
++
++    test "does not apply a cutoff if there is no cutoff date" do
++      source = source_fixture(%{download_cutoff_date: nil})
++
++      old_media_item =
++        media_item_fixture(%{source_id: source.id, media_filepath: nil, upload_date: now_minus(2, :days)})
++
++      new_media_item = media_item_fixture(%{source_id: source.id, media_filepath: nil, upload_date: now()})
++
++      assert Media.list_pending_media_items_for(source) == [old_media_item, new_media_item]
++    end
++  end
++
+   describe "list_downloaded_media_items_for/1" do
+     test "returns only media items with a media_filepath" do
+       source = source_fixture()
+@@ -260,6 +284,27 @@ defmodule Pinchflat.MediaTest do
+ 
+       refute Media.pending_download?(media_item)
+     end
++
++    test "returns true if there is a cutoff date before the media's upload date" do
++      source = source_fixture(%{download_cutoff_date: now_minus(2, :days)})
++      media_item = media_item_fixture(%{source_id: source.id, media_filepath: nil, upload_date: now_minus(1, :day)})
++
++      assert Media.pending_download?(media_item)
++    end
++
++    test "returns false if there is a cutoff date after the media's upload date" do
++      source = source_fixture(%{download_cutoff_date: now_minus(1, :day)})
++      media_item = media_item_fixture(%{source_id: source.id, media_filepath: nil, upload_date: now_minus(2, :days)})
++
++      refute Media.pending_download?(media_item)
++    end
++
++    test "returns true if there is no cutoff date" do
++      source = source_fixture(%{download_cutoff_date: nil})
++      media_item = media_item_fixture(%{source_id: source.id, media_filepath: nil, upload_date: now_minus(1, :day)})
++
++      assert Media.pending_download?(media_item)
++    end
+   end
+ 
+   describe "search/1" do
+@@ -373,10 +418,12 @@ defmodule Pinchflat.MediaTest do
+         title: Faker.Commerce.product_name(),
+         media_filepath: "/video/#{Faker.File.file_name(:video)}",
+         source_id: source_fixture().id,
+-        original_url: "https://www.youtube.com/channel/#{Faker.String.base64(12)}"
++        original_url: "https://www.youtube.com/channel/#{Faker.String.base64(12)}",
++        upload_date: Date.utc_today()
+       }
+ 
+       assert {:ok, %MediaItem{} = media_item} = Media.create_media_item(valid_attrs)
++
+       assert media_item.title == valid_attrs.title
+       assert media_item.media_id == valid_attrs.media_id
+       assert media_item.media_filepath == valid_attrs.media_filepath
+@@ -397,12 +444,30 @@ defmodule Pinchflat.MediaTest do
+         |> YtDlpMedia.response_to_struct()
+ 
+       assert {:ok, %MediaItem{} = media_item} = Media.create_media_item_from_backend_attrs(source, media_attrs)
++
+       assert media_item.source_id == source.id
+       assert media_item.title == media_attrs.title
+       assert media_item.media_id == media_attrs.media_id
+       assert media_item.original_url == media_attrs.original_url
+       assert media_item.description == media_attrs.description
+     end
++
++    test "updates the media item if it already exists" do
++      source = source_fixture()
++
++      media_attrs =
++        media_attributes_return_fixture()
++        |> Phoenix.json_library().decode!()
++        |> YtDlpMedia.response_to_struct()
++
++      different_attrs = %YtDlpMedia{media_attrs | title: "Different title"}
++
++      assert {:ok, %MediaItem{} = media_item_1} = Media.create_media_item_from_backend_attrs(source, media_attrs)
++      assert {:ok, %MediaItem{} = media_item_2} = Media.create_media_item_from_backend_attrs(source, different_attrs)
++
++      assert media_item_1.id == media_item_2.id
++      assert media_item_2.title == different_attrs.title
++    end
+   end
+ 
+   describe "update_media_item/2" do
+diff --git a/test/pinchflat/sources_test.exs b/test/pinchflat/sources_test.exs
+index fe1db7eb6..6841e27ff 100644
+--- a/test/pinchflat/sources_test.exs
++++ b/test/pinchflat/sources_test.exs
+@@ -115,6 +115,12 @@ defmodule Pinchflat.SourcesTest do
+       assert {:error, %Ecto.Changeset{}} = Sources.create_source(@invalid_source_attrs)
+     end
+ 
++    test "creation with invalid data fails fast and does not call the runner" do
++      expect(YtDlpRunnerMock, :run, 0, &channel_mock/3)
++
++      assert {:error, %Ecto.Changeset{}} = Sources.create_source(@invalid_source_attrs)
++    end
++
+     test "creation enforces uniqueness of collection_id scoped to the media_profile" do
+       expect(YtDlpRunnerMock, :run, 2, fn _url, _opts, _ot ->
+         {:ok,
+@@ -225,6 +231,14 @@ defmodule Pinchflat.SourcesTest do
+       assert source.collection_name == "some updated name"
+     end
+ 
++    test "updates with invalid data fails fast and does not call the runner" do
++      expect(YtDlpRunnerMock, :run, 0, &channel_mock/3)
++
++      source = source_fixture()
++
++      assert {:error, %Ecto.Changeset{}} = Sources.update_source(source, @invalid_source_attrs)
++    end
++
+     test "updating the original_url will re-fetch the source details for channels" do
+       expect(YtDlpRunnerMock, :run, &channel_mock/3)
+ 
+@@ -430,7 +444,7 @@ defmodule Pinchflat.SourcesTest do
+     end
+   end
+ 
+-  describe "change_source/2" do
++  describe "change_source/3" do
+     test "it returns a changeset" do
+       source = source_fixture()
+ 
+diff --git a/test/pinchflat/tasks/media_items_tasks_test.exs b/test/pinchflat/tasks/media_items_tasks_test.exs
+index 7cf18e8fc..80fcbbdbd 100644
+--- a/test/pinchflat/tasks/media_items_tasks_test.exs
++++ b/test/pinchflat/tasks/media_items_tasks_test.exs
+@@ -49,10 +49,11 @@ defmodule Pinchflat.Tasks.MediaItemTasksTest do
+     end
+ 
+     test "won't duplicate media_items based on media_id and source", %{source: source} do
+-      assert {:ok, _} = MediaItemTasks.index_and_enqueue_download_for_media_item(source, @media_url)
+-      assert {:error, _} = MediaItemTasks.index_and_enqueue_download_for_media_item(source, @media_url)
++      assert {:ok, mi_1} = MediaItemTasks.index_and_enqueue_download_for_media_item(source, @media_url)
++      assert {:ok, mi_2} = MediaItemTasks.index_and_enqueue_download_for_media_item(source, @media_url)
+ 
+       assert Repo.aggregate(MediaItem, :count) == 1
++      assert mi_1.id == mi_2.id
+     end
+ 
+     test "enqueues a download job", %{source: source} do
+@@ -88,7 +89,8 @@ defmodule Pinchflat.Tasks.MediaItemTasksTest do
+             was_live: true,
+             description: "desc2",
+             aspect_ratio: 1.67,
+-            duration: 345.67
++            duration: 345.67,
++            upload_date: "20210101"
+           })
+ 
+         {:ok, output}
+diff --git a/test/pinchflat/tasks/source_tasks_test.exs b/test/pinchflat/tasks/source_tasks_test.exs
+index 55df00ce8..94bc32a90 100644
+--- a/test/pinchflat/tasks/source_tasks_test.exs
++++ b/test/pinchflat/tasks/source_tasks_test.exs
+@@ -168,12 +168,14 @@ defmodule Pinchflat.Tasks.SourceTasksTest do
+                Enum.map(media_items_other_source, & &1.media_id)
+     end
+ 
+-    test "it returns a list of media_items or changesets", %{source: source} do
++    test "it returns a list of media_items", %{source: source} do
+       first_run = SourceTasks.index_and_enqueue_download_for_media_items(source)
+       duplicate_run = SourceTasks.index_and_enqueue_download_for_media_items(source)
+ 
+-      assert Enum.all?(first_run, fn %MediaItem{} -> true end)
+-      assert Enum.all?(duplicate_run, fn %Ecto.Changeset{} -> true end)
++      first_ids = Enum.map(first_run, & &1.id)
++      duplicate_ids = Enum.map(duplicate_run, & &1.id)
++
++      assert first_ids == duplicate_ids
+     end
+ 
+     test "it updates the source's last_indexed_at field", %{source: source} do
+@@ -282,7 +284,8 @@ defmodule Pinchflat.Tasks.SourceTasksTest do
+             was_live: true,
+             description: "desc2",
+             aspect_ratio: 1.67,
+-            duration: 345.67
++            duration: 345.67,
++            upload_date: "20210101"
+           })
+ 
+         File.write(filepath, contents)
+diff --git a/test/pinchflat/yt_dlp/backend/media_test.exs b/test/pinchflat/yt_dlp/backend/media_test.exs
+index 94c031df0..02d404327 100644
+--- a/test/pinchflat/yt_dlp/backend/media_test.exs
++++ b/test/pinchflat/yt_dlp/backend/media_test.exs
+@@ -79,7 +79,7 @@ defmodule Pinchflat.YtDlp.Backend.MediaTest do
+ 
+   describe "indexing_output_template/0" do
+     test "contains all the greatest hits" do
+-      assert "%(.{id,title,was_live,webpage_url,description,aspect_ratio,duration})j" ==
++      assert "%(.{id,title,was_live,webpage_url,description,aspect_ratio,duration,upload_date})j" ==
+                Media.indexing_output_template()
+     end
+   end
+@@ -93,7 +93,8 @@ defmodule Pinchflat.YtDlp.Backend.MediaTest do
+         "webpage_url" => "https://www.youtube.com/watch?v=TiZPUDkDYbk",
+         "was_live" => false,
+         "aspect_ratio" => 1.0,
+-        "duration" => 60
++        "duration" => 60,
++        "upload_date" => "20210101"
+       }
+ 
+       assert %Media{
+@@ -102,15 +103,17 @@ defmodule Pinchflat.YtDlp.Backend.MediaTest do
+                description: "I'm not sure what I expected.",
+                original_url: "https://www.youtube.com/watch?v=TiZPUDkDYbk",
+                livestream: false,
+-               short_form_content: false
+-             } = Media.response_to_struct(response)
++               short_form_content: false,
++               upload_date: Date.from_iso8601!("2021-01-01")
++             } == Media.response_to_struct(response)
+     end
+ 
+     test "sets short_form_content to true if the URL contains /shorts/" do
+       response = %{
+         "webpage_url" => "https://www.youtube.com/shorts/TiZPUDkDYbk",
+         "aspect_ratio" => 1.0,
+-        "duration" => 61
++        "duration" => 61,
++        "upload_date" => "20210101"
+       }
+ 
+       assert %Media{short_form_content: true} = Media.response_to_struct(response)
+@@ -120,7 +123,8 @@ defmodule Pinchflat.YtDlp.Backend.MediaTest do
+       response = %{
+         "webpage_url" => "https://www.youtube.com/watch?v=TiZPUDkDYbk",
+         "aspect_ratio" => 0.5,
+-        "duration" => 59
++        "duration" => 59,
++        "upload_date" => "20210101"
+       }
+ 
+       assert %Media{short_form_content: true} = Media.response_to_struct(response)
+@@ -130,10 +134,24 @@ defmodule Pinchflat.YtDlp.Backend.MediaTest do
+       response = %{
+         "webpage_url" => "https://www.youtube.com/watch?v=TiZPUDkDYbk",
+         "aspect_ratio" => 1.0,
+-        "duration" => 61
++        "duration" => 61,
++        "upload_date" => "20210101"
+       }
+ 
+       assert %Media{short_form_content: false} = Media.response_to_struct(response)
+     end
++
++    test "parses the upload date" do
++      response = %{
++        "webpage_url" => "https://www.youtube.com/watch?v=TiZPUDkDYbk",
++        "aspect_ratio" => 1.0,
++        "duration" => 61,
++        "upload_date" => "20210101"
++      }
++
++      expected_date = Date.from_iso8601!("2021-01-01")
++
++      assert %Media{upload_date: ^expected_date} = Media.response_to_struct(response)
++    end
+   end
+ end
+diff --git a/test/support/fixtures/media_fixtures.ex b/test/support/fixtures/media_fixtures.ex
+index e4f3ffeb7..ce0a3a76f 100644
+--- a/test/support/fixtures/media_fixtures.ex
++++ b/test/support/fixtures/media_fixtures.ex
+@@ -21,7 +21,8 @@ defmodule Pinchflat.MediaFixtures do
+         livestream: false,
+         short_form_content: false,
+         media_filepath: "/video/#{Faker.File.file_name(:video)}",
+-        source_id: SourcesFixtures.source_fixture().id
++        source_id: SourcesFixtures.source_fixture().id,
++        upload_date: DateTime.utc_now()
+       })
+       |> Pinchflat.Media.create_media_item()
+ 
+@@ -75,7 +76,8 @@ defmodule Pinchflat.MediaFixtures do
+       was_live: false,
+       description: "desc1",
+       aspect_ratio: 1.67,
+-      duration: 123.45
++      duration: 123.45,
++      upload_date: "20210101"
+     }
+ 
+     Phoenix.json_library().encode!(media_attributes)
+diff --git a/test/support/fixtures/sources_fixtures.ex b/test/support/fixtures/sources_fixtures.ex
+index 89c113c12..f6fda5a76 100644
+--- a/test/support/fixtures/sources_fixtures.ex
++++ b/test/support/fixtures/sources_fixtures.ex
+@@ -15,15 +15,19 @@ defmodule Pinchflat.SourcesFixtures do
+     {:ok, source} =
+       %Source{}
+       |> Source.changeset(
+-        Enum.into(attrs, %{
+-          collection_name: "Source ##{:rand.uniform(1_000_000)}",
+-          collection_id: Base.encode16(:crypto.hash(:md5, "#{:rand.uniform(1_000_000)}")),
+-          collection_type: "channel",
+-          custom_name: "Cool and good internal name!",
+-          original_url: "https://www.youtube.com/channel/#{Faker.String.base64(12)}",
+-          media_profile_id: ProfilesFixtures.media_profile_fixture().id,
+-          index_frequency_minutes: 60
+-        })
++        Enum.into(
++          attrs,
++          %{
++            collection_name: "Source ##{:rand.uniform(1_000_000)}",
++            collection_id: Base.encode16(:crypto.hash(:md5, "#{:rand.uniform(1_000_000)}")),
++            collection_type: "channel",
++            custom_name: "Cool and good internal name!",
++            original_url: "https://www.youtube.com/channel/#{Faker.String.base64(12)}",
++            media_profile_id: ProfilesFixtures.media_profile_fixture().id,
++            index_frequency_minutes: 60
++          }
++        ),
++        :pre_insert
+       )
+       |> Repo.insert()
+ 
+@@ -39,7 +43,8 @@ defmodule Pinchflat.SourcesFixtures do
+         was_live: false,
+         description: "desc1",
+         aspect_ratio: 1.67,
+-        duration: 12.34
++        duration: 12.34,
++        upload_date: "20210101"
+       },
+       %{
+         id: "video2",
+@@ -48,7 +53,8 @@ defmodule Pinchflat.SourcesFixtures do
+         was_live: true,
+         description: "desc2",
+         aspect_ratio: 1.67,
+-        duration: 345.67
++        duration: 345.67,
++        upload_date: "20220202"
+       },
+       %{
+         id: "video3",
+@@ -57,7 +63,8 @@ defmodule Pinchflat.SourcesFixtures do
+         was_live: false,
+         description: "desc3",
+         aspect_ratio: 1.0,
+-        duration: 678.90
++        duration: 678.90,
++        upload_date: "20230303"
+       }
+     ]
+ 
+diff --git a/test/support/testing_helper_methods.ex b/test/support/testing_helper_methods.ex
+index 09f16adb2..41eedd47d 100644
+--- a/test/support/testing_helper_methods.ex
++++ b/test/support/testing_helper_methods.ex
+@@ -11,6 +11,14 @@ defmodule Pinchflat.TestingHelperMethods do
+     DateTime.add(now(), offset, :minute)
+   end
+ 
++  def now_minus(offset, unit) when unit in [:minute, :minutes] do
++    DateTime.add(now(), -offset, :minute)
++  end
++
++  def now_minus(offset, unit) when unit in [:day, :days] do
++    DateTime.add(now(), -offset, :day)
++  end
++
+   def assert_changed(checker_fun, action_fn) do
+     before_res = checker_fun.()
+     action_fn.()

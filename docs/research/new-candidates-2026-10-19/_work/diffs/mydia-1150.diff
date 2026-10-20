@@ -1,0 +1,333 @@
+diff --git a/lib/mydia/jobs/airing_episode_refresh.ex b/lib/mydia/jobs/airing_episode_refresh.ex
+index 68856feed..2da334460 100644
+--- a/lib/mydia/jobs/airing_episode_refresh.ex
++++ b/lib/mydia/jobs/airing_episode_refresh.ex
+@@ -23,23 +23,19 @@ defmodule Mydia.Jobs.AiringEpisodeRefresh do
+ 
+   require Logger
+ 
+-  alias Mydia.Jobs.PassFailures
++  alias Mydia.Jobs.{PassFailures, StartupJitter}
+   alias Mydia.Media
+   alias Mydia.Media.AiringRefresh
+ 
+   @job_name "airing_episode_refresh"
+ 
+   # Spread installs hitting the shared relay at the same crontab minute.
+-  # Snoozing releases the queue slot, and Oban raises max_attempts so the
+-  # jitter does not consume a real attempt.
++  # Snoozing releases the queue slot and does not consume a real attempt.
+   @max_startup_delay_seconds 15 * 60
+ 
+   @impl Oban.Worker
+-  def perform(%Oban.Job{attempt: attempt, args: %{"scope" => scope}})
+-      when scope in ["hot", "all"] do
+-    if attempt == 1 do
+-      {:snooze, :rand.uniform(@max_startup_delay_seconds)}
+-    else
++  def perform(%Oban.Job{args: %{"scope" => scope}} = job) when scope in ["hot", "all"] do
++    with :run <- StartupJitter.delay(job, @max_startup_delay_seconds) do
+       scope |> scope_atom() |> run()
+     end
+   end
+diff --git a/lib/mydia/jobs/metadata_refresh.ex b/lib/mydia/jobs/metadata_refresh.ex
+index a17cf663a..2a96b35c5 100644
+--- a/lib/mydia/jobs/metadata_refresh.ex
++++ b/lib/mydia/jobs/metadata_refresh.ex
+@@ -20,7 +20,7 @@ defmodule Mydia.Jobs.MetadataRefresh do
+ 
+   require Logger
+   alias Mydia.Accounts.Scope
+-  alias Mydia.Jobs.PassFailures
++  alias Mydia.Jobs.{PassFailures, StartupJitter}
+   alias Mydia.Media
+   alias Mydia.Media.Refresh
+ 
+@@ -66,22 +66,16 @@ defmodule Mydia.Jobs.MetadataRefresh do
+   end
+ 
+   @impl Oban.Worker
+-  def perform(%Oban.Job{attempt: attempt, args: %{"refresh_all" => true} = raw_args}) do
++  def perform(%Oban.Job{args: %{"refresh_all" => true} = raw_args} = job) do
+     args = Args.parse(raw_args)
+ 
+     # Spread load across self-hosted instances hitting the shared metadata relay
+     # at 05:00 Sunday. Snoozing releases the queue slot instead of holding it for
+-    # up to half an hour, and Oban increments max_attempts so the jitter does not
+-    # consume one of the pass's real attempts.
+-    if attempt == 1 and not args.skip_delay do
+-      delay_seconds = :rand.uniform(@max_startup_delay_seconds)
++    # up to half an hour, and does not consume one of the pass's real attempts.
++    jitter =
++      if args.skip_delay, do: :run, else: StartupJitter.delay(job, @max_startup_delay_seconds)
+ 
+-      Logger.info("Metadata refresh scheduled, snoozing #{delay_seconds}s to spread relay load")
+-
+-      {:snooze, delay_seconds}
+-    else
+-      run_all()
+-    end
++    with :run <- jitter, do: run_all()
+   end
+ 
+   # Manual trigger from the UI sends empty args.
+diff --git a/lib/mydia/jobs/startup_jitter.ex b/lib/mydia/jobs/startup_jitter.ex
+new file mode 100644
+index 000000000..22a0a281c
+--- /dev/null
++++ b/lib/mydia/jobs/startup_jitter.ex
+@@ -0,0 +1,40 @@
++defmodule Mydia.Jobs.StartupJitter do
++  @moduledoc """
++  Delays a cron job's first run by a random snooze, so self-hosted installs do
++  not all hit the shared metadata relay at the same crontab minute.
++
++  A job is on its first run when it has never been snoozed. That is read from
++  `meta["snoozed"]`, never from `attempt`: since Oban 2.24 a snooze rolls
++  `attempt` back, so a job that snoozes whenever `attempt == 1` sees
++  `attempt == 1` again on every wake and snoozes forever. That shipped once and
++  stalled `Mydia.Jobs.MetadataRefresh` and `Mydia.Jobs.AiringEpisodeRefresh`
++  on every install for a month.
++
++  Every `{:snooze, _}` in `lib/` goes through this module, which
++  `test/mydia/jobs/startup_jitter_test.exs` enforces.
++  """
++
++  require Logger
++
++  @doc """
++  Returns `{:snooze, seconds}` with `seconds` in `1..max_seconds` on the job's
++  first run, and `:run` once it has snoozed.
++
++  Pair it with `with` so the snooze passes straight through:
++
++      with :run <- StartupJitter.delay(job, 15 * 60), do: run_pass()
++  """
++  @spec delay(Oban.Job.t(), pos_integer()) :: {:snooze, pos_integer()} | :run
++  def delay(%Oban.Job{} = job, max_seconds) when is_integer(max_seconds) and max_seconds > 0 do
++    if snoozed?(job) do
++      :run
++    else
++      seconds = :rand.uniform(max_seconds)
++      Logger.info("#{job.worker} scheduled, snoozing #{seconds}s to spread relay load")
++      {:snooze, seconds}
++    end
++  end
++
++  defp snoozed?(%Oban.Job{meta: %{"snoozed" => count}}) when is_integer(count), do: count > 0
++  defp snoozed?(%Oban.Job{}), do: false
++end
+diff --git a/priv/repo/migrations/20261015143712_cancel_snooze_looped_refresh_jobs.exs b/priv/repo/migrations/20261015143712_cancel_snooze_looped_refresh_jobs.exs
+new file mode 100644
+index 000000000..a24f8cab6
+--- /dev/null
++++ b/priv/repo/migrations/20261015143712_cancel_snooze_looped_refresh_jobs.exs
+@@ -0,0 +1,36 @@
++defmodule Mydia.Repo.Migrations.CancelSnoozeLoopedRefreshJobs do
++  use Ecto.Migration
++
++  @moduledoc """
++  Cancels the cron runs of `Mydia.Jobs.MetadataRefresh` and
++  `Mydia.Jobs.AiringEpisodeRefresh` that never ran.
++
++  Both workers snoozed whenever `attempt == 1`, and Oban 2.24 rolls `attempt`
++  back on snooze, so every cron run since that upgrade snoozed forever. Each
++  install holds one stuck row per missed run (120 airing refreshes on one
++  install after a month). With the snooze fixed they would all wake inside the
++  same few minutes and re-read the same seasons from the shared relay over and
++  over. One fresh run is enough: the next crontab tick inserts it.
++
++  Only `scheduled` rows that have snoozed are touched. `Mydia.Jobs.MetadataBackfill`
++  also inserts `scheduled` per-item `MetadataRefresh` rows, but those never
++  snooze, so they carry no `"snoozed"` key in `meta` and run as planned.
++  `meta` is TEXT on SQLite and jsonb on PostgreSQL; casting it to text makes
++  the key check portable.
++  """
++
++  def up do
++    execute("""
++    UPDATE oban_jobs
++    SET state = 'cancelled', cancelled_at = CURRENT_TIMESTAMP
++    WHERE worker IN ('Mydia.Jobs.MetadataRefresh', 'Mydia.Jobs.AiringEpisodeRefresh')
++      AND state = 'scheduled'
++      AND CAST(meta AS TEXT) LIKE '%"snoozed"%'
++    """)
++  end
++
++  def down do
++    # The cancelled rows were duplicates of a run the cron plugin inserts again.
++    :ok
++  end
++end
+diff --git a/test/README.md b/test/README.md
+index e9136f7e2..aefb77652 100644
+--- a/test/README.md
++++ b/test/README.md
+@@ -391,6 +391,17 @@ Two consequences worth knowing before you spend a cycle on them:
+ asserted on the returned `Ecto.Changeset`. Only `Oban.insert/1` needs a live
+ instance.
+ 
++## perform_job/3 cannot test a snooze
++
++`perform_job/3` takes `attempt` and `meta` from the caller, so a snooze test
++only checks the test author's model of Oban. Since Oban 2.24 a snooze rolls
++`attempt` back and bumps `meta["snoozed"]`. `MetadataRefresh` and
++`AiringEpisodeRefresh` snoozed on `attempt == 1`, their tests passed by
++calling the wake-up `attempt: 2`, and in production every cron run snoozed
++forever for a month. Snooze through `Mydia.Jobs.StartupJitter`, and prove a
++snooze terminates by draining a real queue twice, as
++`test/mydia/jobs/startup_jitter_test.exs` does.
++
+ ## Oban.insert_all bypasses worker uniqueness
+ 
+ `Oban.insert_all/1` does not honour a worker's `unique: [period: N, fields: [...]]`
+diff --git a/test/mydia/jobs/airing_episode_refresh_test.exs b/test/mydia/jobs/airing_episode_refresh_test.exs
+index f14e08eaa..6e00a0e15 100644
+--- a/test/mydia/jobs/airing_episode_refresh_test.exs
++++ b/test/mydia/jobs/airing_episode_refresh_test.exs
+@@ -30,13 +30,26 @@ defmodule Mydia.Jobs.AiringEpisodeRefreshTest do
+       assert seconds <= 900
+     end
+ 
+-    test "a later attempt runs the pass" do
+-      assert :ok = perform_job(AiringEpisodeRefresh, %{"scope" => "all"}, attempt: 2)
++    # Oban 2.24 rolls attempt back on snooze, so the wake-up is still attempt 1.
++    test "the wake-up after a snooze runs the pass" do
++      assert :ok =
++               perform_job(AiringEpisodeRefresh, %{"scope" => "all"},
++                 attempt: 1,
++                 meta: %{"snoozed" => 1}
++               )
++    end
++
++    test "a retry after a real failure runs the pass" do
++      assert :ok =
++               perform_job(AiringEpisodeRefresh, %{"scope" => "all"},
++                 attempt: 2,
++                 meta: %{"snoozed" => 1}
++               )
+     end
+ 
+     test "an unknown scope is cancelled rather than retried" do
+       assert {:cancel, _reason} =
+-               perform_job(AiringEpisodeRefresh, %{"scope" => "sometimes"}, attempt: 2)
++               perform_job(AiringEpisodeRefresh, %{"scope" => "sometimes"})
+     end
+   end
+ 
+diff --git a/test/mydia/jobs/metadata_refresh_test.exs b/test/mydia/jobs/metadata_refresh_test.exs
+index 41b8b8727..ada49ac4f 100644
+--- a/test/mydia/jobs/metadata_refresh_test.exs
++++ b/test/mydia/jobs/metadata_refresh_test.exs
+@@ -127,8 +127,13 @@ defmodule Mydia.Jobs.MetadataRefreshTest do
+       assert seconds <= 1800
+     end
+ 
+-    test "runs the pass on a later attempt" do
+-      assert :ok = perform_job(MetadataRefresh, %{"refresh_all" => true}, attempt: 2)
++    # Oban 2.24 rolls attempt back on snooze, so the wake-up is still attempt 1.
++    test "runs the pass on the wake-up after a snooze" do
++      assert :ok =
++               perform_job(MetadataRefresh, %{"refresh_all" => true},
++                 attempt: 1,
++                 meta: %{"snoozed" => 1}
++               )
+     end
+ 
+     test "runs immediately when skip_delay is set" do
+diff --git a/test/mydia/jobs/startup_jitter_test.exs b/test/mydia/jobs/startup_jitter_test.exs
+new file mode 100644
+index 000000000..bf2319d58
+--- /dev/null
++++ b/test/mydia/jobs/startup_jitter_test.exs
+@@ -0,0 +1,90 @@
++defmodule Mydia.Jobs.StartupJitterTest do
++  use Mydia.DataCase, async: false
++
++  alias Mydia.Jobs.{AiringEpisodeRefresh, MetadataRefresh, StartupJitter}
++
++  describe "delay/2" do
++    test "snoozes a job that has never snoozed" do
++      job = %Oban.Job{attempt: 1, meta: %{}}
++
++      assert {:snooze, seconds} = StartupJitter.delay(job, 60)
++      assert seconds in 1..60
++    end
++
++    # Oban 2.24 rolls attempt back on snooze, so this is exactly what the
++    # wake-up looks like. Gating on attempt == 1 snoozed it forever.
++    test "runs a job that has snoozed, even though attempt is still 1" do
++      assert :run = StartupJitter.delay(%Oban.Job{attempt: 1, meta: %{"snoozed" => 1}}, 60)
++    end
++
++    test "runs a retried job that snoozed before failing" do
++      assert :run = StartupJitter.delay(%Oban.Job{attempt: 2, meta: %{"snoozed" => 1}}, 60)
++    end
++  end
++
++  # perform_job/3 takes attempt and meta from the caller, so it can only test
++  # the model of Oban the test author had in mind. Draining a real queue runs
++  # Oban's own snooze bookkeeping, which is the thing that changed under us.
++  describe "against a real Oban engine" do
++    setup do
++      engine = if Mydia.DB.postgres?(), do: Oban.Engines.Basic, else: Oban.Engines.Lite
++      start_supervised!({Oban, repo: Mydia.Repo, engine: engine, testing: :manual})
++      :ok
++    end
++
++    for {worker, args} <- [
++          {AiringEpisodeRefresh, %{"scope" => "all"}},
++          {MetadataRefresh, %{"refresh_all" => true}}
++        ] do
++      test "#{inspect(worker)} snoozes once and then runs" do
++        assert {:ok, _job} = Oban.insert(unquote(worker).new(unquote(Macro.escape(args))))
++
++        assert %{snoozed: 1, success: 0} = Oban.drain_queue(queue: :media)
++
++        assert %{snoozed: 0, success: 1} =
++                 Oban.drain_queue(queue: :media, with_scheduled: true)
++      end
++    end
++  end
++
++  describe "source guard" do
++    @helper Path.expand("lib/mydia/jobs/startup_jitter.ex")
++
++    # A snooze decided anywhere else can repeat the attempt == 1 mistake.
++    test "every snooze in lib/ goes through StartupJitter" do
++      offenders =
++        for path <- Path.wildcard("lib/**/*.ex"),
++            Path.expand(path) != @helper,
++            {line, number} <- path |> File.read!() |> String.split("\n") |> Enum.with_index(1),
++            snooze_tuple?(line),
++            do: "#{path}:#{number}: #{String.trim(line)}"
++
++      assert offenders == [],
++             "Build snoozes with Mydia.Jobs.StartupJitter.delay/2, not a literal tuple:\n" <>
++               Enum.join(offenders, "\n")
++    end
++
++    test "no worker gates a snooze on the attempt number" do
++      offenders =
++        for path <- Path.wildcard("lib/**/*.ex"),
++            Path.expand(path) != @helper,
++            source = File.read!(path),
++            String.contains?(source, ["StartupJitter.delay", ":snooze"]),
++            Regex.match?(~r/attempt\s*(==\s*1|<=\s*1|<\s*2)\b/, source),
++            do: path
++
++      assert offenders == [],
++             "Oban rolls attempt back on snooze; read meta[\"snoozed\"] instead:\n" <>
++               Enum.join(offenders, "\n")
++    end
++  end
++
++  # A typespec names the snooze tuple without building one, including on the
++  # continuation line of a wrapped @spec.
++  defp snooze_tuple?(line) do
++    trimmed = String.trim_leading(line)
++
++    String.contains?(line, "{:snooze,") and not String.starts_with?(trimmed, ["@spec", "#", "|"]) and
++      not Regex.match?(~r/\{:snooze,\s*(pos_|non_neg_)?integer\(\)\}/, line)
++  end
++end

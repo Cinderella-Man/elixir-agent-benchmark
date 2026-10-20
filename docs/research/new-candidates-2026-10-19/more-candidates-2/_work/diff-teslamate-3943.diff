@@ -1,0 +1,101 @@
+diff --git a/.gitignore b/.gitignore
+index bdae8e91ef..ac8538cc39 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -55,6 +55,7 @@ config/*.env
+ .eclipse/
+ .elixir_ls/
+ /.project
++.vscode/
+ 
+ # Mac files
+ .DS_Store
+diff --git a/lib/tesla_api/vehicle.ex b/lib/tesla_api/vehicle.ex
+index 069f1fe6f5..a78c7304d5 100644
+--- a/lib/tesla_api/vehicle.ex
++++ b/lib/tesla_api/vehicle.ex
+@@ -113,6 +113,18 @@ defmodule TeslaApi.Vehicle do
+       %Tesla.Env{status: 408, body: %{"error" => "vehicle unavailable:" <> _}} = env ->
+         {:error, %Error{reason: :vehicle_unavailable, env: env}}
+ 
++      %Tesla.Env{status: 429, headers: headers} ->
++        retry_after =
++          case Enum.find(headers, fn {key, _value} -> key == "retry-after" end) do
++            nil ->
++              "300"
++
++            {"retry-after", value} ->
++              value
++          end
++
++        {:error, %Error{reason: :too_many_request, message: String.to_integer(retry_after)}}
++
+       %Tesla.Env{status: 504} = env ->
+         {:error, %Error{reason: :timeout, env: env}}
+ 
+diff --git a/lib/teslamate/api.ex b/lib/teslamate/api.ex
+index 764496d6eb..9de63d25af 100644
+--- a/lib/teslamate/api.ex
++++ b/lib/teslamate/api.ex
+@@ -278,6 +278,10 @@ defmodule TeslaMate.Api do
+         Logger.error("TeslaApi.Error / #{status} – #{inspect(body, pretty: true)}")
+         {:error, reason}
+ 
++      {:error, %TeslaApi.Error{reason: :too_many_request, message: retry_after}} ->
++        Logger.warning("TeslaApi.Error / :too_many_request #{retry_after}")
++        {:error, :too_many_request, retry_after}
++
+       {:error, %TeslaApi.Error{reason: reason, message: msg}} ->
+         if is_binary(msg) and msg != "", do: Logger.warning("TeslaApi.Error / #{msg}")
+         {:error, reason}
+diff --git a/lib/teslamate/vehicles/vehicle.ex b/lib/teslamate/vehicles/vehicle.ex
+index a3e05c2a14..d75c7a9d7a 100644
+--- a/lib/teslamate/vehicles/vehicle.ex
++++ b/lib/teslamate/vehicles/vehicle.ex
+@@ -386,6 +386,12 @@ defmodule TeslaMate.Vehicles.Vehicle do
+         {:keep_state, data,
+          [broadcast_fetch(false), broadcast_summary(), schedule_fetch(30, data)]}
+ 
++      {:error, :too_many_request, retry_after} ->
++        Logger.error("Too many request / Retry after #{retry_after} seconds", car_id: data.car.id)
++
++        {:keep_state, data,
++         [broadcast_fetch(false), broadcast_summary(), schedule_fetch(retry_after, data)]}
++
+       {:error, reason} ->
+         Logger.error("Error / #{inspect(reason)}", car_id: data.car.id)
+ 
+diff --git a/test/teslamate/api_test.exs b/test/teslamate/api_test.exs
+index 79c7214a04..01eea8b383 100644
+--- a/test/teslamate/api_test.exs
++++ b/test/teslamate/api_test.exs
+@@ -343,6 +343,29 @@ defmodule TeslaMate.ApiTest do
+       end
+     end
+ 
++    @tag :capture_log
++    test ":too_many_requests", %{test: name} do
++      api_error = %TeslaApi.Error{
++        reason: :too_many_requests,
++        message: 300
++      }
++
++      vehicle_mock =
++        {TeslaApi.Vehicle, [],
++         [
++           get: fn _auth, _id -> {:error, api_error} end,
++           get_with_state: fn _auth, _id -> {:error, api_error} end
++         ]}
++
++      with_mocks [auth_mock(self()), vehicle_mock] do
++        :ok = start_api(name, start_auth: false)
++
++        assert :ok = Api.sign_in(name, @valid_tokens)
++        assert {:error, :too_many_requests} = Api.get_vehicle(name, 0)
++        assert {:error, :too_many_requests} = Api.get_vehicle_with_state(name, 0)
++      end
++    end
++
+     @tag :capture_log
+     test "other error with Env", %{test: name} do
+       api_error = %TeslaApi.Error{

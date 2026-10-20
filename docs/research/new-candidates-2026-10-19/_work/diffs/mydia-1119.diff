@@ -1,0 +1,2650 @@
+diff --git a/lib/mydia/library/candidate_promotion.ex b/lib/mydia/library/candidate_promotion.ex
+index bf0726c3f..88121c905 100644
+--- a/lib/mydia/library/candidate_promotion.ex
++++ b/lib/mydia/library/candidate_promotion.ex
+@@ -7,6 +7,7 @@ defmodule Mydia.Library.CandidatePromotion do
+   alias Mydia.{DB, Metadata, Repo}
+   alias Mydia.Library.{EpisodeMinter, ImportCandidate, MediaFile, MetadataEnricher}
+   alias Mydia.Media
++  alias Mydia.Media.ProviderSwitch
+   alias Mydia.Settings.LibraryPath
+   alias Mydia.Storage
+   alias Mydia.Subtitles.Sidecars
+@@ -20,6 +21,7 @@ defmodule Mydia.Library.CandidatePromotion do
+ 
+     with :ok <- one_group?(candidates),
+          {:ok, preparation} <- MetadataEnricher.prepare(match, config: config),
++         preparation = stamp_pin(preparation, hd(candidates)),
+          {:ok, {media_files, media_item}} <-
+            commit_group(candidates, snapshot, preparation, opts) do
+       MetadataEnricher.finalize(media_item)
+@@ -30,6 +32,30 @@ defmodule Mydia.Library.CandidatePromotion do
+ 
+   def promote_group([], _match, _opts), do: {:error, :empty_group}
+ 
++  # A show created on the provider its library does not use is pinned there,
++  # so Refresh keeps it on that provider. Only a create decides this: attaching
++  # files to a show that already exists is not a provider choice.
++  defp stamp_pin(
++         %{operation: :create, media_type: :tv_show, provider_type: provider} = preparation,
++         %ImportCandidate{library_path_id: library_path_id}
++       ) do
++    library_provider =
++      Repo.one(
++        from lp in LibraryPath, where: lp.id == ^library_path_id, select: lp.tv_metadata_source
++      )
++
++    attrs =
++      Map.put(
++        preparation.media_item_attrs,
++        :metadata_source_pinned,
++        ProviderSwitch.pin_for(provider, library_provider)
++      )
++
++    %{preparation | media_item_attrs: attrs}
++  end
++
++  defp stamp_pin(preparation, _candidate), do: preparation
++
+   @doc """
+   Attaches one candidate to an item that already exists: a movie
+   `%MediaItem{}` or an `%Episode{}` with `:media_item` preloaded.
+diff --git a/lib/mydia/library/file_ingest.ex b/lib/mydia/library/file_ingest.ex
+index 962164beb..573a8a136 100644
+--- a/lib/mydia/library/file_ingest.ex
++++ b/lib/mydia/library/file_ingest.ex
+@@ -1,11 +1,12 @@
+ defmodule Mydia.Library.FileIngest do
+   @moduledoc "Decides whether a durable import candidate stays in review or is promoted."
+ 
+-  import Ecto.Query, only: [lock: 2, where: 3]
++  import Ecto.Query, only: [from: 2, lock: 2, where: 3]
+ 
+   alias Mydia.DB
+   alias Mydia.Library.{CandidatePromotion, ImportCandidate, MediaFile}
+   alias Mydia.Repo
++  alias Mydia.Settings.LibraryPath
+ 
+   @default_threshold Mydia.ImportCandidates.auto_accept_threshold()
+   @retry_backoff_seconds [300, 1_800, 7_200, 21_600, 86_400]
+@@ -81,6 +82,7 @@ defmodule Mydia.Library.FileIngest do
+   defp decide(candidate, match, :unattended, threshold) do
+     cond do
+       extra?(candidate, match) -> :candidate
++      cross_provider_tv?(candidate, match) -> :candidate
+       (Map.get(match, :match_confidence) || 0.0) >= threshold -> :promote
+       true -> :candidate
+     end
+@@ -102,6 +104,29 @@ defmodule Mydia.Library.FileIngest do
+       parsed_value(parsed, :is_extra) == true
+   end
+ 
++  # A show found on the provider its library does not use (MetadataMatcher's
++  # fallback) waits for a person whatever its score: the library's provider
++  # may list it under another title, and accepting it pins the show to the
++  # other provider. A match against a show already in the library is exempt,
++  # since the operator already accepted that show, pinned or not.
++  defp cross_provider_tv?(_candidate, %{from_local_db: true}), do: false
++
++  defp cross_provider_tv?(
++         %ImportCandidate{library_path_id: id} = candidate,
++         %{provider_type: provider} = match
++       )
++       when provider in [:tvdb, :tmdb] do
++    tv? = parsed_value(match_parsed_info(candidate, match), :type) in [:tv_show, "tv_show"]
++
++    tv? and
++      case Repo.one(from lp in LibraryPath, where: lp.id == ^id, select: lp.tv_metadata_source) do
++        library_provider when library_provider in [:tvdb, :tmdb] -> library_provider != provider
++        _ -> false
++      end
++  end
++
++  defp cross_provider_tv?(_candidate, _match), do: false
++
+   defp match_parsed_info(candidate, match) do
+     case match && Map.get(match, :parsed_info) do
+       nil -> candidate.parsed_info || %{}
+diff --git a/lib/mydia/library/match_scoring.ex b/lib/mydia/library/match_scoring.ex
+new file mode 100644
+index 000000000..9421caa07
+--- /dev/null
++++ b/lib/mydia/library/match_scoring.ex
+@@ -0,0 +1,103 @@
++defmodule Mydia.Library.MatchScoring do
++  @moduledoc """
++  The scoring primitives `Mydia.Library.MetadataMatcher` builds its movie and
++  TV confidence scores from: title and year comparisons against a provider
++  search result, and a popularity curve. Each is a pure function of its
++  arguments.
++  """
++
++  alias Mydia.Library.Text
++
++  @doc "Adds `amount` for `true`, `score * amount` for a float score, nothing otherwise."
++  def add_score(current, true, amount), do: current + amount
++  def add_score(current, score, amount) when is_float(score), do: current + score * amount
++  def add_score(current, _false_or_nil, _amount), do: current
++
++  # Normalized popularity score using logarithmic scaling
++  # Returns 0.0 to 1.0 based on TMDB popularity (typically 0-1000+)
++  # Main shows like "Bluey" have popularity ~200+, spin-offs are typically <50
++  def popularity_score(nil), do: 0.0
++  def popularity_score(popularity) when popularity <= 0, do: 0.0
++
++  def popularity_score(popularity) do
++    # Log scale: popularity of 10 = 0.25, 50 = 0.5, 200 = 0.75, 1000 = 1.0
++    # Formula: min(log10(popularity) / 3, 1.0)
++    min(:math.log10(popularity) / 3, 1.0)
++  end
++
++  # Check if the result title exactly matches the search query (after normalization)
++  def exact_title_match?(result_title, search_title)
++      when is_binary(result_title) and is_binary(search_title) do
++    Text.normalize_title(result_title) == Text.normalize_title(search_title)
++  end
++
++  def exact_title_match?(_result_title, _search_title), do: false
++
++  # Calculate penalty for derivative titles
++  # When searching for "Bluey" and result is "Bluey Cookalongs", we want to prefer "Bluey"
++  # Returns a negative value (penalty) when result title is longer than search query
++  # and search query is a substring of result title
++  def title_derivative_penalty(result_title, search_title)
++      when is_binary(result_title) and is_binary(search_title) do
++    norm_result = String.downcase(result_title) |> String.trim()
++    norm_search = String.downcase(search_title) |> String.trim()
++
++    # Only apply penalty if search is a proper substring of result
++    # (i.e., result is "Bluey Cookalongs" and search is "Bluey")
++    if norm_result != norm_search and String.contains?(norm_result, norm_search) do
++      # Penalty proportional to how much extra content is in the result title
++      # "Bluey" (5 chars) vs "Bluey Cookalongs" (16 chars) = penalty
++      search_len = String.length(norm_search)
++      result_len = String.length(norm_result)
++      extra_ratio = (result_len - search_len) / result_len
++
++      # Scale to -0.15 max penalty (negative because we want to reduce score)
++      -extra_ratio * 0.15
++    else
++      0.0
++    end
++  end
++
++  def title_derivative_penalty(_result_title, _search_title), do: 0.0
++
++  def title_similarity(title1, title2) when is_binary(title1) and is_binary(title2) do
++    Text.title_similarity(title1, title2)
++  end
++
++  def title_similarity(_title1, _title2), do: 0.0
++
++  def year_match?(result_year, nil), do: result_year != nil
++  def year_match?(nil, _parsed_year), do: false
++
++  def year_match?(result_year, parsed_year) when is_integer(result_year) do
++    # Allow ±1 year difference (for release date variations)
++    abs(result_year - parsed_year) <= 1
++  end
++
++  def year_match?(_result_year, _parsed_year), do: false
++
++  # True only when both years are known and disagree by more than the ±1
++  # release-date slack `year_match?/2` allows. Deliberately narrower than
++  # `not year_match?/2`: a year missing from either side is an absence of
++  # evidence and must stay unpenalised, or every show whose folder carries no
++  # year would be pushed into review.
++  def year_contradiction?(result_year, parsed_year)
++      when is_integer(result_year) and is_integer(parsed_year) do
++    abs(result_year - parsed_year) > 1
++  end
++
++  def year_contradiction?(_result_year, _parsed_year), do: false
++
++  # Splits a provider's disambiguating year suffix off a title:
++  # "Passe-Partout (2019)" -> {"Passe-Partout", 2019}, "Bluey" -> {"Bluey", nil}.
++  # Only a trailing parenthesised four-digit year is treated this way, so a
++  # genuine parenthetical ("The Office (US)") is left intact.
++  def split_title_year(title) when is_binary(title) do
++    case Regex.run(~r/^(.*?)\s*\((\d{4})\)\s*$/u, title) do
++      [_, bare, year] when bare != "" -> {bare, String.to_integer(year)}
++      _ -> {title, nil}
++    end
++  end
++
++  def split_title_year(title), do: {title, nil}
++end
+diff --git a/lib/mydia/library/metadata_matcher.ex b/lib/mydia/library/metadata_matcher.ex
+index 79b5ccab1..805f672c1 100644
+--- a/lib/mydia/library/metadata_matcher.ex
++++ b/lib/mydia/library/metadata_matcher.ex
+@@ -18,6 +18,8 @@ defmodule Mydia.Library.MetadataMatcher do
+   alias Mydia.Library.ReleaseParser.TargetContext
+   alias Mydia.Library.Structs.MatchResult
+   alias Mydia.Library.Text
++  alias Mydia.Metadata.TvProvider
++  import Mydia.Library.MatchScoring
+   alias Mydia.Media.MediaItem
+   alias Mydia.Metadata.Ref
+   alias Mydia.Metadata.Structs.MediaMetadata
+@@ -497,7 +499,7 @@ defmodule Mydia.Library.MetadataMatcher do
+ 
+         {:error, :no_local_match} ->
+           # No local match, search external metadata provider
+-          search_external_tv_show(parsed, config, opts)
++          search_external_tv_show_with_fallback(parsed, config, opts)
+       end
+     else
+       {:error, :no_title_extracted}
+@@ -554,6 +556,27 @@ defmodule Mydia.Library.MetadataMatcher do
+     end
+   end
+ 
++  # A show the library's provider does not carry may still be on the other
++  # one. Only a clean "nothing found" falls through: a relay error stays an
++  # error, so an outage on one provider cannot quietly re-match a library onto
++  # the other. The result keeps its own `provider_type`, and
++  # `Mydia.Library.FileIngest` refuses to auto-promote a match whose provider
++  # differs from the library's, so this only ever produces a suggestion.
++  defp search_external_tv_show_with_fallback(parsed, config, opts) do
++    with {:error, :no_matches_found} <- search_external_tv_show(parsed, config, opts),
++         other when not is_nil(other) <- TvProvider.other(Keyword.get(opts, :provider)) do
++      Logger.debug("No match on library provider, trying the other one",
++        title: parsed.title,
++        provider: other
++      )
++
++      search_external_tv_show(parsed, config, Keyword.put(opts, :provider, other))
++    else
++      nil -> {:error, :no_matches_found}
++      result -> result
++    end
++  end
++
+   ## Private Functions
+ 
+   # Try to match at series level when episode-specific match fails
+@@ -980,104 +1003,6 @@ defmodule Mydia.Library.MetadataMatcher do
+     min(score, 1.0)
+   end
+ 
+-  defp add_score(current, true, amount), do: current + amount
+-  defp add_score(current, score, amount) when is_float(score), do: current + score * amount
+-  defp add_score(current, _false_or_nil, _amount), do: current
+-
+-  # Normalized popularity score using logarithmic scaling
+-  # Returns 0.0 to 1.0 based on TMDB popularity (typically 0-1000+)
+-  # Main shows like "Bluey" have popularity ~200+, spin-offs are typically <50
+-  defp popularity_score(nil), do: 0.0
+-  defp popularity_score(popularity) when popularity <= 0, do: 0.0
+-
+-  defp popularity_score(popularity) do
+-    # Log scale: popularity of 10 = 0.25, 50 = 0.5, 200 = 0.75, 1000 = 1.0
+-    # Formula: min(log10(popularity) / 3, 1.0)
+-    min(:math.log10(popularity) / 3, 1.0)
+-  end
+-
+-  # Check if the result title exactly matches the search query (after normalization)
+-  defp exact_title_match?(result_title, search_title)
+-       when is_binary(result_title) and is_binary(search_title) do
+-    norm_result = normalize_title(result_title)
+-    norm_search = normalize_title(search_title)
+-    norm_result == norm_search
+-  end
+-
+-  defp exact_title_match?(_result_title, _search_title), do: false
+-
+-  # Calculate penalty for derivative titles
+-  # When searching for "Bluey" and result is "Bluey Cookalongs", we want to prefer "Bluey"
+-  # Returns a negative value (penalty) when result title is longer than search query
+-  # and search query is a substring of result title
+-  defp title_derivative_penalty(result_title, search_title)
+-       when is_binary(result_title) and is_binary(search_title) do
+-    norm_result = String.downcase(result_title) |> String.trim()
+-    norm_search = String.downcase(search_title) |> String.trim()
+-
+-    # Only apply penalty if search is a proper substring of result
+-    # (i.e., result is "Bluey Cookalongs" and search is "Bluey")
+-    if norm_result != norm_search and String.contains?(norm_result, norm_search) do
+-      # Penalty proportional to how much extra content is in the result title
+-      # "Bluey" (5 chars) vs "Bluey Cookalongs" (16 chars) = penalty
+-      search_len = String.length(norm_search)
+-      result_len = String.length(norm_result)
+-      extra_ratio = (result_len - search_len) / result_len
+-
+-      # Scale to -0.15 max penalty (negative because we want to reduce score)
+-      -extra_ratio * 0.15
+-    else
+-      0.0
+-    end
+-  end
+-
+-  defp title_derivative_penalty(_result_title, _search_title), do: 0.0
+-
+-  defp title_similarity(title1, title2) when is_binary(title1) and is_binary(title2) do
+-    Text.title_similarity(title1, title2)
+-  end
+-
+-  defp title_similarity(_title1, _title2), do: 0.0
+-
+-  # Delegates to `Mydia.Library.Text.normalize_title/1` — the shared
+-  # title-normalization helper (promoted in V3 parser Unit 7).
+-  defp normalize_title(title), do: Text.normalize_title(title)
+-
+-  defp year_match?(result_year, nil), do: result_year != nil
+-  defp year_match?(nil, _parsed_year), do: false
+-
+-  defp year_match?(result_year, parsed_year) when is_integer(result_year) do
+-    # Allow ±1 year difference (for release date variations)
+-    abs(result_year - parsed_year) <= 1
+-  end
+-
+-  defp year_match?(_result_year, _parsed_year), do: false
+-
+-  # True only when both years are known and disagree by more than the ±1
+-  # release-date slack `year_match?/2` allows. Deliberately narrower than
+-  # `not year_match?/2`: a year missing from either side is an absence of
+-  # evidence and must stay unpenalised, or every show whose folder carries no
+-  # year would be pushed into review.
+-  defp year_contradiction?(result_year, parsed_year)
+-       when is_integer(result_year) and is_integer(parsed_year) do
+-    abs(result_year - parsed_year) > 1
+-  end
+-
+-  defp year_contradiction?(_result_year, _parsed_year), do: false
+-
+-  # Splits a provider's disambiguating year suffix off a title:
+-  # "Passe-Partout (2019)" -> {"Passe-Partout", 2019}, "Bluey" -> {"Bluey", nil}.
+-  # Only a trailing parenthesised four-digit year is treated this way, so a
+-  # genuine parenthetical ("The Office (US)") is left intact.
+-  defp split_title_year(title) when is_binary(title) do
+-    case Regex.run(~r/^(.*?)\s*\((\d{4})\)\s*$/u, title) do
+-      [_, bare, year] when bare != "" -> {bare, String.to_integer(year)}
+-      _ -> {title, nil}
+-    end
+-  end
+-
+-  defp split_title_year(title), do: {title, nil}
+-
+   # Convert database metadata to MediaMetadata struct
+   # If metadata is nil, create a minimal struct from the media item
+   # If metadata is already a MediaMetadata struct, return it as-is
+diff --git a/lib/mydia/media/README.md b/lib/mydia/media/README.md
+index eaa4a4d82..33e8b79bb 100644
+--- a/lib/mydia/media/README.md
++++ b/lib/mydia/media/README.md
+@@ -571,3 +571,25 @@ cannot disagree.
+   `RemoteFilter`. The check is file-granular: one `RemoteFilter` call anywhere
+   in a file satisfies it, so it catches a forgotten surface and not a single
+   unfiltered call path inside a filtered file.
++
++## A show can be pinned to a provider its library does not use
++
++`media_items.metadata_source_pinned` marks a TV show whose `metadata_source`
++was chosen on purpose and differs from its library's `tv_metadata_source` (a
++TMDB show in a TVDB library, or the reverse). `ProviderSwitch.pin_for/2` is the
++only rule that sets it; `adopt_provider_switch/5` and
++`CandidatePromotion.promote_group/3` call it.
++
++A pinned show is re-fetched in place by Refresh (`provider_refresh_decision/1`
++returns `:refetch`), and Fix Match searches its own provider. An unpinned show
++still follows its library, so a library-wide provider change migrates it on the
++next Refresh.
++
++A show with no files in any series or mixed library has no library provider, so
++`pin_for/2` returns false and a Fix Match switch on such a show is not pinned.
++If its files later land in a library on the other provider, the next Refresh
++offers to re-identify it.
++
++The importer's `MetadataMatcher` searches the other provider when the library's
++finds nothing, and `FileIngest` never auto-promotes such a match under the
++unattended policy: it always waits in review.
+diff --git a/lib/mydia/media/fix_match.ex b/lib/mydia/media/fix_match.ex
+index 5a3effff3..ba07a0cf8 100644
+--- a/lib/mydia/media/fix_match.ex
++++ b/lib/mydia/media/fix_match.ex
+@@ -8,9 +8,9 @@ defmodule Mydia.Media.FixMatch do
+   item's stored title is the wrong one and searching by it is how the bad
+   match was made.
+ 
+-  Changing provider is not this module's job: the library's provider setting
+-  and `Mydia.Media.ProviderSwitch` own that. A show is fixed on its library's
+-  provider, so the next Refresh does not re-identify it away from the fix.
++  Changing provider is the Fix Match provider toggle's job (see `adopt/5`); a
++  show fixed onto a provider its library does not use is pinned there, so the
++  next Refresh does not re-identify it away from the fix.
+   """
+ 
+   import Ecto.Query, only: [from: 2]
+@@ -24,7 +24,8 @@ defmodule Mydia.Media.FixMatch do
+   @doc """
+   The provider a fix-match searches and adopts from.
+ 
+-  Movies use TMDB. A show uses its library's provider, so a fix lands where
++  Movies use TMDB. A pinned show uses its stored source. Otherwise a show uses
++  its library's provider, so a fix lands where
+   `ProviderSwitch.provider_refresh_decision/1` already expects it and Refresh
+   will not re-identify it away. With no single library provider it falls back
+   to the show's stored source, then TMDB.
+@@ -32,6 +33,9 @@ defmodule Mydia.Media.FixMatch do
+   @spec provider_for(MediaItem.t()) :: :tmdb | :tvdb
+   def provider_for(%MediaItem{type: "movie"}), do: :tmdb
+ 
++  def provider_for(%MediaItem{type: "tv_show", metadata_source_pinned: true} = item),
++    do: stored_provider(item)
++
+   def provider_for(%MediaItem{id: nil} = item), do: stored_provider(item)
+ 
+   def provider_for(%MediaItem{} = item) do
+@@ -59,15 +63,15 @@ defmodule Mydia.Media.FixMatch do
+   end
+ 
+   @doc """
+-  Searches the item's provider for `query`, retrying without `year` when the
+-  year filter finds nothing. Results a restricted `scope` may not see are
+-  dropped.
++  Searches `query` on the item's provider, or on `opts[:provider]` for a show
++  when the operator picked one, retrying without `year` when the year filter
++  finds nothing. Results a restricted `scope` may not see are dropped.
+   """
+-  @spec search(MediaItem.t(), String.t(), integer() | nil, Scope.t(), map() | nil) ::
++  @spec search(MediaItem.t(), String.t(), integer() | nil, Scope.t(), map() | nil, keyword()) ::
+           {:ok, [SearchResult.t()]} | {:error, term()}
+-  def search(%MediaItem{} = item, query, year, %Scope{} = scope, config \\ nil) do
++  def search(%MediaItem{} = item, query, year, %Scope{} = scope, config \\ nil, opts \\ []) do
+     config = config || Metadata.default_relay_config()
+-    base_opts = [media_type: media_type(item), provider: provider_for(item)]
++    base_opts = [media_type: media_type(item), provider: target_provider(item, opts)]
+ 
+     with {:ok, results} <- search_with_year_fallback(config, query, year, base_opts) do
+       {:ok, RemoteFilter.filter(results, scope, config: config)}
+@@ -85,19 +89,21 @@ defmodule Mydia.Media.FixMatch do
+   end
+ 
+   @doc """
+-  Re-points `item` at `candidate` on the item's own provider.
++  Re-points `item` at `candidate` on the item's provider, or on
++  `opts[:provider]` for a show.
+ 
+   A movie is rewritten in place and keeps its files. A show goes through
+   `ProviderSwitch.adopt_provider_switch/5`, which rebuilds its episodes from
+-  the new id and sends their files back through import. Refuses with
++  the new id and sends their files back through import. It pins the show when
++  the new provider is not its library's. Refuses with
+   `{:already_in_library, other}` when another item already holds that id,
+   because merging two items is not something this does.
+   """
+-  @spec adopt(Scope.t(), MediaItem.t(), struct(), map() | nil) ::
++  @spec adopt(Scope.t(), MediaItem.t(), struct(), map() | nil, keyword()) ::
+           {:ok, MediaItem.t()} | {:error, {:already_in_library, MediaItem.t()} | term()}
+-  def adopt(%Scope{} = scope, %MediaItem{} = item, candidate, config \\ nil) do
++  def adopt(%Scope{} = scope, %MediaItem{} = item, candidate, config \\ nil, opts \\ []) do
+     config = config || Metadata.default_relay_config()
+-    provider = provider_for(item)
++    provider = target_provider(item, opts)
+     new_id = String.to_integer(to_string(candidate.provider_id))
+ 
+     cond do
+@@ -115,7 +121,7 @@ defmodule Mydia.Media.FixMatch do
+   # An id is only meaningful on the provider that issued it. A candidate from a
+   # search made before the item's library changed provider would otherwise be
+   # written into the wrong id column. Results that do not name a concrete
+-  # provider are trusted, since they came from `search/5` for this item.
++  # provider are trusted, since they came from `search/6` for this item.
+   defp candidate_from?(%{provider: p}, provider) when p in [:tmdb, :tvdb], do: p == provider
+   defp candidate_from?(_candidate, _provider), do: true
+ 
+@@ -153,6 +159,16 @@ defmodule Mydia.Media.FixMatch do
+           limit: 1
+       )
+ 
++  # The operator's provider toggle applies to shows only; a movie is always TMDB.
++  defp target_provider(%MediaItem{type: "tv_show"} = item, opts) do
++    case Keyword.get(opts, :provider) do
++      provider when provider in [:tvdb, :tmdb] -> provider
++      _ -> provider_for(item)
++    end
++  end
++
++  defp target_provider(%MediaItem{} = item, _opts), do: provider_for(item)
++
+   defp media_type(%MediaItem{type: "tv_show"}), do: :tv_show
+   defp media_type(%MediaItem{}), do: :movie
+ end
+diff --git a/lib/mydia/media/media_item.ex b/lib/mydia/media/media_item.ex
+index d9d0fdd35..72887a457 100644
+--- a/lib/mydia/media/media_item.ex
++++ b/lib/mydia/media/media_item.ex
+@@ -22,6 +22,7 @@ defmodule Mydia.Media.MediaItem do
+           tvdb_id: integer() | nil,
+           imdb_id: String.t() | nil,
+           metadata_source: atom() | nil,
++          metadata_source_pinned: boolean(),
+           season_order: :official | :dvd | :absolute | nil,
+           metadata: Mydia.Metadata.Structs.MediaMetadata.t() | nil,
+           content_rating_age: integer() | nil,
+@@ -59,6 +60,11 @@ defmodule Mydia.Media.MediaItem do
+     # (tv_show only; movies stay nil). Source of truth for provider-aware
+     # refresh — not inferred from tvdb_id/tmdb_id presence.
+     field :metadata_source, Ecto.Enum, values: [:tvdb, :tmdb]
++    # True when an operator put this show on `metadata_source` on purpose and it
++    # differs from its library's provider. Refresh then re-fetches it in place
++    # instead of re-identifying it onto the library's provider. Written only by
++    # `Mydia.Media.ProviderSwitch.pin_for/2` callers.
++    field :metadata_source_pinned, :boolean, default: false
+     # Which TVDB season ordering this show uses. nil means the user has never
+     # been asked and the show behaves as :official; an explicit :official
+     # means they were offered a split and chose aired order. That distinction
+@@ -119,6 +125,7 @@ defmodule Mydia.Media.MediaItem do
+       :tvdb_id,
+       :imdb_id,
+       :metadata_source,
++      :metadata_source_pinned,
+       :season_order,
+       :metadata,
+       :monitored,
+diff --git a/lib/mydia/media/provider_switch.ex b/lib/mydia/media/provider_switch.ex
+index 81e59a711..c20619913 100644
+--- a/lib/mydia/media/provider_switch.ex
++++ b/lib/mydia/media/provider_switch.ex
+@@ -37,6 +37,29 @@ defmodule Mydia.Media.ProviderSwitch do
+     end
+   end
+ 
++  @doc """
++  The single library provider a show lives under, or `nil` when it is in no
++  series/mixed library or its libraries disagree.
++  """
++  @spec library_provider(MediaItem.t()) :: :tvdb | :tmdb | nil
++  def library_provider(%MediaItem{} = media_item) do
++    case resolve_library_provider(media_item) do
++      {:ok, provider} -> provider
++      _ -> nil
++    end
++  end
++
++  @doc """
++  Whether a show on `provider` should be pinned there: only when its library has
++  one provider and it is a different one. With no single library provider there
++  is no library choice to diverge from.
++  """
++  @spec pin_for(atom(), atom() | nil) :: boolean()
++  def pin_for(provider, library_provider) when library_provider in [:tvdb, :tmdb],
++    do: provider != library_provider
++
++  def pin_for(_provider, _library_provider), do: false
++
+   defp library_providers_for_item(%MediaItem{id: id}) do
+     direct =
+       from mf in MediaFile,
+@@ -69,6 +92,17 @@ defmodule Mydia.Media.ProviderSwitch do
+   `target`.
+   """
+   @spec provider_refresh_decision(MediaItem.t()) :: :refetch | {:reidentify, atom()}
++  # A pinned show was put on its provider on purpose. Re-identifying it onto
++  # the library's provider would undo that choice, and for a show the library's
++  # provider does not carry it would open an empty picker.
++  def provider_refresh_decision(%MediaItem{
++        type: "tv_show",
++        metadata_source_pinned: true,
++        metadata_source: source
++      })
++      when source in [:tvdb, :tmdb],
++      do: :refetch
++
+   def provider_refresh_decision(%MediaItem{type: "tv_show"} = media_item) do
+     case resolve_library_provider(media_item) do
+       {:ok, lib_provider} ->
+@@ -223,6 +257,7 @@ defmodule Mydia.Media.ProviderSwitch do
+       ) do
+     config = config || Mydia.Metadata.default_relay_config()
+     new_id = to_string(candidate.provider_id)
++    pinned? = pin_for(target_provider, library_provider(item))
+ 
+     # Step 1 + 2 (no mutation): validate the new show metadata and pre-fetch all
+     # season episode data into memory.
+@@ -299,7 +334,8 @@ defmodule Mydia.Media.ProviderSwitch do
+             case Media.update_media_item(
+                    scope,
+                    item,
+-                   provider_switch_attrs(target_provider, new_id, metadata),
++                   provider_switch_attrs(target_provider, new_id, metadata)
++                   |> Map.put(:metadata_source_pinned, pinned?),
+                    reason: "Provider switched to #{target_provider}"
+                  ) do
+               {:ok, updated} -> updated
+diff --git a/lib/mydia/metadata/tv_provider.ex b/lib/mydia/metadata/tv_provider.ex
+new file mode 100644
+index 000000000..4904a35bf
+--- /dev/null
++++ b/lib/mydia/metadata/tv_provider.ex
+@@ -0,0 +1,39 @@
++defmodule Mydia.Metadata.TvProvider do
++  @moduledoc """
++  The two providers a TV show can take its metadata from, `:tvdb` and `:tmdb`.
++
++  A library picks one through `library_paths.tv_metadata_source`, and a single
++  show can be pinned to the other (see `Mydia.Media.ProviderSwitch.pin_for/2`).
++  """
++
++  @type t :: :tvdb | :tmdb
++
++  @doc "Parses a provider sent by a form or event. Anything else is nil."
++  @spec parse(term()) :: t() | nil
++  def parse("tvdb"), do: :tvdb
++  def parse("tmdb"), do: :tmdb
++  def parse(_), do: nil
++
++  @doc "The provider that is not `provider`, or nil when `provider` is not a TV provider."
++  @spec other(term()) :: t() | nil
++  def other(:tvdb), do: :tmdb
++  def other(:tmdb), do: :tvdb
++  def other(_), do: nil
++
++  @doc "Display name for a provider given as an atom or a string, or nil for anything else."
++  @spec label(term()) :: String.t() | nil
++  def label(provider) when provider in [:tvdb, "tvdb"], do: "TVDB"
++  def label(provider) when provider in [:tmdb, "tmdb"], do: "TMDB"
++  def label(_), do: nil
++
++  @doc """
++  The library's TV provider. Only series and mixed libraries have one: the
++  column defaults to `:tvdb` on every library type, so a movies library (or no
++  library) reports nil.
++  """
++  @spec for_library(map() | nil) :: t() | nil
++  def for_library(%{type: type, tv_metadata_source: source}) when type in [:series, :mixed],
++    do: source
++
++  def for_library(_library_path), do: nil
++end
+diff --git a/lib/mydia_web/live/import_media_live/components.ex b/lib/mydia_web/live/import_media_live/components.ex
+index c9c892d52..1878b8a0b 100644
+--- a/lib/mydia_web/live/import_media_live/components.ex
++++ b/lib/mydia_web/live/import_media_live/components.ex
+@@ -12,7 +12,7 @@ defmodule MydiaWeb.ImportMediaLive.Components do
+   import MydiaWeb.CoreComponents
+ 
+   alias Mydia.Library.ImportCandidateGroup
+-  alias Mydia.Metadata.ImageUrl
++  alias Mydia.Metadata.TvProvider
+   alias Mydia.Settings.LibraryPath
+ 
+   @doc """
+@@ -313,6 +313,7 @@ defmodule MydiaWeb.ImportMediaLive.Components do
+   attr :id, :string, required: true
+   attr :group, :map, required: true
+   attr :band, :atom, required: true
++  attr :library_provider, :atom, default: nil
+   attr :selected, :boolean, required: true
+   attr :expanded, :boolean, required: true
+   attr :members, :any, required: true
+@@ -375,6 +376,15 @@ defmodule MydiaWeb.ImportMediaLive.Components do
+           >
+             {suggestion_line(@group)}
+           </span>
++          <span
++            :if={cross_provider?(@group, @library_provider)}
++            id={"group-provider-badge-#{@dom_key}"}
++            class="badge badge-warning badge-xs"
++          >
++            From {provider_label(@group.provider_type)} · not found on {provider_label(
++              @library_provider
++            )}
++          </span>
+           <span
+             :if={disagreement_label(@group)}
+             class="badge badge-warning/20 text-warning badge-xs"
+@@ -576,109 +586,6 @@ defmodule MydiaWeb.ImportMediaLive.Components do
+     """
+   end
+ 
+-  @doc """
+-  The "Change match" / "Identify" search modal.
+-
+-  `state` is `ImportMediaLive.Index`'s `@match_search` assign -- nil when
+-  closed, otherwise `%{anchor_key:, media_type:, query:, results:, searching:,
+-  error:}`. Selecting a result submits `provider_id` *and* `provider`
+-  together (a result's own provider tag, `:tvdb` or `:metadata_relay`/etc for
+-  TMDB), which is what lets the handler tell two providers' ids apart rather
+-  than trusting `provider_id` alone to be unique.
+-  """
+-  attr :state, :any, default: nil
+-
+-  def match_search_modal(assigns) do
+-    ~H"""
+-    <.modal id="match-search-modal" show={not is_nil(@state)} on_cancel="close_match_search">
+-      <:title>
+-        <div class="flex items-center gap-2">
+-          <.icon name="hero-magnifying-glass" class="w-5 h-5 text-primary" />
+-          <span>Change match</span>
+-        </div>
+-      </:title>
+-
+-      <form phx-change="match_search_query" id="match-search-form" class="mt-3">
+-        <div class="relative">
+-          <.icon
+-            name="hero-magnifying-glass"
+-            class="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 opacity-50"
+-          />
+-          <input
+-            type="text"
+-            name="q"
+-            value={@state && @state.query}
+-            placeholder="Search by title…"
+-            phx-debounce="300"
+-            class="input input-bordered w-full pl-10"
+-          />
+-        </div>
+-      </form>
+-
+-      <div
+-        :if={@state}
+-        class="mt-4 flex flex-col gap-1.5 max-h-96 overflow-y-auto"
+-        id="match-results"
+-      >
+-        <div :if={@state.searching} class="flex justify-center py-8">
+-          <span class="loading loading-spinner loading-md text-primary"></span>
+-        </div>
+-
+-        <div :if={!@state.searching}>
+-          <div :if={@state.error} class="alert alert-error text-xs py-2 mb-2">
+-            <.icon name="hero-exclamation-triangle" class="w-4 h-4 shrink-0" />
+-            <span>{@state.error}</span>
+-          </div>
+-
+-          <div
+-            :if={!@state.error && @state.results == []}
+-            class="text-sm text-base-content/60 text-center py-10"
+-          >
+-            <.icon name="hero-film" class="w-8 h-8 mx-auto mb-2 opacity-30" />
+-            <p>No results found.</p>
+-          </div>
+-
+-          <button
+-            :for={result <- @state.results}
+-            type="button"
+-            id={"match-result-#{result.provider_id}-#{result.provider}"}
+-            class="flex items-center gap-3.5 p-2.5 rounded-xl hover:bg-base-200 text-left w-full transition-colors border border-transparent hover:border-base-300"
+-            phx-click="select_match"
+-            phx-value-provider_id={result.provider_id}
+-            phx-value-provider={result.provider}
+-          >
+-            <img
+-              :if={result.poster_path}
+-              src={ImageUrl.image_url(result.poster_path, "w92")}
+-              class="w-12 h-16 object-cover rounded-lg shrink-0 shadow-sm"
+-            />
+-            <div
+-              :if={!result.poster_path}
+-              class="w-12 h-16 bg-base-300 rounded-lg flex items-center justify-center shrink-0"
+-            >
+-              <.icon name="hero-film" class="w-6 h-6 opacity-30" />
+-            </div>
+-            <div class="flex-1 min-w-0">
+-              <p class="font-semibold text-sm truncate">{result.title}</p>
+-              <p class="text-xs text-base-content/60 flex items-center gap-1.5 mt-1">
+-                <span :if={result.year} class="font-mono">{result.year}</span>
+-                <span class="badge badge-ghost badge-xs font-medium">
+-                  {media_type_label(result.media_type)}
+-                </span>
+-              </p>
+-            </div>
+-            <.icon name="hero-chevron-right" class="w-4 h-4 opacity-40 shrink-0" />
+-          </button>
+-        </div>
+-      </div>
+-
+-      <:actions>
+-        <button class="btn btn-ghost" phx-click="close_match_search">Cancel</button>
+-      </:actions>
+-    </.modal>
+-    """
+-  end
+-
+   @doc """
+   Confirms a permanent delete of every file in the selection.
+ 
+@@ -722,10 +629,6 @@ defmodule MydiaWeb.ImportMediaLive.Components do
+   defp plural(1, word), do: "1 #{word}"
+   defp plural(count, word), do: "#{count} #{word}s"
+ 
+-  defp media_type_label(:tv_show), do: "TV Show"
+-  defp media_type_label(:movie), do: "Movie"
+-  defp media_type_label(_), do: "Unknown"
+-
+   defp band_class(:ready), do: "badge-success"
+   defp band_class(:needs_attention), do: "badge-warning"
+   defp band_class(:no_match), do: "badge-error"
+@@ -751,9 +654,13 @@ defmodule MydiaWeb.ImportMediaLive.Components do
+     "→ #{group.suggested_title}#{year}"
+   end
+ 
+-  defp provider_label("tvdb"), do: "TVDB"
+-  defp provider_label("tmdb"), do: "TMDB"
+-  defp provider_label(_), do: "Provider"
++  defp cross_provider?(%{media_type: "tv_show", provider_type: type}, library_provider)
++       when type in ["tvdb", "tmdb"] and library_provider in [:tvdb, :tmdb],
++       do: type != to_string(library_provider)
++
++  defp cross_provider?(_group, _library_provider), do: false
++
++  defp provider_label(provider), do: TvProvider.label(provider) || "Provider"
+ 
+   # `ImportCandidateGroup` carries no persisted evidence trail (unlike the old
+   # `ImportGroup.evidence` column) -- `provider_count` is the one disagreement
+diff --git a/lib/mydia_web/live/import_media_live/index.ex b/lib/mydia_web/live/import_media_live/index.ex
+index 5a39002d2..56a894905 100644
+--- a/lib/mydia_web/live/import_media_live/index.ex
++++ b/lib/mydia_web/live/import_media_live/index.ex
+@@ -13,15 +13,13 @@ defmodule MydiaWeb.ImportMediaLive.Index do
+   """
+   use MydiaWeb, :live_view
+ 
+-  require Logger
+-
+-  alias Mydia.{Library, Metadata, Settings}
++  alias Mydia.{Library, Settings}
+   alias Mydia.ImportCandidates
+   alias Mydia.Jobs.ImportRun, as: ImportRunJob
+-  alias Mydia.Media.RemoteFilter
+   alias Mydia.Library.{ImportCandidate, ImportCandidateGroup, ImportRun, SelectionScope}
++  alias Mydia.Metadata.TvProvider
+   alias MydiaWeb.Live.Authorization
+-  alias MydiaWeb.ImportMediaLive.{Components, RunControl}
++  alias MydiaWeb.ImportMediaLive.{Components, MatchSearch, MatchSearchModal, RunControl}
+ 
+   # `phx-value-band` is client-controlled, so the atom it names is looked up
+   # rather than converted. An unknown value is a silent no-op because there is
+@@ -660,33 +658,15 @@ defmodule MydiaWeb.ImportMediaLive.Index do
+         {:noreply, put_flash(socket, :error, "That group is no longer available.")}
+ 
+       group ->
+-        query = group.suggested_title || group.display_title || ""
+-
+-        state = %{
+-          anchor_key: group.anchor_key,
+-          media_type: group.media_type,
+-          query: query,
+-          results: [],
+-          searching: true,
+-          error: nil
+-        }
+-
+-        {:noreply, socket |> assign(:match_search, state) |> run_match_search(query)}
++        {:noreply, MatchSearch.open(socket, group)}
+     end
+   end
+ 
+-  def handle_event("match_search_query", %{"q" => query}, socket) do
+-    case socket.assigns.match_search do
+-      nil ->
+-        {:noreply, socket}
++  def handle_event("match_search_query", %{"q" => query}, socket),
++    do: {:noreply, MatchSearch.change_query(socket, query)}
+ 
+-      state ->
+-        {:noreply,
+-         socket
+-         |> assign(:match_search, %{state | query: query, searching: true, error: nil})
+-         |> run_match_search(query)}
+-    end
+-  end
++  def handle_event("match_search_provider", %{"provider" => provider}, socket),
++    do: {:noreply, MatchSearch.change_provider(socket, provider)}
+ 
+   def handle_event("close_match_search", _params, socket) do
+     {:noreply, assign(socket, :match_search, nil)}
+@@ -729,33 +709,11 @@ defmodule MydiaWeb.ImportMediaLive.Index do
+   end
+ 
+   @impl true
+-  def handle_async(:group_match_search, {:ok, {token, anchor_key, result}}, socket) do
+-    if stale_match_search?(socket, token, anchor_key) do
+-      {:noreply, socket}
+-    else
+-      {:noreply,
+-       assign(socket, :match_search, apply_search_result(socket.assigns.match_search, result))}
+-    end
+-  end
+-
+-  def handle_async(:group_match_search, {:exit, reason}, socket) do
+-    Logger.warning("Group match search crashed", reason: inspect(reason))
+-
+-    socket =
+-      case socket.assigns.match_search do
+-        nil ->
+-          socket
+-
+-        state ->
+-          assign(socket, :match_search, %{
+-            state
+-            | searching: false,
+-              error: "Search failed. Try again."
+-          })
+-      end
++  def handle_async(:group_match_search, {:ok, payload}, socket),
++    do: {:noreply, MatchSearch.apply_result(socket, payload)}
+ 
+-    {:noreply, socket}
+-  end
++  def handle_async(:group_match_search, {:exit, reason}, socket),
++    do: {:noreply, MatchSearch.crashed(socket, reason)}
+ 
+   @impl true
+   def handle_info({:import_run_progress, run}, socket) do
+@@ -1164,87 +1122,6 @@ defmodule MydiaWeb.ImportMediaLive.Index do
+     end
+   end
+ 
+-  # Fires (or re-fires) the group match search asynchronously -- the page
+-  # this replaced ran two synchronous relay calls inline in a keystroke
+-  # handler and froze while they were in flight, which is exactly what
+-  # `start_async/3` exists to avoid. `phx-debounce="300"` on the modal's
+-  # input (see Components.match_search_modal/1) keeps every keystroke from
+-  # spawning its own request; the token here is what keeps a slow response
+-  # from an earlier one from clobbering a newer one that already landed.
+-  #
+-  # A blank query (the group's own display title, `PathAnchor`'s
+-  # "Loose files" fallback, or an emptied search box) is refused before
+-  # spawning a task at all: `Metadata.search/3`'s relay adapter treats an
+-  # empty query as invalid, so there is nothing useful to send.
+-  defp run_match_search(socket, query) do
+-    if String.trim(query) == "" do
+-      assign(socket, :match_search, %{socket.assigns.match_search | results: [], searching: false})
+-    else
+-      token = socket.assigns.match_search_token + 1
+-      anchor_key = socket.assigns.match_search.anchor_key
+-      media_type_hint = socket.assigns.match_search.media_type
+-
+-      library_path =
+-        Enum.find(
+-          socket.assigns.library_paths,
+-          &(&1.id == socket.assigns.selected_library_path_id)
+-        )
+-
+-      media_type = search_media_type(library_path, media_type_hint)
+-      provider = library_path && library_path.tv_metadata_source
+-      config = Metadata.default_relay_config()
+-      scope = socket.assigns.current_scope
+-
+-      socket
+-      |> assign(:match_search_token, token)
+-      |> start_async(:group_match_search, fn ->
+-        opts =
+-          if media_type == :tv_show do
+-            [media_type: media_type, provider: provider]
+-          else
+-            [media_type: media_type]
+-          end
+-
+-        result =
+-          with {:ok, results} <- Metadata.search(config, query, opts) do
+-            {:ok, RemoteFilter.filter(results, scope)}
+-          end
+-
+-        {token, anchor_key, result}
+-      end)
+-    end
+-  end
+-
+-  # Scopes the search to the library's own media type where one is knowable,
+-  # per the design note this feature shipped against: a series library
+-  # should never offer movie results. A `:mixed` library has no single type
+-  # to scope by, so this falls back to the group's own `media_type` (already
+-  # known from its rollup) when the group has one, and otherwise leaves the
+-  # search unscoped -- `Metadata.search/3` defaults an unscoped query to a
+-  # movie search.
+-  defp search_media_type(%{type: :movies}, _hint), do: :movie
+-  defp search_media_type(%{type: :series}, _hint), do: :tv_show
+-  defp search_media_type(%{type: :mixed}, "tv_show"), do: :tv_show
+-  defp search_media_type(%{type: :mixed}, "movie"), do: :movie
+-  defp search_media_type(_library_path, _hint), do: nil
+-
+-  defp stale_match_search?(socket, token, anchor_key) do
+-    case socket.assigns.match_search do
+-      nil -> true
+-      %{anchor_key: ^anchor_key} -> socket.assigns.match_search_token != token
+-      _different_group -> true
+-    end
+-  end
+-
+-  defp apply_search_result(state, {:ok, results}) do
+-    %{state | results: results, searching: false, error: nil}
+-  end
+-
+-  defp apply_search_result(state, {:error, reason}) do
+-    Logger.warning("Group match search failed", reason: inspect(reason))
+-    %{state | results: [], searching: false, error: "Search failed. Try again."}
+-  end
+-
+   defp apply_selected_match(socket, anchor_key, result) do
+     library_path_id = socket.assigns.selected_library_path_id
+ 
+diff --git a/lib/mydia_web/live/import_media_live/index.html.heex b/lib/mydia_web/live/import_media_live/index.html.heex
+index 3e1055e86..a047b4071 100644
+--- a/lib/mydia_web/live/import_media_live/index.html.heex
++++ b/lib/mydia_web/live/import_media_live/index.html.heex
+@@ -101,6 +101,7 @@
+               id={dom_id}
+               group={group}
+               band={ImportCandidates.band(group)}
++              library_provider={TvProvider.for_library(@selected_library_path)}
+               selected={SelectionScope.selected?(@selection, group.id)}
+               expanded={MapSet.member?(@expanded_ids, group.id)}
+               members={if @expanded_group_id == group.id, do: @streams.members, else: []}
+@@ -129,7 +130,7 @@
+       </div>
+     </section>
+ 
+-    <Components.match_search_modal state={@match_search} />
++    <MatchSearchModal.match_search_modal state={@match_search} />
+     <Components.delete_files_modal state={@delete_confirm} />
+   </div>
+ </Layouts.app>
+diff --git a/lib/mydia_web/live/import_media_live/match_search.ex b/lib/mydia_web/live/import_media_live/match_search.ex
+new file mode 100644
+index 000000000..8ed01d28e
+--- /dev/null
++++ b/lib/mydia_web/live/import_media_live/match_search.ex
+@@ -0,0 +1,168 @@
++defmodule MydiaWeb.ImportMediaLive.MatchSearch do
++  @moduledoc """
++  The "Change match" search behind `MydiaWeb.ImportMediaLive.Index`'s
++  `@match_search` assign: opening it for a group, re-running it when the query
++  or the TV provider changes, and folding the async result back in.
++
++  The state is nil while the modal is closed, otherwise a map of `anchor_key`,
++  `media_type`, `provider`, `library_provider`, `query`, `results`,
++  `searching` and `error`. `provider` and `library_provider` are nil unless
++  the search is a TV search; the provider toggle only renders when they are
++  set.
++  """
++
++  import Phoenix.Component, only: [assign: 3]
++  import Phoenix.LiveView, only: [start_async: 3]
++
++  require Logger
++
++  alias Mydia.Metadata
++  alias Mydia.Metadata.TvProvider
++  alias Mydia.Media.RemoteFilter
++
++  @doc "Opens the search for `group`, prefilled with its suggested (or folder) title."
++  def open(socket, group) do
++    library_path = selected_library_path(socket)
++
++    library_provider =
++      if search_media_type(library_path, group.media_type) == :tv_show,
++        do: TvProvider.for_library(library_path)
++
++    state = %{
++      anchor_key: group.anchor_key,
++      media_type: group.media_type,
++      provider: library_provider,
++      library_provider: library_provider,
++      query: group.suggested_title || group.display_title || "",
++      results: [],
++      searching: true,
++      error: nil
++    }
++
++    socket |> assign(:match_search, state) |> run(state.query)
++  end
++
++  def change_query(%{assigns: %{match_search: nil}} = socket, _query), do: socket
++
++  def change_query(socket, query) do
++    state = socket.assigns.match_search
++
++    socket
++    |> assign(:match_search, %{state | query: query, searching: true, error: nil})
++    |> run(query)
++  end
++
++  def change_provider(%{assigns: %{match_search: nil}} = socket, _value), do: socket
++
++  def change_provider(socket, value) do
++    case TvProvider.parse(value) do
++      nil ->
++        socket
++
++      provider ->
++        state = socket.assigns.match_search
++
++        socket
++        |> assign(:match_search, %{state | provider: provider, searching: true, error: nil})
++        |> run(state.query)
++    end
++  end
++
++  @doc "Applies a finished search unless a newer one, or another group's, has replaced it."
++  def apply_result(socket, {token, anchor_key, result}) do
++    if stale?(socket, token, anchor_key) do
++      socket
++    else
++      assign(socket, :match_search, apply_search_result(socket.assigns.match_search, result))
++    end
++  end
++
++  def crashed(socket, reason) do
++    Logger.warning("Group match search crashed", reason: inspect(reason))
++
++    # A blank query clears `searching` without starting a replacement task, so
++    # an older task's exit can still arrive; it no longer belongs to anything.
++    case socket.assigns.match_search do
++      nil -> socket
++      %{searching: false} -> socket
++      state -> assign(socket, :match_search, %{state | searching: false, error: search_failed()})
++    end
++  end
++
++  # Fires (or re-fires) the group match search asynchronously -- the page
++  # this replaced ran two synchronous relay calls inline in a keystroke
++  # handler and froze while they were in flight, which is exactly what
++  # `start_async/3` exists to avoid. `phx-debounce="300"` on the modal's
++  # input (see MatchSearchModal.match_search_modal/1) keeps every keystroke from
++  # spawning its own request; the token here is what keeps a slow response
++  # from an earlier one from clobbering a newer one that already landed.
++  #
++  # A blank query (the group's own display title, `PathAnchor`'s
++  # "Loose files" fallback, or an emptied search box) is refused before
++  # spawning a task at all: `Metadata.search/3`'s relay adapter treats an
++  # empty query as invalid, so there is nothing useful to send. It still bumps
++  # the token so a search already in flight cannot land on the cleared modal.
++  defp run(socket, query) do
++    token = socket.assigns.match_search_token + 1
++    state = socket.assigns.match_search
++    socket = assign(socket, :match_search_token, token)
++
++    if String.trim(query) == "" do
++      assign(socket, :match_search, %{state | results: [], searching: false})
++    else
++      media_type = search_media_type(selected_library_path(socket), state.media_type)
++      opts = search_opts(media_type, state.provider)
++      config = Metadata.default_relay_config()
++      scope = socket.assigns.current_scope
++
++      start_async(socket, :group_match_search, fn ->
++        {token, state.anchor_key, search(config, query, opts, scope)}
++      end)
++    end
++  end
++
++  defp search(config, query, opts, scope) do
++    with {:ok, results} <- Metadata.search(config, query, opts) do
++      {:ok, RemoteFilter.filter(results, scope)}
++    end
++  end
++
++  defp search_opts(:tv_show, provider), do: [media_type: :tv_show, provider: provider]
++  defp search_opts(media_type, _provider), do: [media_type: media_type]
++
++  defp selected_library_path(socket) do
++    Enum.find(socket.assigns.library_paths, &(&1.id == socket.assigns.selected_library_path_id))
++  end
++
++  # Scopes the search to the library's own media type where one is knowable,
++  # per the design note this feature shipped against: a series library
++  # should never offer movie results. A `:mixed` library has no single type
++  # to scope by, so this falls back to the group's own `media_type` (already
++  # known from its rollup) when the group has one, and otherwise leaves the
++  # search unscoped -- `Metadata.search/3` defaults an unscoped query to a
++  # movie search.
++  defp search_media_type(%{type: :movies}, _hint), do: :movie
++  defp search_media_type(%{type: :series}, _hint), do: :tv_show
++  defp search_media_type(%{type: :mixed}, "tv_show"), do: :tv_show
++  defp search_media_type(%{type: :mixed}, "movie"), do: :movie
++  defp search_media_type(_library_path, _hint), do: nil
++
++  defp stale?(socket, token, anchor_key) do
++    case socket.assigns.match_search do
++      nil -> true
++      %{anchor_key: ^anchor_key} -> socket.assigns.match_search_token != token
++      _different_group -> true
++    end
++  end
++
++  defp apply_search_result(state, {:ok, results}) do
++    %{state | results: results, searching: false, error: nil}
++  end
++
++  defp apply_search_result(state, {:error, reason}) do
++    Logger.warning("Group match search failed", reason: inspect(reason))
++    %{state | results: [], searching: false, error: search_failed()}
++  end
++
++  defp search_failed, do: "Search failed. Try again."
++end
+diff --git a/lib/mydia_web/live/import_media_live/match_search_modal.ex b/lib/mydia_web/live/import_media_live/match_search_modal.ex
+new file mode 100644
+index 000000000..1cd860bef
+--- /dev/null
++++ b/lib/mydia_web/live/import_media_live/match_search_modal.ex
+@@ -0,0 +1,142 @@
++defmodule MydiaWeb.ImportMediaLive.MatchSearchModal do
++  @moduledoc false
++  use Phoenix.Component
++  import MydiaWeb.CoreComponents
++  import MydiaWeb.SegmentedControl, only: [segmented_control: 1]
++
++  alias Mydia.Metadata.{ImageUrl, TvProvider}
++
++  @doc """
++  The "Change match" / "Identify" search modal.
++
++  `state` is `ImportMediaLive.Index`'s `@match_search` assign, described in
++  `MydiaWeb.ImportMediaLive.MatchSearch`. Selecting a result submits
++  `provider_id` *and* `provider` together (the result's own provider tag),
++  which is what lets the handler tell two providers' ids apart rather than
++  trusting `provider_id` alone to be unique.
++  """
++  attr :state, :any, default: nil
++
++  def match_search_modal(assigns) do
++    ~H"""
++    <.modal id="match-search-modal" show={not is_nil(@state)} on_cancel="close_match_search">
++      <:title>
++        <div class="flex items-center gap-2">
++          <.icon name="hero-magnifying-glass" class="w-5 h-5 text-primary" />
++          <span>Change match</span>
++        </div>
++      </:title>
++
++      <form phx-change="match_search_query" id="match-search-form" class="mt-3">
++        <div class="relative">
++          <.icon
++            name="hero-magnifying-glass"
++            class="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 opacity-50"
++          />
++          <input
++            type="text"
++            name="q"
++            value={@state && @state.query}
++            placeholder="Search by title…"
++            phx-debounce="300"
++            class="input input-bordered w-full pl-10"
++          />
++        </div>
++      </form>
++
++      <div :if={@state && @state.library_provider} class="mt-3">
++        <.segmented_control
++          id="match-provider-toggle"
++          value={@state.provider}
++          event="match_search_provider"
++          param="provider"
++          label="Metadata provider"
++        >
++          <:option value="tvdb" label="TVDB" id="match-provider-tvdb" />
++          <:option value="tmdb" label="TMDB" id="match-provider-tmdb" />
++        </.segmented_control>
++      </div>
++
++      <div
++        :if={@state}
++        class="mt-4 flex flex-col gap-1.5 max-h-96 overflow-y-auto"
++        id="match-results"
++      >
++        <div :if={@state.searching} class="flex justify-center py-8">
++          <span class="loading loading-spinner loading-md text-primary"></span>
++        </div>
++
++        <div :if={!@state.searching}>
++          <div :if={@state.error} class="alert alert-error text-xs py-2 mb-2">
++            <.icon name="hero-exclamation-triangle" class="w-4 h-4 shrink-0" />
++            <span>{@state.error}</span>
++          </div>
++
++          <div
++            :if={!@state.error && @state.results == []}
++            class="text-sm text-base-content/60 text-center py-10"
++          >
++            <.icon name="hero-film" class="w-8 h-8 mx-auto mb-2 opacity-30" />
++            <p>No results found.</p>
++          </div>
++
++          <button
++            :for={result <- @state.results}
++            type="button"
++            id={"match-result-#{result.provider_id}-#{result.provider}"}
++            class="flex items-center gap-3.5 p-2.5 rounded-xl hover:bg-base-200 text-left w-full transition-colors border border-transparent hover:border-base-300"
++            phx-click="select_match"
++            phx-value-provider_id={result.provider_id}
++            phx-value-provider={result.provider}
++          >
++            <img
++              :if={result.poster_path}
++              src={ImageUrl.image_url(result.poster_path, "w92")}
++              class="w-12 h-16 object-cover rounded-lg shrink-0 shadow-sm"
++            />
++            <div
++              :if={!result.poster_path}
++              class="w-12 h-16 bg-base-300 rounded-lg flex items-center justify-center shrink-0"
++            >
++              <.icon name="hero-film" class="w-6 h-6 opacity-30" />
++            </div>
++            <div class="flex-1 min-w-0">
++              <p class="font-semibold text-sm truncate flex items-center gap-1.5">
++                <span class="truncate">{result.title}</span>
++                <span
++                  :if={off_library_provider?(result, @state.library_provider)}
++                  class="badge badge-ghost badge-xs shrink-0"
++                >
++                  {TvProvider.label(result.provider)}
++                </span>
++              </p>
++              <p class="text-xs text-base-content/60 flex items-center gap-1.5 mt-1">
++                <span :if={result.year} class="font-mono">{result.year}</span>
++                <span class="badge badge-ghost badge-xs font-medium">
++                  {media_type_label(result.media_type)}
++                </span>
++              </p>
++            </div>
++            <.icon name="hero-chevron-right" class="w-4 h-4 opacity-40 shrink-0" />
++          </button>
++        </div>
++      </div>
++
++      <:actions>
++        <button class="btn btn-ghost" phx-click="close_match_search">Cancel</button>
++      </:actions>
++    </.modal>
++    """
++  end
++
++  # A TV result from the provider the library does not use. `library_provider`
++  # is nil outside TV searches, so movie results never get the badge.
++  defp off_library_provider?(result, library_provider) do
++    not is_nil(library_provider) and result.provider in [:tvdb, :tmdb] and
++      result.provider != library_provider
++  end
++
++  defp media_type_label(:tv_show), do: "TV Show"
++  defp media_type_label(:movie), do: "Movie"
++  defp media_type_label(_), do: "Unknown"
++end
+diff --git a/lib/mydia_web/live/media_live/show.ex b/lib/mydia_web/live/media_live/show.ex
+index a8eab3fe2..e8f4540d7 100644
+--- a/lib/mydia_web/live/media_live/show.ex
++++ b/lib/mydia_web/live/media_live/show.ex
+@@ -18,6 +18,7 @@ defmodule MydiaWeb.MediaLive.Show do
+   alias MydiaWeb.MediaLive.Show.SubtitleEvents
+   alias MydiaWeb.MediaLive.Show.FileEvents
+   alias MydiaWeb.MediaLive.Show.FixMatchEvents
++  alias MydiaWeb.MediaLive.Show.FixMatchModal
+   alias MydiaWeb.MediaLive.Show.FindFileComponents
+   alias MydiaWeb.MediaLive.Show.FindFileEvents
+   alias MydiaWeb.MediaLive.Show.RenameEvents
+@@ -284,12 +285,9 @@ defmodule MydiaWeb.MediaLive.Show do
+ 
+   def handle_event("open_fix_match", params, socket), do: FixMatchEvents.open(params, socket)
+   def handle_event("close_fix_match", params, socket), do: FixMatchEvents.close(params, socket)
+-  def handle_event("fix_match_search", params, socket), do: FixMatchEvents.search(params, socket)
+-  def handle_event("fix_match_pick", params, socket), do: FixMatchEvents.pick(params, socket)
+-  def handle_event("fix_match_back", params, socket), do: FixMatchEvents.back(params, socket)
+ 
+-  def handle_event("fix_match_confirm", params, socket),
+-    do: FixMatchEvents.confirm(params, socket)
++  def handle_event("fix_match_" <> action, params, socket),
++    do: FixMatchEvents.handle_event(action, params, socket)
+ 
+   def handle_event("refresh_all_file_metadata", params, socket),
+     do: FileEvents.refresh_all_file_metadata(params, socket)
+diff --git a/lib/mydia_web/live/media_live/show.html.heex b/lib/mydia_web/live/media_live/show.html.heex
+index 03e4f4c72..4872144f7 100644
+--- a/lib/mydia_web/live/media_live/show.html.heex
++++ b/lib/mydia_web/live/media_live/show.html.heex
+@@ -84,7 +84,26 @@
+           <%!-- Title and Basic Info --%>
+           <div class="mb-4 md:mb-6">
+             <div class="flex items-start justify-between gap-2 md:gap-4 mb-2">
+-              <h1 class="text-2xl sm:text-3xl md:text-4xl font-bold">{@media_item.title}</h1>
++              <div class="min-w-0">
++                <h1 class="text-2xl sm:text-3xl md:text-4xl font-bold">{@media_item.title}</h1>
++                <div
++                  :if={
++                    @media_item.type == "tv_show" && @media_item.metadata_source_pinned &&
++                      @media_item.metadata_source in [:tmdb, :tvdb]
++                  }
++                  id="metadata-source-pinned-badge"
++                  class="tooltip tooltip-bottom mt-1"
++                  data-tip="Refresh keeps this show on this provider. Use Fix match to move it."
++                >
++                  <span class="badge badge-outline badge-sm gap-1">
++                    <.icon name="hero-lock-closed" class="w-3 h-3" />
++                    {case @media_item.metadata_source do
++                      :tmdb -> "TMDB"
++                      :tvdb -> "TVDB"
++                    end} (pinned)
++                  </span>
++                </div>
++              </div>
+               <div class="flex items-center gap-0.5 flex-shrink-0">
+                 <div class="tooltip tooltip-bottom" data-tip="Refresh metadata">
+                   <button
+@@ -432,7 +451,7 @@
+     <Modals.reidentify_modal provider={@reidentify_provider} candidates={@reidentify_candidates} />
+   <% end %>
+   <%= if @fix_match do %>
+-    <Modals.fix_match_modal fix_match={@fix_match} media_item={@media_item} />
++    <FixMatchModal.fix_match_modal fix_match={@fix_match} media_item={@media_item} />
+   <% end %>
+   <%= if @find_file_target do %>
+     <FindFileComponents.find_file_modal
+diff --git a/lib/mydia_web/live/media_live/show/fix_match_events.ex b/lib/mydia_web/live/media_live/show/fix_match_events.ex
+index 09a71dd68..acc62268e 100644
+--- a/lib/mydia_web/live/media_live/show/fix_match_events.ex
++++ b/lib/mydia_web/live/media_live/show/fix_match_events.ex
+@@ -7,6 +7,7 @@ defmodule MydiaWeb.MediaLive.Show.FixMatchEvents do
+   use MydiaWeb, :verified_routes
+ 
+   alias Mydia.Media.FixMatch
++  alias Mydia.Metadata.TvProvider
+   alias MydiaWeb.Live.Authorization
+ 
+   require Logger
+@@ -24,7 +25,8 @@ defmodule MydiaWeb.MediaLive.Show.FixMatchEvents do
+            searching?: false,
+            error: nil,
+            picked: nil,
+-           adopting?: false
++           adopting?: false,
++           provider: FixMatch.provider_for(item)
+          })}
+ 
+       {:unauthorized, socket} ->
+@@ -34,12 +36,20 @@ defmodule MydiaWeb.MediaLive.Show.FixMatchEvents do
+ 
+   def close(_params, socket), do: {:noreply, assign(socket, :fix_match, nil)}
+ 
++  @doc "Routes a `fix_match_<action>` event from `MydiaWeb.MediaLive.Show`."
++  def handle_event("search", params, socket), do: search(params, socket)
++  def handle_event("provider", params, socket), do: provider(params, socket)
++  def handle_event("pick", params, socket), do: pick(params, socket)
++  def handle_event("back", params, socket), do: back(params, socket)
++  def handle_event("confirm", params, socket), do: confirm(params, socket)
++
+   def search(_params, %{assigns: %{fix_match: nil}} = socket), do: {:noreply, socket}
+ 
+   def search(%{"fix_match" => %{"query" => query} = params}, socket) when is_binary(query) do
+     item = socket.assigns.media_item
+     scope = socket.assigns.current_scope
+     config = socket.assigns[:metadata_config]
++    provider = socket.assigns.fix_match.provider
+     year = parse_year(params["year"])
+     trimmed = String.trim(query)
+ 
+@@ -50,19 +60,21 @@ defmodule MydiaWeb.MediaLive.Show.FixMatchEvents do
+        socket
+        |> update_fix_match(form: form(query, year), searching?: true, error: nil)
+        |> start_async(:fix_match_search, fn ->
+-         FixMatch.search(item, trimmed, year, scope, config)
++         {provider, FixMatch.search(item, trimmed, year, scope, config, provider: provider)}
+        end)}
+     end
+   end
+ 
+   def search(_params, socket), do: {:noreply, socket}
+ 
+-  def handle_search_async({:ok, {:ok, results}}, socket),
+-    do: {:noreply, update_fix_match(socket, results: results, searching?: false)}
+-
+-  def handle_search_async({:ok, {:error, reason}}, socket) do
+-    {:noreply,
+-     update_fix_match(socket, searching?: false, error: "Search failed: #{inspect(reason)}")}
++  # A result tagged with a provider the modal has since toggled away from is
++  # dropped: painting it would show the old provider's ids under the new one.
++  # `searching?` stays on, the newer search is still in flight.
++  def handle_search_async({:ok, {provider, outcome}}, socket) do
++    case socket.assigns.fix_match do
++      %{provider: ^provider} -> apply_search_outcome(outcome, socket)
++      _ -> {:noreply, socket}
++    end
+   end
+ 
+   def handle_search_async({:exit, reason}, socket) do
+@@ -70,6 +82,14 @@ defmodule MydiaWeb.MediaLive.Show.FixMatchEvents do
+     {:noreply, update_fix_match(socket, searching?: false, error: "Search failed unexpectedly")}
+   end
+ 
++  defp apply_search_outcome({:ok, results}, socket),
++    do: {:noreply, update_fix_match(socket, results: results, searching?: false)}
++
++  defp apply_search_outcome({:error, reason}, socket) do
++    {:noreply,
++     update_fix_match(socket, searching?: false, error: "Search failed: #{inspect(reason)}")}
++  end
++
+   def pick(_params, %{assigns: %{fix_match: nil}} = socket), do: {:noreply, socket}
+ 
+   def pick(%{"provider_id" => provider_id}, socket) do
+@@ -78,13 +98,38 @@ defmodule MydiaWeb.MediaLive.Show.FixMatchEvents do
+     picked =
+       Enum.find(socket.assigns.fix_match.results, &(to_string(&1.provider_id) == provider_id))
+ 
+-    if picked && provider_id != current do
++    same_identity? =
++      provider_id == current and
++        socket.assigns.fix_match.provider == FixMatch.provider_for(socket.assigns.media_item)
++
++    if picked && not same_identity? do
+       {:noreply, update_fix_match(socket, step: :confirm, picked: picked)}
+     else
+       {:noreply, socket}
+     end
+   end
+ 
++  def provider(_params, %{assigns: %{fix_match: nil}} = socket), do: {:noreply, socket}
++
++  def provider(%{"provider" => value}, socket) do
++    case TvProvider.parse(value) do
++      nil ->
++        {:noreply, socket}
++
++      provider ->
++        socket =
++          update_fix_match(socket, provider: provider, results: [], step: :search, picked: nil)
++
++        params = socket.assigns.fix_match.form.params
++
++        if String.trim(params["query"] || "") != "" do
++          search(%{"fix_match" => params}, socket)
++        else
++          {:noreply, socket}
++        end
++    end
++  end
++
+   def back(_params, socket),
+     do: {:noreply, update_fix_match(socket, step: :search, picked: nil)}
+ 
+@@ -94,11 +139,14 @@ defmodule MydiaWeb.MediaLive.Show.FixMatchEvents do
+       item = socket.assigns.media_item
+       scope = socket.assigns.current_scope
+       config = socket.assigns[:metadata_config]
++      provider = socket.assigns.fix_match.provider
+ 
+       {:noreply,
+        socket
+        |> update_fix_match(adopting?: true)
+-       |> start_async(:fix_match_adopt, fn -> FixMatch.adopt(scope, item, picked, config) end)}
++       |> start_async(:fix_match_adopt, fn ->
++         FixMatch.adopt(scope, item, picked, config, provider: provider)
++       end)}
+     else
+       {:unauthorized, socket} -> {:noreply, socket}
+       _ -> {:noreply, socket}
+diff --git a/lib/mydia_web/live/media_live/show/fix_match_modal.ex b/lib/mydia_web/live/media_live/show/fix_match_modal.ex
+new file mode 100644
+index 000000000..f94e95c75
+--- /dev/null
++++ b/lib/mydia_web/live/media_live/show/fix_match_modal.ex
+@@ -0,0 +1,164 @@
++defmodule MydiaWeb.MediaLive.Show.FixMatchModal do
++  @moduledoc false
++  use Phoenix.Component
++  import MydiaWeb.CoreComponents
++  import MydiaWeb.SegmentedControl, only: [segmented_control: 1]
++
++  alias Mydia.Media.FixMatch
++  alias MydiaWeb.MediaLive.Show.Helpers
++
++  @doc """
++  Search-then-confirm picker for re-pointing a wrongly matched item at the
++  title it really is. Searches the provider in `fix_match.provider` (the
++  item's own by default; a TV show can toggle to the other one) with the
++  operator's query, since the stored title is the wrong one.
++  """
++  attr :fix_match, :map, required: true
++  attr :media_item, :map, required: true
++
++  def fix_match_modal(assigns) do
++    assigns =
++      assigns
++      |> assign(:provider, assigns.fix_match.provider)
++      |> assign(:current_id, current_id(assigns.fix_match, assigns.media_item))
++
++    ~H"""
++    <div id="fix-match-modal" class="modal modal-open">
++      <div class="modal-box max-w-xl">
++        <h3 class="font-bold text-lg mb-1">Fix match</h3>
++
++        <%= if @fix_match.step == :search do %>
++          <p class="text-sm opacity-75 mb-4">
++            Search {provider_label(@provider)} for the title this really is.
++          </p>
++          <div :if={@media_item.type == "tv_show"} class="mb-3">
++            <.segmented_control
++              id="fix-match-provider-toggle"
++              value={@provider}
++              event="fix_match_provider"
++              param="provider"
++              label="Metadata provider"
++            >
++              <:option value="tvdb" label="TVDB" id="fix-match-provider-tvdb" />
++              <:option value="tmdb" label="TMDB" id="fix-match-provider-tmdb" />
++            </.segmented_control>
++          </div>
++          <.form
++            for={@fix_match.form}
++            id="fix-match-search-form"
++            phx-submit="fix_match_search"
++            class="flex gap-2 mb-4"
++          >
++            <div class="flex-1">
++              <.input field={@fix_match.form[:query]} type="text" placeholder="Title" />
++            </div>
++            <div class="w-24">
++              <.input
++                field={@fix_match.form[:year]}
++                type="text"
++                inputmode="numeric"
++                placeholder="Year"
++              />
++            </div>
++            <.button
++              type="submit"
++              variant="primary"
++              disabled={@fix_match.searching?}
++              aria-label="Search"
++            >
++              <span :if={@fix_match.searching?} class="loading loading-spinner loading-sm"></span>
++              <.icon :if={!@fix_match.searching?} name="hero-magnifying-glass" class="w-4 h-4" />
++            </.button>
++          </.form>
++
++          <div :if={@fix_match.error} class="alert alert-error mb-4">
++            <.icon name="hero-exclamation-triangle" class="w-5 h-5" />
++            <span>{@fix_match.error}</span>
++          </div>
++
++          <div class="space-y-2 max-h-80 overflow-y-auto">
++            <button
++              :for={result <- @fix_match.results}
++              id={"fix-match-candidate-#{result.provider_id}"}
++              type="button"
++              phx-click="fix_match_pick"
++              phx-value-provider_id={to_string(result.provider_id)}
++              disabled={to_string(result.provider_id) == @current_id}
++              class="btn btn-ghost h-auto w-full justify-start normal-case text-left p-3 rounded-lg border-2 border-base-300 hover:border-primary hover:bg-primary/5 transition-colors"
++            >
++              <img
++                :if={result.poster_path}
++                src={Mydia.Metadata.ImageUrl.poster_url(result.poster_path, "w92")}
++                class="w-10 rounded"
++                alt=""
++              />
++              <div class="flex-1">
++                <div class="font-medium">
++                  {result.title}
++                  <span :if={result.year} class="opacity-60 font-normal">({result.year})</span>
++                </div>
++                <div class="text-xs opacity-50 font-mono mt-0.5">
++                  {provider_label(@provider)} ID {to_string(result.provider_id)}
++                </div>
++              </div>
++              <span :if={to_string(result.provider_id) == @current_id} class="badge badge-ghost">
++                Current match
++              </span>
++            </button>
++          </div>
++        <% else %>
++          <p class="mb-3">
++            Change <span class="font-semibold">{@media_item.title}</span>
++            <span :if={@media_item.year} class="opacity-60">({@media_item.year})</span>
++            to <span class="font-semibold">{@fix_match.picked.title}</span>
++            <span :if={@fix_match.picked.year} class="opacity-60">({@fix_match.picked.year})</span>?
++          </p>
++          <%= if @media_item.type == "tv_show" do %>
++            <div class="alert alert-warning text-sm">
++              <.icon name="hero-exclamation-triangle" class="w-5 h-5" />
++              <span>
++                Episodes are rebuilt from {provider_label(@provider)}. Files go back to Import to be matched to the new episodes. Per-episode watch history is reset.
++              </span>
++            </div>
++          <% else %>
++            <p class="text-sm opacity-75">Files stay attached.</p>
++          <% end %>
++        <% end %>
++
++        <div class="modal-action">
++          <button
++            :if={@fix_match.step == :confirm}
++            type="button"
++            phx-click="fix_match_back"
++            class="btn btn-ghost"
++          >
++            Back
++          </button>
++          <button type="button" phx-click="close_fix_match" class="btn btn-ghost">Cancel</button>
++          <button
++            :if={@fix_match.step == :confirm}
++            id="fix-match-confirm"
++            type="button"
++            phx-click="fix_match_confirm"
++            class="btn btn-primary"
++            disabled={@fix_match.adopting?}
++          >
++            <span :if={@fix_match.adopting?} class="loading loading-spinner loading-sm"></span>
++            Confirm
++          </button>
++        </div>
++      </div>
++      <div class="modal-backdrop" phx-click="close_fix_match"></div>
++    </div>
++    """
++  end
++
++  # An id only identifies the current match on the provider it belongs to, so
++  # results from the other provider are never "current".
++  defp current_id(fix_match, media_item) do
++    if fix_match.provider == FixMatch.provider_for(media_item),
++      do: FixMatch.current_provider_id(media_item)
++  end
++
++  defp provider_label(provider), do: Helpers.provider_label(provider)
++end
+diff --git a/lib/mydia_web/live/media_live/show/modals.ex b/lib/mydia_web/live/media_live/show/modals.ex
+index b48377194..6768e81dd 100644
+--- a/lib/mydia_web/live/media_live/show/modals.ex
++++ b/lib/mydia_web/live/media_live/show/modals.ex
+@@ -243,139 +243,6 @@ defmodule MydiaWeb.MediaLive.Show.Modals do
+     """
+   end
+ 
+-  @doc """
+-  Search-then-confirm picker for re-pointing a wrongly matched item at the
+-  title it really is. Searches the item's own provider with the operator's
+-  query, since the stored title is the wrong one.
+-  """
+-  attr :fix_match, :map, required: true
+-  attr :media_item, :map, required: true
+-
+-  def fix_match_modal(assigns) do
+-    assigns =
+-      assigns
+-      |> assign(:provider, Mydia.Media.FixMatch.provider_for(assigns.media_item))
+-      |> assign(:current_id, Mydia.Media.FixMatch.current_provider_id(assigns.media_item))
+-
+-    ~H"""
+-    <div id="fix-match-modal" class="modal modal-open">
+-      <div class="modal-box max-w-xl">
+-        <h3 class="font-bold text-lg mb-1">Fix match</h3>
+-
+-        <%= if @fix_match.step == :search do %>
+-          <p class="text-sm opacity-75 mb-4">
+-            Search {provider_label(@provider)} for the title this really is.
+-          </p>
+-          <.form
+-            for={@fix_match.form}
+-            id="fix-match-search-form"
+-            phx-submit="fix_match_search"
+-            class="flex gap-2 mb-4"
+-          >
+-            <div class="flex-1">
+-              <.input field={@fix_match.form[:query]} type="text" placeholder="Title" />
+-            </div>
+-            <div class="w-24">
+-              <.input
+-                field={@fix_match.form[:year]}
+-                type="text"
+-                inputmode="numeric"
+-                placeholder="Year"
+-              />
+-            </div>
+-            <.button
+-              type="submit"
+-              variant="primary"
+-              disabled={@fix_match.searching?}
+-              aria-label="Search"
+-            >
+-              <span :if={@fix_match.searching?} class="loading loading-spinner loading-sm"></span>
+-              <.icon :if={!@fix_match.searching?} name="hero-magnifying-glass" class="w-4 h-4" />
+-            </.button>
+-          </.form>
+-
+-          <div :if={@fix_match.error} class="alert alert-error mb-4">
+-            <.icon name="hero-exclamation-triangle" class="w-5 h-5" />
+-            <span>{@fix_match.error}</span>
+-          </div>
+-
+-          <div class="space-y-2 max-h-80 overflow-y-auto">
+-            <button
+-              :for={result <- @fix_match.results}
+-              id={"fix-match-candidate-#{result.provider_id}"}
+-              type="button"
+-              phx-click="fix_match_pick"
+-              phx-value-provider_id={to_string(result.provider_id)}
+-              disabled={to_string(result.provider_id) == @current_id}
+-              class="btn btn-ghost h-auto w-full justify-start normal-case text-left p-3 rounded-lg border-2 border-base-300 hover:border-primary hover:bg-primary/5 transition-colors"
+-            >
+-              <img
+-                :if={result.poster_path}
+-                src={Mydia.Metadata.ImageUrl.poster_url(result.poster_path, "w92")}
+-                class="w-10 rounded"
+-                alt=""
+-              />
+-              <div class="flex-1">
+-                <div class="font-medium">
+-                  {result.title}
+-                  <span :if={result.year} class="opacity-60 font-normal">({result.year})</span>
+-                </div>
+-                <div class="text-xs opacity-50 font-mono mt-0.5">
+-                  {provider_label(@provider)} ID {to_string(result.provider_id)}
+-                </div>
+-              </div>
+-              <span :if={to_string(result.provider_id) == @current_id} class="badge badge-ghost">
+-                Current match
+-              </span>
+-            </button>
+-          </div>
+-        <% else %>
+-          <p class="mb-3">
+-            Change <span class="font-semibold">{@media_item.title}</span>
+-            <span :if={@media_item.year} class="opacity-60">({@media_item.year})</span>
+-            to <span class="font-semibold">{@fix_match.picked.title}</span>
+-            <span :if={@fix_match.picked.year} class="opacity-60">({@fix_match.picked.year})</span>?
+-          </p>
+-          <%= if @media_item.type == "tv_show" do %>
+-            <div class="alert alert-warning text-sm">
+-              <.icon name="hero-exclamation-triangle" class="w-5 h-5" />
+-              <span>
+-                Episodes are rebuilt from {provider_label(@provider)}. Files go back to Import to be matched to the new episodes. Per-episode watch history is reset.
+-              </span>
+-            </div>
+-          <% else %>
+-            <p class="text-sm opacity-75">Files stay attached.</p>
+-          <% end %>
+-        <% end %>
+-
+-        <div class="modal-action">
+-          <button
+-            :if={@fix_match.step == :confirm}
+-            type="button"
+-            phx-click="fix_match_back"
+-            class="btn btn-ghost"
+-          >
+-            Back
+-          </button>
+-          <button type="button" phx-click="close_fix_match" class="btn btn-ghost">Cancel</button>
+-          <button
+-            :if={@fix_match.step == :confirm}
+-            id="fix-match-confirm"
+-            type="button"
+-            phx-click="fix_match_confirm"
+-            class="btn btn-primary"
+-            disabled={@fix_match.adopting?}
+-          >
+-            <span :if={@fix_match.adopting?} class="loading loading-spinner loading-sm"></span>
+-            Confirm
+-          </button>
+-        </div>
+-      </div>
+-      <div class="modal-backdrop" phx-click="close_fix_match"></div>
+-    </div>
+-    """
+-  end
+-
+   defp provider_label(provider), do: MydiaWeb.MediaLive.Show.Helpers.provider_label(provider)
+ 
+   @doc """
+diff --git a/priv/repo/migrations/20261011231535_add_metadata_source_pinned_to_media_items.exs b/priv/repo/migrations/20261011231535_add_metadata_source_pinned_to_media_items.exs
+new file mode 100644
+index 000000000..3ba17d752
+--- /dev/null
++++ b/priv/repo/migrations/20261011231535_add_metadata_source_pinned_to_media_items.exs
+@@ -0,0 +1,9 @@
++defmodule Mydia.Repo.Migrations.AddMetadataSourcePinnedToMediaItems do
++  use Ecto.Migration
++
++  def change do
++    alter table(:media_items) do
++      add :metadata_source_pinned, :boolean, null: false, default: false
++    end
++  end
++end
+diff --git a/test/mydia/library/batch_matcher_test.exs b/test/mydia/library/batch_matcher_test.exs
+index 30adc9630..2444d266a 100644
+--- a/test/mydia/library/batch_matcher_test.exs
++++ b/test/mydia/library/batch_matcher_test.exs
+@@ -38,6 +38,12 @@ defmodule Mydia.Library.BatchMatcherTest do
+     Cache.clear()
+     on_exit(fn -> Cache.clear() end)
+ 
++    # A TV title the library's provider does not find is retried on the other
++    # one, so the tests that use TMDB need an (empty) TVDB search behind it.
++    Bypass.stub(bypass, "GET", "/tvdb/search", fn conn ->
++      json(conn, %{"data" => []})
++    end)
++
+     {:ok, bypass: bypass, config: config, counter: counter}
+   end
+ 
+diff --git a/test/mydia/library/candidate_promotion_test.exs b/test/mydia/library/candidate_promotion_test.exs
+index 1eebbeba0..1551e6fa3 100644
+--- a/test/mydia/library/candidate_promotion_test.exs
++++ b/test/mydia/library/candidate_promotion_test.exs
+@@ -714,4 +714,51 @@ defmodule Mydia.Library.CandidatePromotionTest do
+       assert {:error, :queued} = CandidatePromotion.attach(candidate, movie, [])
+     end
+   end
++
++  describe "provider pin on create" do
++    for {library_provider, pinned?} <- [tvdb: true, tmdb: false] do
++      @tag :tmp_dir
++      test "a TMDB match in a #{library_provider} library creates a show with pinned=#{pinned?}",
++           %{tmp_dir: tmp_dir} do
++        library_path =
++          library_path_fixture(%{
++            type: "series",
++            path: tmp_dir,
++            tv_metadata_source: unquote(library_provider)
++          })
++
++        relative_path = "Stub Series/Season 01/Stub.Series.S01E01.mkv"
++        File.mkdir_p!(Path.dirname(Path.join(tmp_dir, relative_path)))
++        File.write!(Path.join(tmp_dir, relative_path), "episode")
++
++        candidate =
++          import_candidate_fixture(%{
++            library_path_id: library_path.id,
++            relative_path: relative_path,
++            media_type: "tv_show",
++            parsed_info: %{"type" => "tv_show", "season" => 1, "episodes" => [1]}
++          })
++
++        match = %{
++          provider_id: to_string(Mydia.MetadataStubProvider.series_tmdb_id()),
++          provider_type: :tmdb,
++          title: Mydia.MetadataStubProvider.tmdb_series_title(),
++          year: nil,
++          match_confidence: 1.0,
++          parsed_info: %{type: :tv_show, season: 1, episodes: [1]}
++        }
++
++        assert {:ok, [file | _]} =
++                 CandidatePromotion.promote_group([candidate], match,
++                   config: stub_config(),
++                   allow_episode_creation: true
++                 )
++
++        episode = Repo.get!(Episode, file.episode_id)
++        item = Repo.get!(MediaItem, episode.media_item_id)
++        assert item.metadata_source == :tmdb
++        assert item.metadata_source_pinned == unquote(pinned?)
++      end
++    end
++  end
+ end
+diff --git a/test/mydia/library/file_ingest_test.exs b/test/mydia/library/file_ingest_test.exs
+index 89ce8840f..c9003fe71 100644
+--- a/test/mydia/library/file_ingest_test.exs
++++ b/test/mydia/library/file_ingest_test.exs
+@@ -2,6 +2,7 @@ defmodule Mydia.Library.FileIngestTest do
+   use Mydia.DataCase, async: false
+ 
+   import Mydia.MediaFixtures
++  import Mydia.MetadataStub
+   import Mydia.SettingsFixtures
+ 
+   alias Mydia.Library.{FileIngest, ImportCandidate, MediaFile}
+@@ -215,4 +216,67 @@ defmodule Mydia.Library.FileIngestTest do
+     assert %ImportCandidate{attempts: 1} = Repo.get!(ImportCandidate, candidate.id)
+     refute Repo.exists?(MediaFile)
+   end
++
++  describe "cross-provider TV matches" do
++    setup :setup_metadata_stub
++
++    defp tv_candidate(library_provider) do
++      library_path =
++        library_path_fixture(%{type: "series", tv_metadata_source: library_provider})
++
++      import_candidate_fixture(%{
++        library_path_id: library_path.id,
++        media_type: "tv_show",
++        parsed_info: %{"type" => "tv_show", "season" => 1, "episodes" => [1]}
++      })
++    end
++
++    defp tv_match(provider_type, extra \\ %{}) do
++      Map.merge(
++        %{
++          provider_id: "880101",
++          provider_type: provider_type,
++          title: "Harbor Lights",
++          year: 2021,
++          match_confidence: 1.0,
++          parsed_info: %{type: :tv_show, season: 1, episodes: [1]}
++        },
++        extra
++      )
++    end
++
++    test "a confident TMDB match in a TVDB library stays a candidate" do
++      candidate = tv_candidate(:tvdb)
++
++      assert {:candidate, %ImportCandidate{}} =
++               FileIngest.ingest(candidate, tv_match(:tmdb), policy: :unattended)
++
++      refute Repo.exists?(MediaFile)
++    end
++
++    test "the guard does not touch a same-provider match" do
++      candidate = tv_candidate(:tmdb)
++
++      match =
++        tv_match(:tmdb, %{
++          provider_id: to_string(Mydia.MetadataStubProvider.series_tmdb_id()),
++          title: Mydia.MetadataStubProvider.tmdb_series_title()
++        })
++
++      assert {:promoted, _} = FileIngest.ingest(candidate, match, policy: :unattended)
++    end
++
++    test "a cross-provider match from the local database is not held for review" do
++      candidate = tv_candidate(:tvdb)
++
++      match =
++        tv_match(:tmdb, %{
++          provider_id: to_string(Mydia.MetadataStubProvider.series_tmdb_id()),
++          title: Mydia.MetadataStubProvider.tmdb_series_title(),
++          from_local_db: true
++        })
++
++      assert {:promoted, _} = FileIngest.ingest(candidate, match, policy: :unattended)
++    end
++  end
+ end
+diff --git a/test/mydia/library/metadata_matcher_fallback_test.exs b/test/mydia/library/metadata_matcher_fallback_test.exs
+new file mode 100644
+index 000000000..87a7e5874
+--- /dev/null
++++ b/test/mydia/library/metadata_matcher_fallback_test.exs
+@@ -0,0 +1,82 @@
++defmodule Mydia.Library.MetadataMatcherFallbackTest do
++  @moduledoc """
++  A show the library's provider does not carry is searched on the other one.
++  async: false because Mydia.Metadata.Cache is a global ETS table.
++  """
++  use Mydia.DataCase, async: false
++
++  alias Mydia.Library.MetadataMatcher
++  alias Mydia.Metadata.Cache
++
++  @tvdb_search "/tvdb/search"
++  @tmdb_tv_search "/tmdb/tv/search"
++
++  setup do
++    bypass = Bypass.open()
++
++    config = %{
++      type: :metadata_relay,
++      base_url: "http://localhost:#{bypass.port}",
++      options: %{language: "en-US", include_adult: false, timeout: 2_000}
++    }
++
++    Cache.clear()
++    on_exit(fn -> Cache.clear() end)
++    {:ok, bypass: bypass, config: config}
++  end
++
++  defp stub(bypass, path, status \\ 200, body) do
++    Bypass.stub(bypass, "GET", path, fn conn ->
++      conn
++      |> Plug.Conn.put_resp_content_type("application/json")
++      |> Plug.Conn.resp(status, Jason.encode!(body))
++    end)
++  end
++
++  defp tv(title, year),
++    do: %{type: :tv_show, title: title, year: year, season: 1, episodes: [1], confidence: 1.0}
++
++  @tmdb_hit %{"id" => 880_001, "name" => "Saltmarsh Kitchen", "first_air_date" => "2021-04-02"}
++
++  test "TVDB empty, TMDB hit: a TMDB match", %{bypass: bypass, config: config} do
++    stub(bypass, @tvdb_search, %{"data" => []})
++    stub(bypass, @tmdb_tv_search, %{"results" => [@tmdb_hit]})
++
++    assert {:ok, match} =
++             MetadataMatcher.match_tv_show(tv("Saltmarsh Kitchen", 2021), config, provider: :tvdb)
++
++    assert match.provider_type == :tmdb
++    assert match.provider_id == "880001"
++  end
++
++  test "a TVDB error is returned without trying TMDB", %{bypass: bypass, config: config} do
++    # 400 rather than 500: the relay client retries 5xx with backoff.
++    stub(bypass, @tvdb_search, 400, %{"error" => "boom"})
++
++    Bypass.stub(bypass, "GET", @tmdb_tv_search, fn _conn ->
++      flunk("TMDB must not be searched when TVDB errored")
++    end)
++
++    assert {:error, _} =
++             MetadataMatcher.match_tv_show(tv("Saltmarsh Kitchen", 2021), config, provider: :tvdb)
++  end
++
++  test "no provider given: no fallback", %{bypass: bypass, config: config} do
++    stub(bypass, @tvdb_search, %{"data" => []})
++
++    Bypass.stub(bypass, "GET", @tmdb_tv_search, fn _conn ->
++      flunk("TMDB must not be searched without a library provider")
++    end)
++
++    assert {:error, :no_matches_found} =
++             MetadataMatcher.match_tv_show(tv("Saltmarsh Kitchen", 2021), config)
++  end
++
++  test "both empty: still no match", %{bypass: bypass, config: config} do
++    stub(bypass, @tvdb_search, %{"data" => []})
++    stub(bypass, @tmdb_tv_search, %{"results" => []})
++
++    assert {:error, :no_matches_found} =
++             MetadataMatcher.match_tv_show(tv("Saltmarsh Kitchen", 2021), config, provider: :tvdb)
++  end
++end
+diff --git a/test/mydia/media/fix_match_test.exs b/test/mydia/media/fix_match_test.exs
+index ec934460e..3beb28102 100644
+--- a/test/mydia/media/fix_match_test.exs
++++ b/test/mydia/media/fix_match_test.exs
+@@ -4,11 +4,14 @@ defmodule Mydia.Media.FixMatchTest do
+   import Mydia.AccountsFixtures
+   import Mydia.MediaFixtures
+   import Mydia.SettingsFixtures
++  import Mydia.MetadataStub
+   import Mydia.MetadataCacheHelpers, only: [unique_provider_id: 0, warm_remote_signals: 3]
+ 
+   alias Mydia.Accounts.Scope
+   alias Mydia.Media.FixMatch
+   alias Mydia.Media.RemoteSignals
++  alias Mydia.Metadata.Structs.SearchResult
++  alias Mydia.MetadataStubProvider
+ 
+   setup do
+     bypass = Bypass.open()
+@@ -327,4 +330,51 @@ defmodule Mydia.Media.FixMatchTest do
+              )
+     end
+   end
++
++  describe "provider override" do
++    setup :setup_metadata_stub
++
++    test "adopt with provider: :tmdb switches a TVDB-library show to TMDB and pins it" do
++      library = library_path_fixture(%{type: "series", tv_metadata_source: :tvdb})
++
++      item =
++        media_item_fixture(%{
++          type: "tv_show",
++          title: "Quiet Orchard",
++          tvdb_id: 70_201,
++          metadata_source: :tvdb
++        })
++
++      episode = episode_fixture(%{media_item_id: item.id})
++      media_file_fixture(%{episode_id: episode.id, library_path_id: library.id})
++      item = Mydia.Repo.get!(Mydia.Media.MediaItem, item.id)
++
++      candidate = %SearchResult{
++        provider: :tmdb,
++        provider_id: MetadataStubProvider.series_tmdb_id(),
++        title: MetadataStubProvider.tmdb_series_title(),
++        media_type: :tv_show
++      }
++
++      assert {:ok, updated} =
++               FixMatch.adopt(Scope.unrestricted(), item, candidate, nil, provider: :tmdb)
++
++      assert updated.metadata_source == :tmdb
++      assert updated.metadata_source_pinned
++    end
++
++    test "a movie ignores the provider override" do
++      movie = media_item_fixture(%{type: "movie", title: "Paper Kite", tmdb_id: 70_202})
++
++      candidate = %SearchResult{
++        provider: :tvdb,
++        provider_id: 1,
++        title: "x",
++        media_type: :movie
++      }
++
++      assert {:error, {:provider_mismatch, :tvdb, :tmdb}} =
++               FixMatch.adopt(Scope.unrestricted(), movie, candidate, nil, provider: :tvdb)
++    end
++  end
+ end
+diff --git a/test/mydia/media/provider_pin_test.exs b/test/mydia/media/provider_pin_test.exs
+new file mode 100644
+index 000000000..b9b2ea74d
+--- /dev/null
++++ b/test/mydia/media/provider_pin_test.exs
+@@ -0,0 +1,99 @@
++defmodule Mydia.Media.ProviderPinTest do
++  use Mydia.DataCase, async: false
++
++  import Mydia.MediaFixtures
++  import Mydia.SettingsFixtures
++  import Mydia.MetadataStub
++
++  alias Mydia.Accounts.Scope
++  alias Mydia.Media.{FixMatch, MediaItem, ProviderSwitch}
++  alias Mydia.MetadataStubProvider
++  alias Mydia.Repo
++
++  setup :setup_metadata_stub
++
++  # A show whose files live in a library with the given TV provider.
++  defp show_in_library(library_provider, attrs) do
++    library = library_path_fixture(%{type: "series", tv_metadata_source: library_provider})
++    item = media_item_fixture(Map.merge(%{type: "tv_show", title: "Lantern Harbor"}, attrs))
++    episode = episode_fixture(%{media_item_id: item.id})
++    media_file_fixture(%{episode_id: episode.id, library_path_id: library.id})
++    Repo.get!(MediaItem, item.id)
++  end
++
++  describe "pin_for/2" do
++    test "pins only when the provider differs from a known library provider" do
++      assert ProviderSwitch.pin_for(:tmdb, :tvdb)
++      assert ProviderSwitch.pin_for(:tvdb, :tmdb)
++      refute ProviderSwitch.pin_for(:tvdb, :tvdb)
++      refute ProviderSwitch.pin_for(:tmdb, :tmdb)
++      refute ProviderSwitch.pin_for(:tmdb, nil)
++    end
++  end
++
++  describe "provider_refresh_decision/1" do
++    test "an unpinned TMDB show in a TVDB library is re-identified" do
++      item = show_in_library(:tvdb, %{tmdb_id: 70_101, metadata_source: :tmdb})
++      assert ProviderSwitch.provider_refresh_decision(item) == {:reidentify, :tvdb}
++    end
++
++    test "a pinned TMDB show in a TVDB library is re-fetched in place" do
++      item =
++        show_in_library(:tvdb, %{
++          tmdb_id: 70_102,
++          metadata_source: :tmdb,
++          metadata_source_pinned: true
++        })
++
++      assert ProviderSwitch.provider_refresh_decision(item) == :refetch
++    end
++  end
++
++  describe "FixMatch.provider_for/1" do
++    test "a pinned show searches its own provider, not the library's" do
++      item =
++        show_in_library(:tvdb, %{
++          tmdb_id: 70_103,
++          metadata_source: :tmdb,
++          metadata_source_pinned: true
++        })
++
++      assert FixMatch.provider_for(item) == :tmdb
++    end
++
++    test "an unpinned show searches the library's provider" do
++      item = show_in_library(:tvdb, %{tmdb_id: 70_104, metadata_source: :tmdb})
++      assert FixMatch.provider_for(item) == :tvdb
++    end
++  end
++
++  describe "adopt_provider_switch/5 writes the pin" do
++    test "switching onto the non-library provider pins the show" do
++      item = show_in_library(:tvdb, %{tvdb_id: 70_105, metadata_source: :tvdb})
++      candidate = %{provider_id: MetadataStubProvider.series_tmdb_id(), provider: :tmdb}
++
++      assert {:ok, updated} =
++               ProviderSwitch.adopt_provider_switch(Scope.system(), item, candidate, :tmdb)
++
++      assert updated.metadata_source == :tmdb
++      assert updated.metadata_source_pinned
++    end
++
++    test "switching back onto the library provider clears the pin" do
++      item =
++        show_in_library(:tvdb, %{
++          tmdb_id: 70_106,
++          metadata_source: :tmdb,
++          metadata_source_pinned: true
++        })
++
++      candidate = %{provider_id: MetadataStubProvider.series_tvdb_id(), provider: :tvdb}
++
++      assert {:ok, updated} =
++               ProviderSwitch.adopt_provider_switch(Scope.system(), item, candidate, :tvdb)
++
++      assert updated.metadata_source == :tvdb
++      refute updated.metadata_source_pinned
++    end
++  end
++end
+diff --git a/test/mydia_web/live/import_media_provider_toggle_test.exs b/test/mydia_web/live/import_media_provider_toggle_test.exs
+new file mode 100644
+index 000000000..ef7132f92
+--- /dev/null
++++ b/test/mydia_web/live/import_media_provider_toggle_test.exs
+@@ -0,0 +1,80 @@
++defmodule MydiaWeb.ImportMediaProviderToggleTest do
++  use MydiaWeb.ConnCase, async: false
++
++  import Phoenix.LiveViewTest
++  import Mydia.AccountsFixtures
++  import Mydia.MediaFixtures
++  import Mydia.MetadataStub
++  import Mydia.SettingsFixtures
++
++  alias Mydia.ImportCandidates
++  alias Mydia.Library.ImportCandidateGroup
++  alias Mydia.MetadataStubProvider
++
++  setup :setup_metadata_stub
++
++  setup %{conn: conn} do
++    user = user_fixture()
++    {:ok, conn: log_in_user(conn, user), user: user}
++  end
++
++  defp seed_group(lp, anchor_key, attrs) do
++    import_candidate_fixture(
++      Map.merge(
++        %{
++          library_path_id: lp.id,
++          anchor_key: anchor_key,
++          relative_path: "#{anchor_key}/file-1.mkv"
++        },
++        attrs
++      )
++    )
++  end
++
++  defp mount_import(conn, lp), do: live(conn, ~p"/import?library=#{lp.id}")
++
++  defp open_match_search(view, lp, anchor_key) do
++    group = ImportCandidates.get_group(lp.id, anchor_key)
++
++    view
++    |> element("#change-match-#{ImportCandidateGroup.dom_id(group)}")
++    |> render_click()
++
++    render_async(view)
++  end
++
++  test "a movies library's match modal has no provider toggle", %{conn: conn} do
++    lp = library_path_fixture(%{type: "movies"})
++
++    seed_group(lp, "Harbor Lights", %{provider_id: nil, confidence: nil, media_type: "movie"})
++
++    {:ok, view, _html} = mount_import(conn, lp)
++    open_match_search(view, lp, "Harbor Lights")
++
++    assert has_element?(view, "#match-search-form")
++    refute has_element?(view, "#match-provider-toggle")
++  end
++
++  test "the toggle searches TMDB and the picked result is stamped TMDB", %{conn: conn} do
++    lp = library_path_fixture(%{type: "series", tv_metadata_source: :tvdb})
++
++    seed_group(lp, "Harbor Lights", %{provider_id: nil, confidence: nil, media_type: "tv_show"})
++
++    {:ok, view, _html} = mount_import(conn, lp)
++    open_match_search(view, lp, "Harbor Lights")
++
++    assert has_element?(view, "#match-provider-toggle")
++    assert has_element?(view, "#match-provider-tvdb[aria-pressed=true]")
++
++    view |> element("#match-provider-tmdb") |> render_click()
++
++    tmdb_id = MetadataStubProvider.series_tmdb_id()
++    assert render_async(view) =~ "match-result-#{tmdb_id}-tmdb"
++
++    view |> element("#match-result-#{tmdb_id}-tmdb") |> render_click()
++
++    group = ImportCandidates.get_group(lp.id, "Harbor Lights")
++    assert group.provider_type == "tmdb"
++    assert has_element?(view, "#group-provider-badge-#{ImportCandidateGroup.dom_id(group)}")
++  end
++end
+diff --git a/test/mydia_web/live/media_live/fix_match_test.exs b/test/mydia_web/live/media_live/fix_match_test.exs
+index 3fafc31cb..611a64ebb 100644
+--- a/test/mydia_web/live/media_live/fix_match_test.exs
++++ b/test/mydia_web/live/media_live/fix_match_test.exs
+@@ -3,6 +3,9 @@ defmodule MydiaWeb.MediaLive.FixMatchTest do
+ 
+   import Phoenix.LiveViewTest
+   import Mydia.MediaFixtures
++  import Mydia.SettingsFixtures
++  import Mydia.MetadataStub
++  import Mydia.MetadataCacheHelpers, only: [warm_recommendations_cache: 3]
+ 
+   test "opens the fix match search for an operator who may delete media", %{conn: conn} do
+     {conn, _user} = register_and_log_in_user(conn)
+@@ -24,4 +27,114 @@ defmodule MydiaWeb.MediaLive.FixMatchTest do
+ 
+     refute has_element?(view, "#fix-match-modal")
+   end
++
++  describe "TV provider toggle" do
++    setup :setup_metadata_stub
++
++    defp show_in_tvdb_library(attrs) do
++      library = library_path_fixture(%{type: "series", tv_metadata_source: :tvdb})
++      item = media_item_fixture(Map.merge(%{type: "tv_show", title: "Lantern Harbor"}, attrs))
++      episode = episode_fixture(%{media_item_id: item.id, season_number: 1, episode_number: 1})
++      media_file_fixture(%{episode_id: episode.id, library_path_id: library.id})
++      item
++    end
++
++    test "a show offers the toggle, a movie does not", %{conn: conn} do
++      {conn, _user} = register_and_log_in_user(conn)
++      show = show_in_tvdb_library(%{metadata_source: :tvdb})
++
++      {:ok, view, _html} = live(conn, ~p"/media/#{show.id}")
++      view |> element("#fix-match-button") |> render_click()
++      assert has_element?(view, "#fix-match-provider-toggle")
++      assert has_element?(view, "#fix-match-provider-tvdb[aria-pressed=true]")
++
++      movie = media_item_fixture(%{type: "movie", title: "Paper Kite", year: 2001})
++      {:ok, view, _html} = live(conn, ~p"/media/#{movie.id}")
++      view |> element("#fix-match-button") |> render_click()
++      refute has_element?(view, "#fix-match-provider-toggle")
++    end
++
++    test "picking a TMDB result switches and pins the show", %{conn: conn} do
++      {conn, _user} = register_and_log_in_user(conn)
++      show = show_in_tvdb_library(%{metadata_source: :tvdb})
++
++      {:ok, view, _html} = live(conn, ~p"/media/#{show.id}")
++      view |> element("#fix-match-button") |> render_click()
++      view |> element("#fix-match-provider-tmdb") |> render_click()
++
++      view
++      |> form("#fix-match-search-form", fix_match: %{query: "Lantern Harbor"})
++      |> render_submit()
++
++      render_async(view)
++      tmdb_id = Mydia.MetadataStubProvider.series_tmdb_id()
++      warm_recommendations_cache(tmdb_id, :tv_show, [])
++      render_click(view, "fix_match_pick", %{"provider_id" => to_string(tmdb_id)})
++      render_click(view, "fix_match_confirm", %{})
++      assert_redirect(view, ~p"/media/#{show.id}", 2000)
++
++      item = Mydia.Repo.get!(Mydia.Media.MediaItem, show.id)
++      assert item.metadata_source == :tmdb
++      assert item.metadata_source_pinned
++
++      {:ok, view, _html} = live(conn, ~p"/media/#{show.id}")
++      assert has_element?(view, "#metadata-source-pinned-badge")
++    end
++
++    # The stub catalog has a TVDB series (series_tvdb_id) and a TMDB series
++    # (series_tmdb_id). Storing the show's TMDB id as the TVDB series' number
++    # makes a TVDB result share its numeric id with the show's current match.
++    defp tmdb_show_with_tmdb_id(tmdb_id) do
++      library = library_path_fixture(%{type: "series", tv_metadata_source: :tmdb})
++
++      item =
++        media_item_fixture(%{
++          type: "tv_show",
++          title: "Lantern Harbor",
++          tmdb_id: tmdb_id,
++          metadata_source: :tmdb
++        })
++
++      episode = episode_fixture(%{media_item_id: item.id, season_number: 1, episode_number: 1})
++      media_file_fixture(%{episode_id: episode.id, library_path_id: library.id})
++      warm_recommendations_cache(tmdb_id, :tv_show, [])
++      item
++    end
++
++    defp search_fix_match(conn, show, provider) do
++      {:ok, view, _html} = live(conn, ~p"/media/#{show.id}")
++      view |> element("#fix-match-button") |> render_click()
++      view |> element("#fix-match-provider-#{provider}") |> render_click()
++
++      view
++      |> form("#fix-match-search-form", fix_match: %{query: "Lantern Harbor"})
++      |> render_submit()
++
++      render_async(view)
++      view
++    end
++
++    test "a result on the other provider sharing the current id stays pickable", %{conn: conn} do
++      {conn, _user} = register_and_log_in_user(conn)
++      shared_id = Mydia.MetadataStubProvider.series_tvdb_id()
++      show = tmdb_show_with_tmdb_id(shared_id)
++
++      view = search_fix_match(conn, show, "tvdb")
++
++      assert has_element?(view, "#fix-match-candidate-#{shared_id}")
++      refute has_element?(view, "#fix-match-candidate-#{shared_id}[disabled]")
++      refute has_element?(view, "#fix-match-candidate-#{shared_id}", "Current match")
++    end
++
++    test "the matching result on the current provider is disabled", %{conn: conn} do
++      {conn, _user} = register_and_log_in_user(conn)
++      current = Mydia.MetadataStubProvider.series_tmdb_id()
++      show = tmdb_show_with_tmdb_id(current)
++
++      view = search_fix_match(conn, show, "tmdb")
++
++      assert has_element?(view, "#fix-match-candidate-#{current}[disabled]")
++      assert has_element?(view, "#fix-match-candidate-#{current}", "Current match")
++    end
++  end
+ end
+diff --git a/test/mydia_web/live/media_live/show/fix_match_events_test.exs b/test/mydia_web/live/media_live/show/fix_match_events_test.exs
+index e93941499..441f7eb8b 100644
+--- a/test/mydia_web/live/media_live/show/fix_match_events_test.exs
++++ b/test/mydia_web/live/media_live/show/fix_match_events_test.exs
+@@ -38,18 +38,30 @@ defmodule MydiaWeb.MediaLive.Show.FixMatchEventsTest do
+     {:noreply, s} = FixMatchEvents.open(%{}, socket(item))
+ 
+     {:noreply, s} =
+-      FixMatchEvents.handle_search_async({:ok, {:ok, [result(42, "Velvet Comet")]}}, s)
++      FixMatchEvents.handle_search_async({:ok, {:tmdb, {:ok, [result(42, "Velvet Comet")]}}}, s)
+ 
+     assert %{step: :search, searching?: false, results: [%{provider_id: "42"}]} =
+              s.assigns.fix_match
+   end
+ 
++  test "a result tagged with the other provider is dropped", _ do
++    item = media_item_fixture(%{type: "movie", title: "Wrong Pick", tmdb_id: 46})
++    {:noreply, s} = FixMatchEvents.open(%{}, socket(item))
++    before = s.assigns.fix_match
++
++    {:noreply, s} =
++      FixMatchEvents.handle_search_async({:ok, {:tvdb, {:ok, [result(46, "Velvet Comet")]}}}, s)
++
++    assert %{results: [], searching?: searching?} = s.assigns.fix_match
++    assert searching? == before.searching?
++  end
++
+   test "the current match cannot be picked", _ do
+     item = media_item_fixture(%{type: "movie", title: "Wrong Pick", tmdb_id: 43})
+     {:noreply, s} = FixMatchEvents.open(%{}, socket(item))
+ 
+     {:noreply, s} =
+-      FixMatchEvents.handle_search_async({:ok, {:ok, [result(43, "Wrong Pick")]}}, s)
++      FixMatchEvents.handle_search_async({:ok, {:tmdb, {:ok, [result(43, "Wrong Pick")]}}}, s)
+ 
+     {:noreply, s} = FixMatchEvents.pick(%{"provider_id" => "43"}, s)
+     assert s.assigns.fix_match.step == :search
+@@ -60,7 +72,7 @@ defmodule MydiaWeb.MediaLive.Show.FixMatchEventsTest do
+     {:noreply, s} = FixMatchEvents.open(%{}, socket(item))
+ 
+     {:noreply, s} =
+-      FixMatchEvents.handle_search_async({:ok, {:ok, [result(45, "Velvet Comet")]}}, s)
++      FixMatchEvents.handle_search_async({:ok, {:tmdb, {:ok, [result(45, "Velvet Comet")]}}}, s)
+ 
+     {:noreply, s} = FixMatchEvents.pick(%{"provider_id" => "45"}, s)
+     assert %{step: :confirm, picked: %{provider_id: "45"}} = s.assigns.fix_match
+@@ -73,13 +85,13 @@ defmodule MydiaWeb.MediaLive.Show.FixMatchEventsTest do
+ 
+     test "a late search result is ignored", %{socket: s} do
+       {:noreply, s} =
+-        FixMatchEvents.handle_search_async({:ok, {:ok, [result(51, "Velvet Comet")]}}, s)
++        FixMatchEvents.handle_search_async({:ok, {:tmdb, {:ok, [result(51, "Velvet Comet")]}}}, s)
+ 
+       assert s.assigns.fix_match == nil
+     end
+ 
+     test "a late search error is ignored", %{socket: s} do
+-      {:noreply, s} = FixMatchEvents.handle_search_async({:ok, {:error, :boom}}, s)
++      {:noreply, s} = FixMatchEvents.handle_search_async({:ok, {:tmdb, {:error, :boom}}}, s)
+       assert s.assigns.fix_match == nil
+     end
+ 
+@@ -138,7 +150,7 @@ defmodule MydiaWeb.MediaLive.Show.FixMatchEventsTest do
+     {:noreply, s} = FixMatchEvents.open(%{}, socket(item))
+ 
+     {:noreply, s} =
+-      FixMatchEvents.handle_search_async({:ok, {:ok, [result(54, "Velvet Comet")]}}, s)
++      FixMatchEvents.handle_search_async({:ok, {:tmdb, {:ok, [result(54, "Velvet Comet")]}}}, s)
+ 
+     {:noreply, s} = FixMatchEvents.pick(%{"provider_id" => "54"}, s)
+     s = %{s | transport_pid: self()}
+diff --git a/test/support/metadata_stub_provider.ex b/test/support/metadata_stub_provider.ex
+index a11c89bf3..0ebe5dc16 100644
+--- a/test/support/metadata_stub_provider.ex
++++ b/test/support/metadata_stub_provider.ex
+@@ -198,8 +198,9 @@ defmodule Mydia.MetadataStubProvider do
+     if :persistent_term.get(@search_failure_key, false) do
+       {:error, Error.connection_failed("stubbed search failure")}
+     else
+-      case Keyword.get(opts, :media_type) do
+-        :tv_show -> {:ok, [series_search_result()]}
++      case {Keyword.get(opts, :media_type), Keyword.get(opts, :provider)} do
++        {:tv_show, :tmdb} -> {:ok, [tmdb_series_search_result()]}
++        {:tv_show, _} -> {:ok, [series_search_result()]}
+         _ -> {:ok, [movie_search_result()]}
+       end
+     end
+@@ -346,6 +347,24 @@ defmodule Mydia.MetadataStubProvider do
+     }
+   end
+ 
++  # The TMDB counterpart of `series_search_result/0`, returned when a TV search
++  # is scoped to the TMDB provider.
++  defp tmdb_series_search_result do
++    %SearchResult{
++      provider_id: to_string(@series_tmdb_id),
++      provider: :tmdb,
++      media_type: :tv_show,
++      id: @series_tmdb_id,
++      title: @tmdb_series_title,
++      name: @tmdb_series_title,
++      original_name: @tmdb_series_title,
++      first_air_date: "2016-05-04",
++      overview: "A TMDB-sourced stub series search result.",
++      poster_path: "/stub-tmdb-series-poster.jpg",
++      vote_average: 7.5
++    }
++  end
++
+   # A TMDB-sourced series, distinct from the TVDB-sourced @series_tvdb_id
+   # catalog entry. Import lists carry TMDB ids regardless of media type, so a
+   # TV import list needs a TMDB-sourced series to resolve against -- there was

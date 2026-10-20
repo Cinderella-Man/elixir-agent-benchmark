@@ -1,0 +1,331 @@
+diff --git a/README.md b/README.md
+index 0b0a10cb5..143623ce1 100644
+--- a/README.md
++++ b/README.md
+@@ -56,6 +56,7 @@ If it doesn't work for your use case, please make a feature request! You can als
+ - Reliable hands-off operation
+ - Can pass cookies to YouTube to download your private playlists ([docs](https://github.com/kieraneglin/pinchflat/wiki/YouTube-Cookies))
+ - Sponsorblock integration
++- \[Advanced\] allows custom `yt-dlp` options ([docs](https://github.com/kieraneglin/pinchflat/wiki/%5BAdvanced%5D-Custom-yt%E2%80%90dlp-options))
+ 
+ ## Screenshots
+ 
+diff --git a/lib/pinchflat/boot/pre_job_startup_tasks.ex b/lib/pinchflat/boot/pre_job_startup_tasks.ex
+index e36d1ca91..9f6bcf7c8 100644
+--- a/lib/pinchflat/boot/pre_job_startup_tasks.ex
++++ b/lib/pinchflat/boot/pre_job_startup_tasks.ex
+@@ -32,7 +32,7 @@ defmodule Pinchflat.Boot.PreJobStartupTasks do
+   @impl true
+   def init(state) do
+     reset_executing_jobs()
+-    create_blank_cookie_file()
++    create_blank_yt_dlp_files()
+     apply_default_settings()
+ 
+     {:ok, state}
+@@ -50,15 +50,19 @@ defmodule Pinchflat.Boot.PreJobStartupTasks do
+     Logger.info("Reset #{count} executing jobs")
+   end
+ 
+-  defp create_blank_cookie_file do
++  defp create_blank_yt_dlp_files do
++    files = ["cookies.txt", "yt-dlp-configs/base-config.txt"]
+     base_dir = Application.get_env(:pinchflat, :extras_directory)
+-    filepath = Path.join(base_dir, "cookies.txt")
+ 
+-    if !File.exists?(filepath) do
+-      Logger.info("yt-dlp cookie file does not exist - creating it")
++    Enum.each(files, fn file ->
++      filepath = Path.join(base_dir, file)
+ 
+-      FilesystemUtils.write_p!(filepath, "")
+-    end
++      if !File.exists?(filepath) do
++        Logger.info("Creating blank file: #{filepath}")
++
++        FilesystemUtils.write_p!(filepath, "")
++      end
++    end)
+   end
+ 
+   defp apply_default_settings do
+diff --git a/lib/pinchflat/downloading/download_option_builder.ex b/lib/pinchflat/downloading/download_option_builder.ex
+index 479e643c3..9e3a5c406 100644
+--- a/lib/pinchflat/downloading/download_option_builder.ex
++++ b/lib/pinchflat/downloading/download_option_builder.ex
+@@ -10,8 +10,7 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+   @doc """
+   Builds the options for yt-dlp to download media based on the given media's profile.
+ 
+-  IDEA: consider adding the ability to pass in a second argument to override
+-        these options
++  Returns {:ok, [Keyword.t()]}
+   """
+   def build(%MediaItem{} = media_item_with_preloads) do
+     media_profile = media_item_with_preloads.source.media_profile
+@@ -23,7 +22,8 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+         metadata_options(media_profile) ++
+         quality_options(media_profile) ++
+         sponsorblock_options(media_profile) ++
+-        output_options(media_item_with_preloads)
++        output_options(media_item_with_preloads) ++
++        config_file_options(media_item_with_preloads)
+ 
+     {:ok, built_options}
+   end
+@@ -128,6 +128,35 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+     end
+   end
+ 
++  # This is put here instead of the CommandRunner module because it should only
++  # be applied to downloading - if it were in CommandRunner it would apply to
++  # all yt-dlp commands (like indexing)
++  defp config_file_options(media_item) do
++    base_dir = Path.join(Application.get_env(:pinchflat, :extras_directory), "yt-dlp-configs")
++    # Ordered by priority - the first file has the highest priority
++    filenames = [
++      "media-item-#{media_item.id}-config.txt",
++      "source-#{media_item.source_id}-config.txt",
++      "media-profile-#{media_item.source.media_profile_id}-config.txt",
++      "base-config.txt"
++    ]
++
++    config_filepaths =
++      Enum.reduce(filenames, [], fn filename, acc ->
++        filepath = Path.join(base_dir, filename)
++
++        case File.read(filepath) do
++          {:ok, file_data} ->
++            if String.trim(file_data) != "", do: [filepath | acc], else: acc
++
++          {:error, _} ->
++            acc
++        end
++      end)
++
++    Enum.map(config_filepaths, fn filepath -> {:config_locations, filepath} end)
++  end
++
+   defp output_options(media_item_with_preloads) do
+     [
+       output: build_output_path_for(media_item_with_preloads.source)
+diff --git a/lib/pinchflat/yt_dlp/command_runner.ex b/lib/pinchflat/yt_dlp/command_runner.ex
+index 00dfebf61..ed13d338d 100644
+--- a/lib/pinchflat/yt_dlp/command_runner.ex
++++ b/lib/pinchflat/yt_dlp/command_runner.ex
+@@ -27,13 +27,14 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+   def run(url, command_opts, output_template, addl_opts \\ []) do
+     # This approach lets us mock the command for testing
+     command = backend_executable()
+-    # These must stay in exactly this order, hence why I'm giving it its own variable.
+-    # Also, can't use RAM file since yt-dlp needs a concrete filepath.
++
+     output_filepath = generate_output_filepath(addl_opts)
+     print_to_file_opts = [{:print_to_file, output_template}, output_filepath]
+-    cookie_opts = build_cookie_options()
+-    formatted_command_opts = [url] ++ CliUtils.parse_options(command_opts ++ print_to_file_opts ++ cookie_opts)
++    external_file_opts = build_external_file_options()
++    # These must stay in exactly this order, hence why I'm giving it its own variable.
++    all_opts = command_opts ++ print_to_file_opts ++ external_file_opts
+ 
++    formatted_command_opts = [url] ++ CliUtils.parse_options(all_opts)
+     Logger.info("[yt-dlp] called with: #{Enum.join(formatted_command_opts, " ")}")
+ 
+     case System.cmd(command, formatted_command_opts, stderr_to_stdout: true) do
+@@ -73,17 +74,25 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+     end
+   end
+ 
+-  defp build_cookie_options do
++  defp build_external_file_options do
+     base_dir = Application.get_env(:pinchflat, :extras_directory)
+-    cookie_file = Path.join(base_dir, "cookies.txt")
+-
+-    case File.read(cookie_file) do
+-      {:ok, cookie_data} ->
+-        if String.trim(cookie_data) != "", do: [cookies: cookie_file], else: []
+-
+-      {:error, _} ->
+-        []
+-    end
++    filename_options_map = %{cookies: "cookies.txt"}
++
++    Enum.reduce(filename_options_map, [], fn {opt_name, filename}, acc ->
++      filepath = Path.join(base_dir, filename)
++
++      case File.read(filepath) do
++        {:ok, file_data} ->
++          if String.trim(file_data) != "" do
++            [{opt_name, filepath} | acc]
++          else
++            acc
++          end
++
++        {:error, _} ->
++          acc
++      end
++    end)
+   end
+ 
+   defp backend_executable do
+diff --git a/test/pinchflat/boot/pre_job_startup_tasks_test.exs b/test/pinchflat/boot/pre_job_startup_tasks_test.exs
+index 8fd81bb50..66ecfce52 100644
+--- a/test/pinchflat/boot/pre_job_startup_tasks_test.exs
++++ b/test/pinchflat/boot/pre_job_startup_tasks_test.exs
+@@ -27,7 +27,7 @@ defmodule Pinchflat.Boot.PreJobStartupTasksTest do
+     end
+   end
+ 
+-  describe "create_blank_cookie_file" do
++  describe "create_blank_yt_dlp_files" do
+     test "creates a blank cookie file" do
+       base_dir = Application.get_env(:pinchflat, :extras_directory)
+       filepath = Path.join(base_dir, "cookies.txt")
+@@ -39,6 +39,18 @@ defmodule Pinchflat.Boot.PreJobStartupTasksTest do
+ 
+       assert File.exists?(filepath)
+     end
++
++    test "creates a blank yt-dlp config file" do
++      base_dir = Application.get_env(:pinchflat, :extras_directory)
++      filepath = Path.join([base_dir, "yt-dlp-configs", "base-config.txt"])
++      File.rm(filepath)
++
++      refute File.exists?(filepath)
++
++      PreJobStartupTasks.init(%{})
++
++      assert File.exists?(filepath)
++    end
+   end
+ 
+   describe "apply_default_settings" do
+diff --git a/test/pinchflat/downloading/download_option_builder_test.exs b/test/pinchflat/downloading/download_option_builder_test.exs
+index d7bc63197..22ca4b2ec 100644
+--- a/test/pinchflat/downloading/download_option_builder_test.exs
++++ b/test/pinchflat/downloading/download_option_builder_test.exs
+@@ -5,6 +5,7 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilderTest do
+   import Pinchflat.ProfilesFixtures
+ 
+   alias Pinchflat.Profiles
++  alias Pinchflat.Utils.FilesystemUtils
+   alias Pinchflat.Downloading.DownloadOptionBuilder
+ 
+   setup do
+@@ -261,6 +262,96 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilderTest do
+     end
+   end
+ 
++  describe "build/1 when testing config file options" do
++    setup do
++      base_dir = Path.join(Application.get_env(:pinchflat, :extras_directory), "yt-dlp-configs")
++
++      {:ok, %{base_dir: base_dir}}
++    end
++
++    test "includes base config file if it's present", %{media_item: media_item, base_dir: base_dir} do
++      filepath = Path.join(base_dir, "base-config.txt")
++
++      FilesystemUtils.write_p!(filepath, "base config")
++
++      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
++      assert {:config_locations, filepath} in res
++    end
++
++    test "includes media profile config file if it's present", %{media_item: media_item, base_dir: base_dir} do
++      media_profile = media_item.source.media_profile
++      filepath = Path.join(base_dir, "media-profile-#{media_profile.id}-config.txt")
++
++      FilesystemUtils.write_p!(filepath, "profile config")
++
++      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
++      assert {:config_locations, filepath} in res
++    end
++
++    test "includes source config file if it's present", %{media_item: media_item, base_dir: base_dir} do
++      source = media_item.source
++      filepath = Path.join(base_dir, "source-#{source.id}-config.txt")
++
++      FilesystemUtils.write_p!(filepath, "profile config")
++
++      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
++      assert {:config_locations, filepath} in res
++    end
++
++    test "includes media item config file if it's present", %{media_item: media_item, base_dir: base_dir} do
++      filepath = Path.join(base_dir, "media-item-#{media_item.id}-config.txt")
++
++      FilesystemUtils.write_p!(filepath, "media item config")
++
++      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
++      assert {:config_locations, filepath} in res
++    end
++
++    test "does not include config file options if they are not present", %{media_item: media_item} do
++      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
++
++      refute :config_locations in res
++    end
++
++    test "does not return a config file if it's blank", %{media_item: media_item, base_dir: base_dir} do
++      filepath = Path.join(base_dir, "base-config.txt")
++
++      FilesystemUtils.write_p!(filepath, " \n \n ")
++
++      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
++      refute :config_locations in res
++    end
++
++    test "returns config files in order of precedence", %{media_item: media_item, base_dir: base_dir} do
++      source = media_item.source
++      media_profile = source.media_profile
++
++      base_filepath = Path.join(base_dir, "base-config.txt")
++      source_filepath = Path.join(base_dir, "source-#{source.id}-config.txt")
++      media_item_filepath = Path.join(base_dir, "media-item-#{media_item.id}-config.txt")
++      media_profile_filepath = Path.join(base_dir, "media-profile-#{media_profile.id}-config.txt")
++
++      FilesystemUtils.write_p!(base_filepath, "config")
++      FilesystemUtils.write_p!(source_filepath, "config")
++      FilesystemUtils.write_p!(media_item_filepath, "config")
++      FilesystemUtils.write_p!(media_profile_filepath, "config")
++
++      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
++
++      expected_order = [
++        {:config_locations, base_filepath},
++        {:config_locations, media_profile_filepath},
++        {:config_locations, source_filepath},
++        {:config_locations, media_item_filepath}
++      ]
++
++      assert Enum.filter(res, fn
++               {:config_locations, _} -> true
++               _ -> false
++             end) == expected_order
++    end
++  end
++
+   describe "build_output_path_for/1" do
+     test "builds an output path for a source", %{media_item: media_item} do
+       path = DownloadOptionBuilder.build_output_path_for(media_item.source)
+diff --git a/test/pinchflat/yt_dlp/command_runner_test.exs b/test/pinchflat/yt_dlp/command_runner_test.exs
+index decd6e5ab..17cf61c2c 100644
+--- a/test/pinchflat/yt_dlp/command_runner_test.exs
++++ b/test/pinchflat/yt_dlp/command_runner_test.exs
+@@ -42,12 +42,13 @@ defmodule Pinchflat.YtDlp.CommandRunnerTest do
+     end
+   end
+ 
+-  describe "run/4 when testing cookie options" do
++  describe "run/4 when testing external file options" do
+     setup do
+       base_dir = Application.get_env(:pinchflat, :extras_directory)
+       cookie_file = Path.join(base_dir, "cookies.txt")
++      yt_dlp_file = Path.join([base_dir, "yt-dlp-configs", "main.txt"])
+ 
+-      {:ok, cookie_file: cookie_file}
++      {:ok, cookie_file: cookie_file, yt_dlp_file: yt_dlp_file}
+     end
+ 
+     test "includes cookie options when cookies.txt exists", %{cookie_file: cookie_file} do

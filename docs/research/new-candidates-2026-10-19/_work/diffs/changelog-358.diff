@@ -1,0 +1,687 @@
+diff --git a/assets/static/images/content/footer/sponsor-fastly.png b/assets/static/images/content/footer/sponsor-fastly.png
+index f4becc3422..5b7363629d 100644
+Binary files a/assets/static/images/content/footer/sponsor-fastly.png and b/assets/static/images/content/footer/sponsor-fastly.png differ
+diff --git a/assets/static/images/content/footer/sponsor-grafana-cloud.png b/assets/static/images/content/footer/sponsor-grafana-cloud.png
+index 02a357d40f..dfa9a6d9e1 100644
+Binary files a/assets/static/images/content/footer/sponsor-grafana-cloud.png and b/assets/static/images/content/footer/sponsor-grafana-cloud.png differ
+diff --git a/assets/static/images/content/footer/sponsor-launchdarkly.png b/assets/static/images/content/footer/sponsor-launchdarkly.png
+index fffb9038e7..e1861becfc 100644
+Binary files a/assets/static/images/content/footer/sponsor-launchdarkly.png and b/assets/static/images/content/footer/sponsor-launchdarkly.png differ
+diff --git a/assets/static/images/content/footer/sponsor-linode.png b/assets/static/images/content/footer/sponsor-linode.png
+index eec91f9702..02f7c1f3d3 100644
+Binary files a/assets/static/images/content/footer/sponsor-linode.png and b/assets/static/images/content/footer/sponsor-linode.png differ
+diff --git a/lib/changelog/application.ex b/lib/changelog/application.ex
+index dd087c277e..51afc0eb4c 100644
+--- a/lib/changelog/application.ex
++++ b/lib/changelog/application.ex
+@@ -13,8 +13,17 @@ defmodule Changelog.Application do
+       Changelog.Repo,
+       # UA.Parser doesn't yet support new Supervisor child specification
+       worker(UA.Parser, []),
+-      {ConCache,
+-       name: :app_cache, ttl_check_interval: :timer.seconds(1), global_ttl: :timer.seconds(60)},
++      con_cache_child_spec(
++        :app_cache,
++        ttl_check_interval: :timer.seconds(1),
++        global_ttl: :timer.seconds(60)
++      ),
++      con_cache_child_spec(
++        :news_item_recommendations,
++        ttl_check_interval: :timer.seconds(30),
++        global_ttl: :timer.minutes(5),
++        touch_on_read: false
++      ),
+       Changelog.Scheduler,
+       Changelog.EpisodeTracker,
+       Changelog.Metacasts.Filterer.Cache,
+@@ -37,4 +46,14 @@ defmodule Changelog.Application do
+     ChangelogWeb.Endpoint.config_change(changed, removed)
+     :ok
+   end
++
++  defp con_cache_child_spec(name, opts) do
++    Supervisor.child_spec(
++      {
++        ConCache,
++        Keyword.put(opts, :name, name)
++      },
++      id: {ConCache, name}
++    )
++  end
+ end
+diff --git a/lib/changelog/schema/news/news_item.ex b/lib/changelog/schema/news/news_item.ex
+index 23fd1e8364..3faeab155f 100644
+--- a/lib/changelog/schema/news/news_item.ex
++++ b/lib/changelog/schema/news/news_item.ex
+@@ -1,6 +1,8 @@
+ defmodule Changelog.NewsItem do
+   use Changelog.Schema, default_sort: :published_at
+ 
++  require Logger
++
+   alias Changelog.{
+     Episode,
+     Files,
+@@ -370,4 +372,69 @@ defmodule Changelog.NewsItem do
+     |> Repo.all()
+     |> Enum.map(&load_object/1)
+   end
++
++  def recommend_podcasts(episode = %Episode{}, num_recommendations) do
++    recommendation_query = "SELECT * FROM query_related_podcast($1::integer, $2::integer)"
++    query_args = [episode.id, num_recommendations]
++
++    ConCache.fetch_or_store(
++      :news_item_recommendations,
++      {:podcast, episode.id, num_recommendations},
++      fn ->
++        query_recommendations(recommendation_query, query_args)
++      end
++    )
++  end
++
++  def recommend_news_items(news_item = %__MODULE__{}, num_recommendations) do
++    recommendation_query = "SELECT * FROM query_related_news_item($1::integer, $2::integer)"
++    query_args = [news_item.id, num_recommendations]
++
++    ConCache.fetch_or_store(
++      :news_item_recommendations,
++      {:news_item, news_item.id, num_recommendations},
++      fn ->
++        query_recommendations(recommendation_query, query_args)
++      end
++    )
++  end
++
++  def recommend_posts(news_item = %__MODULE__{}, num_recommendations) do
++    recommendation_query = "SELECT * FROM query_related_post($1::integer, $2::integer)"
++    query_args = [news_item.id, num_recommendations]
++
++    ConCache.fetch_or_store(
++      :news_item_recommendations,
++      {:post, news_item.id, num_recommendations},
++      fn ->
++        query_recommendations(recommendation_query, query_args)
++      end
++    )
++  end
++
++  defp query_recommendations(query, args) do
++    try do
++      query
++      |> Changelog.Repo.query(args)
++      |> case do
++        {:ok, %Postgrex.Result{columns: columns, rows: rows}} ->
++          results =
++            Enum.map(rows, fn row ->
++              columns
++              |> Enum.zip(row)
++              |> Map.new()
++            end)
++
++          {:ok, results}
++
++        error ->
++          Logger.warn("Failed to fetch recommended items: #{inspect(error)}")
++          {:error, error}
++      end
++    rescue
++      error ->
++        Logger.warn("Failed to fetch recommended items: #{inspect(error)}")
++        {:error, error}
++    end
++  end
+ end
+diff --git a/lib/changelog_web/controllers/podcast_controller.ex b/lib/changelog_web/controllers/podcast_controller.ex
+index b8104b8019..ba5636f7e8 100644
+--- a/lib/changelog_web/controllers/podcast_controller.ex
++++ b/lib/changelog_web/controllers/podcast_controller.ex
+@@ -60,7 +60,8 @@ defmodule ChangelogWeb.PodcastController do
+     podcast = Podcast.get_by_slug!(slug)
+ 
+     page =
+-      Podcast.get_episodes(podcast)
++      podcast
++      |> Podcast.get_episodes()
+       |> Episode.published()
+       # modern era
+       |> Episode.newer_than(~D[2016-10-10])
+diff --git a/lib/changelog_web/email.ex b/lib/changelog_web/email.ex
+index 63c4f67aae..a7b6e3cfd8 100644
+--- a/lib/changelog_web/email.ex
++++ b/lib/changelog_web/email.ex
+@@ -97,6 +97,16 @@ defmodule ChangelogWeb.Email do
+ 
+   # Podcast related emails
+   def episode_published(subscription, episode) do
++    # Fetch related podcasts
++    related_podcasts =
++      case NewsItem.recommend_podcasts(episode, 3) do
++        {:ok, results} ->
++          results
++
++        _ ->
++          []
++      end
++
+     styled_email()
+     |> put_header("X-CMail-GroupName", "#{episode.podcast.name} #{episode.slug}")
+     |> to(subscription.person)
+@@ -104,6 +114,7 @@ defmodule ChangelogWeb.Email do
+     |> assign(:subscription, subscription)
+     |> assign(:person, subscription.person)
+     |> assign(:episode, episode)
++    |> assign(:recommendations, related_podcasts)
+     |> render(:episode_published)
+   end
+ 
+diff --git a/lib/changelog_web/templates/email/episode_published.html.eex b/lib/changelog_web/templates/email/episode_published.html.eex
+index 423e5b96f0..5f6a72053f 100644
+--- a/lib/changelog_web/templates/email/episode_published.html.eex
++++ b/lib/changelog_web/templates/email/episode_published.html.eex
+@@ -10,6 +10,18 @@
+       <%= link("Listen and discuss the episode", to: Routes.episode_url(Endpoint, :show, @episode.podcast.slug, @episode.slug), itemprop: "url") %>
+     </span>
+ 
++    <%= if @recommendations != [] do %>
++      <p>If you enjoyed this episode, you should also check out these:</p>
++
++      <ul>
++        <%= for recommendation <- @recommendations do %>
++          <li>
++            <a href="<%= recommendation["url"] %>"><%= recommendation["headline"] %></a>
++          </li>
++        <% end %>
++      </ul>
++    <% end %>
++
+     <p>Don't want these notifications? <em><%= link("Disable 'em", to: PersonView.opt_out_url(Endpoint, @person, "podcast", @episode.podcast.slug)) %></em></p>
+ 
+     <p>💚, Logbot</p>
+diff --git a/mix.exs b/mix.exs
+index 855809c845..d7f2b6fb00 100644
+--- a/mix.exs
++++ b/mix.exs
+@@ -1,5 +1,6 @@
+ defmodule Changelog.Mixfile do
+   use Mix.Project
++
+   Code.compile_file("config/secret_or_env.exs")
+ 
+   def project do
+@@ -41,7 +42,7 @@ defmodule Changelog.Mixfile do
+       # Leaving this here for future dev loops with @akoutmos
+       # {:prom_ex, github: "akoutmos/prom_ex", branch: "master"},
+       {:oban, "~> 2.4.2"},
+-      {:prom_ex, "~> 0.1.15-beta"},
++      {:prom_ex, "~> 1.0.0"},
+       {:unplug, "~> 0.2.1"},
+       {:postgrex, ">= 0.0.0"},
+       {:timex, "~> 3.0"},
+@@ -58,7 +59,7 @@ defmodule Changelog.Mixfile do
+       {:bamboo_smtp, "~> 2.1.0"},
+       {:httpoison, "~> 1.0", override: true},
+       {:jason, "~> 1.0"},
+-      {:con_cache, "~> 0.13.0"},
++      {:con_cache, "~> 0.14.0"},
+       {:exjsx, "~> 3.2.1 or ~> 4.0"},
+       {:ex_aws, "~> 2.0"},
+       {:ex_aws_s3, "~> 2.0"},
+diff --git a/mix.lock b/mix.lock
+index b59482ec7a..4e89346c83 100644
+--- a/mix.lock
++++ b/mix.lock
+@@ -9,7 +9,7 @@
+   "certifi": {:hex, :certifi, "2.5.3", "70bdd7e7188c804f3a30ee0e7c99655bc35d8ac41c23e12325f36ab449b70651", [:rebar3], [{:parse_trans, "~>3.3", [hex: :parse_trans, repo: "hexpm", optional: false]}], "hexpm", "ed516acb3929b101208a9d700062d520f3953da3b6b918d866106ffa980e1c10"},
+   "cmark": {:hex, :cmark, "0.10.0", "51217dc90fec459f34a30ea73345e6a7c1d2f3d618cb4a1738a2ebd0697a57a0", [:make, :mix], [{:elixir_make, "~> 0.6", [hex: :elixir_make, repo: "hexpm", optional: false]}], "hexpm", "00abeadc6f3176e3941853122413082de95d57787777dd0400d64e568acf7c32"},
+   "combine": {:hex, :combine, "0.10.0", "eff8224eeb56498a2af13011d142c5e7997a80c8f5b97c499f84c841032e429f", [:mix], [], "hexpm", "1b1dbc1790073076580d0d1d64e42eae2366583e7aecd455d1215b0d16f2451b"},
+-  "con_cache": {:hex, :con_cache, "0.13.1", "047e097ab2a8c6876e12d0c29e29a86d487b592df97b98e3e2abedad574e215d", [:mix], [], "hexpm", "d3c19f04153b691d7bfdb15bcfc3b8fea503b0b51635115393809af7eabe2f37"},
++  "con_cache": {:hex, :con_cache, "0.14.0", "863acb90fa08017be3129074993af944cf7a4b6c3ee7c06c5cd0ed6b94fbc223", [:mix], [], "hexpm", "50887a8949377d0b707a3c6653b7610de06074751b52d0f267f52135f391aece"},
+   "connection": {:hex, :connection, "1.1.0", "ff2a49c4b75b6fb3e674bfc5536451607270aac754ffd1bdfe175abe4a6d7a68", [:mix], [], "hexpm", "722c1eb0a418fbe91ba7bd59a47e28008a189d47e37e0e7bb85585a016b2869c"},
+   "cowboy": {:hex, :cowboy, "2.8.0", "f3dc62e35797ecd9ac1b50db74611193c29815401e53bac9a5c0577bd7bc667d", [:rebar3], [{:cowlib, "~> 2.9.1", [hex: :cowlib, repo: "hexpm", optional: false]}, {:ranch, "~> 1.7.1", [hex: :ranch, repo: "hexpm", optional: false]}], "hexpm", "4643e4fba74ac96d4d152c75803de6fad0b3fa5df354c71afdd6cbeeb15fac8a"},
+   "cowboy_telemetry": {:hex, :cowboy_telemetry, "0.3.1", "ebd1a1d7aff97f27c66654e78ece187abdc646992714164380d8a041eda16754", [:rebar3], [{:cowboy, "~> 2.7", [hex: :cowboy, repo: "hexpm", optional: false]}, {:telemetry, "~> 0.4", [hex: :telemetry, repo: "hexpm", optional: false]}], "hexpm", "3a6efd3366130eab84ca372cbd4a7d3c3a97bdfcfb4911233b035d117063f0af"},
+@@ -18,7 +18,7 @@
+   "crontab": {:hex, :crontab, "1.1.10", "dc9bb1f4299138d47bce38341f5dcbee0aa6c205e864fba7bc847f3b5cb48241", [:mix], [{:ecto, "~> 1.0 or ~> 2.0 or ~> 3.0", [hex: :ecto, repo: "hexpm", optional: true]}], "hexpm", "1347d889d1a0eda997990876b4894359e34bfbbd688acbb0ba28a2795ca40685"},
+   "db_connection": {:hex, :db_connection, "2.3.1", "4c9f3ed1ef37471cbdd2762d6655be11e38193904d9c5c1c9389f1b891a3088e", [:mix], [{:connection, "~> 1.0", [hex: :connection, repo: "hexpm", optional: false]}], "hexpm", "abaab61780dde30301d840417890bd9f74131041afd02174cf4e10635b3a63f5"},
+   "decimal": {:hex, :decimal, "2.0.0", "a78296e617b0f5dd4c6caf57c714431347912ffb1d0842e998e9792b5642d697", [:mix], [], "hexpm", "34666e9c55dea81013e77d9d87370fe6cb6291d1ef32f46a1600230b1d44f577"},
+-  "ecto": {:hex, :ecto, "3.5.7", "f440a476bf1be361173a43a4a18f04a2fdf4e6fac5b0457f03d8686e55f13f7e", [:mix], [{:decimal, "~> 1.6 or ~> 2.0", [hex: :decimal, repo: "hexpm", optional: false]}, {:jason, "~> 1.0", [hex: :jason, repo: "hexpm", optional: true]}, {:telemetry, "~> 0.4", [hex: :telemetry, repo: "hexpm", optional: false]}], "hexpm", "04c4e69d4f1cc2bb085aa760d50389ba8ae3003f80c112fbde87d57f5ed75d39"},
++  "ecto": {:hex, :ecto, "3.5.8", "8ebf12be6016cb99313348ba7bb4612f4114b9a506d6da79a2adc7ef449340bc", [:mix], [{:decimal, "~> 1.6 or ~> 2.0", [hex: :decimal, repo: "hexpm", optional: false]}, {:jason, "~> 1.0", [hex: :jason, repo: "hexpm", optional: true]}, {:telemetry, "~> 0.4", [hex: :telemetry, repo: "hexpm", optional: false]}], "hexpm", "ea0be182ea8922eb7742e3ae8e71b67ee00ae177de1bf76210299a5f16ba4c77"},
+   "ecto_enum": {:hex, :ecto_enum, "1.4.0", "d14b00e04b974afc69c251632d1e49594d899067ee2b376277efd8233027aec8", [:mix], [{:ecto, ">= 3.0.0", [hex: :ecto, repo: "hexpm", optional: false]}, {:ecto_sql, "> 3.0.0", [hex: :ecto_sql, repo: "hexpm", optional: false]}, {:mariaex, ">= 0.0.0", [hex: :mariaex, repo: "hexpm", optional: true]}, {:postgrex, ">= 0.0.0", [hex: :postgrex, repo: "hexpm", optional: true]}], "hexpm", "8fb55c087181c2b15eee406519dc22578fa60dd82c088be376d0010172764ee4"},
+   "ecto_sql": {:hex, :ecto_sql, "3.5.4", "a9e292c40bd79fff88885f95f1ecd7b2516e09aa99c7dd0201aa84c54d2358e4", [:mix], [{:db_connection, "~> 2.2", [hex: :db_connection, repo: "hexpm", optional: false]}, {:ecto, "~> 3.5.0", [hex: :ecto, repo: "hexpm", optional: false]}, {:myxql, "~> 0.3.0 or ~> 0.4.0", [hex: :myxql, repo: "hexpm", optional: true]}, {:postgrex, "~> 0.15.0 or ~> 1.0", [hex: :postgrex, repo: "hexpm", optional: true]}, {:tds, "~> 2.1.1", [hex: :tds, repo: "hexpm", optional: true]}, {:telemetry, "~> 0.4.0", [hex: :telemetry, repo: "hexpm", optional: false]}], "hexpm", "1fff1a28a898d7bbef263f1f3ea425b04ba9f33816d843238c84eff883347343"},
+   "elixir_make": {:hex, :elixir_make, "0.6.2", "7dffacd77dec4c37b39af867cedaabb0b59f6a871f89722c25b28fcd4bd70530", [:mix], [], "hexpm", "03e49eadda22526a7e5279d53321d1cced6552f344ba4e03e619063de75348d9"},
+@@ -53,7 +53,7 @@
+   "mock": {:hex, :mock, "0.3.6", "e810a91fabc7adf63ab5fdbec5d9d3b492413b8cda5131a2a8aa34b4185eb9b4", [:mix], [{:meck, "~> 0.8.13", [hex: :meck, repo: "hexpm", optional: false]}], "hexpm", "bcf1d0a6826fb5aee01bae3d74474669a3fa8b2df274d094af54a25266a1ebd2"},
+   "nimble_csv": {:hex, :nimble_csv, "1.1.0", "b1dba4a86be9e03065c9de829050468e591f569100332db949e7ce71be0afc25", [:mix], [], "hexpm", "e986755bc302832cac429be6deda0fc9d82d3c82b47abefb68b3c17c9d949a3f"},
+   "nimble_options": {:hex, :nimble_options, "0.3.5", "a4f6820cdcb4ee444afd78635f323e58e8a5ddf2fbbe9b9d283a99f972034bae", [:mix], [], "hexpm", "f5507cc90033a8d12769522009c80aa9164af6bab245dbd4ad421d008455f1e1"},
+-  "nimble_pool": {:hex, :nimble_pool, "0.2.3", "4b84df87cf8b40c7363782a99faad6aa2bb0811bcd3d275b5402ae4bab1f1251", [:mix], [], "hexpm", "a6bf677d3499ef1639c42bf16b8a72bf490f5fed70206d5851d43dd750c7eaca"},
++  "nimble_pool": {:hex, :nimble_pool, "0.2.4", "1db8e9f8a53d967d595e0b32a17030cdb6c0dc4a451b8ac787bf601d3f7704c3", [:mix], [], "hexpm", "367e8071e137b787764e6a9992ccb57b276dc2282535f767a07d881951ebeac6"},
+   "oauth": {:git, "https://github.com/tim/erlang-oauth.git", "bd19896e31125f99ff45bb5850b1c0e74b996743", []},
+   "oauth2": {:hex, :oauth2, "2.0.0", "338382079fe16c514420fa218b0903f8ad2d4bfc0ad0c9f988867dfa246731b0", [:mix], [{:hackney, "~> 1.13", [hex: :hackney, repo: "hexpm", optional: false]}], "hexpm", "881b8364ac7385f9fddc7949379cbe3f7081da37233a1aa7aab844670a91e7e7"},
+   "oauther": {:hex, :oauther, "1.1.1", "7d8b16167bb587ecbcddd3f8792beb9ec3e7b65c1f8ebd86b8dd25318d535752", [:mix], [], "hexpm", "9374f4302045321874cccdc57eb975893643bd69c3b22bf1312dab5f06e5788e"},
+@@ -66,10 +66,10 @@
+   "phoenix_pubsub": {:hex, :phoenix_pubsub, "2.0.0", "a1ae76717bb168cdeb10ec9d92d1480fec99e3080f011402c0a2d68d47395ffb", [:mix], [], "hexpm", "c52d948c4f261577b9c6fa804be91884b381a7f8f18450c5045975435350f771"},
+   "plug": {:hex, :plug, "1.11.0", "f17217525597628298998bc3baed9f8ea1fa3f1160aa9871aee6df47a6e4d38e", [:mix], [{:mime, "~> 1.0", [hex: :mime, repo: "hexpm", optional: false]}, {:plug_crypto, "~> 1.1.1 or ~> 1.2", [hex: :plug_crypto, repo: "hexpm", optional: false]}, {:telemetry, "~> 0.4", [hex: :telemetry, repo: "hexpm", optional: false]}], "hexpm", "2d9c633f0499f9dc5c2fd069161af4e2e7756890b81adcbb2ceaa074e8308876"},
+   "plug_cowboy": {:hex, :plug_cowboy, "2.4.1", "779ba386c0915027f22e14a48919a9545714f849505fa15af2631a0d298abf0f", [:mix], [{:cowboy, "~> 2.7", [hex: :cowboy, repo: "hexpm", optional: false]}, {:cowboy_telemetry, "~> 0.3", [hex: :cowboy_telemetry, repo: "hexpm", optional: false]}, {:plug, "~> 1.7", [hex: :plug, repo: "hexpm", optional: false]}, {:telemetry, "~> 0.4", [hex: :telemetry, repo: "hexpm", optional: false]}], "hexpm", "d72113b6dff7b37a7d9b2a5b68892808e3a9a752f2bf7e503240945385b70507"},
+-  "plug_crypto": {:hex, :plug_crypto, "1.2.0", "1cb20793aa63a6c619dd18bb33d7a3aa94818e5fd39ad357051a67f26dfa2df6", [:mix], [], "hexpm", "a48b538ae8bf381ffac344520755f3007cc10bd8e90b240af98ea29b69683fc2"},
++  "plug_crypto": {:hex, :plug_crypto, "1.2.1", "5c854427528bf61d159855cedddffc0625e2228b5f30eff76d5a4de42d896ef4", [:mix], [], "hexpm", "6961c0e17febd9d0bfa89632d391d2545d2e0eb73768f5f50305a23961d8782c"},
+   "poison": {:hex, :poison, "3.1.0", "d9eb636610e096f86f25d9a46f35a9facac35609a7591b3be3326e99a0484665", [:mix], [], "hexpm", "fec8660eb7733ee4117b85f55799fd3833eb769a6df71ccf8903e8dc5447cfce"},
+   "postgrex": {:hex, :postgrex, "0.15.8", "f5e782bbe5e8fa178d5e3cd1999c857dc48eda95f0a4d7f7bd92a50e84a0d491", [:mix], [{:connection, "~> 1.0", [hex: :connection, repo: "hexpm", optional: false]}, {:db_connection, "~> 2.1", [hex: :db_connection, repo: "hexpm", optional: false]}, {:decimal, "~> 1.5 or ~> 2.0", [hex: :decimal, repo: "hexpm", optional: false]}, {:jason, "~> 1.0", [hex: :jason, repo: "hexpm", optional: true]}], "hexpm", "698fbfacea34c4cf22c8281abeb5cf68d99628d541874f085520ab3b53d356fe"},
+-  "prom_ex": {:hex, :prom_ex, "0.1.15-beta", "d20108d64b0d6b84720f91ef2e76734a34567cba420eec77b713c9d75dc397d4", [:mix], [{:ecto, ">= 3.5.0", [hex: :ecto, repo: "hexpm", optional: true]}, {:finch, "~> 0.5.2", [hex: :finch, repo: "hexpm", optional: false]}, {:jason, "~> 1.2", [hex: :jason, repo: "hexpm", optional: false]}, {:oban, ">= 2.4.0", [hex: :oban, repo: "hexpm", optional: true]}, {:phoenix, ">= 1.5.0", [hex: :phoenix, repo: "hexpm", optional: true]}, {:phoenix_live_view, ">= 0.14.0", [hex: :phoenix_live_view, repo: "hexpm", optional: true]}, {:plug, ">= 1.10.0", [hex: :plug, repo: "hexpm", optional: true]}, {:plug_cowboy, "~> 2.1", [hex: :plug_cowboy, repo: "hexpm", optional: false]}, {:telemetry, "~> 0.4.2", [hex: :telemetry, repo: "hexpm", optional: false]}, {:telemetry_metrics, "~> 0.6.0", [hex: :telemetry_metrics, repo: "hexpm", optional: false]}, {:telemetry_poller, "~> 0.5.1", [hex: :telemetry_poller, repo: "hexpm", optional: false]}], "hexpm", "e1d6b672093c68a17009519e72c3394dd7e088353c2c60d3625e7e2f5f136f58"},
++  "prom_ex": {:hex, :prom_ex, "1.0.0", "512b438e07b499c6cf2db4d68b9f3ad0959aea3314420484bff268f0d402eafb", [:mix], [{:ecto, ">= 3.5.0", [hex: :ecto, repo: "hexpm", optional: true]}, {:finch, "~> 0.5.2", [hex: :finch, repo: "hexpm", optional: false]}, {:jason, "~> 1.2", [hex: :jason, repo: "hexpm", optional: false]}, {:oban, ">= 2.4.0", [hex: :oban, repo: "hexpm", optional: true]}, {:phoenix, ">= 1.5.0", [hex: :phoenix, repo: "hexpm", optional: true]}, {:phoenix_live_view, ">= 0.14.0", [hex: :phoenix_live_view, repo: "hexpm", optional: true]}, {:plug, ">= 1.10.0", [hex: :plug, repo: "hexpm", optional: true]}, {:plug_cowboy, "~> 2.1", [hex: :plug_cowboy, repo: "hexpm", optional: false]}, {:telemetry, "~> 0.4.2", [hex: :telemetry, repo: "hexpm", optional: false]}, {:telemetry_metrics, "~> 0.6.0", [hex: :telemetry_metrics, repo: "hexpm", optional: false]}, {:telemetry_poller, "~> 0.5.1", [hex: :telemetry_poller, repo: "hexpm", optional: false]}], "hexpm", "a4dcebac0f92032cc80b27fb19e5dc3cb05fb1197a7840cb2e3ba553373ba418"},
+   "quantum": {:hex, :quantum, "3.3.0", "e8f6b9479728774288c5f426b11a6e3e8f619f3c226163a7e18bccfe543b714d", [:mix], [{:crontab, "~> 1.1", [hex: :crontab, repo: "hexpm", optional: false]}, {:gen_stage, "~> 0.14 or ~> 1.0", [hex: :gen_stage, repo: "hexpm", optional: false]}, {:telemetry, "~> 0.4", [hex: :telemetry, repo: "hexpm", optional: false]}], "hexpm", "3b83ef137ab3887e783b013418b5ce3e847d66b71c4ef0f233b0321c84b72f67"},
+   "ranch": {:hex, :ranch, "1.7.1", "6b1fab51b49196860b733a49c07604465a47bdb78aa10c1c16a3d199f7f8c881", [:rebar3], [], "hexpm", "451d8527787df716d99dc36162fca05934915db0b6141bbdac2ea8d3c7afc7d7"},
+   "rollbax": {:hex, :rollbax, "0.8.2", "204a47a83fe32745def19ea0307b297395c00315fb85f30dfda04d5009b5ecb9", [:mix], [{:hackney, "~> 1.1", [hex: :hackney, repo: "hexpm", optional: false]}, {:poison, "~> 1.4 or ~> 2.0 or ~> 3.0", [hex: :poison, repo: "hexpm", optional: false]}], "hexpm", "6575d11dab446ef8010d7b3815bd476965825964d77cf45632b7f28ba88b9de9"},
+diff --git a/priv/repo/migrations/20210206150407_adding_news_item_indexes.exs b/priv/repo/migrations/20210206150407_adding_news_item_indexes.exs
+new file mode 100644
+index 0000000000..c77a9e7693
+--- /dev/null
++++ b/priv/repo/migrations/20210206150407_adding_news_item_indexes.exs
+@@ -0,0 +1,329 @@
++defmodule Changelog.Repo.Migrations.AddingNewsItemIndexes do
++  use Ecto.Migration
++
++  def down do
++    execute("DROP FUNCTION query_related_news_item(integer, integer)")
++    execute("DROP FUNCTION query_related_podcast(integer, integer)")
++    execute("DROP FUNCTION query_related_post(integer, integer)")
++
++    drop(index("news_items", [:published_at]))
++    drop(index("news_items", [:click_count]))
++  end
++
++  def up do
++    create(index("news_items", [:published_at]))
++    create(index("news_items", [:click_count]))
++
++    execute(related_podcast_function())
++    execute(related_news_function())
++    execute(related_post_function())
++  end
++
++  defp related_post_function do
++    """
++    CREATE OR REPLACE FUNCTION query_related_post(news_item_id INTEGER, num_recommendations INTEGER)
++    RETURNS TABLE (
++      original_id BIGINT,
++      original_tags VARCHAR[],
++      id BIGINT,
++      headline VARCHAR,
++      url VARCHAR,
++      click_count INTEGER,
++      tags VARCHAR[],
++      published_at TIMESTAMP,
++      num_comments INTEGER,
++      ranking INTEGER
++    )
++    AS $$
++      with original_news_item AS (
++        SELECT
++          news_items.id,
++          ARRAY_AGG(DISTINCT topics.slug) AS tags
++        FROM news_items
++        LEFT OUTER JOIN news_item_topics AS news_item_topics ON
++          news_item_topics.item_id = news_items.id
++        LEFT OUTER JOIN topics AS topics ON
++          topics.id = news_item_topics.topic_id
++        WHERE news_items.id = news_item_id
++        GROUP BY news_items.id
++      )
++      SELECT DISTINCT
++        (SELECT id FROM original_news_item)::BIGINT,
++        (SELECT tags FROM original_news_item),
++        news_items.id::BIGINT,
++        news_items.headline,
++        news_items.url,
++        news_items.click_count,
++        ARRAY_AGG(DISTINCT topics.slug) AS tags,
++        news_items.published_at,
++        COUNT(DISTINCT news_item_comments.id)::INTEGER AS num_comments,
++        CASE
++          WHEN COUNT(DISTINCT news_item_comments.id) <= 10 THEN
++            200
++          WHEN COUNT(DISTINCT news_item_comments.id) <= 20 THEN
++            400
++          WHEN COUNT(DISTINCT news_item_comments.id) <= 30 THEN
++            600
++          WHEN COUNT(DISTINCT news_item_comments.id) <= 40 THEN
++            800
++          ELSE
++            1000
++        END +
++        CASE
++          WHEN ARRAY_AGG(DISTINCT topics.slug) = (SELECT tags FROM original_news_item) THEN
++            2250
++          WHEN ARRAY_AGG(DISTINCT topics.slug) <@ (SELECT tags FROM original_news_item) THEN
++            1250
++          WHEN ARRAY_AGG(DISTINCT topics.slug) && (SELECT tags FROM original_news_item) THEN
++            750
++          ELSE
++            0
++        END +
++        CASE
++          WHEN news_items.click_count > 1500 THEN
++            1500
++          ELSE
++            news_items.click_count
++        END +
++        CASE
++          WHEN ((DATE_PART('year', age(news_items.published_at)) * 12) + (DATE_PART('month', age(news_items.published_at)))) <= 12 THEN
++            500
++          WHEN ((DATE_PART('year', age(news_items.published_at)) * 12) + (DATE_PART('month', age(news_items.published_at)))) <= 24 THEN
++            250
++          WHEN ((DATE_PART('year', age(news_items.published_at)) * 12) + (DATE_PART('month', age(news_items.published_at)))) <= 36 THEN
++            100
++          ELSE
++            0
++        END
++        AS ranking
++      FROM
++        news_items AS news_items
++      LEFT OUTER JOIN news_item_topics AS news_item_topics ON
++        news_item_topics.item_id = news_items.id
++      LEFT OUTER JOIN topics AS topics ON
++        topics.id = news_item_topics.topic_id
++      LEFT OUTER JOIN news_item_comments AS news_item_comments ON
++        news_item_comments.item_id = news_items.id
++      WHERE
++        news_items.id != (SELECT id FROM original_news_item) AND
++        news_items.status = 3 AND
++        news_items.published_at <= timezone('utc', now()) AND
++        news_items.object_id LIKE 'posts:%'
++      GROUP BY
++        news_items.id
++      ORDER BY
++        ranking DESC NULLS LAST
++      LIMIT num_recommendations;
++    $$ LANGUAGE SQL;
++    """
++  end
++
++  defp related_podcast_function do
++    """
++    CREATE OR REPLACE FUNCTION query_related_podcast(episode_id INTEGER, num_recommendations INTEGER)
++    RETURNS TABLE (
++      original_id BIGINT,
++      original_tags VARCHAR[],
++      id BIGINT,
++      headline VARCHAR,
++      url VARCHAR,
++      click_count INTEGER,
++      tags VARCHAR[],
++      published_at TIMESTAMP,
++      num_comments INTEGER,
++      ranking INTEGER
++    )
++    AS $$
++      with original_news_item AS (
++        SELECT
++          news_items.id,
++          ARRAY_AGG(DISTINCT topics.slug) AS tags
++        FROM news_items
++        INNER JOIN episodes AS episodes ON
++          CONCAT(episodes.podcast_id, ':', episodes.id) = news_items.object_id
++        LEFT OUTER JOIN news_item_topics AS news_item_topics ON
++          news_item_topics.item_id = news_items.id
++        LEFT OUTER JOIN topics AS topics ON
++          topics.id = news_item_topics.topic_id
++        WHERE episodes.id = episode_id
++        GROUP BY news_items.id
++      )
++      SELECT DISTINCT
++        (SELECT id FROM original_news_item)::BIGINT,
++        (SELECT tags FROM original_news_item),
++        news_items.id::BIGINT,
++        news_items.headline,
++        CASE
++          WHEN podcasts.vanity_domain IS NULL OR episodes.slug IS NULL THEN
++            news_items.url
++          ELSE
++            CONCAT(podcasts.vanity_domain, '/', episodes.slug)
++        END AS url,
++        news_items.click_count,
++        ARRAY_AGG(DISTINCT topics.slug) AS tags,
++        news_items.published_at,
++        COUNT(DISTINCT news_item_comments.id)::INTEGER AS num_comments,
++        CASE
++          WHEN COUNT(DISTINCT news_item_comments.id) <= 10 THEN
++            200
++          WHEN COUNT(DISTINCT news_item_comments.id) <= 20 THEN
++            400
++          WHEN COUNT(DISTINCT news_item_comments.id) <= 30 THEN
++            600
++          WHEN COUNT(DISTINCT news_item_comments.id) <= 40 THEN
++            800
++          ELSE
++            1000
++        END +
++        CASE
++          WHEN ARRAY_AGG(DISTINCT topics.slug) = (SELECT tags FROM original_news_item) THEN
++            2250
++          WHEN ARRAY_AGG(DISTINCT topics.slug) <@ (SELECT tags FROM original_news_item) THEN
++            1250
++          WHEN ARRAY_AGG(DISTINCT topics.slug) && (SELECT tags FROM original_news_item) THEN
++            750
++          ELSE
++            0
++        END +
++        CASE
++          WHEN news_items.click_count > 1500 THEN
++            1500
++          ELSE
++            news_items.click_count
++        END +
++        CASE
++          WHEN ((DATE_PART('year', age(news_items.published_at)) * 12) + (DATE_PART('month', age(news_items.published_at)))) <= 12 THEN
++            500
++          WHEN ((DATE_PART('year', age(news_items.published_at)) * 12) + (DATE_PART('month', age(news_items.published_at)))) <= 24 THEN
++            250
++          WHEN ((DATE_PART('year', age(news_items.published_at)) * 12) + (DATE_PART('month', age(news_items.published_at)))) <= 36 THEN
++            100
++          ELSE
++            0
++        END
++        AS ranking
++      FROM
++        news_items AS news_items
++      INNER JOIN episodes AS episodes ON
++        CONCAT(episodes.podcast_id, ':', episodes.id) = news_items.object_id
++      INNER JOIN podcasts AS podcasts ON
++        episodes.podcast_id = podcasts.id
++      LEFT OUTER JOIN news_item_topics AS news_item_topics ON
++        news_item_topics.item_id = news_items.id
++      LEFT OUTER JOIN topics AS topics ON
++        topics.id = news_item_topics.topic_id
++      LEFT OUTER JOIN news_item_comments AS news_item_comments ON
++        news_item_comments.item_id = news_items.id
++      WHERE
++        news_items.id != (SELECT id FROM original_news_item) AND
++        news_items.status = 3 AND
++        news_items.published_at <= timezone('utc', now())
++      GROUP BY
++        news_items.id, podcasts.vanity_domain, episodes.slug
++      ORDER BY
++        ranking DESC NULLS LAST
++      LIMIT num_recommendations;
++    $$ LANGUAGE SQL;
++    """
++  end
++
++  defp related_news_function do
++    """
++    CREATE OR REPLACE FUNCTION query_related_news_item(news_item_id INTEGER, num_recommendations INTEGER)
++    RETURNS TABLE (
++      original_id BIGINT,
++      original_tags VARCHAR[],
++      id BIGINT,
++      headline VARCHAR,
++      url VARCHAR,
++      click_count INTEGER,
++      tags VARCHAR[],
++      published_at TIMESTAMP,
++      num_comments INTEGER,
++      ranking INTEGER
++    )
++    AS $$
++      with original_news_item AS (
++        SELECT
++          news_items.id,
++          ARRAY_AGG(DISTINCT topics.slug) AS tags
++        FROM news_items
++        LEFT OUTER JOIN news_item_topics AS news_item_topics ON
++          news_item_topics.item_id = news_items.id
++        LEFT OUTER JOIN topics AS topics ON
++          topics.id = news_item_topics.topic_id
++        WHERE news_items.id = news_item_id
++        GROUP BY news_items.id
++      )
++      SELECT DISTINCT
++        (SELECT id FROM original_news_item)::BIGINT,
++        (SELECT tags FROM original_news_item),
++        news_items.id::BIGINT,
++        news_items.headline,
++        news_items.url,
++        news_items.click_count,
++        ARRAY_AGG(DISTINCT topics.slug) AS tags,
++        news_items.published_at,
++        COUNT(DISTINCT news_item_comments.id)::INTEGER AS num_comments,
++        CASE
++          WHEN COUNT(DISTINCT news_item_comments.id) <= 10 THEN
++            200
++          WHEN COUNT(DISTINCT news_item_comments.id) <= 20 THEN
++            400
++          WHEN COUNT(DISTINCT news_item_comments.id) <= 30 THEN
++            600
++          WHEN COUNT(DISTINCT news_item_comments.id) <= 40 THEN
++            800
++          ELSE
++            1000
++        END +
++        CASE
++          WHEN ARRAY_AGG(DISTINCT topics.slug) = (SELECT tags FROM original_news_item) THEN
++            2250
++          WHEN ARRAY_AGG(DISTINCT topics.slug) <@ (SELECT tags FROM original_news_item) THEN
++            1250
++          WHEN ARRAY_AGG(DISTINCT topics.slug) && (SELECT tags FROM original_news_item) THEN
++            750
++          ELSE
++            0
++        END +
++        CASE
++          WHEN news_items.click_count > 1500 THEN
++            1500
++          ELSE
++            news_items.click_count
++        END +
++        CASE
++          WHEN ((DATE_PART('year', age(news_items.published_at)) * 12) + (DATE_PART('month', age(news_items.published_at)))) <= 12 THEN
++            500
++          WHEN ((DATE_PART('year', age(news_items.published_at)) * 12) + (DATE_PART('month', age(news_items.published_at)))) <= 24 THEN
++            250
++          WHEN ((DATE_PART('year', age(news_items.published_at)) * 12) + (DATE_PART('month', age(news_items.published_at)))) <= 36 THEN
++            100
++          ELSE
++            0
++        END
++        AS ranking
++      FROM
++        news_items AS news_items
++      LEFT OUTER JOIN news_item_topics AS news_item_topics ON
++        news_item_topics.item_id = news_items.id
++      LEFT OUTER JOIN topics AS topics ON
++        topics.id = news_item_topics.topic_id
++      LEFT OUTER JOIN news_item_comments AS news_item_comments ON
++        news_item_comments.item_id = news_items.id
++      WHERE
++        news_items.id != (SELECT id FROM original_news_item) AND
++        news_items.status = 3 AND
++        news_items.published_at <= timezone('utc', now()) AND
++        news_items.pinned AND
++        NOT news_items.feed_only
++      GROUP BY
++        news_items.id
++      ORDER BY
++        ranking DESC NULLS LAST
++      LIMIT num_recommendations;
++    $$ LANGUAGE SQL;
++    """
++  end
++end
+diff --git a/test/changelog/schema/news/news_item_test.exs b/test/changelog/schema/news/news_item_test.exs
+index 2a6a338728..5714431708 100644
+--- a/test/changelog/schema/news/news_item_test.exs
++++ b/test/changelog/schema/news/news_item_test.exs
+@@ -88,4 +88,74 @@ defmodule Changelog.NewsItemTest do
+       refute Enum.member?(subscribed_ids, wilma.id)
+     end
+   end
++
++  describe "recommend_podcasts/2" do
++    test "should return a list of similar podcasts" do
++      podcast = insert(:podcast)
++
++      author = insert(:person, twitter_handle: "ohai")
++      t1 = insert(:topic, name: "iOS", slug: "ios", twitter_handle: "OfficialiOS")
++      t2 = insert(:topic, name: "Machine Learning", slug: "machine-learning")
++
++      e1 = insert(:episode, podcast: podcast, slug: "114", audio_bytes: 26_238_621)
++
++      i1 =
++        insert(:news_item,
++          author: author,
++          object_id: "#{podcast.id}:#{e1.id}",
++          type: :audio,
++          status: :published,
++          published_at: NaiveDateTime.utc_now()
++        )
++
++      e2 = insert(:episode, podcast: podcast, slug: "181", audio_bytes: 59_310_792)
++
++      i2 =
++        insert(:news_item,
++          author: author,
++          click_count: 10,
++          object_id: "#{podcast.id}:#{e2.id}",
++          type: :audio,
++          status: :published,
++          published_at: NaiveDateTime.utc_now()
++        )
++
++      e3 = insert(:episode, podcast: podcast, slug: "182", audio_bytes: 56_304_828)
++
++      i3 =
++        insert(:news_item,
++          author: author,
++          click_count: 50,
++          object_id: "#{podcast.id}:#{e3.id}",
++          type: :audio,
++          status: :published,
++          published_at: NaiveDateTime.utc_now()
++        )
++
++      e4 = insert(:episode, podcast: podcast, slug: "183", audio_bytes: 63_723_737)
++
++      i4 =
++        insert(:news_item,
++          author: author,
++          click_count: 100,
++          object_id: "#{podcast.id}:#{e4.id}",
++          type: :audio,
++          status: :published,
++          published_at: NaiveDateTime.utc_now()
++        )
++
++      insert(:news_item_topic, news_item: i1, topic: t1)
++      insert(:news_item_topic, news_item: i2, topic: t2)
++      insert(:news_item_topic, news_item: i3, topic: t2)
++      insert(:news_item_topic, news_item: i4, topic: t2)
++
++      i1
++      |> NewsItem.load_object()
++      |> Repo.preload([:news_item_topics, :topics])
++
++      assert {:ok, [rec1, rec2, rec3]} = NewsItem.recommend_podcasts(e1, 3)
++      assert rec1["ranking"] > rec2["ranking"]
++      assert rec2["ranking"] > rec3["ranking"]
++    end
++  end
+ end

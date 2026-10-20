@@ -1,0 +1,4748 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index cb499cbc70..c8bbbc4489 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,7 @@
+ - fix: re-assign drives and charges only when a geofence's location or radius changes (#5823 - @JakobLichterfeld)
+ - perf(web): connect to the map tile server early, so maps appear sooner (#5826 - @JakobLichterfeld)
+ - fix(web): label cars without a name by their VIN in the settings, like the car summary (#5821 - @TUNER88)
++- fix(web): label cars without a name by their VIN on the charge cost page and in the vehicle reload hint, like the car summary (#5827 - @JakobLichterfeld)
+ 
+ #### Build, CI, internal
+ 
+diff --git a/elixir/lib/teslamate_web/live/car_live/summary.ex b/elixir/lib/teslamate_web/live/car_live/summary.ex
+index 1a4a400858..2a19c1f15e 100644
+--- a/elixir/lib/teslamate_web/live/car_live/summary.ex
++++ b/elixir/lib/teslamate_web/live/car_live/summary.ex
+@@ -8,6 +8,7 @@ defmodule TeslaMateWeb.CarLive.Summary do
+   alias TeslaMate.Vehicles.Vehicle.Summary
+   alias TeslaMate.Vehicles.Vehicle
+   alias TeslaMate.{Vehicles, Convert}
++  alias TeslaMateWeb.CarTitle
+ 
+   on_mount {TeslaMateWeb.InitAssigns, :locale}
+ 
+@@ -133,15 +134,6 @@ defmodule TeslaMateWeb.CarLive.Summary do
+ 
+   def format_tpms(_, _), do: "—"
+ 
+-  def format_car_title(display_name, vin) when display_name in [nil, ""] do
+-    label = gettext("VIN %{vin}", vin: vin)
+-    {label, label}
+-  end
+-
+-  def format_car_title(display_name, vin) do
+-    {display_name, gettext("VIN %{vin}", vin: String.slice(vin, -6, 6))}
+-  end
+-
+   defp translate_state(:start), do: ""
+   defp translate_state(:driving), do: gettext("driving")
+   defp translate_state(:charging), do: gettext("charging")
+diff --git a/elixir/lib/teslamate_web/live/car_live/summary.html.heex b/elixir/lib/teslamate_web/live/car_live/summary.html.heex
+index ed9fe0ce14..8b671a7599 100644
+--- a/elixir/lib/teslamate_web/live/car_live/summary.html.heex
++++ b/elixir/lib/teslamate_web/live/car_live/summary.html.heex
+@@ -39,7 +39,7 @@
+   <div class="card-content">
+     <div class="media is-flex mb-5">
+       <div class="media-content">
+-        <% {display_name, vin_label} = format_car_title(@summary.display_name, @car.vin) %>
++        <% {display_name, vin_label} = CarTitle.format(@summary.display_name, @car.vin) %>
+         <p class="title is-5">
+           <span
+             class="has-tooltip-right has-tooltip-bottom-mobile"
+diff --git a/elixir/lib/teslamate_web/live/car_title.ex b/elixir/lib/teslamate_web/live/car_title.ex
+new file mode 100644
+index 0000000000..2dfc97d834
+--- /dev/null
++++ b/elixir/lib/teslamate_web/live/car_title.ex
+@@ -0,0 +1,31 @@
++defmodule TeslaMateWeb.CarTitle do
++  @moduledoc """
++  User-facing title of a car, shared by every page that names one: cars
++  without a name are titled by their full VIN.
++  """
++  use Gettext, backend: TeslaMateWeb.Gettext
++
++  alias TeslaMate.Log.Car
++
++  @doc """
++  Returns the title and the VIN label shown next to it. A car without a name
++  shows its full VIN as title and label; a named car is labeled by the last six
++  characters of its VIN.
++  """
++  @spec format(String.t() | nil, String.t()) :: {String.t(), String.t()}
++  def format(name, vin) when name in [nil, ""] do
++    label = gettext("VIN %{vin}", vin: vin)
++    {label, label}
++  end
++
++  def format(name, vin) do
++    {name, gettext("VIN %{vin}", vin: String.slice(vin, -6, 6))}
++  end
++
++  @doc "Returns only the title of `format/2`."
++  @spec title(Car.t()) :: String.t()
++  def title(%Car{name: name, vin: vin}) do
++    {title, _vin_label} = format(name, vin)
++    title
++  end
++end
+diff --git a/elixir/lib/teslamate_web/live/charge_live/cost.ex b/elixir/lib/teslamate_web/live/charge_live/cost.ex
+index 7a858c5998..c426dc9be1 100644
+--- a/elixir/lib/teslamate_web/live/charge_live/cost.ex
++++ b/elixir/lib/teslamate_web/live/charge_live/cost.ex
+@@ -6,6 +6,7 @@ defmodule TeslaMateWeb.ChargeLive.Cost do
+   alias TeslaMate.Locations.{GeoFence, Address}
+   alias TeslaMate.Log.ChargingProcess
+   alias TeslaMate.Log
++  alias TeslaMateWeb.CarTitle
+ 
+   use Gettext, backend: TeslaMateWeb.Gettext
+ 
+diff --git a/elixir/lib/teslamate_web/live/charge_live/cost.html.heex b/elixir/lib/teslamate_web/live/charge_live/cost.html.heex
+index 860935da68..912d3a7242 100644
+--- a/elixir/lib/teslamate_web/live/charge_live/cost.html.heex
++++ b/elixir/lib/teslamate_web/live/charge_live/cost.html.heex
+@@ -67,7 +67,7 @@
+             <span class="tag is-info is-light">
+               <span class="icon"><span class="mdi mdi-car"></span></span>
+             </span>
+-            <span class="tag">{@charging_process.car.name}</span>
++            <span class="tag">{CarTitle.title(@charging_process.car)}</span>
+           </div>
+         </div>
+ 
+diff --git a/elixir/lib/teslamate_web/live/settings_live/index.ex b/elixir/lib/teslamate_web/live/settings_live/index.ex
+index bcdefa155e..65298efacc 100644
+--- a/elixir/lib/teslamate_web/live/settings_live/index.ex
++++ b/elixir/lib/teslamate_web/live/settings_live/index.ex
+@@ -5,7 +5,7 @@ defmodule TeslaMateWeb.SettingsLive.Index do
+ 
+   alias TeslaMate.Settings.{GlobalSettings, CarSettings}
+   alias TeslaMate.{Log, Settings, Updater, Api, Vehicles}
+-  alias TeslaMateWeb.VehicleReload
++  alias TeslaMateWeb.{CarTitle, VehicleReload}
+ 
+   on_mount {TeslaMateWeb.InitAssigns, :locale}
+ 
+@@ -195,12 +195,6 @@ defmodule TeslaMateWeb.SettingsLive.Index do
+ 
+   defp supported_ui_languages, do: @supported_ui_languages
+ 
+-  # Same visible title the car summary uses (format_car_title/2, #5556).
+-  defp car_label(%{name: name, vin: vin}) do
+-    {title, _vin_label} = TeslaMateWeb.CarLive.Summary.format_car_title(name, vin)
+-    title
+-  end
+-
+   defp addresses_migrated? do
+     alias TeslaMate.Log.{Drive, ChargingProcess}
+     alias TeslaMate.Repo
+diff --git a/elixir/lib/teslamate_web/live/settings_live/index.html.heex b/elixir/lib/teslamate_web/live/settings_live/index.html.heex
+index c78c61f750..03534fc596 100644
+--- a/elixir/lib/teslamate_web/live/settings_live/index.html.heex
++++ b/elixir/lib/teslamate_web/live/settings_live/index.html.heex
+@@ -11,7 +11,7 @@
+       <ul>
+         <%= for {car_id, %{original: %{car: car}}} <- @car_settings do %>
+           <li class={if car_id == @car, do: "is-active"}>
+-            {link(car_label(car), to: "#", phx_click: "car", phx_value_id: car_id)}
++            {link(CarTitle.title(car), to: "#", phx_click: "car", phx_value_id: car_id)}
+           </li>
+         <% end %>
+       </ul>
+@@ -186,7 +186,7 @@
+       <%= for {{car_id, %{original: %{car: car}}}, index} <- Enum.with_index(@car_settings) do %>
+         <div class="field is-horizontal center-vertically car-order-row">
+           <div class="field-label is-normal is-paddingless">
+-            <label class="label">{car_label(car)}</label>
++            <label class="label">{CarTitle.title(car)}</label>
+           </div>
+           <div class="field-body">
+             <div class="field is-grouped">
+diff --git a/elixir/lib/teslamate_web/live/vehicle_reload.ex b/elixir/lib/teslamate_web/live/vehicle_reload.ex
+index 1e378f435c..8e7f1eb5e0 100644
+--- a/elixir/lib/teslamate_web/live/vehicle_reload.ex
++++ b/elixir/lib/teslamate_web/live/vehicle_reload.ex
+@@ -7,6 +7,7 @@ defmodule TeslaMateWeb.VehicleReload do
+ 
+   alias TeslaMate.Log.Car
+   alias TeslaMate.Vehicles
++  alias TeslaMateWeb.CarTitle
+ 
+   @doc "Explains a discovery result; `nil` for a result that needs no explanation."
+   @spec hint(Vehicles.discovery() | nil) :: String.t() | nil
+@@ -15,7 +16,7 @@ defmodule TeslaMateWeb.VehicleReload do
+   def hint({:ok, []}), do: gettext("No new vehicle was found in your Tesla account.")
+ 
+   def hint({:ok, [_ | _] = cars}) do
+-    names = Enum.map_join(cars, ", ", fn %Car{name: name, vin: vin} -> name || vin end)
++    names = Enum.map_join(cars, ", ", fn %Car{} = car -> CarTitle.title(car) end)
+     gettext("Started logging for: %{names}", names: names)
+   end
+ 
+diff --git a/elixir/priv/gettext/ca/LC_MESSAGES/default.po b/elixir/priv/gettext/ca/LC_MESSAGES/default.po
+index 1c0a4adcfe..7bab3a571a 100644
+--- a/elixir/priv/gettext/ca/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/ca/LC_MESSAGES/default.po
+@@ -29,32 +29,32 @@ msgstr "Nivell de càrrega"
+ msgid "Charged"
+ msgstr "Carregat"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "en repòs"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "carregant"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "conduint"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "sense connexió"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "en línia"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "actualitzant"
+@@ -102,12 +102,12 @@ msgstr "Endollat"
+ msgid "Charge Limit"
+ msgstr "Límit de càrrega"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "entrant en repòs"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "no disponible"
+@@ -199,7 +199,7 @@ msgstr "min"
+ msgid "Signed in successfully"
+ msgstr "Autenticat correctament"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "Cotxe obert"
+@@ -209,18 +209,18 @@ msgstr "Cotxe obert"
+ msgid "Create"
+ msgstr "Crea"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "Precondicionant"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "Mode centinella activat"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -298,7 +298,7 @@ msgstr ""
+ "L'estimació de l'autonomia restant del vehicle es basa en un consum fix d'energia en Wh/km. El factor Wh/km ve determinat per Tesla i no és específic per a cada país, mentre que l'autonomia nominal es basa en proves regulatòries als diferents mercats per a "
+ "aquest vehicle."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "Actualitzant"
+@@ -377,12 +377,12 @@ msgstr "Mode de repòs"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "S'ha actualitzat la geotanca \"%{name}\""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "S'ha produit un error"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "S'ha excedit el temps"
+@@ -397,7 +397,7 @@ msgstr "Bateria amb autonomia reduïda"
+ msgid "≈ %{range} at 100%"
+ msgstr "≈ %{range} al 100%"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -414,7 +414,7 @@ msgstr "Cost"
+ msgid "Enter charge cost"
+ msgstr "Introduïu el cost de càrrega"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "Desat!"
+@@ -552,12 +552,12 @@ msgstr "GitHub"
+ msgid "Update available"
+ msgstr "Actualització disponible"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "Portes obertes"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "Maleter obert"
+@@ -603,7 +603,7 @@ msgstr "Per a obtenir tokens a través de l'API de Tesla cal tenir experiència
+ msgid "here"
+ msgstr "aquí"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr "Descarregant l'actualització"
+@@ -640,7 +640,7 @@ msgstr "Pressió dels pneumàtics"
+ msgid "Dog Mode"
+ msgstr "Mode gos"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr "Mode gos actiu"
+@@ -853,8 +853,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -884,12 +884,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -910,17 +910,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -935,12 +935,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/da/LC_MESSAGES/default.po b/elixir/priv/gettext/da/LC_MESSAGES/default.po
+index 2b525a8da0..7e457cac9d 100644
+--- a/elixir/priv/gettext/da/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/da/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr "Batteriniveau"
+ msgid "Charged"
+ msgstr "Opladet"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "sover"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "oplader"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "kører"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "offline"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "online"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "opdaterer"
+@@ -103,12 +103,12 @@ msgstr "Stikket sat i"
+ msgid "Charge Limit"
+ msgstr "Opladningsgrænse"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "ved at falde i søvn"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "ikke tilgængelig"
+@@ -200,7 +200,7 @@ msgstr "min"
+ msgid "Signed in successfully"
+ msgstr "Logget ind"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "Bilen er ikke låst"
+@@ -210,18 +210,18 @@ msgstr "Bilen er ikke låst"
+ msgid "Create"
+ msgstr "Opret"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "Forvarmer"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "Vagttilstand er aktiveret"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr "Rækkevidde (ideel)"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "Bilens overslag på den tilbageværende rækkevidde er baseret på et fast energiforbrug i Wh/km. Wh/km faktoren er bestem af Tesla og er ikke landespecifik, hvorimod den beregnede rækkevidde er baseret på myndighedernes testregler i de forskellige markeder for køretøjet."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "Opdatering i gang"
+@@ -376,12 +376,12 @@ msgstr "Dvaletilstand"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "Geografisk afgrænsning \"%{name}\" opdateret"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "Der opstod en fejl"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "Timeout"
+@@ -396,7 +396,7 @@ msgstr "Batteri har reduceret rækkevidde"
+ msgid "≈ %{range} at 100%"
+ msgstr "≈ %{range} ved 100%"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr "Pris"
+ msgid "Enter charge cost"
+ msgstr "Indtast pris for opladning"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "Gemt!"
+@@ -551,12 +551,12 @@ msgstr "GitHub"
+ msgid "Update available"
+ msgstr "Opdatering tilgængelig"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "Døre er åbne"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "Bagklap åben"
+@@ -602,7 +602,7 @@ msgstr ""
+ msgid "here"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr ""
+@@ -637,7 +637,7 @@ msgstr ""
+ msgid "Dog Mode"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr ""
+@@ -850,8 +850,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -881,12 +881,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -907,17 +907,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -932,12 +932,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/de/LC_MESSAGES/default.po b/elixir/priv/gettext/de/LC_MESSAGES/default.po
+index a379d89872..d0bcb9e7ef 100644
+--- a/elixir/priv/gettext/de/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/de/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr "Ladestand"
+ msgid "Charged"
+ msgstr "Geladen"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "schläft"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "lädt"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "fährt"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "offline"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "online"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "installiert Update"
+@@ -103,12 +103,12 @@ msgstr "Eingesteckt"
+ msgid "Charge Limit"
+ msgstr "Ladelimit"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "schläft ein"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "nicht verfügbar"
+@@ -200,7 +200,7 @@ msgstr ""
+ msgid "Signed in successfully"
+ msgstr "Erfolgreich angemeldet"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "Das Auto ist aufgeschlossen"
+@@ -210,18 +210,18 @@ msgstr "Das Auto ist aufgeschlossen"
+ msgid "Create"
+ msgstr "Erstellen"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "Vorkonditionierung"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "Wächtermodus aktiviert"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr "Reichweite (ideal)"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "Die Schätzung der verbleibenden Reichweite basiert auf einem fixen Energieverbrauch in Wh/km. Der Wh/km-Faktor wird von Tesla bestimmt und ist nicht länderspezifisch, wohingegen die 'rated' Reichweite auf regulatorischen Tests in den verschiedenen Märkten für dieses Fahrzeug basiert."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "Update läuft"
+@@ -376,12 +376,12 @@ msgstr "Schlafmodus"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "Geo-Fence \"%{name}\" aktualisiert"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "Ein Fehler ist aufgetreten"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "Zeitüberschreitung"
+@@ -396,7 +396,7 @@ msgstr "Verringerte Reichweite"
+ msgid "≈ %{range} at 100%"
+ msgstr "≈ %{range} bei 100%"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr "Kosten"
+ msgid "Enter charge cost"
+ msgstr "Ladekosten eingeben"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "Gespeichert!"
+@@ -551,12 +551,12 @@ msgstr ""
+ msgid "Update available"
+ msgstr "Update verfügbar"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "Türen geöffnet"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "Kofferraum ist geöffnet"
+@@ -602,7 +602,7 @@ msgstr "Der Abruf von Tokens über die Tesla-API erfordert Programmierkenntnisse
+ msgid "here"
+ msgstr "hier"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr "Update wird heruntergeladen"
+@@ -637,7 +637,7 @@ msgstr "Reifendruck"
+ msgid "Dog Mode"
+ msgstr "Hundemodus"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr "Hundemodus ist aktiviert"
+@@ -850,8 +850,8 @@ msgstr "Dieser unterbrochene Import wird mit seiner gespeicherten Zeitzone fortg
+ msgid "row belongs to a different vehicle"
+ msgstr "Zeile gehört zu einem anderen Fahrzeug"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -881,12 +881,12 @@ msgstr "Für die bekannten Fahrzeuge ist die Datenerfassung deaktiviert, oder si
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr "Ruft die Fahrzeugliste deines Tesla-Kontos einmal ab und startet die Aufzeichnung für Fahrzeuge, die noch nicht aufgezeichnet werden. Laufende Aufzeichnungen werden nicht unterbrochen."
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr "Das Abrufen der Fahrzeuge von der Tesla-API ist fehlgeschlagen: %{reason}"
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr "In deinem Tesla-Konto wurde kein neues Fahrzeug gefunden."
+@@ -907,17 +907,17 @@ msgstr "Beim Start von TeslaMate wurde kein Fahrzeug gefunden. Sobald dein Fahrz
+ msgid "Reload vehicles"
+ msgstr "Fahrzeuge neu laden"
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr "Das Neuladen der Fahrzeuge ist fehlgeschlagen. Bitte prüfe die Logs."
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr "Aufzeichnung gestartet für: %{names}"
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr "Beim Abrufen der Fahrzeuge wurde das Anfragelimit der Tesla-API überschritten. Bitte warte einige Minuten, bevor du neu lädst."
+@@ -932,12 +932,12 @@ msgstr "Fahrzeugliste"
+ msgid "Vehicles"
+ msgstr "Fahrzeuge"
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr "Dein Tesla-Konto enthält noch kein Fahrzeug. Sobald das Fahrzeug in der Tesla-App erscheint, lade die Fahrzeugliste neu."
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr "Ein Fahrzeug konnte nicht in der Datenbank gespeichert werden. Bitte prüfe die Logs."
+diff --git a/elixir/priv/gettext/default.pot b/elixir/priv/gettext/default.pot
+index 226857bed3..e84459cb21 100644
+--- a/elixir/priv/gettext/default.pot
++++ b/elixir/priv/gettext/default.pot
+@@ -30,32 +30,32 @@ msgstr ""
+ msgid "Charged"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr ""
+@@ -103,12 +103,12 @@ msgstr ""
+ msgid "Charge Limit"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr ""
+@@ -200,7 +200,7 @@ msgstr ""
+ msgid "Signed in successfully"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr ""
+@@ -210,18 +210,18 @@ msgstr ""
+ msgid "Create"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr ""
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr ""
+@@ -376,12 +376,12 @@ msgstr ""
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr ""
+@@ -396,7 +396,7 @@ msgstr ""
+ msgid "≈ %{range} at 100%"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr ""
+ msgid "Enter charge cost"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr ""
+@@ -551,12 +551,12 @@ msgstr ""
+ msgid "Update available"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr ""
+@@ -602,7 +602,7 @@ msgstr ""
+ msgid "here"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr ""
+@@ -637,7 +637,7 @@ msgstr ""
+ msgid "Dog Mode"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr ""
+@@ -850,8 +850,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -881,12 +881,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -907,17 +907,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -932,12 +932,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/en/LC_MESSAGES/default.po b/elixir/priv/gettext/en/LC_MESSAGES/default.po
+index 310d684252..4791335ccc 100644
+--- a/elixir/priv/gettext/en/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/en/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr ""
+ msgid "Charged"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr ""
+@@ -103,12 +103,12 @@ msgstr ""
+ msgid "Charge Limit"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr ""
+@@ -200,7 +200,7 @@ msgstr ""
+ msgid "Signed in successfully"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr ""
+@@ -210,18 +210,18 @@ msgstr ""
+ msgid "Create"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr ""
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr ""
+@@ -376,12 +376,12 @@ msgstr ""
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr ""
+@@ -396,7 +396,7 @@ msgstr ""
+ msgid "≈ %{range} at 100%"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr ""
+ msgid "Enter charge cost"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr ""
+@@ -551,12 +551,12 @@ msgstr ""
+ msgid "Update available"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr ""
+@@ -602,7 +602,7 @@ msgstr ""
+ msgid "here"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr ""
+@@ -637,7 +637,7 @@ msgstr ""
+ msgid "Dog Mode"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr ""
+@@ -850,8 +850,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -881,12 +881,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -907,17 +907,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -932,12 +932,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/es/LC_MESSAGES/default.po b/elixir/priv/gettext/es/LC_MESSAGES/default.po
+index 55909cb9e3..ac8ad87fff 100644
+--- a/elixir/priv/gettext/es/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/es/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr "Nivel de carga"
+ msgid "Charged"
+ msgstr "Cargado"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "en reposo"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "cargando"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "conduciendo"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "sin conexión"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "en línea"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "actualizando"
+@@ -103,12 +103,12 @@ msgstr "Enchufado"
+ msgid "Charge Limit"
+ msgstr "Límite de carga"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "entrando en reposo"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "no disponible"
+@@ -200,7 +200,7 @@ msgstr "min"
+ msgid "Signed in successfully"
+ msgstr "Sesión iniciada correctamente"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "Coche abierto"
+@@ -210,18 +210,18 @@ msgstr "Coche abierto"
+ msgid "Create"
+ msgstr "Crear"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "Acondicionando"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "Modo centinela activo"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr "Autonomía (ideal)"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "La estimación por parte del coche de la autonomía restante está basada en un consumo fijo de energía en Wh/km. El factor de Wh/km está determinado por Tesla y no es específico del país, mientras que la autonomía nominal está basada en pruebas regulatorias en los diferentes mercados para ese vehículo."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "Actualización en curso"
+@@ -376,12 +376,12 @@ msgstr "Modo de reposo"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "Actualizada la geovalla \"%{name}\""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "Ha ocurrido un error"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "Plazo de espera agotado"
+@@ -396,7 +396,7 @@ msgstr "Batería con autonomía reducida"
+ msgid "≈ %{range} at 100%"
+ msgstr "≈ %{range} al 100%"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr "Coste"
+ msgid "Enter charge cost"
+ msgstr "Introduce el coste de carga"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "¡Guardado!"
+@@ -551,12 +551,12 @@ msgstr "GitHub"
+ msgid "Update available"
+ msgstr "Actualización disponible"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "Puertas abiertas"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "Maletero abierto"
+@@ -602,7 +602,7 @@ msgstr "La generación de tokens por medio del API de Tesla requiere habilidades
+ msgid "here"
+ msgstr "aquí"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr "Descargando actualización"
+@@ -637,7 +637,7 @@ msgstr "Presión de las ruedas"
+ msgid "Dog Mode"
+ msgstr "Modo Perro"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr "El modo Perro está activado"
+@@ -850,8 +850,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -881,12 +881,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -907,17 +907,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -932,12 +932,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/fi/LC_MESSAGES/default.po b/elixir/priv/gettext/fi/LC_MESSAGES/default.po
+index 14bfeeb137..f07c026ce8 100644
+--- a/elixir/priv/gettext/fi/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/fi/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr "Lataustaso"
+ msgid "Charged"
+ msgstr "Ladattu"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "lepotilassa"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "lataa"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "ajossa"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "offline-tilassa"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "yhteydessä"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "päivittää"
+@@ -103,12 +103,12 @@ msgstr "Kytketty johtoon"
+ msgid "Charge Limit"
+ msgstr "Latausraja"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "menossa lepotilaan"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "ei saatavilla"
+@@ -200,7 +200,7 @@ msgstr "min"
+ msgid "Signed in successfully"
+ msgstr "Kirjauduttu sisään onnistuneesti"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "Auto ei ole lukittu"
+@@ -210,18 +210,18 @@ msgstr "Auto ei ole lukittu"
+ msgid "Create"
+ msgstr "Luo"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "Esilämmitys"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "Sentry-moodi on päällä"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr "Range (ihanteellinen)"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "Auton arvio jäljellä olevasta rangesta perustuu kiinteään Wh/km kulutukseen. Tämä kiinteä kulutus on Teslan määrittelemä eikä se riipu maasta, toisin kuin rated-range, joka pohjautuu testeihin eri markkina-alueilla."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "Päivitys käynnissä"
+@@ -376,12 +376,12 @@ msgstr "Lepotila"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "Georajaus \"%{name}\" päivitetty"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "Virhe tapahtui"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "Aikakatkaisu"
+@@ -396,7 +396,7 @@ msgstr "Pienennetty akun range"
+ msgid "≈ %{range} at 100%"
+ msgstr "≈ %{range} 100%:ssa"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr "Hinta"
+ msgid "Enter charge cost"
+ msgstr "Syötä latauskustannukset"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "Tallennettu!"
+@@ -551,12 +551,12 @@ msgstr "GitHub"
+ msgid "Update available"
+ msgstr "Päivitys saatavilla"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "Ovia on auki"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "Takakontti on auki"
+@@ -602,7 +602,7 @@ msgstr ""
+ msgid "here"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr ""
+@@ -637,7 +637,7 @@ msgstr ""
+ msgid "Dog Mode"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr ""
+@@ -850,8 +850,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -881,12 +881,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -907,17 +907,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -932,12 +932,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/fr/LC_MESSAGES/default.po b/elixir/priv/gettext/fr/LC_MESSAGES/default.po
+index 3bf81ae11a..db25b6ec43 100644
+--- a/elixir/priv/gettext/fr/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/fr/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr "Niveau de charge"
+ msgid "Charged"
+ msgstr "Chargée"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "Endormie"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "En charge"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "Conduite"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "Hors ligne"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "En ligne"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "Mise à jour en cours"
+@@ -103,12 +103,12 @@ msgstr "Branchée"
+ msgid "Charge Limit"
+ msgstr "Limite de charge"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "S'endort"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "Indisponible"
+@@ -200,7 +200,7 @@ msgstr "min"
+ msgid "Signed in successfully"
+ msgstr "Connecté avec succès"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "La voiture est déverrouillée"
+@@ -210,18 +210,18 @@ msgstr "La voiture est déverrouillée"
+ msgid "Create"
+ msgstr "Créer"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "Préconditionnement"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "Mode sentinelle activé"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr "Autonomie Estimée"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "Théorique = Autonomie indiquée par Tesla. Estimée = Autonomie norme WLTP Europe"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "Mise à jour en cours d'installation"
+@@ -376,12 +376,12 @@ msgstr "Mode veille"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "Géo-repérage \"%{name}\" mis à jour"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "Une erreur est survenue"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "Délai maximum expiré"
+@@ -396,7 +396,7 @@ msgstr "Autonomie de la batterie réduite"
+ msgid "≈ %{range} at 100%"
+ msgstr "≈ %{range} à 100%"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr "Coût"
+ msgid "Enter charge cost"
+ msgstr "Entrez le coût de charge"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "Enregistré!"
+@@ -551,12 +551,12 @@ msgstr "GitHub"
+ msgid "Update available"
+ msgstr "Mise à jour disponible"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "Les portes sont ouvertes"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "Le coffre est ouvert"
+@@ -602,7 +602,7 @@ msgstr "L'obtention de jetons via l'API Tesla nécessite une expérience de prog
+ msgid "here"
+ msgstr "ici"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr "Mise à jour en cours de téléchargement"
+@@ -637,7 +637,7 @@ msgstr "Pression des pneus"
+ msgid "Dog Mode"
+ msgstr "Mode Chien"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr "Le Mode Chien est actif"
+@@ -850,8 +850,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -881,12 +881,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -907,17 +907,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -932,12 +932,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/hu/LC_MESSAGES/default.po b/elixir/priv/gettext/hu/LC_MESSAGES/default.po
+index 75c3652afd..97d5b85ccc 100644
+--- a/elixir/priv/gettext/hu/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/hu/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr "Töltöttségi szint"
+ msgid "Charged"
+ msgstr "Feltöltve"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "alvó"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "töltés"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "vezetés"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "offline"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "online"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "frissítés alatt"
+@@ -103,12 +103,12 @@ msgstr "Csatlakoztatva"
+ msgid "Charge Limit"
+ msgstr "Töltési limit"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "elalvás folyamatban"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "nem elérhető"
+@@ -200,7 +200,7 @@ msgstr "perc"
+ msgid "Signed in successfully"
+ msgstr "Sikeres bejelentkezés"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "Az autó nyitva van"
+@@ -210,18 +210,18 @@ msgstr "Az autó nyitva van"
+ msgid "Create"
+ msgstr "Létrehozás"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "Előklimatizálás"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "Az Őrszem mód be van kapcsolva"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr "Hatótáv (ideális)"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "Az autó a fennmaradó hatótávot rögzített Wh/km energiafogyasztás alapján becsüli. A Wh/km értéket a Tesla határozza meg, és nem országspecifikus, míg a névleges hatótáv az adott jármű különböző piacain alkalmazott szabályozási teszteken alapul."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "Frissítés folyamatban"
+@@ -376,12 +376,12 @@ msgstr "Alvó mód"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "A(z) \"%{name}\" geokerítés frissítve"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "Hiba történt"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "Időtúllépés"
+@@ -396,7 +396,7 @@ msgstr "Csökkentett akkumulátor-hatótáv"
+ msgid "≈ %{range} at 100%"
+ msgstr "≈ %{range} 100%-nál"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr "Költség"
+ msgid "Enter charge cost"
+ msgstr "Add meg a töltési költséget"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "Mentve!"
+@@ -551,12 +551,12 @@ msgstr "GitHub"
+ msgid "Update available"
+ msgstr "Frissítés elérhető"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "Az ajtók nyitva vannak"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "A csomagtartó nyitva van"
+@@ -602,7 +602,7 @@ msgstr "A Tesla API-n keresztüli tokenek beszerzéséhez programozási tapaszta
+ msgid "here"
+ msgstr "itt"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr "Frissítés letöltése"
+@@ -637,7 +637,7 @@ msgstr "Abroncsnyomás"
+ msgid "Dog Mode"
+ msgstr "Kutya mód"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr "A Kutya mód be van kapcsolva"
+@@ -850,8 +850,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -881,12 +881,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -907,17 +907,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -932,12 +932,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/it/LC_MESSAGES/default.po b/elixir/priv/gettext/it/LC_MESSAGES/default.po
+index dd9dc0a2a2..72dfbd2044 100644
+--- a/elixir/priv/gettext/it/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/it/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr "Livello di carica"
+ msgid "Charged"
+ msgstr "Caricato"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "sospesa"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "in carica"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "in movimento"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "non raggiungibile"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "in linea"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "aggiornamento in corso"
+@@ -103,12 +103,12 @@ msgstr "Collegata"
+ msgid "Charge Limit"
+ msgstr "Limite di carica"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "sospensione in corso"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "non disponibile"
+@@ -200,7 +200,7 @@ msgstr "min"
+ msgid "Signed in successfully"
+ msgstr "Accesso effettuato"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "La vettura è aperta"
+@@ -210,18 +210,18 @@ msgstr "La vettura è aperta"
+ msgid "Create"
+ msgstr "Crea"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "Precondizionamento"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "Modalità sentinella attiva"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr "Autonomia (stimata)"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "La stima dell'autonomia residua dell'auto si basa su un consumo energetico fisso in Wh/km. Il fattore Wh/km è determinato da Tesla e non è specifico per ogni Paese, mentre l'autonomia nominale si basa sui test di certificazione effettuati nei diversi mercati per quel veicolo."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "Aggiornamento in corso"
+@@ -376,12 +376,12 @@ msgstr "Modalità sospensione"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "Geo-fence \"%{name}\" aggiornata"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "Si è verificato un errore"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "Tempo massimo scaduto"
+@@ -396,7 +396,7 @@ msgstr "Durata della batteria ridotta"
+ msgid "≈ %{range} at 100%"
+ msgstr "≈ %{range} al 100%"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr "Costo"
+ msgid "Enter charge cost"
+ msgstr "Inserire il costo di ricarica"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "Salvato!"
+@@ -551,12 +551,12 @@ msgstr "GitHub"
+ msgid "Update available"
+ msgstr "Aggiornamento disponibile"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "Le portiere sono aperte"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "Il baule è aperto"
+@@ -602,7 +602,7 @@ msgstr "Ottenere i token tramite le API Tesla richede esperienza nel campo della
+ msgid "here"
+ msgstr "qui"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr "Download dell'aggiornamento in corso"
+@@ -637,7 +637,7 @@ msgstr "Pressione pneumatici"
+ msgid "Dog Mode"
+ msgstr "Modalità Cane"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr "Modalità Cane attiva"
+@@ -850,8 +850,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -881,12 +881,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -907,17 +907,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -932,12 +932,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/ja/LC_MESSAGES/default.po b/elixir/priv/gettext/ja/LC_MESSAGES/default.po
+index 08dfd5bd14..e379dc749d 100644
+--- a/elixir/priv/gettext/ja/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/ja/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr "充電状態"
+ msgid "Charged"
+ msgstr "充電完了"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "スリープ"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "充電中"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "運転中"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "オフライン"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "オンライン"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "アップデート中"
+@@ -103,12 +103,12 @@ msgstr "電源に差し込み済"
+ msgid "Charge Limit"
+ msgstr "充電制限"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "スリープ中"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "利用不可"
+@@ -200,7 +200,7 @@ msgstr "分"
+ msgid "Signed in successfully"
+ msgstr "サインイン成功"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "車両のロックが解除されました"
+@@ -210,18 +210,18 @@ msgstr "車両のロックが解除されました"
+ msgid "Create"
+ msgstr "作成"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "プリコンディショニング"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "セントリーモードが有効化されました"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr "想定距離"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "車の残存距離の推定値は、Wh / km単位の固定エネルギー消費量に基づいています。 Wh / km係数はテスラによって決定され、国固有ではありませんが、定格範囲はその車両のさまざまな市場での規制テストに基づいています。"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "アップデート中"
+@@ -376,12 +376,12 @@ msgstr "スリープモード"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "ジオフェンス \"%{name}\" がアップデートされました"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "エラーが発生しました"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "タイムアウト"
+@@ -396,7 +396,7 @@ msgstr "バッテリー範囲の縮小"
+ msgid "≈ %{range} at 100%"
+ msgstr "100% チャージ時"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr "コスト"
+ msgid "Enter charge cost"
+ msgstr "充電コストを入力"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "保存しました"
+@@ -551,12 +551,12 @@ msgstr "GitHub"
+ msgid "Update available"
+ msgstr "アップデート可能"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "ドアが開いています"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "トランクが開いています"
+@@ -602,7 +602,7 @@ msgstr "Tesla APIを介してトークンを取得するには、プログラミ
+ msgid "here"
+ msgstr "ここ"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr ""
+@@ -637,7 +637,7 @@ msgstr ""
+ msgid "Dog Mode"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr ""
+@@ -849,8 +849,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -880,12 +880,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -906,17 +906,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -931,12 +931,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/ko/LC_MESSAGES/default.po b/elixir/priv/gettext/ko/LC_MESSAGES/default.po
+index 19804ef5d5..5d1330fe41 100644
+--- a/elixir/priv/gettext/ko/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/ko/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr "충전상태"
+ msgid "Charged"
+ msgstr "충전됨"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "절전"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "충전"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "주행"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "오프라인"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "온라인"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "업데이트"
+@@ -103,12 +103,12 @@ msgstr "충전 준비됨"
+ msgid "Charge Limit"
+ msgstr "충전목표"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "절전 중"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "사용불가"
+@@ -200,7 +200,7 @@ msgstr "분"
+ msgid "Signed in successfully"
+ msgstr "로그인 성공"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "차량이 잠김해제되었습니다."
+@@ -210,18 +210,18 @@ msgstr "차량이 잠김해제되었습니다."
+ msgid "Create"
+ msgstr "생성"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "프리컨디셔닝"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "감시모드가 활성화되었습니다."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr "거리 (이상적)"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "차량의 잔여거리 추정치는 고정 에너지 소비량(Wh/km)을 기준으로합니다. Wh/km 계수는 Tesla에 의해 결정되며 국가별로 다르지 않지만 정규 거리는 해당 차량의 다른 시장에서 규제 테스트를 기반으로합니다."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "업데이트 진행 중"
+@@ -376,12 +376,12 @@ msgstr "절전모드"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "지오펜스 \"%{name}\" 가 업데이트 되었습니다."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "오류가 발생하였습니다"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "시간초과"
+@@ -396,7 +396,7 @@ msgstr "감소된 배터리 거리"
+ msgid "≈ %{range} at 100%"
+ msgstr "≈ 100%에서 %{range}"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr "비용"
+ msgid "Enter charge cost"
+ msgstr "충전비용 입력"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "저장완료!"
+@@ -551,12 +551,12 @@ msgstr "깃허브"
+ msgid "Update available"
+ msgstr "업데이트 가능"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "문이 열려있습니다."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "트렁크가 열려있습니다."
+@@ -602,7 +602,7 @@ msgstr "Tesla API 토큰을 얻으러면 프로그래밍 경험이나 서드파
+ msgid "here"
+ msgstr "이곳"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr "업데이트 다운로드 중"
+@@ -637,7 +637,7 @@ msgstr "공기압"
+ msgid "Dog Mode"
+ msgstr "애견 모드"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr "애견 모드가 켜져있습니다."
+@@ -849,8 +849,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -880,12 +880,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -906,17 +906,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -931,12 +931,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/nb/LC_MESSAGES/default.po b/elixir/priv/gettext/nb/LC_MESSAGES/default.po
+index b4c8302f03..975f26489d 100644
+--- a/elixir/priv/gettext/nb/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/nb/LC_MESSAGES/default.po
+@@ -31,32 +31,32 @@ msgstr "Ladenivå nå"
+ msgid "Charged"
+ msgstr "Ladet hittil"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "dvale"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "Ladet"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "kjører"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "Offline"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "online"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "oppdaterer"
+@@ -104,12 +104,12 @@ msgstr "Koblet til"
+ msgid "Charge Limit"
+ msgstr "Ladelimit"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "Dvale"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "ikke tilgjengelig"
+@@ -201,7 +201,7 @@ msgstr "min"
+ msgid "Signed in successfully"
+ msgstr "Innlogget"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "Bilen er ulåst"
+@@ -211,18 +211,18 @@ msgstr "Bilen er ulåst"
+ msgid "Create"
+ msgstr "Opprett"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "Forvarming"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "Sentry Mode er aktivert"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -298,7 +298,7 @@ msgstr "Rekkevidde typisk"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "Kjøretøyets estimerte tilgjengelige rekkevidde er basert på et fast energiforbruk oppgitt i Wh/km. Wh/km-faktoren er bestemt av Tesla og er ikke landspesifikk, der oppgitt rekkevidde er basert på regulatoriske tester i de ulike markeder for det spesifikke kjøretøyet."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "Oppdaterer software"
+@@ -377,12 +377,12 @@ msgstr "Dvalemodus"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "Geo-lokasjon \"%{name}\" oppdatert"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "En feil har oppstått"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "Timeout"
+@@ -397,7 +397,7 @@ msgstr "Redusert batterirekkevidde"
+ msgid "≈ %{range} at 100%"
+ msgstr "≈ %{range} ved 100%"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -414,7 +414,7 @@ msgstr "Pris"
+ msgid "Enter charge cost"
+ msgstr "Angi ladepris"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "Lagret!"
+@@ -552,12 +552,12 @@ msgstr "GitHub"
+ msgid "Update available"
+ msgstr "Ny software tilgjengelig"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "Åpen dør"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "Bagasjeluken er åpen"
+@@ -603,7 +603,7 @@ msgstr ""
+ msgid "here"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr ""
+@@ -638,7 +638,7 @@ msgstr ""
+ msgid "Dog Mode"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr ""
+@@ -851,8 +851,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -882,12 +882,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -908,17 +908,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -933,12 +933,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/nl/LC_MESSAGES/default.po b/elixir/priv/gettext/nl/LC_MESSAGES/default.po
+index f1c1164419..4f85711703 100644
+--- a/elixir/priv/gettext/nl/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/nl/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr "Laadtoestand"
+ msgid "Charged"
+ msgstr "Opgeladen"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "slaapt"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "opladen"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "rijden"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "offline"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "online"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "bijwerken"
+@@ -103,12 +103,12 @@ msgstr "Ingeplugd"
+ msgid "Charge Limit"
+ msgstr "Laadlimiet"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "valt in slaap"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "onbeschikbaar"
+@@ -200,7 +200,7 @@ msgstr "min"
+ msgid "Signed in successfully"
+ msgstr "Succesvol ingelogd"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "Auto is ontgrendeld"
+@@ -210,18 +210,18 @@ msgstr "Auto is ontgrendeld"
+ msgid "Create"
+ msgstr "Creëer"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "Voorconditionering"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "Bewakingsmodus is geactiveerd"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr "Bereik (ideaal)"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "De auto schat de resterende actieradius op basis van een vast energieverbruik in Wh/km. De Wh/km-factor wordt bepaald door Tesla en is niet landspecifiek, terwijl het nominale bereik gebaseerd is op wettelijke tests in de verschillende markten voor dat voertuig."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "Update wordt uitgevoerd"
+@@ -376,12 +376,12 @@ msgstr "Slaapstand"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "Geo-hek \"%{name}\" bijgewerkt"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "Er is een fout opgetreden"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "Timeout"
+@@ -396,7 +396,7 @@ msgstr "Verminderd accubereik"
+ msgid "≈ %{range} at 100%"
+ msgstr "≈ %{range} op 100%"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr "Kosten"
+ msgid "Enter charge cost"
+ msgstr "Voer laadkosten in"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "Opgeslagen!"
+@@ -551,12 +551,12 @@ msgstr "GitHub"
+ msgid "Update available"
+ msgstr "Update beschikbaar"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "Deuren zijn open"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "Kofferbak is open"
+@@ -602,7 +602,7 @@ msgstr ""
+ msgid "here"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr ""
+@@ -637,7 +637,7 @@ msgstr ""
+ msgid "Dog Mode"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr ""
+@@ -850,8 +850,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -881,12 +881,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -907,17 +907,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -932,12 +932,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/sv/LC_MESSAGES/default.po b/elixir/priv/gettext/sv/LC_MESSAGES/default.po
+index f9fe380f5e..c3a2527481 100644
+--- a/elixir/priv/gettext/sv/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/sv/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr "Laddningsnivå"
+ msgid "Charged"
+ msgstr "Laddad"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "vilat"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "laddat"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "kört"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "uppdaterat"
+@@ -103,12 +103,12 @@ msgstr "Inkopplad"
+ msgid "Charge Limit"
+ msgstr "Laddningsgräns"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "gått ner i vila"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "inte tillgänglig"
+@@ -200,7 +200,7 @@ msgstr ""
+ msgid "Signed in successfully"
+ msgstr "Inloggad"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "Bilen är olåst"
+@@ -210,18 +210,18 @@ msgstr "Bilen är olåst"
+ msgid "Create"
+ msgstr "Skapa"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "Förvärmning"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "Vaktläge är aktiverad"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr "Räckvidd (idealisk)"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "Bilens uppskattning av återstående räckvidd baseras på en fast energiförbrukning i Wh/km. Wh/km-faktorn är bestämd av Tesla och är inte landsspecifik medan det nominella räckvidden är baserat på reglerande tester på de olika marknaderna för fordonet."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "Uppdatering pågår"
+@@ -376,12 +376,12 @@ msgstr "Viloläge"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "Geostaket \"%{name}\" uppdaterad"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "Ett fel uppstod"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr ""
+@@ -396,7 +396,7 @@ msgstr "Reducerad batteriräckvidd"
+ msgid "≈ %{range} at 100%"
+ msgstr "≈ %{range} vid 100%"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr "Kostnad"
+ msgid "Enter charge cost"
+ msgstr "Ange laddningskostnad"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "Sparat!"
+@@ -551,12 +551,12 @@ msgstr ""
+ msgid "Update available"
+ msgstr "Uppdatering tillgänglig"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "Dörrar är öppna"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "Bakluckan är öppen"
+@@ -602,7 +602,7 @@ msgstr "För att få tokens via Tesla API krävs programmeringserfarenhet eller
+ msgid "here"
+ msgstr "här"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr "Laddar ner uppdatering"
+@@ -637,7 +637,7 @@ msgstr "Däcktryck"
+ msgid "Dog Mode"
+ msgstr "Hundläge"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr "Hundläge är aktiverad"
+@@ -850,8 +850,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -881,12 +881,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -907,17 +907,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -932,12 +932,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/th/LC_MESSAGES/default.po b/elixir/priv/gettext/th/LC_MESSAGES/default.po
+index 3755134651..3eda5d1651 100644
+--- a/elixir/priv/gettext/th/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/th/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr "สถานะการชาร์จ"
+ msgid "Charged"
+ msgstr "ชาร์จเรียบร้อยแล้ว"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "หลับอยู่"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "กำลังชาร์จ"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "กำลังขับรถ"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "ออฟไลน์"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "ออนไลน์"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "กำลังอัปเดท"
+@@ -103,12 +103,12 @@ msgstr "เสียบปลั๊กแล้ว"
+ msgid "Charge Limit"
+ msgstr "การจำกัดการชาร์จ"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "กำลังเข้าสู่การหลับ"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "ไม่พร้อมใช้งาน"
+@@ -200,7 +200,7 @@ msgstr "นาที"
+ msgid "Signed in successfully"
+ msgstr "ลงชื่อเข้าใช้เรียบร้อย"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "รถถูกปลดล็อคแล้ว"
+@@ -210,18 +210,18 @@ msgstr "รถถูกปลดล็อคแล้ว"
+ msgid "Create"
+ msgstr "สร้าง"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "การปรับสภาพล่วงหน้า"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "โหมด Sentry เปิดแล้ว"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr "ระยะทาง (ในอุดมคติ)"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "ระยะทางที่เหลือโดยประมาณของรถจะขึ้นอยู่กับอัตราการสิ้นเปลืองพลังงานคงที่ในหน่วยกิโลวัตต์ชั่วโมง ปัจจัยกิโลวัตต์ชั่วโมงถูกกำหนดโดย Tesla และไม่ได้ระบุเฉพาะประเทศ ในขณะที่ช่วงพิกัดจะขึ้นอยู่กับการทดสอบตามกฎข้อบังคับในตลาดต่างๆ สำหรับยานพาหนะนั้น"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "อยู่ระหว่างการอัพเดท"
+@@ -376,12 +376,12 @@ msgstr "โหมดหลับ"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "อัปเดตขอบเขตทางภูมิศาสตร์ \"%{name}\" แล้ว"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "เกิดข้อผิดพลาด"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "หมดเวลา"
+@@ -396,7 +396,7 @@ msgstr "ระยะแบตเตอรี่ลดลง"
+ msgid "≈ %{range} at 100%"
+ msgstr "≈ %{range} ที่ 100%"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr "ค่าใช้จ่าย"
+ msgid "Enter charge cost"
+ msgstr "ป้อนค่าใช้จ่ายในการชาร์จ"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "บันทึกแล้ว!"
+@@ -550,12 +550,12 @@ msgstr "GitHub"
+ msgid "Update available"
+ msgstr "มีการอัปเดต"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "ประตูเปิดอยู่"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "ที่เก็บสัมภาระท้ายรถเปิดอยู่"
+@@ -601,7 +601,7 @@ msgstr "การได้รับโทเค็นผ่าน Tesla API ต
+ msgid "here"
+ msgstr "ที่นี่"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr "กำลังดาวน์โหลดอัปเดต"
+@@ -636,7 +636,7 @@ msgstr "แรงดันลมยาง"
+ msgid "Dog Mode"
+ msgstr "โหมดสำหรับสุนัข"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr "เปิดใช้งานโหมดสำหรับสุนัขแล้ว"
+@@ -848,8 +848,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -879,12 +879,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -905,17 +905,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -930,12 +930,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/tr/LC_MESSAGES/default.po b/elixir/priv/gettext/tr/LC_MESSAGES/default.po
+index 90f851d0a5..c328c20b0e 100644
+--- a/elixir/priv/gettext/tr/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/tr/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr "Şarj Durumu"
+ msgid "Charged"
+ msgstr "Şarj Oldu"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "uykuda"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "şarj oluyor"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "sürüş"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "çevrimdışı"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "çevrimiçi"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "güncelleniyor"
+@@ -103,12 +103,12 @@ msgstr "Prize Takılı"
+ msgid "Charge Limit"
+ msgstr "Şarj Sınırı"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "uykuya dalıyor"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "mevcut değil"
+@@ -200,7 +200,7 @@ msgstr "min"
+ msgid "Signed in successfully"
+ msgstr "Oturum başarıyla açıldı"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "Araba kilitli değil"
+@@ -210,18 +210,18 @@ msgstr "Araba kilitli değil"
+ msgid "Create"
+ msgstr "Oluştur"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "Batarya şarja hazırlanıyor"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "Sentry-modu devrede"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr "Menzil (ideal)"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "Aracın kalan menzil tahmini Wh/km cinsinden belirlenmiş sabit bir enerji tüketimine göre temel alınmıştır. Hesaplanan menzil, düzenliyici kurumların ilgili piyasalarda bu araç için yaptığı testlere göre temel alınırken Wh/km çarpanı Tesla tarafından belirlenir ve ülkeye özgü değildir."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "Güncelleniyor"
+@@ -376,12 +376,12 @@ msgstr "Uyku Modu"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "Coğrafi-sınır \"%{name}\" güncellendi"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "Bir hata oluştu"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "Zamanaşımı"
+@@ -396,7 +396,7 @@ msgstr "Kısıtlı Batarya Menzili"
+ msgid "≈ %{range} at 100%"
+ msgstr "≈ %100'de %{range}"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr "Tutar"
+ msgid "Enter charge cost"
+ msgstr "Şarj tutarını girin"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "Kaydedildi!"
+@@ -551,12 +551,12 @@ msgstr "GitHub"
+ msgid "Update available"
+ msgstr "Güncelleme mevcut"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "Kapılar açık"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "Bağaj açık"
+@@ -602,7 +602,7 @@ msgstr ""
+ msgid "here"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr ""
+@@ -637,7 +637,7 @@ msgstr ""
+ msgid "Dog Mode"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr ""
+@@ -850,8 +850,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -881,12 +881,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -907,17 +907,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -932,12 +932,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/uk/LC_MESSAGES/default.po b/elixir/priv/gettext/uk/LC_MESSAGES/default.po
+index 91f559845c..645da91f79 100644
+--- a/elixir/priv/gettext/uk/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/uk/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr "Рівень заряду"
+ msgid "Charged"
+ msgstr "Заряджено"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "спить"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "заряджається"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "подорожує"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "офлайн"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "онлайн"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "оновлюється"
+@@ -103,12 +103,12 @@ msgstr "З кабелем"
+ msgid "Charge Limit"
+ msgstr "Ліміт зарядки"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "Засинає"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "недоступно"
+@@ -200,7 +200,7 @@ msgstr "мінімум"
+ msgid "Signed in successfully"
+ msgstr "Вхід успішний"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "Авто відкрите"
+@@ -210,18 +210,18 @@ msgstr "Авто відкрите"
+ msgid "Create"
+ msgstr "Створити"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "Прогрів"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "Сентрі мод увімкнено"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr "Дальність (ideal)"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "Авто розраховує залишок відстані базаючись на фіксованому споживання енергії в Вт/км. Одиниця Вт/км визначено Теслою і не змінюється для кожної країни окремо, в залежності від законодавства різних країн та відповідного тестування."
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "Оновлення в процессі"
+@@ -376,12 +376,12 @@ msgstr "Спить"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "Гео-позиція \"%{name}\" оновлена"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "Сталась помилка"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "Таймаут"
+@@ -396,7 +396,7 @@ msgstr "Зменшено доступний залишок батареї"
+ msgid "≈ %{range} at 100%"
+ msgstr "≈ %{range} при 100%"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr "Вартість"
+ msgid "Enter charge cost"
+ msgstr "Введіть вартість зарядки"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "Збережено!"
+@@ -553,12 +553,12 @@ msgstr ""
+ msgid "Update available"
+ msgstr "Доступне оновлення"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "Двері відкриті"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "Багажник відкритий"
+@@ -604,7 +604,7 @@ msgstr "Для отримання токенів через API Tesla вимаг
+ msgid "here"
+ msgstr "тут"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr "Завантаження оновлення"
+@@ -639,7 +639,7 @@ msgstr "Тиск"
+ msgid "Dog Mode"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr ""
+@@ -853,8 +853,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -884,12 +884,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -910,17 +910,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -935,12 +935,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po b/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po
+index cba1adbc56..76abda0903 100644
+--- a/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/zh_Hans/LC_MESSAGES/default.po
+@@ -31,32 +31,32 @@ msgstr "当前电量"
+ msgid "Charged"
+ msgstr "已充入电量"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "已休眠"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "充电中"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "行驶中"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "离线"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "在线"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "更新中"
+@@ -104,12 +104,12 @@ msgstr "充电头已插入"
+ msgid "Charge Limit"
+ msgstr "充电上限"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "进入休眠中"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "不可用"
+@@ -201,7 +201,7 @@ msgstr "分钟"
+ msgid "Signed in successfully"
+ msgstr "登录成功"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "已锁车"
+@@ -211,18 +211,18 @@ msgstr "已锁车"
+ msgid "Create"
+ msgstr "新建"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "预热/冷"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "哨兵模式已启用"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -298,7 +298,7 @@ msgstr "当前剩余里程 (额定)"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "实际续航里程会因车辆配置、电池使用时长和状况、驾驶习惯及操作、环境和气候状况等因素的影响而有所不同。"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "更新中"
+@@ -377,12 +377,12 @@ msgstr "休眠模式"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "收藏点 \"%{name}\" 已更新"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "发生了一个错误"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "已超时"
+@@ -397,7 +397,7 @@ msgstr "已降低续航里程"
+ msgid "≈ %{range} at 100%"
+ msgstr "100%时续航为 %{range}"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -414,7 +414,7 @@ msgstr "费用"
+ msgid "Enter charge cost"
+ msgstr "请输入充电费用"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "已保存!"
+@@ -552,12 +552,12 @@ msgstr "GitHub"
+ msgid "Update available"
+ msgstr "有可用更新"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "未上锁"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "行李箱已打开"
+@@ -603,7 +603,7 @@ msgstr "通过 Tesla API 获得令牌需要有编程经验或者借助第三方
+ msgid "here"
+ msgstr "这里"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr "正在下载更新程序"
+@@ -638,7 +638,7 @@ msgstr "胎压"
+ msgid "Dog Mode"
+ msgstr "爱犬模式"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr "爱犬模式已激活"
+@@ -850,8 +850,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -881,12 +881,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -907,17 +907,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -932,12 +932,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po b/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po
+index 93e547bc71..acd6dd448b 100644
+--- a/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po
++++ b/elixir/priv/gettext/zh_Hant/LC_MESSAGES/default.po
+@@ -30,32 +30,32 @@ msgstr "目前電量"
+ msgid "Charged"
+ msgstr "已充電量"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:152
++#: lib/teslamate_web/live/car_live/summary.ex:144
+ #, elixir-autogen, elixir-format
+ msgid "asleep"
+ msgstr "休眠"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:147
++#: lib/teslamate_web/live/car_live/summary.ex:139
+ #, elixir-autogen, elixir-format
+ msgid "charging"
+ msgstr "充電中"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:146
++#: lib/teslamate_web/live/car_live/summary.ex:138
+ #, elixir-autogen, elixir-format
+ msgid "driving"
+ msgstr "駕駛中"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:151
++#: lib/teslamate_web/live/car_live/summary.ex:143
+ #, elixir-autogen, elixir-format
+ msgid "offline"
+ msgstr "離線中"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:150
++#: lib/teslamate_web/live/car_live/summary.ex:142
+ #, elixir-autogen, elixir-format
+ msgid "online"
+ msgstr "線上"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:148
++#: lib/teslamate_web/live/car_live/summary.ex:140
+ #, elixir-autogen, elixir-format
+ msgid "updating"
+ msgstr "更新中"
+@@ -103,12 +103,12 @@ msgstr "已連接充電埠"
+ msgid "Charge Limit"
+ msgstr "充電上限"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:149
++#: lib/teslamate_web/live/car_live/summary.ex:141
+ #, elixir-autogen, elixir-format
+ msgid "falling asleep"
+ msgstr "進入休眠中"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:153
++#: lib/teslamate_web/live/car_live/summary.ex:145
+ #, elixir-autogen, elixir-format
+ msgid "unavailable"
+ msgstr "無法使用"
+@@ -200,7 +200,7 @@ msgstr "分鐘"
+ msgid "Signed in successfully"
+ msgstr "登入成功"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:155
++#: lib/teslamate_web/live/car_live/summary.ex:147
+ #, elixir-autogen, elixir-format
+ msgid "Car is unlocked"
+ msgstr "車輛未上鎖"
+@@ -210,18 +210,18 @@ msgstr "車輛未上鎖"
+ msgid "Create"
+ msgstr "新增"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:159
++#: lib/teslamate_web/live/car_live/summary.ex:151
+ #: lib/teslamate_web/live/car_live/summary.html.heex:80
+ #, elixir-autogen, elixir-format
+ msgid "Preconditioning"
+ msgstr "預先調節車內溫度"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:158
++#: lib/teslamate_web/live/car_live/summary.ex:150
+ #, elixir-autogen, elixir-format
+ msgid "Sentry mode is enabled"
+ msgstr "哨兵模式已啟用"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:161
++#: lib/teslamate_web/live/car_live/summary.ex:153
+ #: lib/teslamate_web/live/car_live/summary.html.heex:104
+ #, elixir-autogen, elixir-format
+ msgid "Driver present"
+@@ -297,7 +297,7 @@ msgstr "續航里程 (理想狀態)"
+ msgid "The car's estimate of remaining range is based on a fixed energy consumption in Wh/km. The Wh/km factor is determined by Tesla and is not country specific whereas the rated range is based on regulatory tests in the different markets for that vehicle."
+ msgstr "車輛顯示的預估剩餘里程，是依每公里固定耗電量（Wh/km）計算；此係數由 Tesla 決定，不因國家而異。表定里程則依該車款在不同市場的法規測試結果計算。"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:163
++#: lib/teslamate_web/live/car_live/summary.ex:155
+ #, elixir-autogen, elixir-format
+ msgid "Update in progress"
+ msgstr "更新中"
+@@ -376,12 +376,12 @@ msgstr "休眠模式"
+ msgid "Geo-fence \"%{name}\" updated"
+ msgstr "收藏點 \"%{name}\" 已更新"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:165
++#: lib/teslamate_web/live/car_live/summary.ex:157
+ #, elixir-autogen, elixir-format
+ msgid "An error occurred"
+ msgstr "發生錯誤"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:164
++#: lib/teslamate_web/live/car_live/summary.ex:156
+ #, elixir-autogen, elixir-format
+ msgid "Timeout"
+ msgstr "已逾時"
+@@ -396,7 +396,7 @@ msgstr "已降低續航里程"
+ msgid "≈ %{range} at 100%"
+ msgstr "電量 100% 時約可行駛 %{range}"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:20
++#: lib/teslamate_web/live/charge_live/cost.ex:21
+ #: lib/teslamate_web/live/charge_live/cost.html.heex:4
+ #, elixir-autogen, elixir-format
+ msgid "Charge Cost"
+@@ -413,7 +413,7 @@ msgstr "費用"
+ msgid "Enter charge cost"
+ msgstr "請輸入充電費用"
+ 
+-#: lib/teslamate_web/live/charge_live/cost.ex:87
++#: lib/teslamate_web/live/charge_live/cost.ex:88
+ #, elixir-autogen, elixir-format
+ msgid "Saved!"
+ msgstr "已儲存！"
+@@ -549,12 +549,12 @@ msgstr "GitHub"
+ msgid "Update available"
+ msgstr "有可用更新"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:156
++#: lib/teslamate_web/live/car_live/summary.ex:148
+ #, elixir-autogen, elixir-format
+ msgid "Doors are open"
+ msgstr "車門開啟"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:157
++#: lib/teslamate_web/live/car_live/summary.ex:149
+ #, elixir-autogen, elixir-format
+ msgid "Trunk is open"
+ msgstr "行李廂開啟"
+@@ -600,7 +600,7 @@ msgstr "透過 Tesla API 取得權杖，需要具備程式設計經驗或使用
+ msgid "here"
+ msgstr "這裡"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:162
++#: lib/teslamate_web/live/car_live/summary.ex:154
+ #, elixir-autogen, elixir-format
+ msgid "Downloading update"
+ msgstr "正在下載更新"
+@@ -635,7 +635,7 @@ msgstr "胎壓"
+ msgid "Dog Mode"
+ msgstr "寵物模式"
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:160
++#: lib/teslamate_web/live/car_live/summary.ex:152
+ #, elixir-autogen, elixir-format
+ msgid "Dog mode is enabled"
+ msgstr "寵物模式已啟用"
+@@ -847,8 +847,8 @@ msgstr ""
+ msgid "row belongs to a different vehicle"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/car_live/summary.ex:137
+-#: lib/teslamate_web/live/car_live/summary.ex:142
++#: lib/teslamate_web/live/car_title.ex:17
++#: lib/teslamate_web/live/car_title.ex:22
+ #, elixir-autogen, elixir-format
+ msgid "VIN %{vin}"
+ msgstr ""
+@@ -878,12 +878,12 @@ msgstr ""
+ msgid "Fetches the vehicle list from your Tesla account once and starts logging for vehicles that are not logged yet. Running loggers are not interrupted."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:39
++#: lib/teslamate_web/live/vehicle_reload.ex:40
+ #, elixir-autogen, elixir-format
+ msgid "Fetching the vehicles from the Tesla API failed: %{reason}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:15
++#: lib/teslamate_web/live/vehicle_reload.ex:16
+ #, elixir-autogen, elixir-format
+ msgid "No new vehicle was found in your Tesla account."
+ msgstr ""
+@@ -904,17 +904,17 @@ msgstr ""
+ msgid "Reload vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:43
++#: lib/teslamate_web/live/vehicle_reload.ex:44
+ #, elixir-autogen, elixir-format
+ msgid "Reloading the vehicles failed. Please check the logs."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:19
++#: lib/teslamate_web/live/vehicle_reload.ex:20
+ #, elixir-autogen, elixir-format
+ msgid "Started logging for: %{names}"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:29
++#: lib/teslamate_web/live/vehicle_reload.ex:30
+ #, elixir-autogen, elixir-format
+ msgid "The Tesla API rate limit was exceeded while fetching the vehicles. Please wait a few minutes before reloading."
+ msgstr ""
+@@ -929,12 +929,12 @@ msgstr ""
+ msgid "Vehicles"
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:23
++#: lib/teslamate_web/live/vehicle_reload.ex:24
+ #, elixir-autogen, elixir-format
+ msgid "Your Tesla account does not contain a vehicle yet. Once the vehicle shows up in the Tesla app, reload the vehicle list."
+ msgstr ""
+ 
+-#: lib/teslamate_web/live/vehicle_reload.ex:35
++#: lib/teslamate_web/live/vehicle_reload.ex:36
+ #, elixir-autogen, elixir-format
+ msgid "A vehicle could not be saved to the database. Please check the logs."
+ msgstr ""
+diff --git a/elixir/test/teslamate_web/live/charge_cost_live_test.exs b/elixir/test/teslamate_web/live/charge_cost_live_test.exs
+index 5a4935e7b4..ff3158363e 100644
+--- a/elixir/test/teslamate_web/live/charge_cost_live_test.exs
++++ b/elixir/test/teslamate_web/live/charge_cost_live_test.exs
+@@ -116,6 +116,17 @@ defmodule TeslaMateWeb.ChargeLive.CostTest do
+                |> Floki.find("#car-tag")
+     end
+ 
++    test "shows the VIN of a car without a name", %{conn: conn} do
++      car = car_fixture(name: nil, vin: "5YJ3E1EA1KF000001")
++      %ChargingProcess{id: id} = charging_process_fixture(car)
++      assert {:ok, _view, html} = live(conn, "/charge-cost/#{id}")
++
++      assert html
++             |> Floki.parse_document!()
++             |> Floki.find("#car-tag")
++             |> Floki.text() == "VIN 5YJ3E1EA1KF000001"
++    end
++
+     test "shows the geo-fence name", %{conn: conn} do
+       {:ok, geofence} =
+         Locations.create_geofence(%{
+diff --git a/elixir/test/teslamate_web/live/vehicle_reload_test.exs b/elixir/test/teslamate_web/live/vehicle_reload_test.exs
+new file mode 100644
+index 0000000000..26a7d9fa84
+--- /dev/null
++++ b/elixir/test/teslamate_web/live/vehicle_reload_test.exs
+@@ -0,0 +1,16 @@
++defmodule TeslaMateWeb.VehicleReloadTest do
++  use ExUnit.Case, async: true
++
++  alias TeslaMate.Log.Car
++  alias TeslaMateWeb.VehicleReload
++
++  test "names newly logged cars by their title, unnamed ones by their VIN" do
++    cars = [
++      %Car{name: "named", vin: "5YJ3E1EB1KF000002"},
++      %Car{name: nil, vin: "5YJ3E1EA1KF000001"}
++    ]
++
++    assert VehicleReload.hint({:ok, cars}) ==
++             "Started logging for: named, VIN 5YJ3E1EA1KF000001"
++  end
++end

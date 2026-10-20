@@ -1,0 +1,1132 @@
+diff --git a/lib/mydia/indexers.ex b/lib/mydia/indexers.ex
+index 2ce9b2ed5..ed2e16725 100644
+--- a/lib/mydia/indexers.ex
++++ b/lib/mydia/indexers.ex
+@@ -885,6 +885,7 @@ defmodule Mydia.Indexers do
+     - `:type` - Filter by indexer type ("public", "private", "semi-private")
+     - `:language` - Filter by language code (e.g., "en-US")
+     - `:enabled` - Filter by enabled status (true/false)
++    - `:in_library` - Filter by library membership (true/false)
+     - `:search` - Search by name or description (case-insensitive)
+ 
+   ## Examples
+@@ -1072,37 +1073,19 @@ defmodule Mydia.Indexers do
+ 
+   def cardigann_download_credential_allowed?(_indexer_name, _download_url), do: false
+ 
+-  @doc """
+-  Enables a Cardigann indexer definition.
+-
+-  ## Examples
+-
+-      iex> enable_cardigann_definition(definition)
+-      {:ok, %CardigannDefinition{enabled: true}}
+-  """
+-  @spec enable_cardigann_definition(CardigannDefinition.t()) ::
+-          {:ok, CardigannDefinition.t()} | {:error, Ecto.Changeset.t()}
+-  def enable_cardigann_definition(%CardigannDefinition{} = definition) do
+-    definition
+-    |> CardigannDefinition.toggle_changeset(%{enabled: true})
+-    |> Repo.update()
+-  end
++  defdelegate add_cardigann_definition(definition), to: Mydia.Indexers.CardigannLibrary, as: :add
+ 
+-  @doc """
+-  Disables a Cardigann indexer definition.
++  defdelegate remove_cardigann_definition(definition),
++    to: Mydia.Indexers.CardigannLibrary,
++    as: :remove
+ 
+-  ## Examples
++  defdelegate enable_cardigann_definition(definition),
++    to: Mydia.Indexers.CardigannLibrary,
++    as: :enable
+ 
+-      iex> disable_cardigann_definition(definition)
+-      {:ok, %CardigannDefinition{enabled: false}}
+-  """
+-  @spec disable_cardigann_definition(CardigannDefinition.t()) ::
+-          {:ok, CardigannDefinition.t()} | {:error, Ecto.Changeset.t()}
+-  def disable_cardigann_definition(%CardigannDefinition{} = definition) do
+-    definition
+-    |> CardigannDefinition.toggle_changeset(%{enabled: false})
+-    |> Repo.update()
+-  end
++  defdelegate disable_cardigann_definition(definition),
++    to: Mydia.Indexers.CardigannLibrary,
++    as: :disable
+ 
+   @doc """
+   Updates the configuration for a Cardigann definition (credentials, etc.).
+@@ -1272,6 +1255,13 @@ defmodule Mydia.Indexers do
+     |> apply_cardigann_filters(rest)
+   end
+ 
++  defp apply_cardigann_filters(query, [{:in_library, in_library} | rest])
++       when is_boolean(in_library) do
++    query
++    |> where([d], d.in_library == ^in_library)
++    |> apply_cardigann_filters(rest)
++  end
++
+   defp apply_cardigann_filters(query, [{:search, search_term} | rest])
+        when is_binary(search_term) do
+     search_pattern = "%#{String.downcase(search_term)}%"
+diff --git a/lib/mydia/indexers/cardigann_definition.ex b/lib/mydia/indexers/cardigann_definition.ex
+index 423f0b0bf..024a6b38b 100644
+--- a/lib/mydia/indexers/cardigann_definition.ex
++++ b/lib/mydia/indexers/cardigann_definition.ex
+@@ -29,6 +29,7 @@ defmodule Mydia.Indexers.CardigannDefinition do
+           definition: String.t() | nil,
+           schema_version: String.t() | nil,
+           enabled: boolean(),
++          in_library: boolean(),
+           config: map() | nil,
+           last_synced_at: DateTime.t() | nil,
+           health_status: String.t(),
+@@ -57,6 +58,7 @@ defmodule Mydia.Indexers.CardigannDefinition do
+     field :definition, :string
+     field :schema_version, :string
+     field :enabled, :boolean, default: false
++    field :in_library, :boolean, default: false
+     field :config, Mydia.Settings.JsonMapType
+     field :last_synced_at, :utc_datetime
+ 
+@@ -95,6 +97,7 @@ defmodule Mydia.Indexers.CardigannDefinition do
+       :definition,
+       :schema_version,
+       :enabled,
++      :in_library,
+       :config,
+       :last_synced_at,
+       :flaresolverr_required,
+@@ -110,16 +113,37 @@ defmodule Mydia.Indexers.CardigannDefinition do
+       :schema_version
+     ])
+     |> validate_inclusion(:type, @indexer_types)
++    |> validate_enabled_in_library()
+     |> unique_constraint(:indexer_id)
+   end
+ 
+   @doc """
+-  Changeset for enabling/disabling an indexer.
++  Changeset for enabling/disabling an indexer. Only a definition in the
++  library can be enabled.
+   """
+   def toggle_changeset(definition, attrs) do
+     definition
+     |> cast(attrs, [:enabled])
+     |> validate_required([:enabled])
++    |> validate_enabled_in_library()
++  end
++
++  @doc """
++  Changeset for adding a definition to, or removing it from, the library.
++  """
++  def membership_changeset(definition, attrs) do
++    definition
++    |> cast(attrs, [:in_library, :enabled])
++    |> validate_required([:in_library, :enabled])
++    |> validate_enabled_in_library()
++  end
++
++  defp validate_enabled_in_library(changeset) do
++    if get_field(changeset, :enabled) == true and get_field(changeset, :in_library) != true do
++      add_error(changeset, :enabled, "add the indexer before enabling it")
++    else
++      changeset
++    end
+   end
+ 
+   @doc """
+diff --git a/lib/mydia/indexers/cardigann_library.ex b/lib/mydia/indexers/cardigann_library.ex
+new file mode 100644
+index 000000000..6ec65b463
+--- /dev/null
++++ b/lib/mydia/indexers/cardigann_library.ex
+@@ -0,0 +1,52 @@
++defmodule Mydia.Indexers.CardigannLibrary do
++  @moduledoc """
++  Library membership and enablement for Cardigann definitions.
++
++  `in_library` records whether the user added a definition to their indexers;
++  `enabled` records whether searches use it. A definition can be in the library
++  and disabled, but never enabled outside it.
++  """
++
++  alias Mydia.Indexers.CardigannDefinition
++  alias Mydia.Repo
++
++  @type result :: {:ok, CardigannDefinition.t()} | {:error, Ecto.Changeset.t()}
++
++  @doc """
++  Adds a definition to the library and enables it. Config from an earlier
++  membership is kept, so re-adding restores credentials.
++  """
++  @spec add(CardigannDefinition.t()) :: result()
++  def add(%CardigannDefinition{} = definition), do: set_membership(definition, true)
++
++  @doc """
++  Removes a definition from the library, disabling it. Its config is kept in
++  case it is added again.
++  """
++  @spec remove(CardigannDefinition.t()) :: result()
++  def remove(%CardigannDefinition{} = definition), do: set_membership(definition, false)
++
++  @doc """
++  Enables a definition that is in the library.
++  """
++  @spec enable(CardigannDefinition.t()) :: result()
++  def enable(%CardigannDefinition{} = definition), do: set_enabled(definition, true)
++
++  @doc """
++  Disables a definition, leaving it in the library.
++  """
++  @spec disable(CardigannDefinition.t()) :: result()
++  def disable(%CardigannDefinition{} = definition), do: set_enabled(definition, false)
++
++  defp set_membership(definition, member?) do
++    definition
++    |> CardigannDefinition.membership_changeset(%{in_library: member?, enabled: member?})
++    |> Repo.update()
++  end
++
++  defp set_enabled(definition, enabled?) do
++    definition
++    |> CardigannDefinition.toggle_changeset(%{enabled: enabled?})
++    |> Repo.update()
++  end
++end
+diff --git a/lib/mydia/indexers/definition_sync.ex b/lib/mydia/indexers/definition_sync.ex
+index 27bbd0ac7..1af3ef8e6 100644
+--- a/lib/mydia/indexers/definition_sync.ex
++++ b/lib/mydia/indexers/definition_sync.ex
+@@ -171,7 +171,7 @@ defmodule Mydia.Indexers.DefinitionSync do
+       existing ->
+         # Update existing definition (preserve user's enabled/config settings)
+         existing
+-        |> CardigannDefinition.changeset(Map.drop(attrs, [:enabled, :config]))
++        |> CardigannDefinition.changeset(Map.drop(attrs, [:enabled, :in_library, :config]))
+         |> Repo.update()
+         |> case do
+           {:ok, definition} ->
+diff --git a/lib/mydia/logger.ex b/lib/mydia/logger.ex
+index c92357468..acf548da5 100644
+--- a/lib/mydia/logger.ex
++++ b/lib/mydia/logger.ex
+@@ -193,6 +193,7 @@ defmodule Mydia.Logger do
+   defp operation_message(:save_indexer), do: "Failed to save indexer"
+   defp operation_message(:delete_indexer), do: "Failed to delete indexer"
+   defp operation_message(:test_indexer), do: "Failed to test indexer"
++  defp operation_message(:remove_library_indexer), do: "Failed to remove indexer"
+   defp operation_message(:save_library_path), do: "Failed to save library path"
+   defp operation_message(:delete_library_path), do: "Failed to delete library path"
+   defp operation_message(operation), do: "Operation failed: #{operation}"
+diff --git a/lib/mydia_web/live/admin_indexers_live/components.ex b/lib/mydia_web/live/admin_indexers_live/components.ex
+index a297d9f6c..35a32deba 100644
+--- a/lib/mydia_web/live/admin_indexers_live/components.ex
++++ b/lib/mydia_web/live/admin_indexers_live/components.ex
+@@ -15,7 +15,6 @@ defmodule MydiaWeb.AdminIndexersLive.Components do
+   attr :library_indexers, :list, required: true
+   attr :library_indexer_stats, :map, required: true
+   attr :cardigann_enabled, :boolean, required: true
+-  attr :recently_disabled_indexer, :any, default: nil
+   attr :flaresolverr, :map, default: %{enabled: false, url: nil, configured: false, env?: false}
+   attr :flaresolverr_status, :map, default: %{configured: false, status: :loading}
+   attr :retesting_paused, :any, default: MapSet.new()
+@@ -56,7 +55,7 @@ defmodule MydiaWeb.AdminIndexersLive.Components do
+         </.admin_section>
+ 
+         <.admin_section
+-          :if={@library_indexers != [] or @recently_disabled_indexer}
++          :if={@library_indexers != []}
+           id="library-indexers-section"
+           title="Library Indexers"
+           icon="hero-book-open"
+@@ -72,27 +71,6 @@ defmodule MydiaWeb.AdminIndexersLive.Components do
+               <.icon name="hero-plus" class="w-3 h-3" /> Add More
+             </button>
+           </div>
+-          <%!-- Undo Banner for Recently Disabled Indexer --%>
+-          <%= if @recently_disabled_indexer do %>
+-            <div id="undo-disabled-indexer" class="alert alert-warning shadow-sm">
+-              <.icon name="hero-arrow-uturn-left" class="w-5 h-5" />
+-              <span>
+-                <strong>{@recently_disabled_indexer.name}</strong> was disabled
+-              </span>
+-              <div class="flex gap-2">
+-                <button class="btn btn-sm btn-ghost" phx-click="undo_disable_library_indexer">
+-                  Undo
+-                </button>
+-                <button
+-                  class="btn btn-sm btn-ghost btn-circle"
+-                  phx-click="dismiss_undo_banner"
+-                  title="Dismiss"
+-                >
+-                  <.icon name="hero-x-mark" class="w-4 h-4" />
+-                </button>
+-              </div>
+-            </div>
+-          <% end %>
+           <.admin_list id="library-indexers" items={@library_indexers}>
+             <:row :let={indexer}>
+               <.library_indexer_row
+@@ -102,7 +80,7 @@ defmodule MydiaWeb.AdminIndexersLive.Components do
+                 }
+               />
+             </:row>
+-            <:empty>No enabled library indexers.</:empty>
++            <:empty>No library indexers.</:empty>
+           </.admin_list>
+         </.admin_section>
+       <% end %>
+@@ -220,7 +198,10 @@ defmodule MydiaWeb.AdminIndexersLive.Components do
+ 
+   defp library_indexer_row(assigns) do
+     ~H"""
+-    <.admin_row id={"library-indexer-#{@indexer.id}"}>
++    <.admin_row
++      id={"library-indexer-#{@indexer.id}"}
++      class={if(!@indexer.enabled, do: "opacity-60")}
++    >
+       <:title>
+         {@indexer.name}
+         <span class={"badge badge-xs #{library_indexer_type_badge_class(@indexer.type)}"}>
+@@ -230,6 +211,7 @@ defmodule MydiaWeb.AdminIndexersLive.Components do
+       </:title>
+       <:descriptor :if={@indexer.description}>{@indexer.description}</:descriptor>
+       <:badges>
++        <span :if={!@indexer.enabled} class="badge badge-sm badge-ghost">Disabled</span>
+         <%= if @indexer.health_status not in [nil, "unknown"] do %>
+           <span class={"badge badge-sm badge-outline #{library_health_status_badge_class(@indexer.health_status)}"}>
+             {library_health_status_label(@indexer.health_status)}
+@@ -299,6 +281,15 @@ defmodule MydiaWeb.AdminIndexersLive.Components do
+             phx-click="test_library_indexer"
+             phx-value-id={@indexer.id}
+           />
++          <.row_action
++            id={"remove-library-indexer-#{@indexer.id}"}
++            icon="hero-trash"
++            title="Remove"
++            destructive
++            phx-click="remove_library_indexer"
++            phx-value-id={@indexer.id}
++            data-confirm={"Remove #{@indexer.name}? Its settings are kept if you add it again."}
++          />
+         </.row_actions>
+       </:actions>
+     </.admin_row>
+diff --git a/lib/mydia_web/live/admin_indexers_live/index.ex b/lib/mydia_web/live/admin_indexers_live/index.ex
+index 27fe84ea1..3a2f16e4e 100644
+--- a/lib/mydia_web/live/admin_indexers_live/index.ex
++++ b/lib/mydia_web/live/admin_indexers_live/index.ex
+@@ -507,16 +507,12 @@ defmodule MydiaWeb.AdminIndexersLive.Index do
+ 
+     case result do
+       {:ok, updated_definition} ->
+-        socket =
+-          if updated_definition.enabled do
+-            socket
+-            |> put_flash(:info, "#{definition.name} enabled")
+-            |> assign(:recently_disabled_indexer, nil)
+-          else
+-            assign(socket, :recently_disabled_indexer, updated_definition)
+-          end
++        action = if updated_definition.enabled, do: "enabled", else: "disabled"
+ 
+-        {:noreply, load_data(socket)}
++        {:noreply,
++         socket
++         |> put_flash(:info, "#{definition.name} #{action}")
++         |> reload_library_indexers()}
+ 
+       {:error, changeset} ->
+         MydiaLogger.log_error(:liveview, "Failed to toggle library indexer",
+@@ -532,29 +528,27 @@ defmodule MydiaWeb.AdminIndexersLive.Index do
+   end
+ 
+   @impl true
+-  def handle_event("undo_disable_library_indexer", _params, socket) do
+-    case socket.assigns.recently_disabled_indexer do
+-      nil ->
+-        {:noreply, socket}
++  def handle_event("remove_library_indexer", %{"id" => id}, socket) do
++    definition = Indexers.get_cardigann_definition!(id)
+ 
+-      definition ->
+-        case Indexers.enable_cardigann_definition(definition) do
+-          {:ok, _updated} ->
+-            {:noreply,
+-             socket
+-             |> assign(:recently_disabled_indexer, nil)
+-             |> put_flash(:info, "#{definition.name} re-enabled")
+-             |> load_data()}
++    case Indexers.remove_cardigann_definition(definition) do
++      {:ok, _removed} ->
++        {:noreply,
++         socket
++         |> put_flash(:info, "#{definition.name} removed")
++         |> reload_library_indexers()}
+ 
+-          {:error, _changeset} ->
+-            {:noreply, put_flash(socket, :error, "Failed to re-enable indexer")}
+-        end
+-    end
+-  end
++      {:error, changeset} ->
++        MydiaLogger.log_error(:liveview, "Failed to remove library indexer",
++          error: changeset,
++          operation: :remove_library_indexer,
++          definition_id: id,
++          user_id: socket.assigns.current_user.id
++        )
+ 
+-  @impl true
+-  def handle_event("dismiss_undo_banner", _params, socket) do
+-    {:noreply, assign(socket, :recently_disabled_indexer, nil)}
++        error_msg = MydiaLogger.user_error_message(:remove_library_indexer, changeset)
++        {:noreply, put_flash(socket, :error, error_msg)}
++    end
+   end
+ 
+   @impl true
+@@ -773,8 +767,8 @@ defmodule MydiaWeb.AdminIndexersLive.Index do
+        params["language"] || socket.assigns.library_filter_language
+      )
+      |> assign(
+-       :library_filter_enabled,
+-       params["enabled"] || socket.assigns.library_filter_enabled
++       :library_filter_added,
++       params["added"] || socket.assigns.library_filter_added
+      )
+      |> load_library_definitions()}
+   end
+@@ -792,10 +786,10 @@ defmodule MydiaWeb.AdminIndexersLive.Index do
+     definition = Indexers.get_cardigann_definition!(id)
+ 
+     result =
+-      if definition.enabled do
+-        Indexers.disable_cardigann_definition(definition)
++      if definition.in_library do
++        Indexers.remove_cardigann_definition(definition)
+       else
+-        Indexers.enable_cardigann_definition(definition)
++        Indexers.add_cardigann_definition(definition)
+       end
+ 
+     case result do
+@@ -904,7 +898,7 @@ defmodule MydiaWeb.AdminIndexersLive.Index do
+ 
+     library_indexers =
+       if cardigann_enabled,
+-        do: Indexers.list_cardigann_definitions(enabled: true),
++        do: Indexers.list_cardigann_definitions(in_library: true),
+         else: []
+ 
+     library_indexer_stats =
+@@ -922,7 +916,6 @@ defmodule MydiaWeb.AdminIndexersLive.Index do
+     |> assign(:library_indexer_settings, [])
+     |> assign(:library_config_testing, false)
+     |> assign(:library_config_test_result, nil)
+-    |> assign_new(:recently_disabled_indexer, fn -> nil end)
+     |> assign_flaresolverr()
+   end
+ 
+@@ -931,7 +924,7 @@ defmodule MydiaWeb.AdminIndexersLive.Index do
+ 
+     library_indexers =
+       if cardigann_enabled,
+-        do: Indexers.list_cardigann_definitions(enabled: true),
++        do: Indexers.list_cardigann_definitions(in_library: true),
+         else: []
+ 
+     library_indexer_stats =
+@@ -1219,7 +1212,7 @@ defmodule MydiaWeb.AdminIndexersLive.Index do
+     |> assign(:library_available_languages, [])
+     |> assign(:library_filter_type, "all")
+     |> assign(:library_filter_language, "all")
+-    |> assign(:library_filter_enabled, "all")
++    |> assign(:library_filter_added, "all")
+     |> assign(:library_search_query, "")
+     |> assign(:library_syncing, false)
+     |> assign(:library_configuring_definition, nil)
+@@ -1262,9 +1255,9 @@ defmodule MydiaWeb.AdminIndexersLive.Index do
+       end
+ 
+     filters =
+-      case assigns.library_filter_enabled do
+-        "enabled" -> [{:enabled, true} | filters]
+-        "disabled" -> [{:enabled, false} | filters]
++      case assigns.library_filter_added do
++        "added" -> [{:in_library, true} | filters]
++        "not_added" -> [{:in_library, false} | filters]
+         _ -> filters
+       end
+ 
+diff --git a/lib/mydia_web/live/admin_indexers_live/index.html.heex b/lib/mydia_web/live/admin_indexers_live/index.html.heex
+index 3d6e037a0..f6a036117 100644
+--- a/lib/mydia_web/live/admin_indexers_live/index.html.heex
++++ b/lib/mydia_web/live/admin_indexers_live/index.html.heex
+@@ -12,7 +12,6 @@
+       library_indexers={@library_indexers}
+       library_indexer_stats={@library_indexer_stats}
+       cardigann_enabled={@cardigann_enabled}
+-      recently_disabled_indexer={@recently_disabled_indexer}
+       flaresolverr={@flaresolverr}
+       flaresolverr_status={@flaresolverr_status}
+       retesting_paused={@retesting_paused}
+@@ -41,7 +40,7 @@
+         available_languages={@library_available_languages}
+         filter_type={@library_filter_type}
+         filter_language={@library_filter_language}
+-        filter_enabled={@library_filter_enabled}
++        filter_added={@library_filter_added}
+         search_query={@library_search_query}
+         syncing={@library_syncing}
+         configuring_definition={@library_configuring_definition}
+diff --git a/lib/mydia_web/live/admin_indexers_live/library_browser_components.ex b/lib/mydia_web/live/admin_indexers_live/library_browser_components.ex
+index d6cbdb91c..1f6be0ced 100644
+--- a/lib/mydia_web/live/admin_indexers_live/library_browser_components.ex
++++ b/lib/mydia_web/live/admin_indexers_live/library_browser_components.ex
+@@ -11,7 +11,7 @@ defmodule MydiaWeb.AdminIndexersLive.LibraryBrowserComponents do
+   attr :available_languages, :list, required: true
+   attr :filter_type, :string, required: true
+   attr :filter_language, :string, required: true
+-  attr :filter_enabled, :string, required: true
++  attr :filter_added, :string, required: true
+   attr :search_query, :string, required: true
+   attr :syncing, :boolean, required: true
+   attr :configuring_definition, :any, required: true
+@@ -23,7 +23,7 @@ defmodule MydiaWeb.AdminIndexersLive.LibraryBrowserComponents do
+       id="indexer-library-modal"
+       icon="hero-book-open"
+       title="Indexer Library"
+-      subtitle="Browse and enable indexers from the definition library"
++      subtitle="Browse and add indexers from the definition library"
+       on_close="close_indexer_library"
+       size={:lg}
+     >
+@@ -93,11 +93,11 @@ defmodule MydiaWeb.AdminIndexersLive.LibraryBrowserComponents do
+               <label class="label py-1">
+                 <span class="label-text text-xs">Status</span>
+               </label>
+-              <select class="select select-bordered select-sm" name="enabled">
+-                <option value="all" selected={@filter_enabled == "all"}>All Status</option>
+-                <option value="enabled" selected={@filter_enabled == "enabled"}>Enabled</option>
+-                <option value="disabled" selected={@filter_enabled == "disabled"}>
+-                  Disabled
++              <select class="select select-bordered select-sm" name="added">
++                <option value="all" selected={@filter_added == "all"}>All</option>
++                <option value="added" selected={@filter_added == "added"}>Added</option>
++                <option value="not_added" selected={@filter_added == "not_added"}>
++                  Not added
+                 </option>
+               </select>
+             </div>
+@@ -126,7 +126,7 @@ defmodule MydiaWeb.AdminIndexersLive.LibraryBrowserComponents do
+             <.definition_row definition={definition} />
+           </:row>
+           <:empty>
+-            <%= if @search_query != "" or @filter_type != "all" or @filter_language != "all" or @filter_enabled != "all" do %>
++            <%= if @search_query != "" or @filter_type != "all" or @filter_language != "all" or @filter_added != "all" do %>
+               No indexers match your filters. Try adjusting your search criteria.
+             <% else %>
+               No indexer definitions available. Click "Sync Library" to fetch indexers from the repository.
+@@ -208,34 +208,34 @@ defmodule MydiaWeb.AdminIndexersLive.LibraryBrowserComponents do
+       </:title>
+       <:descriptor :if={@definition.description}>{@definition.description}</:descriptor>
+       <:badges>
+-        <%= if Components.needs_library_config?(@definition) and @definition.enabled do %>
++        <%= if Components.needs_library_config?(@definition) and @definition.in_library do %>
+           <div class="tooltip" data-tip="This indexer requires configuration">
+             <.icon name="hero-exclamation-triangle" class="w-4 h-4 text-warning" />
+           </div>
+         <% end %>
+-        <%= if @definition.enabled and @definition.health_status not in [nil, "unknown"] do %>
++        <%= if @definition.in_library and @definition.health_status not in [nil, "unknown"] do %>
+           <span class={"badge badge-sm badge-outline #{Components.library_health_status_badge_class(@definition.health_status)}"}>
+             {Components.library_health_status_label(@definition.health_status)}
+           </span>
+         <% end %>
+-        <%!-- Enable/Disable toggle with status label --%>
++        <%!-- Add/remove toggle with membership label --%>
+         <label class="flex items-center gap-2 cursor-pointer">
+           <span class={[
+-            "text-xs font-medium min-w-14 text-right",
+-            if(@definition.enabled, do: "text-success", else: "text-base-content/50")
++            "text-xs font-medium min-w-16 text-right",
++            if(@definition.in_library, do: "text-success", else: "text-base-content/50")
+           ]}>
+-            {if @definition.enabled, do: "Enabled", else: "Disabled"}
++            {if @definition.in_library, do: "Added", else: "Not added"}
+           </span>
+           <input
+             type="checkbox"
+             class="toggle toggle-success toggle-sm"
+-            checked={@definition.enabled}
++            checked={@definition.in_library}
+             phx-click="toggle_library_definition"
+             phx-value-id={@definition.id}
+             aria-label={
+-              if @definition.enabled,
+-                do: "Disable #{@definition.name}",
+-                else: "Enable #{@definition.name}"
++              if @definition.in_library,
++                do: "Remove #{@definition.name}",
++                else: "Add #{@definition.name}"
+             }
+           />
+         </label>
+diff --git a/priv/repo/migrations/20261011110156_add_in_library_to_cardigann_definitions.exs b/priv/repo/migrations/20261011110156_add_in_library_to_cardigann_definitions.exs
+new file mode 100644
+index 000000000..83492c9f2
+--- /dev/null
++++ b/priv/repo/migrations/20261011110156_add_in_library_to_cardigann_definitions.exs
+@@ -0,0 +1,26 @@
++defmodule Mydia.Repo.Migrations.AddInLibraryToCardigannDefinitions do
++  @moduledoc """
++  Separates "added to my indexers" from "used in searches".
++
++  Until now `enabled` meant both, so switching a library indexer off also took
++  it off the Indexers page. Every enabled definition is in the library; a
++  disabled one was indistinguishable from one never added, so it starts out of
++  the library, which is exactly where the page already showed it.
++  """
++
++  use Ecto.Migration
++
++  def up do
++    alter table(:cardigann_definitions) do
++      add :in_library, :boolean, null: false, default: false
++    end
++
++    execute "UPDATE cardigann_definitions SET in_library = enabled"
++  end
++
++  def down do
++    alter table(:cardigann_definitions) do
++      remove :in_library
++    end
++  end
++end
+diff --git a/test/mydia/downloads/cardigann_download_grab_test.exs b/test/mydia/downloads/cardigann_download_grab_test.exs
+index a925dc5a9..5e2cd9592 100644
+--- a/test/mydia/downloads/cardigann_download_grab_test.exs
++++ b/test/mydia/downloads/cardigann_download_grab_test.exs
+@@ -42,7 +42,8 @@ defmodule Mydia.Downloads.CardigannDownloadGrabTest do
+       capabilities: %{},
+       definition: yaml,
+       schema_version: "1",
+-      enabled: true
++      enabled: true,
++      in_library: true
+     })
+     |> Repo.insert!()
+   end
+diff --git a/test/mydia/downloads/queue_cookie_scope_test.exs b/test/mydia/downloads/queue_cookie_scope_test.exs
+index c150e4f5e..c2912d684 100644
+--- a/test/mydia/downloads/queue_cookie_scope_test.exs
++++ b/test/mydia/downloads/queue_cookie_scope_test.exs
+@@ -55,7 +55,8 @@ defmodule Mydia.Downloads.QueueCookieScopeTest do
+       capabilities: %{},
+       definition: yaml,
+       schema_version: "1",
+-      enabled: true
++      enabled: true,
++      in_library: true
+     })
+     |> Repo.insert!()
+   end
+diff --git a/test/mydia/indexers/adapter/cardigann_test.exs b/test/mydia/indexers/adapter/cardigann_test.exs
+index f16ad8a18..42c799049 100644
+--- a/test/mydia/indexers/adapter/cardigann_test.exs
++++ b/test/mydia/indexers/adapter/cardigann_test.exs
+@@ -106,6 +106,7 @@ defmodule Mydia.Indexers.Adapter.CardigannTest do
+         definition: sample_yaml(base_url),
+         schema_version: "v11",
+         enabled: true,
++        in_library: true,
+         last_synced_at: DateTime.utc_now()
+       })
+       |> Repo.insert()
+@@ -261,6 +262,7 @@ defmodule Mydia.Indexers.Adapter.CardigannTest do
+           definition: yaml,
+           schema_version: "v11",
+           enabled: true,
++          in_library: true,
+           # String keys, exactly as the database and the admin form supply them.
+           config: %{"username" => "stringuser", "password" => "stringpass"},
+           last_synced_at: DateTime.utc_now()
+@@ -376,6 +378,7 @@ defmodule Mydia.Indexers.Adapter.CardigannTest do
+           definition: yaml,
+           schema_version: "v11",
+           enabled: true,
++          in_library: true,
+           # String keys, exactly as the database and the admin form supply
+           # them. apiurl deliberately does not match the setting's default
+           # (localhost:1), so the rendered login URL can only hit `override`
+@@ -559,7 +562,8 @@ defmodule Mydia.Indexers.Adapter.CardigannTest do
+           schema_version: "v11",
+           config: %{"username" => "me", "password" => "secret"},
+           definition: yaml,
+-          enabled: true
++          enabled: true,
++          in_library: true
+         })
+         |> Repo.insert()
+ 
+diff --git a/test/mydia/indexers/cardigann_definition_test.exs b/test/mydia/indexers/cardigann_definition_test.exs
+index 4e8dfa5e2..1476fc6b1 100644
+--- a/test/mydia/indexers/cardigann_definition_test.exs
++++ b/test/mydia/indexers/cardigann_definition_test.exs
+@@ -218,6 +218,25 @@ defmodule Mydia.Indexers.CardigannDefinitionTest do
+   end
+ 
+   describe "changeset/2" do
++    test "refuses an enabled definition outside the library" do
++      attrs = %{
++        indexer_id: "outside-test",
++        name: "Outside Test",
++        type: "public",
++        links: %{"0" => "https://a.example.com"},
++        capabilities: %{},
++        definition: "id: outside-test",
++        schema_version: "v11",
++        enabled: true,
++        in_library: false
++      }
++
++      changeset = CardigannDefinition.changeset(%CardigannDefinition{}, attrs)
++
++      refute changeset.valid?
++      assert {"add the indexer before enabling it", _} = changeset.errors[:enabled]
++    end
++
+     test "casts active_link and link_status" do
+       attrs = %{
+         indexer_id: "link-test",
+@@ -257,6 +276,71 @@ defmodule Mydia.Indexers.CardigannDefinitionTest do
+     end
+   end
+ 
++  describe "toggle_changeset/2 and in_library" do
++    test "refuses to enable a definition outside the library" do
++      changeset =
++        CardigannDefinition.toggle_changeset(%CardigannDefinition{in_library: false}, %{
++          enabled: true
++        })
++
++      refute changeset.valid?
++      assert {"add the indexer before enabling it", _} = changeset.errors[:enabled]
++    end
++
++    test "enables a definition in the library" do
++      changeset =
++        CardigannDefinition.toggle_changeset(%CardigannDefinition{in_library: true}, %{
++          enabled: true
++        })
++
++      assert changeset.valid?
++    end
++  end
++
++  describe "nil flags" do
++    test "toggle_changeset returns an invalid changeset for enabled: nil" do
++      changeset =
++        CardigannDefinition.toggle_changeset(%CardigannDefinition{in_library: true}, %{
++          enabled: nil
++        })
++
++      refute changeset.valid?
++    end
++
++    test "membership_changeset returns an invalid changeset for in_library: nil" do
++      changeset =
++        CardigannDefinition.membership_changeset(%CardigannDefinition{}, %{
++          in_library: nil,
++          enabled: true
++        })
++
++      refute changeset.valid?
++    end
++  end
++
++  describe "membership_changeset/2" do
++    test "sets both flags" do
++      changeset =
++        CardigannDefinition.membership_changeset(%CardigannDefinition{}, %{
++          in_library: true,
++          enabled: true
++        })
++
++      assert changeset.valid?
++      assert Ecto.Changeset.get_change(changeset, :in_library) == true
++    end
++
++    test "refuses enabled without in_library" do
++      changeset =
++        CardigannDefinition.membership_changeset(%CardigannDefinition{}, %{
++          in_library: false,
++          enabled: true
++        })
++
++      refute changeset.valid?
++    end
++  end
++
+   # Helper function to insert a Cardigann definition
+   defp insert_cardigann_definition(attrs) do
+     %CardigannDefinition{}
+diff --git a/test/mydia/indexers/cardigann_download_resolution_test.exs b/test/mydia/indexers/cardigann_download_resolution_test.exs
+index 0a7814953..8598e06d4 100644
+--- a/test/mydia/indexers/cardigann_download_resolution_test.exs
++++ b/test/mydia/indexers/cardigann_download_resolution_test.exs
+@@ -26,7 +26,8 @@ defmodule Mydia.Indexers.CardigannDownloadResolutionTest do
+       capabilities: %{},
+       definition: yaml,
+       schema_version: "1",
+-      enabled: true
++      enabled: true,
++      in_library: true
+     })
+     |> Repo.insert!()
+   end
+@@ -134,6 +135,7 @@ defmodule Mydia.Indexers.CardigannDownloadResolutionTest do
+           definition: yaml,
+           schema_version: "1",
+           enabled: true,
++          in_library: true,
+           config: %{"apiurl" => "localhost:#{api.port}"}
+         })
+         |> Repo.insert!()
+diff --git a/test/mydia/indexers/cardigann_membership_test.exs b/test/mydia/indexers/cardigann_membership_test.exs
+new file mode 100644
+index 000000000..1d3c65a79
+--- /dev/null
++++ b/test/mydia/indexers/cardigann_membership_test.exs
+@@ -0,0 +1,60 @@
++defmodule Mydia.Indexers.CardigannMembershipTest do
++  use Mydia.DataCase, async: true
++
++  import Mydia.IndexersFixtures
++
++  alias Mydia.Indexers
++
++  test "add puts a definition in the library and enables it" do
++    definition = cardigann_definition_fixture(%{enabled: false})
++
++    assert {:ok, added} = Indexers.add_cardigann_definition(definition)
++    assert added.in_library
++    assert added.enabled
++  end
++
++  test "remove takes it out of the library and keeps its config" do
++    definition =
++      cardigann_definition_fixture(%{enabled: true, config: %{"username" => "someone"}})
++
++    assert {:ok, removed} = Indexers.remove_cardigann_definition(definition)
++    refute removed.in_library
++    refute removed.enabled
++    assert removed.config == %{"username" => "someone"}
++  end
++
++  test "disable keeps a definition in the library" do
++    definition = cardigann_definition_fixture(%{enabled: true})
++
++    assert {:ok, disabled} = Indexers.disable_cardigann_definition(definition)
++    assert disabled.in_library
++    refute disabled.enabled
++  end
++
++  test "enable refuses a definition outside the library" do
++    definition = cardigann_definition_fixture(%{enabled: false})
++
++    assert {:error, changeset} = Indexers.enable_cardigann_definition(definition)
++    assert changeset.errors[:enabled]
++  end
++
++  test "lists by library membership, disabled members included" do
++    member = cardigann_definition_fixture(%{enabled: true})
++    {:ok, disabled_member} = Indexers.disable_cardigann_definition(member)
++    outsider = cardigann_definition_fixture(%{enabled: false})
++
++    ids = Indexers.list_cardigann_definitions(in_library: true) |> Enum.map(& &1.id)
++
++    assert disabled_member.id in ids
++    refute outsider.id in ids
++  end
++
++  test "a disabled member is left out of the enabled listing searches use" do
++    {:ok, disabled} =
++      cardigann_definition_fixture(%{enabled: true})
++      |> Indexers.disable_cardigann_definition()
++
++    ids = Indexers.list_cardigann_definitions(enabled: true) |> Enum.map(& &1.id)
++    refute disabled.id in ids
++  end
++end
+diff --git a/test/mydia/repo/migrations/add_in_library_to_cardigann_definitions_test.exs b/test/mydia/repo/migrations/add_in_library_to_cardigann_definitions_test.exs
+new file mode 100644
+index 000000000..4bac0db9e
+--- /dev/null
++++ b/test/mydia/repo/migrations/add_in_library_to_cardigann_definitions_test.exs
+@@ -0,0 +1,37 @@
++defmodule Mydia.Repo.Migrations.AddInLibraryToCardigannDefinitionsTest do
++  use Mydia.MigrationCase
++
++  Code.require_file(
++    "priv/repo/migrations/20261011110156_add_in_library_to_cardigann_definitions.exs"
++  )
++
++  alias Mydia.Repo.Migrations.AddInLibraryToCardigannDefinitions
++
++  defp build_schema do
++    sql!("""
++    CREATE TABLE cardigann_definitions (
++      id TEXT PRIMARY KEY NOT NULL,
++      name TEXT,
++      enabled INTEGER NOT NULL DEFAULT 0,
++      inserted_at TEXT NOT NULL,
++      updated_at TEXT NOT NULL
++    )
++    """)
++
++    sql!("""
++    INSERT INTO cardigann_definitions (id, name, enabled, inserted_at, updated_at) VALUES
++      ('on', 'On', 1, '2026-01-01 00:00:00', '2026-01-01 00:00:00'),
++      ('off', 'Off', 0, '2026-01-01 00:00:00', '2026-01-01 00:00:00')
++    """)
++  end
++
++  @tag :tmp_dir
++  test "an enabled definition starts in the library, a disabled one does not" do
++    build_schema()
++
++    run_migration!(AddInLibraryToCardigannDefinitions, 20_261_011_110_156)
++
++    assert %{rows: [["off", 0], ["on", 1]]} =
++             sql!("SELECT id, in_library FROM cardigann_definitions ORDER BY id")
++  end
++end
+diff --git a/test/mydia_web/live/admin_indexers_live/indexer_library_test.exs b/test/mydia_web/live/admin_indexers_live/indexer_library_test.exs
+index bdec055d3..407a13b5c 100644
+--- a/test/mydia_web/live/admin_indexers_live/indexer_library_test.exs
++++ b/test/mydia_web/live/admin_indexers_live/indexer_library_test.exs
+@@ -42,7 +42,7 @@ defmodule MydiaWeb.AdminIndexersLive.IndexerLibraryTest do
+ 
+       # Modal should be visible with the Indexer Library title
+       assert html =~ "Indexer Library"
+-      assert html =~ "Browse and enable indexers from the definition library"
++      assert html =~ "Browse and add indexers from the definition library"
+     end
+ 
+     test "displays stats correctly in modal", %{conn: conn} do
+@@ -84,7 +84,7 @@ defmodule MydiaWeb.AdminIndexersLive.IndexerLibraryTest do
+         |> render_click()
+ 
+       # Modal should be closed
+-      refute html =~ "Browse and enable indexers from the definition library"
++      refute html =~ "Browse and add indexers from the definition library"
+     end
+   end
+ 
+@@ -116,27 +116,23 @@ defmodule MydiaWeb.AdminIndexersLive.IndexerLibraryTest do
+       refute html =~ private_def.name
+     end
+ 
+-    test "filters by enabled status", %{conn: conn} do
+-      enabled_def = cardigann_definition_fixture(%{name: "Enabled Indexer", enabled: true})
+-
+-      disabled_def =
+-        cardigann_definition_fixture(%{name: "Disabled Indexer", enabled: false})
++    test "filters by whether an indexer is added", %{conn: conn} do
++      added_def = cardigann_definition_fixture(%{name: "Added Indexer", enabled: true})
++      other_def = cardigann_definition_fixture(%{name: "Other Indexer", enabled: false})
+ 
+       {:ok, view, _html} = live(conn, ~p"/admin/indexers")
+ 
+-      # Open the modal using dropdown button
+       view
+       |> element("button.flex.items-start[phx-click='show_indexer_library']")
+       |> render_click()
+ 
+-      # Filter by enabled
+       html =
+         view
+         |> element("form#indexer-library-filter-form")
+-        |> render_change(%{"enabled" => "enabled"})
++        |> render_change(%{"added" => "added"})
+ 
+-      assert html =~ enabled_def.name
+-      refute html =~ disabled_def.name
++      assert html =~ added_def.name
++      refute html =~ other_def.name
+     end
+ 
+     test "searches by name", %{conn: conn} do
+@@ -166,12 +162,11 @@ defmodule MydiaWeb.AdminIndexersLive.IndexerLibraryTest do
+     setup :enable_cardigann_feature_flag
+     setup :start_indexers_health
+ 
+-    test "enables a disabled indexer", %{conn: conn} do
++    test "adds an indexer from the library", %{conn: conn} do
+       definition = cardigann_definition_fixture(%{enabled: false})
+ 
+       {:ok, view, _html} = live(conn, ~p"/admin/indexers")
+ 
+-      # Open the modal using dropdown button
+       view
+       |> element("button.flex.items-start[phx-click='show_indexer_library']")
+       |> render_click()
+@@ -184,33 +179,57 @@ defmodule MydiaWeb.AdminIndexersLive.IndexerLibraryTest do
+ 
+       assert has_element?(
+                view,
+-               "input[phx-click='toggle_library_definition'][aria-label='Disable #{definition.name}']"
++               "input[phx-click='toggle_library_definition'][aria-label='Remove #{definition.name}']"
+              )
+ 
+-      # Verify the indexer is now enabled
+-      updated_definition = Indexers.get_cardigann_definition!(definition.id)
+-      assert updated_definition.enabled
++      assert has_element?(view, "#library-indexer-#{definition.id}")
++
++      updated = Indexers.get_cardigann_definition!(definition.id)
++      assert updated.in_library
++      assert updated.enabled
+     end
+ 
+-    test "disables an enabled indexer", %{conn: conn} do
+-      definition = cardigann_definition_fixture(%{enabled: true})
++    test "keeps the config warning on an added but disabled private indexer", %{conn: conn} do
++      {:ok, definition} =
++        cardigann_definition_fixture(%{type: "private", enabled: true})
++        |> Indexers.disable_cardigann_definition()
+ 
+       {:ok, view, _html} = live(conn, ~p"/admin/indexers")
+ 
+-      # Open the modal using dropdown button
+       view
+       |> element("button.flex.items-start[phx-click='show_indexer_library']")
+       |> render_click()
+ 
++      assert has_element?(
++               view,
++               "#library-definition-#{definition.id} .tooltip[data-tip='This indexer requires configuration']"
++             )
++    end
++
++    test "removes an added indexer, even a disabled one", %{conn: conn} do
++      {:ok, definition} =
++        cardigann_definition_fixture(%{enabled: true})
++        |> Indexers.disable_cardigann_definition()
++
++      {:ok, view, _html} = live(conn, ~p"/admin/indexers")
++
++      view
++      |> element("button.flex.items-start[phx-click='show_indexer_library']")
++      |> render_click()
++
++      assert has_element?(
++               view,
++               "input[phx-click='toggle_library_definition'][aria-label='Remove #{definition.name}']"
++             )
++
+       view
+       |> element(
+         "input[type='checkbox'][phx-click='toggle_library_definition'][phx-value-id='#{definition.id}']"
+       )
+       |> render_click()
+ 
+-      # Verify the indexer is now disabled
+-      updated_definition = Indexers.get_cardigann_definition!(definition.id)
+-      refute updated_definition.enabled
++      refute Indexers.get_cardigann_definition!(definition.id).in_library
++      refute has_element?(view, "#library-indexer-#{definition.id}")
+     end
+   end
+ 
+@@ -329,16 +348,56 @@ defmodule MydiaWeb.AdminIndexersLive.IndexerLibraryTest do
+       assert html =~ "Enabled Library Indexer"
+     end
+ 
+-    test "does not show library indexers section when no enabled indexers exist", %{conn: conn} do
++    test "does not list definitions that were never added", %{conn: conn} do
+       set_cardigann_feature_flag(true)
++      definition = cardigann_definition_fixture(%{enabled: false})
+ 
+-      # Create a disabled library indexer only
+-      cardigann_definition_fixture(%{name: "Disabled Library Indexer", enabled: false})
++      {:ok, view, _html} = live(conn, ~p"/admin/indexers")
+ 
+-      {:ok, _view, html} = live(conn, ~p"/admin/indexers")
++      refute has_element?(view, "#library-indexer-#{definition.id}")
++    end
++
++    test "switching an indexer off keeps it listed", %{conn: conn} do
++      set_cardigann_feature_flag(true)
++      definition = cardigann_definition_fixture(%{name: "Stays Listed", enabled: true})
++
++      {:ok, view, _html} = live(conn, ~p"/admin/indexers")
++
++      view
++      |> element("input[phx-click='toggle_library_indexer'][phx-value-id='#{definition.id}']")
++      |> render_click()
++
++      assert has_element?(view, "#library-indexer-#{definition.id}")
++      assert has_element?(view, "input[aria-label='Enable Stays Listed']")
++      refute Indexers.get_cardigann_definition!(definition.id).enabled
++    end
++
++    test "switching a disabled indexer back on enables it", %{conn: conn} do
++      set_cardigann_feature_flag(true)
++
++      {:ok, definition} =
++        cardigann_definition_fixture(%{enabled: true})
++        |> Indexers.disable_cardigann_definition()
++
++      {:ok, view, _html} = live(conn, ~p"/admin/indexers")
++
++      view
++      |> element("input[phx-click='toggle_library_indexer'][phx-value-id='#{definition.id}']")
++      |> render_click()
++
++      assert Indexers.get_cardigann_definition!(definition.id).enabled
++    end
++
++    test "Remove takes an indexer off the page", %{conn: conn} do
++      set_cardigann_feature_flag(true)
++      definition = cardigann_definition_fixture(%{enabled: true})
++
++      {:ok, view, _html} = live(conn, ~p"/admin/indexers")
++
++      view |> element("#remove-library-indexer-#{definition.id}") |> render_click()
+ 
+-      # Should NOT show the Library Indexers section (since no enabled ones exist)
+-      refute html =~ "Disabled Library Indexer"
++      refute has_element?(view, "#library-indexer-#{definition.id}")
++      refute Indexers.get_cardigann_definition!(definition.id).in_library
+     end
+ 
+     test "library indexer rows use the shared row actions", %{conn: conn} do
+@@ -349,6 +408,7 @@ defmodule MydiaWeb.AdminIndexersLive.IndexerLibraryTest do
+ 
+       assert has_element?(view, "#library-indexers .join .join-item[title=Configure]")
+       assert has_element?(view, "#library-indexers .join .join-item[title=Test]")
++      assert has_element?(view, "#library-indexers .join .join-item[title=Remove]")
+     end
+ 
+     test "library indexer enable toggle has an accessible name", %{conn: conn} do
+diff --git a/test/support/fixtures/indexers_fixtures.ex b/test/support/fixtures/indexers_fixtures.ex
+index 9030b8e89..84cad9aca 100644
+--- a/test/support/fixtures/indexers_fixtures.ex
++++ b/test/support/fixtures/indexers_fixtures.ex
+@@ -65,6 +65,8 @@ defmodule Mydia.IndexersFixtures do
+         last_synced_at: DateTime.utc_now()
+       })
+ 
++    definition_attrs = Map.put_new(definition_attrs, :in_library, definition_attrs.enabled)
++
+     %CardigannDefinition{}
+     |> CardigannDefinition.changeset(definition_attrs)
+     |> Repo.insert!()

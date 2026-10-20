@@ -1,0 +1,111 @@
+diff --git a/lib/beacon/loader.ex b/lib/beacon/loader.ex
+index ab5be655e..14b60f3a3 100644
+--- a/lib/beacon/loader.ex
++++ b/lib/beacon/loader.ex
+@@ -40,13 +40,26 @@ defmodule Beacon.Loader do
+     end
+   rescue
+     error ->
+-      raise_invoke_error(site, error, module, function, args, opts[:context], __STACKTRACE__)
++      if live_data_module?(module) do
++        # LiveData is user-provided code, which always has the possibility of errors.
++        # In this case, we want to ensure the original error is surfaced to the user for easier debugging.
++        reraise error, __STACKTRACE__
++      else
++        raise_invoke_error(site, error, module, function, args, opts[:context], __STACKTRACE__)
++      end
+   end
+ 
+   defp raise_invoke_error(site, error, module, function, args, context, stacktrace) do
+     reraise Beacon.InvokeError, [site: site, error: error, module: module, function: function, args: args, context: context], stacktrace
+   end
+ 
++  defp live_data_module?(module) do
++    case module |> Module.split() |> List.last() do
++      "LiveData" -> true
++      _ -> false
++    end
++  end
++
+   defp worker(site) do
+     supervisor = Beacon.Registry.via({site, Beacon.LoaderSupervisor})
+     config = %{site: site}
+diff --git a/lib/beacon/loader/live_data.ex b/lib/beacon/loader/live_data.ex
+index 16c6de7ba..7965c2362 100644
+--- a/lib/beacon/loader/live_data.ex
++++ b/lib/beacon/loader/live_data.ex
+@@ -64,8 +64,26 @@ defmodule Beacon.Loader.LiveData do
+             acc,
+             String.to_atom(assign.key),
+             case assign.format do
+-              :text -> assign.value
+-              :elixir -> assign.value |> Code.eval_string(unquote(bindings), __ENV__) |> elem(0)
++              :text ->
++                assign.value
++
++              :elixir ->
++                try do
++                  assign.value |> Code.eval_string(unquote(bindings), __ENV__) |> elem(0)
++                rescue
++                  error ->
++                    path = "/" <> Enum.join(unquote(path_list), "/")
++
++                    Logger.error("""
++                    failed to evaluate Live Data
++
++                    path: #{path}
++                    params: #{inspect(unquote(params_var))}
++                    assign: @#{assign.key}
++                    """)
++
++                    reraise error, __STACKTRACE__
++                end
+             end
+           )
+         end)
+diff --git a/test/beacon/loader/live_data_test.exs b/test/beacon/loader/live_data_test.exs
+index 5087d6645..0543c4523 100644
+--- a/test/beacon/loader/live_data_test.exs
++++ b/test/beacon/loader/live_data_test.exs
+@@ -27,6 +27,15 @@ defmodule Beacon.Loader.LiveDataTest do
+     assert assigns_for_path("/bar") == %{product_id: "678"}
+   end
+ 
++  test "forward errors" do
++    live_data = beacon_live_data_fixture(path: "/error")
++    beacon_live_data_assign_fixture(live_data: live_data, format: :elixir, key: "test", value: "String.foo()")
++
++    assert_raise UndefinedFunctionError, "function String.foo/0 is undefined or private", fn ->
++      assert assigns_for_path("/error")
++    end
++  end
++
+   defp assigns_for_path(path) do
+     path_list = String.split(path, "/", trim: true)
+     module = Beacon.Loader.fetch_live_data_module(default_site())
+diff --git a/test/beacon/loader_test.exs b/test/beacon/loader_test.exs
+index 852f9ed2e..eb4fd4234 100644
+--- a/test/beacon/loader_test.exs
++++ b/test/beacon/loader_test.exs
+@@ -41,6 +41,21 @@ defmodule Beacon.LoaderTest do
+         Loader.safe_apply_mfa(default_site(), String, :foo, ["bar"])
+       end
+     end
++
++    test "forwards live data errors" do
++      live_data = beacon_live_data_fixture(path: "/error")
++      beacon_live_data_assign_fixture(live_data: live_data, format: :elixir, key: "test", value: "String.foo()")
++
++      assert_raise UndefinedFunctionError, "function String.foo/0 is undefined or private", fn ->
++        assert assigns_for_path("/error")
++      end
++    end
++
++    defp assigns_for_path(path) do
++      path_list = String.split(path, "/", trim: true)
++      module = Beacon.Loader.fetch_live_data_module(default_site())
++      module.live_data(path_list, %{})
++    end
+   end
+ 
+   describe "populate default components" do

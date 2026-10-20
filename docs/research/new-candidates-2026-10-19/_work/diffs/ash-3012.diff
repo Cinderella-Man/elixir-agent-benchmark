@@ -1,0 +1,5299 @@
+diff --git a/.formatter.exs b/.formatter.exs
+index 744d1b047..7dd6cc221 100644
+--- a/.formatter.exs
++++ b/.formatter.exs
+@@ -56,6 +56,7 @@ spark_locals_without_parens = [
+   avg: 3,
+   avg: 4,
+   base_filter: 1,
++  batch?: 1,
+   batch_size: 1,
+   before_action?: 1,
+   belongs_to: 2,
+@@ -116,6 +117,7 @@ spark_locals_without_parens = [
+   define_calculation: 2,
+   delay_global_validations?: 1,
+   delimiter: 1,
++  delivery: 1,
+   description: 1,
+   destination_attribute: 1,
+   destination_attribute_on_join_resource: 1,
+@@ -156,6 +158,8 @@ spark_locals_without_parens = [
+   forbid_if: 2,
+   forbid_unless: 1,
+   forbid_unless: 2,
++  from: 1,
++  from: 2,
+   from_many?: 1,
+   functions: 1,
+   generated?: 1,
+@@ -225,12 +229,15 @@ spark_locals_without_parens = [
+   offset: 1,
+   offset?: 1,
+   on: 1,
++  on: 2,
++  on: 3,
+   only_when_valid?: 1,
+   page: 1,
+   paginate_by_default?: 1,
+   pagination: 0,
+   pagination: 1,
+   parse_attribute: 1,
++  phase: 1,
+   pipe_through: 1,
+   pipe_through: 2,
+   pipeline: 1,
+@@ -292,6 +299,8 @@ spark_locals_without_parens = [
+   sensitive?: 1,
+   short_name: 1,
+   show_inspect_fields: 1,
++  signal: 1,
++  signal: 2,
+   skip_global_validations?: 1,
+   skip_unknown_inputs: 1,
+   soft?: 1,
+diff --git a/documentation/dsls/DSL-Ash.Resource.md b/documentation/dsls/DSL-Ash.Resource.md
+index 7883a8506..84686044b 100644
+--- a/documentation/dsls/DSL-Ash.Resource.md
++++ b/documentation/dsls/DSL-Ash.Resource.md
+@@ -3250,6 +3250,136 @@ Target: `Ash.Resource.Pipeline`
+ 
+ 
+ 
++## signals_in
++Listen to signals emitted by other resources. See `Ash.Signals`.
++
++
++### Nested DSLs
++ * [from](#signals_in-from)
++   * on
++
++
++### Examples
++```
++signals_in do
++  from MyApp.Blog.Signals do
++    on :add_to_feeds, :post_created
++  end
++end
++
++```
++
++
++
++
++### signals_in.from
++```elixir
++from signal_module
++```
++
++
++Listens to signals from an `Ash.Signals` module.
++
++
++### Nested DSLs
++ * [on](#signals_in-from-on)
++
++
++### Examples
++```
++from MyApp.Blog.Signals do
++  on :add_to_feeds, :post_created
++end
++
++```
++
++
++
++### Arguments
++
++| Name | Type | Default | Docs |
++|------|------|---------|------|
++| [`signal_module`](#signals_in-from-signal_module){: #signals_in-from-signal_module .spark-required} | `atom` |  | The `Ash.Signals` module that declares the signals. |
++
++
++
++### signals_in.from.on
++```elixir
++on name, signal
++```
++
++
++Runs an action when a signal is emitted. Its return value is ignored.
++
++The action defaults to the listener's name. A generic action receives the signal struct as an
++argument (named `signal` by default), or every signal emitted together as a list with
++`batch?: true`. A create action creates a record from each signal. An update or destroy action
++runs on the records selected for each signal by `read_action`, `args` and `get_by`. Create,
++update and destroy actions handle the signals emitted together in bulk.
++
++
++
++
++### Examples
++```
++on :add_to_feeds, :post_created
++```
++
++```
++on :add_all_to_feeds, :post_created, batch?: true
++```
++
++```
++on :record_post, :post_created, action: :create, inputs: [:post_id, body: :title]
++```
++
++```
++on :archive, :post_archived, read_action: :for_post, args: [:post_id]
++```
++
++```
++on :archive, :post_archived, get_by: [post_id: :post_id]
++```
++
++
++
++### Arguments
++
++| Name | Type | Default | Docs |
++|------|------|---------|------|
++| [`name`](#signals_in-from-on-name){: #signals_in-from-on-name .spark-required} | `atom` |  | The name of the listener, unique within the resource. Also the action it runs, unless `action` is set. |
++| [`signal`](#signals_in-from-on-signal){: #signals_in-from-on-signal .spark-required} | `atom` |  | The name of the signal. |
++### Options
++
++| Name | Type | Default | Docs |
++|------|------|---------|------|
++| [`action`](#signals_in-from-on-action){: #signals_in-from-on-action } | `atom` |  | The action to run when the signal is emitted. Defaults to the listener's name. A generic action receives the signal struct as an argument. A create action creates a record from each signal. An update or destroy action runs on the records that `read_action`, `args` and `get_by` select for each signal. |
++| [`batch?`](#signals_in-from-on-batch?){: #signals_in-from-on-batch? } | `boolean` | `false` | For a generic action, run it once with every signal emitted together (by `Ash.Signals.emit_many/5`), as a list, instead of once per signal. Create, update and destroy actions always handle signals in bulk. |
++| [`argument`](#signals_in-from-on-argument){: #signals_in-from-on-argument } | `atom` |  | For a generic action, the argument that receives the signal struct. Defaults to `:signal`, or to `:signals` with `batch?: true`, in which case it receives a list of signal structs. |
++| [`inputs`](#signals_in-from-on-inputs){: #signals_in-from-on-inputs } | `list(atom \| {atom, atom})` |  | For a create, update or destroy action, the inputs of the action to set from the signal. Defaults to every signal field with the same name as an input of the action. A keyword list mapping each name to the signal field it takes its value from. A bare name takes its value from the signal field with the same name, e.g. `[:customer_id, order: :order_id]`. |
++| [`read_action`](#signals_in-from-on-read_action){: #signals_in-from-on-read_action } | `atom` |  | For an update or destroy action, the read action that selects the records to change. Defaults to the primary read action. Signals for which it returns no records are handled. |
++| [`args`](#signals_in-from-on-args){: #signals_in-from-on-args } | `list(atom \| {atom, atom})` | `[]` | For an update or destroy action, the arguments of the read action to set from the signal. A keyword list mapping each name to the signal field it takes its value from. A bare name takes its value from the signal field with the same name, e.g. `[:customer_id, order: :order_id]`. |
++| [`get_by`](#signals_in-from-on-get_by){: #signals_in-from-on-get_by } | `list(atom \| {atom, atom})` | `[]` | For an update or destroy action, fields of the resource that must equal the given signal fields. A keyword list mapping each name to the signal field it takes its value from. A bare name takes its value from the signal field with the same name, e.g. `[:customer_id, order: :order_id]`. |
++| [`description`](#signals_in-from-on-description){: #signals_in-from-on-description } | `String.t` |  | A description of the listener. |
++
++
++
++
++
++### Introspection
++
++Target: `Ash.Resource.SignalListener`
++
++
++
++
++### Introspection
++
++Target: `Ash.Resource.SignalSource`
++
++
++
++
+ ## aggregates
+ Declare named aggregates on the resource.
+ 
+diff --git a/documentation/dsls/DSL-Ash.Signals.md b/documentation/dsls/DSL-Ash.Signals.md
+new file mode 100644
+index 000000000..4a2e4fd23
+--- /dev/null
++++ b/documentation/dsls/DSL-Ash.Signals.md
+@@ -0,0 +1,121 @@
++<!--
++This file was generated by Spark. Do not edit it by hand.
++-->
++# Ash.Signals
++
++
++
++## signals
++Declare signals that resources can emit and listen to.
++
++### Nested DSLs
++ * [signal](#signals-signal)
++   * argument
++
++
++### Examples
++```
++signals do
++  signal :post_created do
++    phase :after_action
++    argument :post_id, :uuid, allow_nil?: false
++  end
++end
++
++```
++
++
++
++
++### signals.signal
++```elixir
++signal name
++```
++
++
++Declares a signal, and defines a struct for its arguments.
++
++For a signal named `:post_created` in `MyApp.Signals`, this is `MyApp.Signals.PostCreated`.
++
++
++### Nested DSLs
++ * [argument](#signals-signal-argument)
++
++
++### Examples
++```
++signal :post_created do
++  phase :after_action
++  argument :post_id, :uuid, allow_nil?: false
++end
++
++```
++
++
++
++### Arguments
++
++| Name | Type | Default | Docs |
++|------|------|---------|------|
++| [`name`](#signals-signal-name){: #signals-signal-name .spark-required} | `atom` |  | The name of the signal. |
++### Options
++
++| Name | Type | Default | Docs |
++|------|------|---------|------|
++| [`phase`](#signals-signal-phase){: #signals-signal-phase .spark-required} | `:before_action \| :after_action \| :after_transaction` |  | The phase of the emitting action during which the signal may be emitted. |
++| [`delivery`](#signals-signal-delivery){: #signals-signal-delivery } | `module` | `{Ash.Signals.Delivery.Inline, []}` | How the signal is delivered to its listeners. Defaults to `Ash.Signals.Delivery.Inline`, which runs them immediately, during the signal's phase. See `Ash.Signals.Delivery`. |
++| [`description`](#signals-signal-description){: #signals-signal-description } | `String.t` |  | A description of the signal. |
++
++
++### signals.signal.argument
++```elixir
++argument name, type
++```
++
++
++An argument of the signal, provided by the emitter.
++
++
++
++### Examples
++```
++argument :post_id, :uuid, allow_nil?: false
++```
++
++
++
++### Arguments
++
++| Name | Type | Default | Docs |
++|------|------|---------|------|
++| [`name`](#signals-signal-argument-name){: #signals-signal-argument-name .spark-required} | `atom` |  | The name of the field. |
++| [`type`](#signals-signal-argument-type){: #signals-signal-argument-type .spark-required} | `module` |  | The type of the field. |
++### Options
++
++| Name | Type | Default | Docs |
++|------|------|---------|------|
++| [`constraints`](#signals-signal-argument-constraints){: #signals-signal-argument-constraints } | `keyword` | `[]` | Constraints for the type. |
++| [`allow_nil?`](#signals-signal-argument-allow_nil?){: #signals-signal-argument-allow_nil? } | `boolean` | `true` | Whether the field may be `nil`. |
++| [`default`](#signals-signal-argument-default){: #signals-signal-argument-default } | `any` |  | A default value for the field. |
++| [`description`](#signals-signal-argument-description){: #signals-signal-argument-description } | `String.t` |  | A description of the field. |
++
++
++
++
++
++### Introspection
++
++Target: `Ash.Signals.Field`
++
++
++
++
++### Introspection
++
++Target: `Ash.Signals.Signal`
++
++
++
++
++
++<style type="text/css">.spark-required::after { content: "*"; color: red !important; }</style>
+diff --git a/documentation/topics/resources/signals.md b/documentation/topics/resources/signals.md
+new file mode 100644
+index 000000000..53b372495
+--- /dev/null
++++ b/documentation/topics/resources/signals.md
+@@ -0,0 +1,357 @@
++<!--
++SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++
++SPDX-License-Identifier: MIT
++-->
++
++# Signals
++
++Signals let one resource react to what happens in another, without either depending on the
++other. A resource emits a typed signal, like `:order_placed`, and any resource can listen to it
++with one of its own actions.
++
++Signals are useful when one part of your application needs to react to another part, but the
++part that acts shouldn't have to know about the reactions. For example, when an order is placed,
++a loyalty program might award points, a ticketing system might open a task, and a reporting
++system might record the sale. With signals, the order resource emits `:order_placed`, and each of
++those resources listens to it. The order resource doesn't change when a new reaction is added.
++
++## Signals vs. calling another resource
++
++If a resource needs something from another resource to finish its action, call that resource
++directly, for example with its code interface. Signals are fire and forget: the emitter gets
++nothing back from its listeners, so it doesn't depend on what they do, or on whether anything
++listens at all. Needing a value back from a listener is a sign that a signal is the wrong tool.
++
++## Signals vs. notifiers
++
++[Notifiers](/documentation/topics/resources/notifiers.md) run after the transaction commits, and
++are for "at most once" side effects like publishing to PubSub. With the default delivery,
++listeners of a signal run as nested actions, during the phase the signal declares, usually inside
++the emitter's transaction. If a listener fails, the emitting action fails, and its changes are
++rolled back. Signals can also use other deliveries, for example to run listeners in jobs. See
++[Delivery](#delivery).
++
++## Declaring signals
++
++Signals are declared in a signal module, which is the contract between the resources that emit
++them and the resources that listen to them. Both depend on it, and not on each other.
++
++```elixir
++defmodule MyApp.Shop.Signals do
++  use Ash.Signals
++
++  signals do
++    signal :order_placed do
++      phase :after_action
++      argument :order_id, :uuid, allow_nil?: false
++      argument :customer_id, :uuid, allow_nil?: false
++      argument :total, :money
++    end
++  end
++end
++```
++
++Each signal defines a struct for its arguments, `MyApp.Shop.Signals.OrderPlaced`, which is what
++listeners receive. Every signal struct also has a `signal_id`, a UUIDv7 generated when the signal
++is emitted, so `signal_id` can't be used as an argument name.
++
++A signal's `phase` is when it is emitted: `:before_action`, `:after_action`, or
++`:after_transaction`. Its `delivery` is how it reaches its listeners, which by default is by
++running them immediately, during that phase. See [Delivery](#delivery), and the
++[Signals DSL documentation](/documentation/dsls/DSL-Ash.Signals.md) for every option.
++
++## Emitting signals
++
++Emit signals with the `emit_signal` change, giving the signal module, the signal, and its phase:
++
++```elixir
++actions do
++  create :place do
++    accept [:customer_id, :total]
++
++    change emit_signal(MyApp.Shop.Signals, :order_placed, :after_action,
++             fields: [order_id: :id]
++           )
++  end
++end
++```
++
++The phase must be the one the signal declares. It's repeated so that the action shows when it
++emits, and it is checked at compile time.
++
++Signal fields are taken from the record's fields with the same name, so `customer_id` and `total`
++above come from the order. Use these options for the others:
++
++- `fields` - signal fields to take from other fields of the record, like `order_id: :id`.
++- `values` - signal fields to set to a value, which may be a template like `actor(:id)` or
++  `arg(:reason)`. In update and destroy actions, `previous(:field)` is the value of a field before
++  the action.
++
++```elixir
++update :change_status do
++  accept [:status]
++  require_atomic? false
++
++  change emit_signal(MyApp.Shop.Signals, :order_status_changed, :after_action,
++           fields: [order_id: :id],
++           values: [previous_status: previous(:status), changed_by: actor(:id)]
++         ),
++         where: [changing(:status)]
++end
++```
++
++Use `where` to emit only in some cases, like any other change.
++
++`emit_signal` is checked at compile time: the signal must exist, every field it sets must be a
++field of the signal, every field it reads must be a field of the resource, and every required
++field of the signal must be set. Using it also adds the signal module to the resource's
++`signals_out`.
++
++### Generic actions
++
++Generic actions emit signals with the `emit_signal` preparation. Signal fields are taken from the
++action's arguments with the same name, and `fields` takes them from the action's result:
++
++```elixir
++action :send_invoice do
++  argument :invoice_id, :uuid, allow_nil?: false
++
++  prepare emit_signal(MyApp.Billing.Signals, :invoice_sent, :after_action)
++
++  run MyApp.Billing.SendInvoice
++end
++```
++
++### Bulk actions
++
++Bulk actions emit their signals together, once per batch, so listeners can handle them in bulk
++too. Signals emitted `:after_transaction` are the exception, and are emitted once per record.
++
++### Atomic actions
++
++Signals emitted `:after_action` work with atomic actions. Signals emitted `:before_action` or
++`:after_transaction`, and `previous/1`, need things atomic actions don't have, so an action using
++them can't be atomic. Set `require_atomic? false` on update and destroy actions that use them.
++
++### Emitting from your own code
++
++To emit from your own changes, list the signal module in the resource's `signals_out`, and call
++`Ash.Signals.emit/5` during the signal's phase. `Ash.Signals.emit_many/5` emits a signal for each
++of a list of payloads, for example from a change's `after_batch/3` callback.
++
++```elixir
++use Ash.Resource, signals_out: [MyApp.Shop.Signals]
++
++# in a change
++Ash.Changeset.after_action(changeset, fn changeset, order ->
++  with :ok <-
++         Ash.Signals.emit(changeset, MyApp.Shop.Signals, :order_placed, %{
++           order_id: order.id,
++           customer_id: order.customer_id
++         }) do
++    {:ok, order}
++  end
++end)
++```
++
++Listeners run as the emitting action's actor, with its tenant and `authorize?`. Pass `:actor`,
++`:tenant`, `:authorize?`, `:context`, or a `:scope` to `emit/5` to change them. Include a
++`signal_id` in the payload to set it yourself, for example to emit the same signal again.
++
++## Listening to signals
++
++Resources listen to signals in their `signals_in` section. Each listener has a name, and runs the
++action with that name, unless it sets `action`:
++
++```elixir
++signals_in do
++  from MyApp.Shop.Signals do
++    on :award_points, :order_placed
++    on :notify_sales, :order_placed, action: :notify
++  end
++end
++```
++
++Listener names are unique within a resource, so the same action can listen to a signal more than
++once, for example with different `inputs`:
++
++```elixir
++from MyApp.Shop.Signals do
++  on :record_buyer_entry, :order_placed,
++    action: :record_entry,
++    inputs: [account_id: :customer_id]
++
++  on :record_seller_entry, :order_placed,
++    action: :record_entry,
++    inputs: [account_id: :seller_id]
++end
++```
++
++What happens depends on the type of the action.
++
++### Generic actions
++
++A generic action receives the signal struct as its `signal` argument:
++
++```elixir
++signals_in do
++  from MyApp.Shop.Signals do
++    on :notify_warehouse, :order_placed
++  end
++end
++
++actions do
++  action :notify_warehouse do
++    argument :signal, MyApp.Shop.Signals.OrderPlaced, allow_nil?: false
++    run MyApp.Warehouse.Notify
++  end
++end
++```
++
++With `batch?: true`, it is called once with every signal emitted together, as its `signals`
++argument:
++
++```elixir
++on :notify_warehouse, :order_placed, batch?: true
++
++action :notify_warehouse do
++  argument :signals, {:array, MyApp.Shop.Signals.OrderPlaced}, allow_nil?: false
++  run MyApp.Warehouse.NotifyAll
++end
++```
++
++### Create actions
++
++A create action creates a record for each signal, with its inputs taken from the signal fields of
++the same name, except `signal_id`. Use `inputs` to map them, as `input: :signal_field`:
++
++```elixir
++from MyApp.Shop.Signals do
++  # sets `order_id` and `customer_id` from the signal
++  on :record_order, :order_placed, action: :create
++
++  # sets `reference` from the signal's `order_id`
++  on :open_task, :order_placed, inputs: [reference: :order_id]
++
++  # records which signal created the record
++  on :log, :order_placed, inputs: [:order_id, source_signal_id: :signal_id]
++end
++```
++
++### Update and destroy actions
++
++An update or destroy action runs on the records selected for each signal by a read action, the
++primary read action by default. Use `args` to set the read action's arguments from the signal,
++and `get_by` to select records whose fields equal fields of the signal. They can be used
++together:
++
++```elixir
++from MyApp.Shop.Signals do
++  on :mark_ordered, :order_placed, read_action: :active, get_by: [id: :customer_id]
++  on :clear, :order_placed, read_action: :for_customer, args: [:customer_id]
++end
++```
++
++If the read action selects no records for a signal, the signal is handled, and nothing happens.
++Filter in the read action to only react to some signals.
++
++### Bulk
++
++Create, update and destroy listeners always handle the signals emitted together as bulk actions.
++Update and destroy listeners run one bulk action for each distinct set of `args` and `inputs`.
++
++## Delivery
++
++A signal's `delivery` decides how it reaches its listeners. Because it's part of the signal, the
++module that owns the signal decides, not the listeners: whether a listener can fail or slow down
++the emitting action is the emitter's concern.
++
++The default, `Ash.Signals.Delivery.Inline`, runs listeners immediately, as nested actions, with
++each listener handling every signal before the next listener runs. During `:before_action` and
++`:after_action`, they run inside the emitter's transaction: if a listener fails, the emitting
++action fails and is rolled back.
++
++Signals emitted `:after_transaction` run after the emitter's transaction has committed. If a
++listener fails, the emitting action returns its error, but its changes are not rolled back. If
++the emitting action is itself running inside another transaction, its `after_transaction` hooks
++run while that transaction is still open, and so do the listeners.
++
++Other deliveries are provided by extensions, and implement `Ash.Signals.Delivery`. For example, a
++delivery could enqueue a job for each listener during `:after_action`, so that the jobs are
++committed with the emitter's changes, and the listeners run after the transaction commits, and are
++retried when they fail:
++
++```elixir
++signal :order_status_changed do
++  phase :after_action
++  delivery MyApp.JobDelivery
++  argument :order_id, :uuid, allow_nil?: false
++end
++```
++
++Listeners don't change: they declare the same `on` whatever the delivery.
++
++## Setup
++
++Add the `:ash_signals` compiler to your project:
++
++```elixir
++def project do
++  [
++    compilers: [:ash_signals] ++ Mix.compilers(),
++    ...
++  ]
++end
++```
++
++Like protocol consolidation, it finds the listeners of each signal once per build, and compiles
++them into a module, so that emitting a signal doesn't have to search for them. Without it,
++listeners are searched for every time a signal is emitted, which is much slower.
++
++If you use the Phoenix code reloader, add it to your endpoint's reloadable compilers too, so that
++listeners added during development are picked up:
++
++```elixir
++config :my_app, MyAppWeb.Endpoint,
++  reloadable_compilers: [:ash_signals, :phoenix_live_view, :gettext, :elixir, :app]
++```
++
++Listeners defined after compilation, like resources defined inside tests, aren't part of the
++consolidated modules. To use them, disable consolidation in that environment:
++
++```elixir
++def project do
++  [
++    ash: [consolidate_signals: Mix.env() != :test],
++    ...
++  ]
++end
++```
++
++## Testing
++
++`Ash.Signals.Test` has helpers for asserting on emitted signals. `assert_emits_signal/4` and
++`refute_emits_signal/4` check the signals emitted by a function:
++
++```elixir
++import Ash.Signals.Test
++
++test "placing an order emits order_placed" do
++  order =
++    assert_emits_signal MyApp.Shop.Signals, :order_placed, %{order_id: order_id}, fn ->
++      MyApp.Shop.place_order!(customer, 100)
++    end
++
++  assert order.id == order_id
++end
++```
++
++`assert_signal_emitted/4` and `refute_signal_emitted/4` check the signals emitted so far, after
++calling `capture_signals/1`, for example with `setup :capture_signals`.
++
++## Telemetry
++
++Each emitted signal fires an `[:ash, :signal, :emitted]` telemetry event, before it is
++delivered. Its metadata has the `:signal_module`, the signal's `:name`, the `:signal` struct, the
++emitting `:resource` and `:action`, and the `:actor` and `:tenant` the listeners run with.
+diff --git a/lib/ash/action_input.ex b/lib/ash/action_input.ex
+index 43cfa09f5..bd6f9218c 100644
+--- a/lib/ash/action_input.ex
++++ b/lib/ash/action_input.ex
+@@ -29,6 +29,7 @@ defmodule Ash.ActionInput do
+     valid?: true,
+     errors: [],
+     handle_errors: nil,
++    phase: :pending,
+     before_action: [],
+     after_action: [],
+     before_transaction: [],
+@@ -104,6 +105,7 @@ defmodule Ash.ActionInput do
+           domain: Ash.Domain.t() | nil,
+           valid?: boolean(),
+           errors: [Ash.Error.t()],
++          phase: :pending | :before_action | :after_action | :after_transaction,
+           handle_errors:
+             nil
+             | (t(), error :: term ->
+@@ -1607,6 +1609,8 @@ defmodule Ash.ActionInput do
+   def run_before_actions(%{valid?: false} = input), do: {input, %{notifications: []}}
+ 
+   def run_before_actions(input) do
++    input = %{input | phase: :before_action}
++
+     Enum.reduce_while(
+       input.before_action,
+       {input, %{notifications: []}},
+@@ -1699,6 +1703,8 @@ defmodule Ash.ActionInput do
+ 
+   @doc false
+   def run_after_actions(result, input, before_action_notifications) do
++    input = %{input | phase: :after_action}
++
+     Enum.reduce_while(
+       input.after_action,
+       {:ok, result, input, %{notifications: before_action_notifications}},
+@@ -1888,6 +1894,8 @@ defmodule Ash.ActionInput do
+   end
+ 
+   def run_after_transaction_hooks(result, input) do
++    input = %{input | phase: :after_transaction}
++
+     input.after_transaction
+     |> Enum.reduce(
+       result,
+diff --git a/lib/ash/resource.ex b/lib/ash/resource.ex
+index 93ffde7ad..deb6f7d2e 100644
+--- a/lib/ash/resource.ex
++++ b/lib/ash/resource.ex
+@@ -35,6 +35,11 @@ defmodule Ash.Resource do
+         type: {:list, {:behaviour, Ash.Notifier}},
+         doc: "Notifiers with no DSL."
+       ],
++      signals_out: [
++        type: {:wrap_list, :atom},
++        default: [],
++        doc: "`Ash.Signals` modules that this resource may emit events to"
++      ],
+       validate_domain_inclusion?: [
+         type: :boolean,
+         doc: "Whether or not to validate that this resource is included in a domain.",
+@@ -130,6 +135,7 @@ defmodule Ash.Resource do
+             embed_nil_values?: opts[:embed_nil_values?]
+           ] do
+       @persist {:simple_notifiers, List.wrap(opts[:simple_notifiers])}
++      @persist {:signals_out, List.wrap(opts[:signals_out])}
+       @persist {:primary_read_warning?, Keyword.get(opts, :primary_read_warning?, true)}
+ 
+       import Ash.Resource, only: [timestamps: 0, timestamps: 1]
+diff --git a/lib/ash/resource/change/builtins.ex b/lib/ash/resource/change/builtins.ex
+index 8069352c3..d95f851b2 100644
+--- a/lib/ash/resource/change/builtins.ex
++++ b/lib/ash/resource/change/builtins.ex
+@@ -309,6 +309,52 @@ defmodule Ash.Resource.Change.Builtins do
+      [argument: argument, relationship: relationship_name, opts: opts]}
+   end
+ 
++  @doc """
++  Emits a signal from the action. See `Ash.Signals`.
++
++  The phase must be the one the signal declares, so that the action shows when it emits. The
++  signal is emitted during it, once for each record. Bulk actions emit
++  their signals together, with `Ash.Signals.emit_many/5`, except for signals emitted after the
++  transaction. Using this adds the signal module to the resource's `signals_out`.
++
++  Signal fields are taken from the record's fields of the same name, unless set with the
++  options below. Before the action, they are read from the changeset.
++
++  ## Options
++
++  #{Spark.Options.docs(Keyword.drop(Ash.Signals.Emitter.schema(), [:signal_module, :signal, :phase]))}
++
++  Using `previous/1` makes the change non-atomic, since atomic actions don't read the record
++  before changing it.
++
++  ## Examples
++
++      change emit_signal(MyApp.Blog.Signals, :post_created, :after_action)
++
++      change emit_signal(MyApp.Shop.Signals, :order_status_changed, :after_action,
++               fields: [order_id: :id],
++               values: [previous_status: previous(:status), changed_by: actor(:id)]
++             ),
++             where: [changing(:status)]
++  """
++  @spec emit_signal(Ash.Signals.t(), atom(), Ash.Signals.Signal.phase(), Keyword.t()) ::
++          Ash.Resource.Change.ref()
++  def emit_signal(signal_module, signal, phase, opts \\ []) do
++    {Ash.Resource.Change.EmitSignal,
++     Keyword.merge(opts, signal_module: signal_module, signal: signal, phase: phase)}
++  end
++
++  @doc """
++  The value of a field before the action, for the `values` of `emit_signal/4` in update and
++  destroy actions.
++
++      change emit_signal(MyApp.Shop.Signals, :order_status_changed, :after_action,
++               values: [previous_status: previous(:status)]
++             )
++  """
++  @spec previous(atom()) :: {:_previous, atom()}
++  def previous(field) when is_atom(field), do: {:_previous, field}
++
+   @doc """
+   Merges the given query context.
+ 
+diff --git a/lib/ash/resource/change/emit_signal.ex b/lib/ash/resource/change/emit_signal.ex
+new file mode 100644
+index 000000000..ad3c929c5
+--- /dev/null
++++ b/lib/ash/resource/change/emit_signal.ex
+@@ -0,0 +1,133 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Resource.Change.EmitSignal do
++  @moduledoc false
++  # See `Ash.Resource.Change.Builtins.emit_signal/4`.
++  use Ash.Resource.Change
++
++  alias Ash.Signals.Emitter
++
++  @impl true
++  def init(opts), do: Emitter.init(opts)
++
++  @impl true
++  def atomic(changeset, opts, _context) do
++    cond do
++      # atomic actions don't run `before_batch/3`, or hooks added by `batch_change/3`
++      opts[:phase] in [:before_action, :after_transaction] ->
++        {:not_atomic,
++         "signals emitted in `#{opts[:phase]}` cannot be emitted from atomic actions"}
++
++      Emitter.previous_fields(opts) != [] ->
++        {:not_atomic,
++         "`previous/1` needs the record before the action, which atomic actions don't have"}
++
++      true ->
++        {:ok, changeset}
++    end
++  end
++
++  # Only signals emitted during the action use `before_batch/3` and `after_batch/3`. Signals
++  # emitted after the transaction use a hook per record, so the batch callbacks are skipped.
++  @impl true
++  def batch_callbacks?(_changesets_or_query, opts, _context),
++    do: opts[:phase] != :after_transaction
++
++  # Used for single actions, and for bulk actions without batch callbacks.
++  @impl true
++  def change(changeset, opts, _context) do
++    case opts[:phase] do
++      :before_action ->
++        Ash.Changeset.before_action(changeset, fn changeset ->
++          case emit(changeset, opts, [{changeset, nil}]) do
++            :ok -> changeset
++            {:error, error} -> Ash.Changeset.add_error(changeset, error)
++          end
++        end)
++
++      :after_action ->
++        Ash.Changeset.after_action(changeset, fn changeset, record ->
++          with :ok <- emit(changeset, opts, [{changeset, record}]) do
++            {:ok, record}
++          end
++        end)
++
++      :after_transaction ->
++        add_after_transaction_hook(changeset, opts)
++    end
++  end
++
++  # Bulk creates call this whether or not batch callbacks are run.
++  @impl true
++  def batch_change(changesets, opts, _context) do
++    if opts[:phase] == :after_transaction do
++      Enum.map(changesets, &add_after_transaction_hook(&1, opts))
++    else
++      changesets
++    end
++  end
++
++  defp add_after_transaction_hook(changeset, opts) do
++    Ash.Changeset.after_transaction(changeset, fn
++      changeset, {:ok, record} ->
++        with :ok <- emit(changeset, opts, [{changeset, record}]) do
++          {:ok, record}
++        end
++
++      _changeset, result ->
++        result
++    end)
++  end
++
++  @impl true
++  def before_batch([changeset | _] = changesets, opts, _context) do
++    if opts[:phase] == :before_action do
++      case emit(changeset, opts, Enum.map(changesets, &{&1, nil})) do
++        :ok -> changesets
++        {:error, error} -> Enum.map(changesets, &Ash.Changeset.add_error(&1, error))
++      end
++    else
++      changesets
++    end
++  end
++
++  def before_batch([], _opts, _context), do: []
++
++  @impl true
++  def after_batch([{changeset, _} | _] = changesets_and_records, opts, _context) do
++    with :after_action <- opts[:phase],
++         {:error, error} <- emit(changeset, opts, changesets_and_records) do
++      [{:error, error}]
++    else
++      _ -> Enum.map(changesets_and_records, fn {_, record} -> {:ok, record} end)
++    end
++  end
++
++  def after_batch([], _opts, _context), do: []
++
++  # `record` is nil before the action, when values are read from the changeset
++  defp emit(changeset, opts, changesets_and_records) do
++    payloads =
++      Enum.map(changesets_and_records, fn
++        {changeset, nil} ->
++          get = &fetch_attribute(changeset, &1)
++          Emitter.payload(opts, get, get, changeset.data)
++
++        {changeset, record} ->
++          get = &Map.fetch(record, &1)
++          Emitter.payload(opts, get, get, changeset.data)
++      end)
++
++    Ash.Signals.emit_many(changeset, opts[:signal_module], opts[:signal], payloads)
++  end
++
++  defp fetch_attribute(changeset, name) do
++    if Ash.Resource.Info.attribute(changeset.resource, name) do
++      {:ok, Ash.Changeset.get_attribute(changeset, name)}
++    else
++      :error
++    end
++  end
++end
+diff --git a/lib/ash/resource/dsl.ex b/lib/ash/resource/dsl.ex
+index 326f8f336..b71a4a377 100644
+--- a/lib/ash/resource/dsl.ex
++++ b/lib/ash/resource/dsl.ex
+@@ -1247,6 +1247,65 @@ defmodule Ash.Resource.Dsl do
+     ]
+   }
+ 
++  @signal_listener %Spark.Dsl.Entity{
++    name: :on,
++    describe: """
++    Runs an action when a signal is emitted. Its return value is ignored.
++
++    The action defaults to the listener's name. A generic action receives the signal struct as an
++    argument (named `signal` by default), or every signal emitted together as a list with
++    `batch?: true`. A create action creates a record from each signal. An update or destroy action
++    runs on the records selected for each signal by `read_action`, `args` and `get_by`. Create,
++    update and destroy actions handle the signals emitted together in bulk.
++    """,
++    examples: [
++      "on :add_to_feeds, :post_created",
++      "on :add_all_to_feeds, :post_created, batch?: true",
++      "on :record_post, :post_created, action: :create, inputs: [:post_id, body: :title]",
++      "on :archive, :post_archived, read_action: :for_post, args: [:post_id]",
++      "on :archive, :post_archived, get_by: [post_id: :post_id]"
++    ],
++    target: Ash.Resource.SignalListener,
++    schema: Ash.Resource.SignalListener.schema(),
++    args: [:name, :signal]
++  }
++
++  @signal_source %Spark.Dsl.Entity{
++    name: :from,
++    describe: """
++    Listens to signals from an `Ash.Signals` module.
++    """,
++    examples: [
++      """
++      from MyApp.Blog.Signals do
++        on :add_to_feeds, :post_created
++      end
++      """
++    ],
++    target: Ash.Resource.SignalSource,
++    schema: Ash.Resource.SignalSource.schema(),
++    no_depend_modules: [:signal_module],
++    entities: [listeners: [@signal_listener]],
++    args: [:signal_module]
++  }
++
++  @signals_in %Spark.Dsl.Section{
++    name: :signals_in,
++    describe: """
++    Listen to signals emitted by other resources. See `Ash.Signals`.
++    """,
++    examples: [
++      """
++      signals_in do
++        from MyApp.Blog.Signals do
++          on :add_to_feeds, :post_created
++        end
++      end
++      """
++    ],
++    entities: [@signal_source]
++  }
++
+   @join_filter %Spark.Dsl.Entity{
+     name: :join_filter,
+     describe: """
+@@ -1805,6 +1864,7 @@ defmodule Ash.Resource.Dsl do
+     @preparations,
+     @validations,
+     @pipelines,
++    @signals_in,
+     @aggregates,
+     @calculations,
+     @multitenancy,
+@@ -1835,6 +1895,8 @@ defmodule Ash.Resource.Dsl do
+   ]
+ 
+   @persisters [
++    Ash.Resource.Transformers.DefineSignalListeners,
++    Ash.Resource.Transformers.SetSignalsOut,
+     Ash.Resource.Transformers.CacheRelationships,
+     Ash.Resource.Transformers.ResolveAutoTypes,
+     Ash.Resource.Transformers.CacheCalculations,
+@@ -1872,7 +1934,9 @@ defmodule Ash.Resource.Dsl do
+     Ash.Resource.Verifiers.VerifyNotifiers,
+     Ash.Resource.Verifiers.VerifyPrimaryKeyPresent,
+     Ash.Resource.Verifiers.VerifyGenericActionReactorInputs,
+-    Ash.Resource.Verifiers.ValidateArgumentsToCodeInterface
++    Ash.Resource.Verifiers.ValidateArgumentsToCodeInterface,
++    Ash.Resource.Verifiers.VerifySignalListeners,
++    Ash.Resource.Verifiers.VerifyEmitSignal
+   ]
+ 
+   @moduledoc false
+diff --git a/lib/ash/resource/info.ex b/lib/ash/resource/info.ex
+index 7d61d5ddf..5bd089b0d 100644
+--- a/lib/ash/resource/info.ex
++++ b/lib/ash/resource/info.ex
+@@ -584,6 +584,27 @@ defmodule Ash.Resource.Info do
+     end
+   end
+ 
++  @doc "Returns the `Ash.Signals` modules whose signals a resource may emit"
++  @spec signals_out(Spark.Dsl.t() | Ash.Resource.t()) :: [Ash.Signals.t()]
++  def signals_out(resource) do
++    Extension.get_persisted(resource, :signals_out, [])
++  end
++
++  @doc "Returns the signal listeners of a resource"
++  @spec signal_listeners(Spark.Dsl.t() | Ash.Resource.t()) :: [Ash.Resource.SignalListener.t()]
++  def signal_listeners(resource) do
++    Extension.get_persisted(resource, :signal_listeners, [])
++  end
++
++  @doc "Returns the signal listener of a resource with the given name, or `nil`."
++  @spec signal_listener(Spark.Dsl.t() | Ash.Resource.t(), atom()) ::
++          Ash.Resource.SignalListener.t() | nil
++  def signal_listener(resource, name) do
++    resource
++    |> signal_listeners()
++    |> Enum.find(&(&1.name == name))
++  end
++
+   @doc "Returns all pipelines of a resource"
+   @spec pipelines(Spark.Dsl.t() | Ash.Resource.t()) :: list(Ash.Resource.Pipeline.t())
+   def pipelines(resource) do
+diff --git a/lib/ash/resource/preparation/builtins.ex b/lib/ash/resource/preparation/builtins.ex
+index 1c2c9de71..c8522b2fd 100644
+--- a/lib/ash/resource/preparation/builtins.ex
++++ b/lib/ash/resource/preparation/builtins.ex
+@@ -5,6 +5,28 @@
+ defmodule Ash.Resource.Preparation.Builtins do
+   @moduledoc "Builtin query preparations"
+ 
++  @doc """
++  Emits a signal from a generic action. See `Ash.Signals`.
++
++  The phase must be the one the signal declares, so that the action shows when it emits. Signal fields are taken from the action's
++  arguments of the same name, unless set with the options below.
++
++  ## Options
++
++  #{Spark.Options.docs(Keyword.drop(Ash.Signals.Emitter.schema(), [:signal_module, :signal, :phase]))}
++
++  ## Examples
++
++      prepare emit_signal(MyApp.Billing.Signals, :invoice_sent, :after_action)
++      prepare emit_signal(MyApp.Billing.Signals, :invoice_sent, :after_action, fields: [invoice_id: :id])
++  """
++  @spec emit_signal(Ash.Signals.t(), atom(), Ash.Signals.Signal.phase(), Keyword.t()) ::
++          Ash.Resource.Preparation.ref()
++  def emit_signal(signal_module, signal, phase, opts \\ []) do
++    {Ash.Resource.Preparation.EmitSignal,
++     Keyword.merge(opts, signal_module: signal_module, signal: signal, phase: phase)}
++  end
++
+   @doc """
+   Merges the given query context.
+ 
+diff --git a/lib/ash/resource/preparation/emit_signal.ex b/lib/ash/resource/preparation/emit_signal.ex
+new file mode 100644
+index 000000000..443eed877
+--- /dev/null
++++ b/lib/ash/resource/preparation/emit_signal.ex
+@@ -0,0 +1,64 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Resource.Preparation.EmitSignal do
++  @moduledoc false
++  # See `Ash.Resource.Preparation.Builtins.emit_signal/4`.
++  use Ash.Resource.Preparation
++
++  alias Ash.Signals.Emitter
++
++  @impl true
++  def init(opts), do: Emitter.init(opts)
++
++  @impl true
++  def supports(_opts), do: [Ash.ActionInput]
++
++  @impl true
++  def prepare(input, opts, _context) do
++    case opts[:phase] do
++      :before_action ->
++        Ash.ActionInput.before_action(input, fn input ->
++          case emit(input, opts, nil) do
++            :ok -> input
++            {:error, error} -> Ash.ActionInput.add_error(input, error)
++          end
++        end)
++
++      :after_action ->
++        Ash.ActionInput.after_action(input, fn input, result ->
++          with :ok <- emit(input, opts, result) do
++            if input.action.returns, do: {:ok, result}, else: :ok
++          end
++        end)
++
++      :after_transaction ->
++        Ash.ActionInput.after_transaction(input, fn
++          input, :ok ->
++            emit(input, opts, nil)
++
++          input, {:ok, result} ->
++            with :ok <- emit(input, opts, result) do
++              {:ok, result}
++            end
++
++          _input, result ->
++            result
++        end)
++    end
++  end
++
++  # unmapped signal fields come from arguments of the same name, and `fields` from the result
++  defp emit(input, opts, result) do
++    payload =
++      Emitter.payload(
++        opts,
++        &Map.fetch(input.arguments, &1),
++        fn field -> if is_map(result), do: Map.fetch(result, field), else: :error end,
++        %{}
++      )
++
++    Ash.Signals.emit(input, opts[:signal_module], opts[:signal], payload)
++  end
++end
+diff --git a/lib/ash/resource/signal_listener.ex b/lib/ash/resource/signal_listener.ex
+new file mode 100644
+index 000000000..9587d7624
+--- /dev/null
++++ b/lib/ash/resource/signal_listener.ex
+@@ -0,0 +1,137 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Resource.SignalListener do
++  @moduledoc "Represents an `on` declaration in the `signals_in` section of a resource."
++  defstruct [
++    :name,
++    :signal_module,
++    :signal,
++    :action,
++    :action_type,
++    :resource,
++    :description,
++    :argument,
++    :inputs,
++    :read_action,
++    args: [],
++    get_by: [],
++    batch?: false,
++    __spark_metadata__: nil
++  ]
++
++  @type mapping :: [{atom(), atom()}]
++
++  @type t :: %__MODULE__{
++          name: atom(),
++          signal_module: Ash.Signals.t(),
++          signal: atom(),
++          action: atom(),
++          action_type: Ash.Resource.Actions.action_type() | nil,
++          resource: Ash.Resource.t(),
++          argument: atom() | nil,
++          inputs: mapping() | nil,
++          read_action: atom() | nil,
++          args: mapping(),
++          get_by: mapping(),
++          batch?: boolean(),
++          description: String.t() | nil,
++          __spark_metadata__: Spark.Dsl.Entity.spark_meta()
++        }
++
++  @mapping_doc """
++  A keyword list mapping each name to the signal field it takes its value from. A bare name takes
++  its value from the signal field with the same name, e.g. `[:customer_id, order: :order_id]`.
++  """
++
++  @schema [
++    name: [
++      type: :atom,
++      required: true,
++      doc: """
++      The name of the listener, unique within the resource. Also the action it runs, unless
++      `action` is set.
++      """
++    ],
++    signal: [
++      type: :atom,
++      required: true,
++      doc: "The name of the signal."
++    ],
++    action: [
++      type: :atom,
++      doc: """
++      The action to run when the signal is emitted. Defaults to the listener's name. A generic
++      action receives the signal struct as an argument. A create action creates a record from each
++      signal. An update or destroy action runs on the records that `read_action`, `args` and
++      `get_by` select for each signal.
++      """
++    ],
++    batch?: [
++      type: :boolean,
++      default: false,
++      doc: """
++      For a generic action, run it once with every signal emitted together (by
++      `Ash.Signals.emit_many/5`), as a list, instead of once per signal. Create, update and destroy
++      actions always handle signals in bulk.
++      """
++    ],
++    argument: [
++      type: :atom,
++      doc: """
++      For a generic action, the argument that receives the signal struct. Defaults to `:signal`,
++      or to `:signals` with `batch?: true`, in which case it receives a list of signal structs.
++      """
++    ],
++    inputs: [
++      type: {:list, {:or, [:atom, {:tuple, [:atom, :atom]}]}},
++      doc: """
++      For a create, update or destroy action, the inputs of the action to set from the signal.
++      Defaults to every signal field with the same name as an input of the action.
++      #{@mapping_doc}
++      """
++    ],
++    read_action: [
++      type: :atom,
++      doc: """
++      For an update or destroy action, the read action that selects the records to change.
++      Defaults to the primary read action. Signals for which it returns no records are handled.
++      """
++    ],
++    args: [
++      type: {:list, {:or, [:atom, {:tuple, [:atom, :atom]}]}},
++      default: [],
++      doc: """
++      For an update or destroy action, the arguments of the read action to set from the signal.
++      #{@mapping_doc}
++      """
++    ],
++    get_by: [
++      type: {:list, {:or, [:atom, {:tuple, [:atom, :atom]}]}},
++      default: [],
++      doc: """
++      For an update or destroy action, fields of the resource that must equal the given signal
++      fields. #{@mapping_doc}
++      """
++    ],
++    description: [
++      type: :string,
++      doc: "A description of the listener."
++    ]
++  ]
++
++  @doc false
++  def schema, do: @schema
++
++  @doc false
++  # Normalizes a mapping option to a keyword list of `name => signal_field`.
++  def normalize_mapping(nil), do: nil
++
++  def normalize_mapping(mapping) do
++    Enum.map(mapping, fn
++      {name, field} -> {name, field}
++      name -> {name, name}
++    end)
++  end
++end
+diff --git a/lib/ash/resource/signal_source.ex b/lib/ash/resource/signal_source.ex
+new file mode 100644
+index 000000000..53c288936
+--- /dev/null
++++ b/lib/ash/resource/signal_source.ex
+@@ -0,0 +1,25 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Resource.SignalSource do
++  @moduledoc "Represents a `from` declaration in the `signals_in` section of a resource."
++  defstruct [:signal_module, listeners: [], __spark_metadata__: nil]
++
++  @type t :: %__MODULE__{
++          signal_module: Ash.Signals.t(),
++          listeners: [Ash.Resource.SignalListener.t()],
++          __spark_metadata__: Spark.Dsl.Entity.spark_meta()
++        }
++
++  @schema [
++    signal_module: [
++      type: :atom,
++      required: true,
++      doc: "The `Ash.Signals` module that declares the signals."
++    ]
++  ]
++
++  @doc false
++  def schema, do: @schema
++end
+diff --git a/lib/ash/resource/transformers/define_signal_listeners.ex b/lib/ash/resource/transformers/define_signal_listeners.ex
+new file mode 100644
+index 000000000..121c3bcd2
+--- /dev/null
++++ b/lib/ash/resource/transformers/define_signal_listeners.ex
+@@ -0,0 +1,94 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Resource.Transformers.DefineSignalListeners do
++  @moduledoc false
++  # Flattens the listeners in each `from`, resolves their resource, signal module, action and
++  # defaults, persists them as `:signal_listeners`, and defines an
++  # `Ash.Signals.Listeners.<Resource>` module returning them, which is how `Ash.Signals.Registry`
++  # finds listeners.
++  use Spark.Dsl.Transformer
++
++  alias Spark.Dsl.Transformer
++
++  def transform(dsl_state) do
++    resource = Transformer.get_persisted(dsl_state, :module)
++
++    listeners =
++      for source <- Transformer.get_entities(dsl_state, [:signals_in]),
++          listener <- source.listeners do
++        resolve(%{listener | signal_module: source.signal_module}, resource, dsl_state)
++      end
++
++    dsl_state = Transformer.persist(dsl_state, :signal_listeners, listeners)
++
++    case listeners do
++      [] ->
++        {:ok, dsl_state}
++
++      listeners ->
++        listeners = Enum.map(listeners, &%{&1 | __spark_metadata__: nil})
++        {:ok, Transformer.eval(dsl_state, [], define_listener_module(resource, listeners))}
++    end
++  end
++
++  defp resolve(listener, resource, dsl_state) do
++    listener = %{listener | action: listener.action || listener.name}
++
++    action_type =
++      case Ash.Resource.Info.action(dsl_state, listener.action) do
++        %{type: type} -> type
++        nil -> nil
++      end
++
++    # options that don't apply to the action type are kept, so the verifier can report them
++    argument =
++      cond do
++        action_type != :action -> listener.argument
++        listener.argument -> listener.argument
++        listener.batch? -> :signals
++        true -> :signal
++      end
++
++    read_action =
++      if action_type in [:update, :destroy] do
++        listener.read_action ||
++          case Ash.Resource.Info.primary_action(dsl_state, :read) do
++            %{name: name} -> name
++            nil -> nil
++          end
++      else
++        listener.read_action
++      end
++
++    %{
++      listener
++      | resource: resource,
++        action_type: action_type,
++        argument: argument,
++        read_action: read_action,
++        inputs: Ash.Resource.SignalListener.normalize_mapping(listener.inputs),
++        args: Ash.Resource.SignalListener.normalize_mapping(listener.args),
++        get_by: Ash.Resource.SignalListener.normalize_mapping(listener.get_by)
++    }
++  end
++
++  defp define_listener_module(resource, listeners) do
++    body =
++      quote do
++        @moduledoc false
++
++        @doc false
++        def listeners, do: unquote(Macro.escape(listeners))
++      end
++
++    quote do
++      Module.create(
++        unquote(Ash.Signals.Registry.listener_module(resource)),
++        unquote(Macro.escape(body)),
++        Macro.Env.location(__ENV__)
++      )
++    end
++  end
++end
+diff --git a/lib/ash/resource/transformers/set_signals_out.ex b/lib/ash/resource/transformers/set_signals_out.ex
+new file mode 100644
+index 000000000..ff4418810
+--- /dev/null
++++ b/lib/ash/resource/transformers/set_signals_out.ex
+@@ -0,0 +1,27 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Resource.Transformers.SetSignalsOut do
++  @moduledoc false
++  # Adds the signal modules of `emit_signal` changes and preparations to `signals_out`.
++  use Spark.Dsl.Transformer
++
++  alias Spark.Dsl.Transformer
++
++  def transform(dsl_state) do
++    case Ash.Signals.Emitter.usages(dsl_state) do
++      [] ->
++        {:ok, dsl_state}
++
++      usages ->
++        signals_out =
++          dsl_state
++          |> Transformer.get_persisted(:signals_out, [])
++          |> Enum.concat(Enum.map(usages, fn {_, _, _, opts} -> opts[:signal_module] end))
++          |> Enum.uniq()
++
++        {:ok, Transformer.persist(dsl_state, :signals_out, signals_out)}
++    end
++  end
++end
+diff --git a/lib/ash/resource/verifiers/verify_emit_signal.ex b/lib/ash/resource/verifiers/verify_emit_signal.ex
+new file mode 100644
+index 000000000..e407ab0cd
+--- /dev/null
++++ b/lib/ash/resource/verifiers/verify_emit_signal.ex
+@@ -0,0 +1,115 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Resource.Verifiers.VerifyEmitSignal do
++  @moduledoc """
++  Verifies `emit_signal` changes and preparations: that the signal exists, that every option
++  refers to fields that exist, and that every required field of the signal is set.
++  """
++  use Spark.Dsl.Verifier
++
++  alias Spark.Dsl.{Entity, Verifier}
++  alias Spark.Error.DslError
++
++  @impl true
++  def verify(dsl_state) do
++    module = Verifier.get_persisted(dsl_state, :module)
++
++    dsl_state
++    |> Ash.Signals.Emitter.usages()
++    |> Enum.each(&verify_usage(&1, module, dsl_state))
++
++    :ok
++  end
++
++  defp verify_usage({kind, action, entity, opts}, module, dsl_state) do
++    error = &raise_error(module, entity, kind, &1)
++    signal_module = opts[:signal_module]
++
++    signal =
++      if Code.ensure_loaded?(signal_module) && Spark.Dsl.is?(signal_module, Ash.Signals) do
++        Ash.Signals.Info.signal(signal_module, opts[:signal]) ||
++          error.("`#{inspect(signal_module)}` has no signal named `#{inspect(opts[:signal])}`.")
++      else
++        error.("`#{inspect(signal_module)}` is not an `Ash.Signals` module.")
++      end
++
++    if opts[:phase] != signal.phase do
++      error.(
++        "Signal `#{inspect(signal.name)}` is emitted during `#{inspect(signal.phase)}`, so the phase given to `emit_signal` must be `#{inspect(signal.phase)}`, got: #{inspect(opts[:phase])}"
++      )
++    end
++
++    fields = Ash.Resource.SignalListener.normalize_mapping(opts[:fields] || [])
++    values = opts[:values] || []
++    previous = Ash.Signals.Emitter.previous_fields(opts)
++    signal_fields = Enum.map(signal.arguments, & &1.name)
++
++    for {option, mapping} <- [fields: fields, values: values],
++        {name, _} <- mapping,
++        name not in signal_fields do
++      error.(
++        "`#{option}` sets `#{inspect(name)}`, but signal `#{inspect(signal.name)}` has no field with that name."
++      )
++    end
++
++    if kind == :change do
++      verify_change(error, action, entity, fields, previous, dsl_state)
++    else
++      if previous != [] do
++        error.("`previous/1` is only for update and destroy actions.")
++      end
++    end
++
++    explicit = Keyword.keys(fields) ++ Keyword.keys(values)
++
++    for %{name: name, allow_nil?: false, default: nil} <- signal.arguments,
++        name not in explicit,
++        !default_source?(kind, action, name, dsl_state) do
++      source =
++        if kind == :change,
++          do: "an attribute, calculation or aggregate of the resource",
++          else: "an argument of the action"
++
++      error.(
++        "Signal `#{inspect(signal.name)}` requires `#{inspect(name)}`, which is not #{source}. Set it with `fields` or `values`."
++      )
++    end
++  end
++
++  defp verify_change(error, action, entity, fields, previous, dsl_state) do
++    for field <- Keyword.values(fields) ++ previous, !resource_field?(field, dsl_state) do
++      error.("`#{inspect(field)}` is not an attribute, calculation or aggregate of the resource.")
++    end
++
++    if previous != [] do
++      types = if action, do: [action.type], else: entity.on
++
++      if :create in types do
++        error.("`previous/1` is only for update and destroy actions.")
++      end
++    end
++  end
++
++  defp default_source?(:change, _action, name, dsl_state), do: resource_field?(name, dsl_state)
++
++  defp default_source?(:prepare, nil, _name, _dsl_state), do: true
++
++  defp default_source?(:prepare, action, name, _dsl_state),
++    do: Enum.any?(action.arguments, &(&1.name == name))
++
++  defp resource_field?(name, dsl_state) do
++    !!(Ash.Resource.Info.attribute(dsl_state, name) ||
++         Ash.Resource.Info.calculation(dsl_state, name) ||
++         Ash.Resource.Info.aggregate(dsl_state, name))
++  end
++
++  defp raise_error(module, entity, kind, message) do
++    raise DslError,
++      module: module,
++      path: [if(kind == :change, do: :change, else: :prepare), :emit_signal],
++      location: Entity.anno(entity),
++      message: message
++  end
++end
+diff --git a/lib/ash/resource/verifiers/verify_signal_listeners.ex b/lib/ash/resource/verifiers/verify_signal_listeners.ex
+new file mode 100644
+index 000000000..8586a24ad
+--- /dev/null
++++ b/lib/ash/resource/verifiers/verify_signal_listeners.ex
+@@ -0,0 +1,235 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Resource.Verifiers.VerifySignalListeners do
++  @moduledoc """
++  Verifies the `signals_in` section: that each signal and action exists, and that the listener's
++  options fit the type of its action.
++  """
++  use Spark.Dsl.Verifier
++
++  alias Spark.Dsl.{Entity, Verifier}
++  alias Spark.Error.DslError
++
++  @impl true
++  def verify(dsl_state) do
++    module = Verifier.get_persisted(dsl_state, :module)
++
++    listeners = Verifier.get_persisted(dsl_state, :signal_listeners, [])
++
++    listeners
++    |> Enum.group_by(& &1.name)
++    |> Enum.each(fn
++      {_, [_]} ->
++        :ok
++
++      {name, [_ | duplicates]} ->
++        raise_error(
++          List.last(duplicates),
++          module,
++          "There is already a listener named `#{inspect(name)}`. Listener names must be unique within a resource."
++        )
++    end)
++
++    Enum.each(listeners, &verify_listener(&1, module, dsl_state))
++
++    :ok
++  end
++
++  defp verify_listener(listener, module, dsl_state) do
++    signal_module = listener.signal_module
++
++    signal =
++      if Code.ensure_loaded?(signal_module) && Spark.Dsl.is?(signal_module, Ash.Signals) do
++        Ash.Signals.Info.signal(signal_module, listener.signal) ||
++          raise_error(
++            listener,
++            module,
++            "`#{inspect(signal_module)}` has no signal named `#{inspect(listener.signal)}`."
++          )
++      else
++        raise_error(
++          listener,
++          module,
++          "`#{inspect(signal_module)}` is not an `Ash.Signals` module."
++        )
++      end
++
++    action =
++      Ash.Resource.Info.action(dsl_state, listener.action) ||
++        raise_error(
++          listener,
++          module,
++          "No action named `#{inspect(listener.action)}`.#{if listener.action == listener.name, do: " The action defaults to the listener's name: set `action` to run a different one."}"
++        )
++
++    signal_fields = [:signal_id | Enum.map(signal.arguments, & &1.name)]
++
++    case action.type do
++      :action -> verify_generic(listener, module, action, signal)
++      :read -> raise_error(listener, module, "Signal listeners cannot be read actions.")
++      _ -> verify_bulk(listener, module, action, signal_fields, dsl_state)
++    end
++
++    verify_delivery(listener, module, signal, dsl_state)
++  end
++
++  defp verify_delivery(listener, module, %{delivery: {delivery, opts}} = signal, dsl_state) do
++    if Code.ensure_loaded?(delivery) && function_exported?(delivery, :verify_listener, 4) do
++      case delivery.verify_listener(listener, signal, opts, dsl_state) do
++        :ok -> :ok
++        {:error, message} -> raise_error(listener, module, message)
++      end
++    end
++  end
++
++  defp verify_generic(listener, module, action, signal) do
++    for {option, value} <- [
++          inputs: listener.inputs,
++          read_action: listener.read_action,
++          args: non_empty(listener.args),
++          get_by: non_empty(listener.get_by)
++        ],
++        value do
++      raise_error(
++        listener,
++        module,
++        "`#{option}` is only for create, update and destroy actions, but `#{inspect(action.name)}` is a generic action."
++      )
++    end
++
++    argument = Enum.find(action.arguments, &(&1.name == listener.argument))
++
++    example =
++      if listener.batch?,
++        do: "{:array, #{inspect(signal.struct)}}",
++        else: inspect(signal.struct)
++
++    cond do
++      !argument ->
++        raise_error(
++          listener,
++          module,
++          "Action `#{inspect(action.name)}` must accept an argument named `#{inspect(listener.argument)}` for the signal, e.g `argument #{inspect(listener.argument)}, #{example}`."
++        )
++
++      listener.batch? and !match?({:array, _}, argument.type) ->
++        raise_error(
++          listener,
++          module,
++          "With `batch?: true`, the `#{inspect(listener.argument)}` argument of `#{inspect(action.name)}` receives a list of signals, so it must be an array, e.g `argument #{inspect(listener.argument)}, #{example}`."
++        )
++
++      true ->
++        :ok
++    end
++  end
++
++  defp verify_bulk(listener, module, action, signal_fields, dsl_state) do
++    if listener.batch? do
++      raise_error(
++        listener,
++        module,
++        "`batch?` is only for generic actions. #{String.capitalize(to_string(action.type))} actions always handle signals in bulk."
++      )
++    end
++
++    if listener.argument do
++      raise_error(
++        listener,
++        module,
++        "`argument` is only for generic actions. #{String.capitalize(to_string(action.type))} actions set their inputs from the signal with `inputs`."
++      )
++    end
++
++    action_inputs = Ash.Resource.Info.action_inputs(dsl_state, action.name)
++
++    for {input, _field} <- listener.inputs || [], input not in action_inputs do
++      raise_error(
++        listener,
++        module,
++        "`#{inspect(input)}` is not an input of `#{inspect(action.name)}`."
++      )
++    end
++
++    verify_fields(listener, module, :inputs, listener.inputs || [], signal_fields)
++
++    if action.type == :create do
++      for {option, value} <- [
++            read_action: listener.read_action,
++            args: non_empty(listener.args),
++            get_by: non_empty(listener.get_by)
++          ],
++          value do
++        raise_error(
++          listener,
++          module,
++          "`#{option}` is only for update and destroy actions, but `#{inspect(action.name)}` is a create action."
++        )
++      end
++    else
++      verify_query(listener, module, signal_fields, dsl_state)
++    end
++  end
++
++  defp verify_query(listener, module, signal_fields, dsl_state) do
++    read_action =
++      case listener.read_action && Ash.Resource.Info.action(dsl_state, listener.read_action) do
++        %{type: :read} = read_action ->
++          read_action
++
++        nil when is_nil(listener.read_action) ->
++          raise_error(
++            listener,
++            module,
++            "The resource has no primary read action, so the listener must set `read_action`."
++          )
++
++        _ ->
++          raise_error(
++            listener,
++            module,
++            "`#{inspect(listener.read_action)}` is not a read action."
++          )
++      end
++
++    for {arg, _field} <- listener.args,
++        !Enum.any?(read_action.arguments, &(&1.name == arg)) do
++      raise_error(
++        listener,
++        module,
++        "`#{inspect(arg)}` is not an argument of the `#{inspect(read_action.name)}` read action."
++      )
++    end
++
++    for {field, _signal_field} <- listener.get_by,
++        !Ash.Resource.Info.attribute(dsl_state, field) do
++      raise_error(listener, module, "`get_by` field `#{inspect(field)}` is not an attribute.")
++    end
++
++    verify_fields(listener, module, :args, listener.args, signal_fields)
++    verify_fields(listener, module, :get_by, listener.get_by, signal_fields)
++  end
++
++  defp verify_fields(listener, module, option, mapping, signal_fields) do
++    for {_name, field} <- mapping, field not in signal_fields do
++      raise_error(
++        listener,
++        module,
++        "`#{option}` uses `#{inspect(field)}`, but signal `#{inspect(listener.signal)}` has no field with that name."
++      )
++    end
++  end
++
++  defp non_empty([]), do: nil
++  defp non_empty(value), do: value
++
++  defp raise_error(listener, module, message) do
++    raise DslError,
++      module: module,
++      path: [:signals_in, :from, listener.signal_module, :on, listener.name],
++      location: Entity.anno(listener),
++      message: message
++  end
++end
+diff --git a/lib/ash/signals.ex b/lib/ash/signals.ex
+new file mode 100644
+index 000000000..6a9f3cb38
+--- /dev/null
++++ b/lib/ash/signals.ex
+@@ -0,0 +1,362 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Signals do
++  @moduledoc """
++  Typed signals that resources emit, and other resources listen to with their own actions.
++
++  A signal module declares signals, and is the contract between the resources that emit them and
++  the resources that listen to them:
++
++  ```elixir
++  defmodule MyApp.Shop.Signals do
++    use Ash.Signals
++
++    signals do
++      signal :order_placed do
++        phase :after_action
++        argument :order_id, :uuid, allow_nil?: false
++      end
++    end
++  end
++  ```
++
++  See the [signals guide](/documentation/topics/resources/signals.md) for how to emit and listen
++  to signals, and the [Signals DSL documentation](dsl-ash-signals.html) for every option.
++  """
++
++  use Spark.Dsl, default_extensions: [extensions: [Ash.Signals.Dsl]]
++
++  @type t :: module
++
++  @doc """
++  Emits a signal, delivering it to its listeners.
++
++  Takes the changeset of a create, update or destroy action, or the input of a generic action.
++  Must be called during the phase declared by the signal, by a resource that lists the signal
++  module in `signals_out`. How listeners receive the signal depends on its `delivery`. By default,
++  they run immediately. See `Ash.Signals.Delivery`.
++
++  Every signal has a `signal_id`, a UUIDv7 generated when it is emitted. Include `signal_id` in
++  the payload to set it yourself, for example to emit the same signal again.
++
++  ## Options
++
++  * `:actor` - The actor to run the listeners as. Defaults to the emitting action's actor.
++  * `:tenant` - Defaults to the emitting action's tenant.
++  * `:authorize?` - Defaults to the emitting action's `authorize?`.
++  * `:tracer` - Defaults to the emitting action's tracer.
++  * `:context` - Context to pass to the listeners, merged into the emitting action's shared
++    context.
++  * `:scope` - A value implementing `Ash.Scope.ToOpts`. Any of the above that are also given
++    explicitly take precedence over the scope.
++  """
++  @spec emit(
++          Ash.Changeset.t() | Ash.ActionInput.t(),
++          t(),
++          atom(),
++          map() | Keyword.t(),
++          Keyword.t()
++        ) ::
++          :ok | {:error, term()}
++  def emit(subject, signal_module, name, payload, opts \\ []) do
++    emit_many(subject, signal_module, name, [payload], opts)
++  end
++
++  @doc """
++  Emits a signal once for each payload, delivering them to its listeners together.
++
++  Use this from the batch callbacks of a change, so that a bulk action emits its signals
++  together. Pass any one of the batch's changesets as the subject, for example in
++  `c:Ash.Resource.Change.after_batch/3`:
++
++  ```elixir
++  def after_batch([{changeset, _} | _] = changesets_and_posts, _opts, _context) do
++    payloads = Enum.map(changesets_and_posts, fn {_, post} -> %{post_id: post.id} end)
++
++    case Ash.Signals.emit_many(changeset, MyApp.Blog.Signals, :post_created, payloads) do
++      :ok -> Enum.map(changesets_and_posts, fn {_, post} -> {:ok, post} end)
++      {:error, error} -> [{:error, error}]
++    end
++  end
++  ```
++
++  Every payload is cast before the signals are delivered, so an invalid payload emits nothing.
++  With the default delivery, each listener then handles every signal before the next listener
++  runs.
++
++  Takes the same options as `emit/5`.
++  """
++  @spec emit_many(
++          Ash.Changeset.t() | Ash.ActionInput.t(),
++          t(),
++          atom(),
++          [map() | Keyword.t()],
++          Keyword.t()
++        ) ::
++          :ok | {:error, term()}
++  def emit_many(subject, signal_module, name, payloads, opts \\ [])
++
++  def emit_many(%struct{} = subject, signal_module, name, payloads, opts)
++      when struct in [Ash.Changeset, Ash.ActionInput] do
++    signal = fetch_signal!(signal_module, name)
++
++    if signal_module not in Ash.Resource.Info.signals_out(subject.resource) do
++      raise ArgumentError, """
++      #{inspect(subject.resource)} cannot emit signals from #{inspect(signal_module)}.
++
++      Add it to the resource:
++
++          use Ash.Resource, signals_out: [#{inspect(signal_module)}]
++      """
++    end
++
++    if subject.phase != signal.phase do
++      raise ArgumentError,
++            "Signal `#{inspect(name)}` from #{inspect(signal_module)} can only be emitted during `#{inspect(signal.phase)}`, but the #{if struct == Ash.Changeset, do: "changeset", else: "action input"} is in `#{inspect(subject.phase)}`."
++    end
++
++    with {:ok, signal_structs} <- cast_payloads(signal, payloads) do
++      context = context(subject, signal_module, signal, opts)
++      {delivery, delivery_opts} = signal.delivery
++
++      Enum.each(signal_structs, &emit_telemetry(signal_module, name, &1, context))
++
++      signal_module
++      |> Ash.Signals.Registry.listeners(name)
++      |> then(&delivery.deliver(signal_structs, &1, delivery_opts, context))
++    end
++  end
++
++  @doc """
++  Runs a listener for the given signals, which is what the default delivery does for each
++  listener.
++
++  Deliveries that run listeners later, for example in a job, call this to run them the same way.
++  Takes the options of the action the listener runs: `:actor`, `:tenant`, `:authorize?`,
++  `:tracer` and `:context`.
++  """
++  @spec run_listener(Ash.Resource.SignalListener.t(), [struct()], Keyword.t()) ::
++          :ok | {:error, term()}
++  def run_listener(%{action_type: :action, batch?: true} = listener, signal_structs, opts) do
++    run_generic(listener, signal_structs, opts)
++  end
++
++  def run_listener(%{action_type: :action} = listener, signal_structs, opts) do
++    Enum.reduce_while(signal_structs, :ok, fn signal_struct, :ok ->
++      case run_generic(listener, signal_struct, opts) do
++        :ok -> {:cont, :ok}
++        {:error, error} -> {:halt, {:error, error}}
++      end
++    end)
++  end
++
++  def run_listener(%{action_type: :create} = listener, signal_structs, opts) do
++    signal_structs
++    |> Enum.map(&listener_inputs(listener, &1))
++    |> Ash.bulk_create(listener.resource, listener.action, bulk_opts(opts))
++    |> bulk_result()
++  end
++
++  def run_listener(%{action_type: type} = listener, signal_structs, opts)
++      when type in [:update, :destroy] do
++    listener
++    |> listener_queries(signal_structs, opts)
++    |> Enum.reduce_while(:ok, fn {query, inputs, _signal_structs}, :ok ->
++      opts = Keyword.put(bulk_opts(opts), :strategy, [:atomic, :atomic_batches, :stream])
++
++      result =
++        case type do
++          :update -> Ash.bulk_update(query, listener.action, inputs, opts)
++          :destroy -> Ash.bulk_destroy(query, listener.action, inputs, opts)
++        end
++
++      case bulk_result(result) do
++        :ok -> {:cont, :ok}
++        {:error, error} -> {:halt, {:error, error}}
++      end
++    end)
++  end
++
++  @doc """
++  Returns the queries that select the records an update or destroy listener runs on.
++
++  Signals are grouped by the arguments they give the listener's read action and the inputs they
++  give its action. Returns a `{query, inputs, signals}` tuple for each group.
++  """
++  @spec listener_queries(Ash.Resource.SignalListener.t(), [struct()], Keyword.t()) ::
++          [{Ash.Query.t(), map(), [struct()]}]
++  def listener_queries(%{action_type: type} = listener, signal_structs, opts)
++      when type in [:update, :destroy] do
++    signal_structs
++    |> Enum.group_by(&{map_fields(listener.args, &1), listener_inputs(listener, &1)})
++    |> Enum.map(fn {{args, inputs}, signal_structs} ->
++      query =
++        listener.resource
++        |> Ash.Query.for_read(listener.read_action, args, opts)
++        |> filter_get_by(listener.get_by, signal_structs)
++
++      {query, inputs, signal_structs}
++    end)
++  end
++
++  @doc """
++  Dumps signal structs to maps that can be stored, for example in a job's arguments.
++
++  Load them again with `load/3`.
++  """
++  @spec dump(t(), atom(), [struct()]) :: {:ok, [map()]} | {:error, term()}
++  def dump(signal_module, name, signal_structs) do
++    type = {:array, fetch_signal!(signal_module, name).struct}
++
++    with {:ok, constraints} <- Ash.Type.init(type, []) do
++      Ash.Type.dump_to_embedded(type, signal_structs, constraints)
++    end
++  end
++
++  @doc """
++  Loads signal structs from maps produced by `dump/3`.
++
++  Fields the signal no longer has are ignored, and a required field that is missing is an error,
++  so maps dumped by an older version of the signal load if they are still valid.
++  """
++  @spec load(t(), atom(), [map()]) :: {:ok, [struct()]} | {:error, term()}
++  def load(signal_module, name, dumped) do
++    type = {:array, fetch_signal!(signal_module, name).struct}
++
++    with {:ok, constraints} <- Ash.Type.init(type, []),
++         {:ok, signal_structs} <- Ash.Type.cast_stored(type, dumped, constraints) do
++      Ash.Type.apply_constraints(type, signal_structs, constraints)
++    end
++  end
++
++  defp cast_payloads(signal, payloads) do
++    payloads
++    |> Enum.reduce_while({:ok, []}, fn payload, {:ok, signal_structs} ->
++      case signal.struct.new(with_signal_id(Map.new(payload))) do
++        {:ok, signal_struct} -> {:cont, {:ok, [signal_struct | signal_structs]}}
++        {:error, error} -> {:halt, {:error, error}}
++      end
++    end)
++    |> case do
++      {:ok, signal_structs} -> {:ok, Enum.reverse(signal_structs)}
++      {:error, error} -> {:error, error}
++    end
++  end
++
++  defp run_generic(listener, signal_or_signals, opts) do
++    listener.resource
++    |> Ash.ActionInput.for_action(
++      listener.action,
++      %{listener.argument => signal_or_signals},
++      opts
++    )
++    |> Ash.run_action()
++    |> case do
++      {:error, error} -> {:error, error}
++      _ -> :ok
++    end
++  end
++
++  defp with_signal_id(payload) do
++    if Map.has_key?(payload, :signal_id) or Map.has_key?(payload, "signal_id") do
++      payload
++    else
++      Map.put(payload, :signal_id, Ash.UUIDv7.generate())
++    end
++  end
++
++  # Without `inputs`, every signal field with the same name as an input of the action, except
++  # `signal_id`, which is only set explicitly.
++  defp listener_inputs(%{inputs: nil} = listener, signal_struct) do
++    action_inputs = Ash.Resource.Info.action_inputs(listener.resource, listener.action)
++
++    signal_struct
++    |> Map.from_struct()
++    |> Map.filter(fn {field, _} -> field != :signal_id and field in action_inputs end)
++  end
++
++  defp listener_inputs(listener, signal_struct), do: map_fields(listener.inputs, signal_struct)
++
++  defp map_fields(mapping, signal_struct) do
++    Map.new(mapping, fn {name, field} -> {name, Map.fetch!(signal_struct, field)} end)
++  end
++
++  defp filter_get_by(query, [], _signal_structs), do: query
++
++  defp filter_get_by(query, get_by, signal_structs) do
++    Ash.Query.do_filter(query,
++      or:
++        signal_structs
++        |> Enum.map(fn signal_struct ->
++          Enum.map(get_by, fn {field, signal_field} ->
++            {field, Map.fetch!(signal_struct, signal_field)}
++          end)
++        end)
++        |> Enum.uniq()
++    )
++  end
++
++  defp bulk_opts(opts) do
++    Keyword.merge(opts,
++      return_errors?: true,
++      stop_on_error?: true,
++      notify?: true,
++      return_records?: false
++    )
++  end
++
++  defp bulk_result(%Ash.BulkResult{status: :success}), do: :ok
++
++  defp bulk_result(%Ash.BulkResult{errors: errors}),
++    do: {:error, Ash.Error.to_error_class(errors || [])}
++
++  defp emit_telemetry(signal_module, name, signal_struct, context) do
++    :telemetry.execute(
++      [:ash, :signal, :emitted],
++      %{system_time: System.system_time()},
++      %{
++        signal_module: signal_module,
++        name: name,
++        signal: signal_struct,
++        resource: context.resource,
++        action: context.action,
++        actor: context.actor,
++        tenant: context.tenant
++      }
++    )
++  end
++
++  defp context(subject, signal_module, signal, opts) do
++    private = subject.context[:private] || %{}
++    opts = Ash.Actions.Helpers.apply_scope_to_opts(opts)
++
++    shared_context = if shared = subject.context[:shared], do: %{shared: shared}, else: %{}
++
++    defaults = [
++      actor: private[:actor],
++      tenant: subject.tenant,
++      authorize?: private[:authorize?],
++      tracer: private[:tracer]
++    ]
++
++    struct!(
++      Ash.Signals.Delivery.Context,
++      defaults
++      |> Keyword.merge(Keyword.take(opts, [:actor, :tenant, :authorize?, :tracer]))
++      |> Keyword.merge(
++        signal_module: signal_module,
++        signal: signal,
++        resource: subject.resource,
++        action: subject.action && subject.action.name,
++        source_context: Ash.Helpers.deep_merge_maps(shared_context, opts[:context] || %{})
++      )
++    )
++  end
++
++  defp fetch_signal!(signal_module, name) do
++    Ash.Signals.Info.signal(signal_module, name) ||
++      raise ArgumentError, "#{inspect(signal_module)} has no signal named `#{inspect(name)}`."
++  end
++end
+diff --git a/lib/ash/signals/delivery.ex b/lib/ash/signals/delivery.ex
+new file mode 100644
+index 000000000..679213358
+--- /dev/null
++++ b/lib/ash/signals/delivery.ex
+@@ -0,0 +1,104 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Signals.Delivery do
++  @moduledoc """
++  A behaviour for delivering signals to their listeners.
++
++  Each signal declares how it is delivered, with its `delivery` option. The default,
++  `Ash.Signals.Delivery.Inline`, runs the listeners immediately, during the phase in which the
++  signal is emitted. Other deliveries can, for example, enqueue a job for each listener, so that
++  listeners run after the emitting action's transaction commits.
++
++  ```elixir
++  signal :order_placed do
++    phase :after_action
++    delivery {MyApp.JobDelivery, queue: :orders}
++    argument :order_id, :uuid, allow_nil?: false
++  end
++  ```
++
++  `c:deliver/4` is called each time the signal is emitted, during the signal's phase, after every
++  payload has been cast. It is called even when the signal has no listeners. To run a listener,
++  immediately or later, use `Ash.Signals.run_listener/3`, which does exactly what the inline
++  delivery does. A delivery that runs listeners later can store signals with `Ash.Signals.dump/3`,
++  load them with `Ash.Signals.load/3`, and find the listener again with
++  `Ash.Resource.Info.signal_listener/2`.
++  """
++
++  defmodule Context do
++    @moduledoc """
++    The context in which a signal was emitted, passed to `c:Ash.Signals.Delivery.deliver/4`.
++
++    It implements `Ash.Scope.ToOpts`, so `Ash.Scope.to_opts(context)` returns the options to run
++    listeners with.
++    """
++    defstruct [
++      :signal_module,
++      :signal,
++      :resource,
++      :action,
++      :actor,
++      :tenant,
++      :authorize?,
++      :tracer,
++      source_context: %{}
++    ]
++
++    @type t :: %__MODULE__{
++            signal_module: Ash.Signals.t(),
++            signal: Ash.Signals.Signal.t(),
++            resource: Ash.Resource.t(),
++            action: atom() | nil,
++            actor: term(),
++            tenant: term(),
++            authorize?: boolean() | nil,
++            tracer: Ash.Tracer.t() | [Ash.Tracer.t()] | nil,
++            source_context: map()
++          }
++
++    defimpl Ash.Scope.ToOpts do
++      def get_actor(%{actor: actor}), do: {:ok, actor}
++      def get_tenant(%{tenant: tenant}), do: {:ok, tenant}
++      def get_context(%{source_context: source_context}), do: {:ok, source_context}
++      def get_tracer(%{tracer: tracer}), do: {:ok, tracer}
++      def get_authorize?(%{authorize?: authorize?}), do: {:ok, authorize?}
++    end
++  end
++
++  @doc """
++  Delivers signals to the given listeners.
++
++  `signals` are the signal structs emitted together, and `opts` are the options given to the
++  delivery in the signal's `delivery` option. Returning an error fails the emit.
++  """
++  @callback deliver(
++              signals :: [struct()],
++              listeners :: [Ash.Resource.SignalListener.t()],
++              opts :: Keyword.t(),
++              context :: Context.t()
++            ) :: :ok | {:error, term()}
++
++  @doc """
++  Verifies a signal that uses this delivery, when its signal module is compiled.
++  """
++  @callback verify_signal(
++              signal :: Ash.Signals.Signal.t(),
++              opts :: Keyword.t(),
++              dsl_state :: Spark.Dsl.t()
++            ) :: :ok | {:error, String.t()}
++
++  @doc """
++  Verifies a listener of a signal that uses this delivery, when the listening resource is
++  compiled.
++  """
++  @callback verify_listener(
++              listener :: Ash.Resource.SignalListener.t(),
++              signal :: Ash.Signals.Signal.t(),
++              opts :: Keyword.t(),
++              dsl_state :: Spark.Dsl.t()
++            ) :: :ok | {:error, String.t()}
++
++  @optional_callbacks verify_signal: 3, verify_listener: 4
++end
+diff --git a/lib/ash/signals/delivery/inline.ex b/lib/ash/signals/delivery/inline.ex
+new file mode 100644
+index 000000000..0e9c3cf36
+--- /dev/null
++++ b/lib/ash/signals/delivery/inline.ex
+@@ -0,0 +1,27 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Signals.Delivery.Inline do
++  @moduledoc """
++  The default delivery: runs each listener immediately, during the phase in which the signal is
++  emitted.
++
++  Each listener handles every signal emitted together before the next listener runs. During
++  `:before_action` and `:after_action`, listeners run inside the emitting action's transaction, so
++  if one fails, the emitting action fails and is rolled back.
++  """
++  @behaviour Ash.Signals.Delivery
++
++  @impl true
++  def deliver(signals, listeners, _opts, context) do
++    opts = Ash.Scope.to_opts(context)
++
++    Enum.reduce_while(listeners, :ok, fn listener, :ok ->
++      case Ash.Signals.run_listener(listener, signals, opts) do
++        :ok -> {:cont, :ok}
++        {:error, error} -> {:halt, {:error, error}}
++      end
++    end)
++  end
++end
+diff --git a/lib/ash/signals/dsl.ex b/lib/ash/signals/dsl.ex
+new file mode 100644
+index 000000000..61678bc3d
+--- /dev/null
++++ b/lib/ash/signals/dsl.ex
+@@ -0,0 +1,62 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Signals.Dsl do
++  @moduledoc false
++
++  @argument %Spark.Dsl.Entity{
++    name: :argument,
++    describe: "An argument of the signal, provided by the emitter.",
++    examples: ["argument :post_id, :uuid, allow_nil?: false"],
++    target: Ash.Signals.Field,
++    schema: Ash.Signals.Field.schema(),
++    transform: {Ash.Signals.Field, :transform, []},
++    args: [:name, :type]
++  }
++
++  @signal %Spark.Dsl.Entity{
++    name: :signal,
++    describe: """
++    Declares a signal, and defines a struct for its arguments.
++
++    For a signal named `:post_created` in `MyApp.Signals`, this is `MyApp.Signals.PostCreated`.
++    """,
++    examples: [
++      """
++      signal :post_created do
++        phase :after_action
++        argument :post_id, :uuid, allow_nil?: false
++      end
++      """
++    ],
++    target: Ash.Signals.Signal,
++    schema: Ash.Signals.Signal.schema(),
++    no_depend_modules: [:delivery],
++    entities: [
++      arguments: [@argument]
++    ],
++    args: [:name]
++  }
++
++  @signals %Spark.Dsl.Section{
++    name: :signals,
++    describe: "Declare signals that resources can emit and listen to.",
++    examples: [
++      """
++      signals do
++        signal :post_created do
++          phase :after_action
++          argument :post_id, :uuid, allow_nil?: false
++        end
++      end
++      """
++    ],
++    entities: [@signal]
++  }
++
++  use Spark.Dsl.Extension,
++    sections: [@signals],
++    transformers: [Ash.Signals.Transformers.DefineStructs],
++    verifiers: [Ash.Signals.Verifiers.VerifyDelivery]
++end
+diff --git a/lib/ash/signals/emitter.ex b/lib/ash/signals/emitter.ex
+new file mode 100644
+index 000000000..4e03e7bb9
+--- /dev/null
++++ b/lib/ash/signals/emitter.ex
+@@ -0,0 +1,135 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Signals.Emitter do
++  @moduledoc false
++  # Options and payload building shared by the `emit_signal` change and preparation.
++
++  @mapping_type {:list, {:or, [:atom, {:tuple, [:atom, :atom]}]}}
++
++  @schema [
++    signal_module: [
++      type: :atom,
++      required: true,
++      doc: "The `Ash.Signals` module that declares the signal."
++    ],
++    signal: [
++      type: :atom,
++      required: true,
++      doc: "The name of the signal."
++    ],
++    phase: [
++      type: {:one_of, [:before_action, :after_action, :after_transaction]},
++      required: true,
++      doc: "When the signal is emitted, which must be the phase the signal declares."
++    ],
++    fields: [
++      type: @mapping_type,
++      default: [],
++      doc: """
++      Signal fields to take from fields of the record (or of a generic action's result), as a
++      keyword list of `signal_field: field`. A bare name takes the field with the same name.
++      """
++    ],
++    values: [
++      type: :keyword_list,
++      default: [],
++      doc: """
++      Signal fields to set to the given values, which may be templates like `arg(:reason)` or
++      `actor(:id)`, or for update and destroy actions `previous(:field)`, the value of a field
++      before the action.
++      """
++    ]
++  ]
++
++  @doc false
++  def schema, do: @schema
++
++  @doc false
++  def init(opts) do
++    with {:ok, opts} <- Spark.Options.validate(opts, @schema) do
++      {:ok, Keyword.update!(opts, :fields, &Ash.Resource.SignalListener.normalize_mapping/1)}
++    end
++  end
++
++  @doc false
++  def signal!(opts) do
++    Ash.Signals.Info.signal(opts[:signal_module], opts[:signal]) ||
++      raise ArgumentError,
++            "#{inspect(opts[:signal_module])} has no signal named `#{inspect(opts[:signal])}`."
++  end
++
++  @doc """
++  Builds a payload. Unmapped signal fields are read with `get_default`, and `fields` with
++  `get_field`, both returning `:error` when there is no such field. `data` is the record before
++  the action, for `previous/1` values.
++  """
++  def payload(opts, get_default, get_field, data) do
++    signal = signal!(opts)
++
++    explicit = Keyword.keys(opts[:fields]) ++ Keyword.keys(opts[:values])
++
++    defaults =
++      for %{name: name} <- signal.arguments,
++          name not in explicit,
++          {:ok, value} <- [get_default.(name)],
++          into: %{},
++          do: {name, value}
++
++    from_fields =
++      for {name, field} <- opts[:fields],
++          {:ok, value} <- [get_field.(field)],
++          into: %{},
++          do: {name, value}
++
++    values =
++      Map.new(opts[:values], fn
++        {name, {:_previous, field}} -> {name, Map.get(data, field)}
++        {name, value} -> {name, value}
++      end)
++
++    defaults
++    |> Map.merge(from_fields)
++    |> Map.merge(values)
++  end
++
++  @doc "Returns the fields that `previous/1` values refer to."
++  def previous_fields(opts) do
++    for {_name, {:_previous, field}} <- opts[:values] || [], do: field
++  end
++
++  @doc """
++  Returns the `emit_signal` changes and preparations of a resource, as
++  `{:change | :prepare, action | nil, entity, opts}`, where `action` is nil for global ones.
++  """
++  def usages(dsl_state) do
++    global_changes =
++      for %Ash.Resource.Change{change: {Ash.Resource.Change.EmitSignal, opts}} = change <-
++            Spark.Dsl.Extension.get_entities(dsl_state, [:changes]),
++          do: {:change, nil, change, opts}
++
++    global_preparations =
++      for %Ash.Resource.Preparation{preparation: {Ash.Resource.Preparation.EmitSignal, opts}} =
++            preparation <- Spark.Dsl.Extension.get_entities(dsl_state, [:preparations]),
++          do: {:prepare, nil, preparation, opts}
++
++    action_usages =
++      Enum.flat_map(Spark.Dsl.Extension.get_entities(dsl_state, [:actions]), fn action ->
++        changes =
++          for %Ash.Resource.Change{change: {Ash.Resource.Change.EmitSignal, opts}} = change <-
++                Map.get(action, :changes, []),
++              do: {:change, action, change, opts}
++
++        preparations =
++          for %Ash.Resource.Preparation{
++                preparation: {Ash.Resource.Preparation.EmitSignal, opts}
++              } = preparation <- Map.get(action, :preparations, []),
++              do: {:prepare, action, preparation, opts}
++
++        changes ++ preparations
++      end)
++
++    global_changes ++ global_preparations ++ action_usages
++  end
++end
+diff --git a/lib/ash/signals/field.ex b/lib/ash/signals/field.ex
+new file mode 100644
+index 000000000..e210ad9d7
+--- /dev/null
++++ b/lib/ash/signals/field.ex
+@@ -0,0 +1,65 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Signals.Field do
++  @moduledoc "Represents an `argument` or `result` of a signal."
++  defstruct [
++    :name,
++    :type,
++    :description,
++    :default,
++    constraints: [],
++    allow_nil?: true,
++    __spark_metadata__: nil
++  ]
++
++  @type t :: %__MODULE__{
++          name: atom(),
++          type: Ash.Type.t(),
++          constraints: Keyword.t(),
++          allow_nil?: boolean(),
++          default: term(),
++          description: String.t() | nil,
++          __spark_metadata__: Spark.Dsl.Entity.spark_meta()
++        }
++
++  @schema [
++    name: [
++      type: :atom,
++      required: true,
++      doc: "The name of the field."
++    ],
++    type: [
++      type: Ash.OptionsHelpers.ash_type(),
++      required: true,
++      doc: "The type of the field."
++    ],
++    constraints: [
++      type: :keyword_list,
++      default: [],
++      doc: "Constraints for the type."
++    ],
++    allow_nil?: [
++      type: :boolean,
++      default: true,
++      doc: "Whether the field may be `nil`."
++    ],
++    default: [
++      type: :any,
++      doc: "A default value for the field."
++    ],
++    description: [
++      type: :string,
++      doc: "A description of the field."
++    ]
++  ]
++
++  @doc false
++  def schema, do: @schema
++
++  @doc false
++  def transform(field) do
++    {:ok, %{field | type: Ash.Type.get_type(field.type)}}
++  end
++end
+diff --git a/lib/ash/signals/info.ex b/lib/ash/signals/info.ex
+new file mode 100644
+index 000000000..c0ba198f8
+--- /dev/null
++++ b/lib/ash/signals/info.ex
+@@ -0,0 +1,23 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Signals.Info do
++  @moduledoc "Introspection for `Ash.Signals` modules."
++
++  alias Spark.Dsl.Extension
++
++  @doc "Returns all signals declared in the module."
++  @spec signals(Spark.Dsl.t() | Ash.Signals.t()) :: [Ash.Signals.Signal.t()]
++  def signals(module) do
++    Extension.get_entities(module, [:signals])
++  end
++
++  @doc "Returns the signal with the given name, or `nil`."
++  @spec signal(Spark.Dsl.t() | Ash.Signals.t(), atom()) :: Ash.Signals.Signal.t() | nil
++  def signal(module, name) do
++    module
++    |> signals()
++    |> Enum.find(&(&1.name == name))
++  end
++end
+diff --git a/lib/ash/signals/registry.ex b/lib/ash/signals/registry.ex
+new file mode 100644
+index 000000000..1159475a8
+--- /dev/null
++++ b/lib/ash/signals/registry.ex
+@@ -0,0 +1,105 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Signals.Registry do
++  @moduledoc """
++  Finds the listeners of a signal module.
++
++  This works like protocol consolidation. A resource that listens to signals defines a module
++  named `Ash.Signals.Listeners.<Resource>`, which returns its listeners. Listeners are found by
++  looking for modules with that prefix, among the loaded modules and the `.beam` files on the
++  code path. Neither the signal module nor any domain needs to know about them.
++
++  The `:ash_signals` compiler does this once per build, and compiles the result into an
++  `Ash.Signals.Dispatch.<SignalModule>` module, so emitting a signal does not search for
++  listeners. When there is no dispatch module, because the compiler is not used or
++  `ash: [consolidate_signals: false]` is set in the project, listeners are searched for each
++  time a signal is emitted. See `Mix.Tasks.Compile.AshSignals`.
++  """
++
++  @doc "Returns the listeners of the given signal, in a deterministic order."
++  @spec listeners(Ash.Signals.t(), atom()) :: [Ash.Resource.SignalListener.t()]
++  def listeners(signal_module, signal) do
++    dispatch = dispatch_module(signal_module)
++
++    if Code.ensure_loaded?(dispatch) do
++      dispatch.listeners(signal)
++    else
++      signal_module
++      |> discover()
++      |> Enum.filter(&(&1.signal == signal))
++    end
++  end
++
++  @doc "Finds all listeners of the given signal module, ignoring any dispatch module."
++  @spec discover(Ash.Signals.t()) :: [Ash.Resource.SignalListener.t()]
++  def discover(signal_module) do
++    Enum.filter(discover_all(), &(&1.signal_module == signal_module))
++  end
++
++  @doc "Finds all listeners of all signal modules, ignoring any dispatch modules."
++  @spec discover_all() :: [Ash.Resource.SignalListener.t()]
++  def discover_all do
++    Ash.Signals.Listeners
++    |> modules_in_namespace()
++    |> Enum.filter(&(Code.ensure_loaded?(&1) && function_exported?(&1, :listeners, 0)))
++    |> Enum.flat_map(& &1.listeners())
++  end
++
++  @doc """
++  Finds all signal modules, whether or not anything listens to them.
++
++  Each signal module defines an empty `Ash.Signals.Index.<SignalModule>` module for this purpose.
++  """
++  @spec signal_modules() :: [Ash.Signals.t()]
++  def signal_modules do
++    Ash.Signals.Index
++    |> modules_in_namespace()
++    |> Enum.map(&strip_namespace(&1, Ash.Signals.Index))
++    |> Enum.filter(&(Code.ensure_loaded?(&1) && Spark.Dsl.is?(&1, Ash.Signals)))
++  end
++
++  # Loaded modules and `.beam` files on the code path whose names start with `namespace.`,
++  # sorted. The atoms are names of modules compiled onto the code path, never user input.
++  # sobelow_skip ["DOS.StringToAtom"]
++  defp modules_in_namespace(namespace) do
++    prefix = Atom.to_string(namespace) <> "."
++
++    on_disk =
++      for dir <- :code.get_path(),
++          {:ok, files} <- [:erl_prim_loader.list_dir(dir)],
++          file <- files,
++          file = List.to_string(file),
++          String.starts_with?(file, prefix),
++          String.ends_with?(file, ".beam") do
++        file |> String.trim_trailing(".beam") |> String.to_atom()
++      end
++
++    loaded =
++      for {module, _} <- :code.all_loaded(),
++          String.starts_with?(Atom.to_string(module), prefix) do
++        module
++      end
++
++    (on_disk ++ loaded)
++    |> Enum.uniq()
++    |> Enum.sort()
++  end
++
++  defp strip_namespace(module, namespace) do
++    module
++    |> Module.split()
++    |> Enum.drop(length(Module.split(namespace)))
++    |> Module.concat()
++  end
++
++  @doc false
++  def index_module(signal_module), do: Module.concat(Ash.Signals.Index, signal_module)
++
++  @doc false
++  def dispatch_module(signal_module), do: Module.concat(Ash.Signals.Dispatch, signal_module)
++
++  @doc false
++  def listener_module(resource), do: Module.concat(Ash.Signals.Listeners, resource)
++end
+diff --git a/lib/ash/signals/signal.ex b/lib/ash/signals/signal.ex
+new file mode 100644
+index 000000000..4950fa0b7
+--- /dev/null
++++ b/lib/ash/signals/signal.ex
+@@ -0,0 +1,56 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Signals.Signal do
++  @moduledoc "Represents a `signal` declared in an `Ash.Signals` module."
++  defstruct [
++    :name,
++    :phase,
++    :description,
++    :struct,
++    delivery: {Ash.Signals.Delivery.Inline, []},
++    arguments: [],
++    __spark_metadata__: nil
++  ]
++
++  @type phase :: :before_action | :after_action | :after_transaction
++
++  @type t :: %__MODULE__{
++          name: atom(),
++          phase: phase(),
++          delivery: {module(), Keyword.t()},
++          description: String.t() | nil,
++          struct: module(),
++          arguments: [Ash.Signals.Field.t()],
++          __spark_metadata__: Spark.Dsl.Entity.spark_meta()
++        }
++
++  @schema [
++    name: [
++      type: :atom,
++      required: true,
++      doc: "The name of the signal."
++    ],
++    phase: [
++      type: {:one_of, [:before_action, :after_action, :after_transaction]},
++      required: true,
++      doc: "The phase of the emitting action during which the signal may be emitted."
++    ],
++    delivery: [
++      type: {:spark_behaviour, Ash.Signals.Delivery},
++      default: {Ash.Signals.Delivery.Inline, []},
++      doc: """
++      How the signal is delivered to its listeners. Defaults to `Ash.Signals.Delivery.Inline`,
++      which runs them immediately, during the signal's phase. See `Ash.Signals.Delivery`.
++      """
++    ],
++    description: [
++      type: :string,
++      doc: "A description of the signal."
++    ]
++  ]
++
++  @doc false
++  def schema, do: @schema
++end
+diff --git a/lib/ash/signals/test.ex b/lib/ash/signals/test.ex
+new file mode 100644
+index 000000000..dc08daca8
+--- /dev/null
++++ b/lib/ash/signals/test.ex
+@@ -0,0 +1,299 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Signals.Test do
++  @moduledoc """
++  Test helpers for asserting on emitted signals.
++
++  `assert_emits_signal/4` and `refute_emits_signal/4` check the signals emitted while running a
++  function, and need no setup:
++
++  ```elixir
++  import Ash.Signals.Test
++
++  test "creating a post emits post_created" do
++    post =
++      assert_emits_signal MyApp.Blog.Signals, :post_created, %{title: "Hello"}, fn ->
++        MyApp.Blog.create_post!("Hello")
++      end
++
++    assert post.title == "Hello"
++  end
++  ```
++
++  `assert_signal_emitted/4` and `refute_signal_emitted/4` check the signals emitted so far, and
++  require calling `capture_signals/1` first:
++
++  ```elixir
++  setup :capture_signals
++
++  test "creating a post emits post_created" do
++    %{id: post_id} = MyApp.Blog.create_post!("Hello")
++
++    assert_signal_emitted MyApp.Blog.Signals, :post_created, %{post_id: ^post_id}
++  end
++  ```
++
++  Only signals emitted by the test process, or by processes it started (that have it in their
++  `$callers`, like tasks and LiveViews under test), are seen. No other process is sent anything,
++  and listeners still run as usual.
++
++  Patterns match against the signal struct, and may use pins or bind variables.
++
++  To also match on who emitted a signal, receive the messages sent after `capture_signals/1`
++  directly. They have the shape `{:ash_signal_emitted, signal_module, signal_name, signal,
++  metadata}`, where `metadata` is the metadata of the `[:ash, :signal, :emitted]` telemetry
++  event, see `Ash.Signals`.
++  """
++
++  @event [:ash, :signal, :emitted]
++  @capturing {__MODULE__, :capturing?}
++
++  @doc """
++  Sends signals emitted by the current test, or by processes it started, to the test process,
++  for `assert_signal_emitted/4` and `refute_signal_emitted/4`.
++
++  Can be used as `setup :capture_signals`. Stops when the test exits.
++  """
++  @spec capture_signals(map()) :: :ok
++  def capture_signals(_context \\ %{}) do
++    if !Process.get(@capturing) do
++      test_pid = self()
++      id = {__MODULE__, test_pid, make_ref()}
++
++      :ok = :telemetry.attach(id, @event, &__MODULE__.handle_event/4, test_pid)
++      ExUnit.Callbacks.on_exit(fn -> :telemetry.detach(id) end)
++      Process.put(@capturing, true)
++    end
++
++    :ok
++  end
++
++  @doc false
++  def handle_event(@event, _measurements, metadata, {test_pid, ref}) do
++    if from_test?(test_pid) do
++      send(test_pid, {ref, metadata.signal_module, metadata.name, metadata.signal})
++    end
++  end
++
++  def handle_event(@event, _measurements, metadata, test_pid) do
++    if from_test?(test_pid) do
++      send(
++        test_pid,
++        {:ash_signal_emitted, metadata.signal_module, metadata.name, metadata.signal, metadata}
++      )
++    end
++  end
++
++  defp from_test?(test_pid) do
++    self() == test_pid or test_pid in Process.get(:"$callers", [])
++  end
++
++  @doc """
++  Runs the function, asserts that it emitted a signal matching the given pattern, and returns
++  the function's result. Variables bound by the pattern are available afterwards.
++
++  ```elixir
++  assert_emits_signal MyApp.Blog.Signals, :post_created, fn ->
++    MyApp.Blog.create_post!("Hello")
++  end
++
++  post =
++    assert_emits_signal MyApp.Blog.Signals, :post_created, %{post_id: post_id}, fn ->
++      MyApp.Blog.create_post!("Hello")
++    end
++
++  assert post.id == post_id
++  ```
++  """
++  defmacro assert_emits_signal(signal_module, signal_name, pattern \\ quote(do: _), fun) do
++    quote do
++      signal_module = unquote(signal_module)
++      signal_name = unquote(signal_name)
++
++      {result, signals} =
++        Ash.Signals.Test.__run_capturing__(unquote(fun), signal_module, signal_name)
++
++      signal =
++        Enum.find(signals, &match?(unquote(ignore_vars(pattern)), &1)) ||
++          raise ExUnit.AssertionError,
++            message:
++              Ash.Signals.Test.__not_emitted__(
++                signal_module,
++                signal_name,
++                unquote(Macro.to_string(pattern)),
++                signals
++              )
++
++      unquote(pattern) = signal
++      result
++    end
++  end
++
++  @doc """
++  Runs the function, asserts that it did not emit a signal matching the given pattern, and
++  returns the function's result.
++
++  ```elixir
++  refute_emits_signal MyApp.Blog.Signals, :post_created, fn ->
++    MyApp.Blog.create_draft!("Hello")
++  end
++  ```
++  """
++  defmacro refute_emits_signal(signal_module, signal_name, pattern \\ quote(do: _), fun) do
++    quote do
++      signal_module = unquote(signal_module)
++      signal_name = unquote(signal_name)
++
++      {result, signals} =
++        Ash.Signals.Test.__run_capturing__(unquote(fun), signal_module, signal_name)
++
++      if signal = Enum.find(signals, &match?(unquote(ignore_vars(pattern)), &1)) do
++        raise ExUnit.AssertionError,
++          message:
++            "Expected signal #{inspect(signal_name)} from #{inspect(signal_module)} matching " <>
++              unquote(Macro.to_string(pattern)) <>
++              " not to be emitted, but got:\n\n    #{inspect(signal)}"
++      end
++
++      result
++    end
++  end
++
++  @doc """
++  Asserts that a signal matching the given pattern was emitted since `capture_signals/1` was
++  called, and returns the signal.
++
++  ```elixir
++  assert_signal_emitted MyApp.Blog.Signals, :post_created
++  assert_signal_emitted MyApp.Blog.Signals, :post_created, %{title: "Hello"}
++
++  %{post_id: post_id} = assert_signal_emitted MyApp.Blog.Signals, :post_created
++  ```
++
++  The optional timeout, defaulting to `0`, waits for signals emitted by other processes.
++  """
++  defmacro assert_signal_emitted(
++             signal_module,
++             signal_name,
++             pattern \\ quote(do: _),
++             timeout \\ 0
++           ) do
++    quote do
++      Ash.Signals.Test.__ensure_capturing__!(:assert_signal_emitted)
++      signal_module = unquote(signal_module)
++      signal_name = unquote(signal_name)
++
++      {:ash_signal_emitted, _, _, signal, _} =
++        ExUnit.Assertions.assert_receive(
++          {:ash_signal_emitted, ^signal_module, ^signal_name, unquote(pattern), _},
++          unquote(timeout),
++          "Expected signal #{inspect(signal_name)} from #{inspect(signal_module)} matching " <>
++            unquote(Macro.to_string(pattern)) <> " to be emitted."
++        )
++
++      signal
++    end
++  end
++
++  @doc """
++  Asserts that no signal matching the given pattern was emitted since `capture_signals/1` was
++  called.
++
++  ```elixir
++  refute_signal_emitted MyApp.Blog.Signals, :post_created
++  refute_signal_emitted MyApp.Blog.Signals, :post_created, %{title: "Draft"}
++  ```
++
++  The optional timeout, defaulting to `0`, waits for signals emitted by other processes.
++  """
++  defmacro refute_signal_emitted(
++             signal_module,
++             signal_name,
++             pattern \\ quote(do: _),
++             timeout \\ 0
++           ) do
++    quote do
++      Ash.Signals.Test.__ensure_capturing__!(:refute_signal_emitted)
++      signal_module = unquote(signal_module)
++      signal_name = unquote(signal_name)
++
++      ExUnit.Assertions.refute_receive(
++        {:ash_signal_emitted, ^signal_module, ^signal_name, unquote(pattern), _},
++        unquote(timeout),
++        "Expected signal #{inspect(signal_name)} from #{inspect(signal_module)} matching " <>
++          unquote(Macro.to_string(pattern)) <> " not to be emitted."
++      )
++    end
++  end
++
++  # Replaces the variables a pattern binds with `_`, keeping pinned ones, so it can be used to
++  # find a match without warning about unused variables.
++  defp ignore_vars({:^, _, _} = pinned), do: pinned
++
++  defp ignore_vars({name, meta, context}) when is_atom(name) and is_atom(context),
++    do: {:_, meta, context}
++
++  defp ignore_vars({left, meta, right}),
++    do: {ignore_vars(left), meta, ignore_vars(right)}
++
++  defp ignore_vars({left, right}), do: {ignore_vars(left), ignore_vars(right)}
++  defp ignore_vars(list) when is_list(list), do: Enum.map(list, &ignore_vars/1)
++  defp ignore_vars(other), do: other
++
++  @doc false
++  # Runs the function, and returns its result with the matching signals it emitted, in order.
++  def __run_capturing__(fun, signal_module, signal_name) do
++    test_pid = self()
++    ref = make_ref()
++    id = {__MODULE__, test_pid, ref}
++
++    :ok = :telemetry.attach(id, @event, &__MODULE__.handle_event/4, {test_pid, ref})
++
++    result =
++      try do
++        fun.()
++      after
++        :telemetry.detach(id)
++      end
++
++    {result, receive_signals(ref, signal_module, signal_name, [])}
++  end
++
++  defp receive_signals(ref, signal_module, signal_name, acc) do
++    receive do
++      {^ref, ^signal_module, ^signal_name, signal} ->
++        receive_signals(ref, signal_module, signal_name, [signal | acc])
++
++      {^ref, _, _, _} ->
++        receive_signals(ref, signal_module, signal_name, acc)
++    after
++      0 -> Enum.reverse(acc)
++    end
++  end
++
++  @doc false
++  def __not_emitted__(signal_module, signal_name, pattern, []) do
++    "Expected signal #{inspect(signal_name)} from #{inspect(signal_module)} matching #{pattern} " <>
++      "to be emitted, but no #{inspect(signal_name)} signals were emitted."
++  end
++
++  def __not_emitted__(signal_module, signal_name, pattern, signals) do
++    "Expected signal #{inspect(signal_name)} from #{inspect(signal_module)} matching #{pattern} " <>
++      "to be emitted, but none of the emitted #{inspect(signal_name)} signals matched:\n\n" <>
++      Enum.map_join(signals, "\n", &"    #{inspect(&1)}")
++  end
++
++  @doc false
++  def __ensure_capturing__!(helper) do
++    if !Process.get(@capturing) do
++      raise ExUnit.AssertionError,
++        message:
++          "`#{helper}` only sees signals emitted after `Ash.Signals.Test.capture_signals/1` is " <>
++            "called in the test process, for example with `setup :capture_signals`. " <>
++            "To check the signals emitted by a function instead, use `assert_emits_signal/4` " <>
++            "or `refute_emits_signal/4`."
++    end
++  end
++end
+diff --git a/lib/ash/signals/transformers/define_structs.ex b/lib/ash/signals/transformers/define_structs.ex
+new file mode 100644
+index 000000000..01b1e84f2
+--- /dev/null
++++ b/lib/ash/signals/transformers/define_structs.ex
+@@ -0,0 +1,94 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Signals.Transformers.DefineStructs do
++  @moduledoc false
++  # Defines the argument struct for each signal.
++  use Spark.Dsl.Transformer
++
++  alias Spark.Dsl.Transformer
++
++  def transform(dsl_state) do
++    module = Transformer.get_persisted(dsl_state, :module)
++
++    dsl_state = Transformer.eval(dsl_state, [], define_index_module(module))
++
++    dsl_state
++    |> Transformer.get_entities([:signals])
++    |> Enum.reduce_while({:ok, dsl_state}, fn signal, {:ok, dsl_state} ->
++      if field = Enum.find(signal.arguments, &(&1.name == :signal_id)) do
++        {:halt,
++         {:error,
++          Spark.Error.DslError.exception(
++            module: module,
++            path: [:signals, :signal, signal.name, :argument, :signal_id],
++            location: Spark.Dsl.Entity.anno(field),
++            message:
++              "`signal_id` is reserved: every signal has a `signal_id`, generated when it is emitted."
++          )}}
++      else
++        struct = Module.concat(module, Macro.camelize(to_string(signal.name)))
++        signal = %{signal | struct: struct}
++
++        dsl_state =
++          dsl_state
++          |> Transformer.replace_entity([:signals], signal, &(&1.name == signal.name))
++          |> Transformer.eval([], define_struct(struct, signal.arguments, signal))
++
++        {:cont, {:ok, dsl_state}}
++      end
++    end)
++  end
++
++  # Lets `Ash.Signals.Registry.signal_modules/0` find this module.
++  defp define_index_module(module) do
++    quote do
++      Module.create(
++        unquote(Ash.Signals.Registry.index_module(module)),
++        quote(do: @moduledoc(false)),
++        Macro.Env.location(__ENV__)
++      )
++    end
++  end
++
++  defp define_struct(module, fields, signal) do
++    fields =
++      Enum.map(fields, fn field ->
++        opts =
++          [
++            allow_nil?: field.allow_nil?,
++            constraints: field.constraints,
++            description: field.description
++          ]
++          |> then(fn opts ->
++            if is_nil(field.default), do: opts, else: Keyword.put(opts, :default, field.default)
++          end)
++          |> Enum.reject(fn {_, value} -> is_nil(value) end)
++
++        quote do
++          field unquote(field.name),
++                unquote(Macro.escape(field.type)),
++                unquote(Macro.escape(opts))
++        end
++      end)
++
++    body =
++      quote do
++        @moduledoc unquote("Generated by the `#{inspect(signal.name)}` signal.")
++        use Ash.TypedStruct
++
++        typed_struct do
++          field :signal_id, :uuid_v7,
++            allow_nil?: false,
++            description: "Identifies the signal. Generated when the signal is emitted."
++
++          (unquote_splicing(fields))
++        end
++      end
++
++    quote do
++      Module.create(unquote(module), unquote(Macro.escape(body)), Macro.Env.location(__ENV__))
++    end
++  end
++end
+diff --git a/lib/ash/signals/verifiers/verify_delivery.ex b/lib/ash/signals/verifiers/verify_delivery.ex
+new file mode 100644
+index 000000000..e8821debc
+--- /dev/null
++++ b/lib/ash/signals/verifiers/verify_delivery.ex
+@@ -0,0 +1,48 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Signals.Verifiers.VerifyDelivery do
++  @moduledoc """
++  Verifies that each signal's delivery implements `Ash.Signals.Delivery`, and lets the delivery
++  verify the signal.
++  """
++  use Spark.Dsl.Verifier
++
++  alias Spark.Dsl.{Entity, Verifier}
++  alias Spark.Error.DslError
++
++  @impl true
++  def verify(dsl_state) do
++    module = Verifier.get_persisted(dsl_state, :module)
++
++    dsl_state
++    |> Verifier.get_entities([:signals])
++    |> Enum.each(fn %{delivery: {delivery, opts}} = signal ->
++      if !(Code.ensure_loaded?(delivery) && function_exported?(delivery, :deliver, 4)) do
++        raise_error(
++          module,
++          signal,
++          "`#{inspect(delivery)}` does not implement `Ash.Signals.Delivery`."
++        )
++      end
++
++      if function_exported?(delivery, :verify_signal, 3) do
++        case delivery.verify_signal(signal, opts, dsl_state) do
++          :ok -> :ok
++          {:error, message} -> raise_error(module, signal, message)
++        end
++      end
++    end)
++
++    :ok
++  end
++
++  defp raise_error(module, signal, message) do
++    raise DslError,
++      module: module,
++      path: [:signals, :signal, signal.name, :delivery],
++      location: Entity.anno(signal),
++      message: message
++  end
++end
+diff --git a/lib/mix/tasks/compile/ash_signals.ex b/lib/mix/tasks/compile/ash_signals.ex
+new file mode 100644
+index 000000000..c275add07
+--- /dev/null
++++ b/lib/mix/tasks/compile/ash_signals.ex
+@@ -0,0 +1,139 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Mix.Tasks.Compile.AshSignals do
++  @moduledoc """
++  Consolidates `Ash.Signals` listeners, once all modules have been compiled.
++
++  Add it to your `mix.exs`:
++
++      compilers: [:ash_signals] ++ Mix.compilers()
++
++  If you use the Phoenix code reloader, add it to your endpoint's reloadable compilers too, so
++  that listeners added in development are picked up:
++
++      reloadable_compilers: [:ash_signals, :phoenix_live_view, :gettext, :elixir, :app]
++
++  ## Consolidation
++
++  Like protocol consolidation, this finds the listeners of each signal module once per build,
++  and compiles them into an `Ash.Signals.Dispatch.<SignalModule>` module in your application's
++  build directory, so that emitting a signal does not have to search for listeners.
++
++  Listeners defined after compilation, like resources defined inside tests, are not part of the
++  consolidated modules. To use them, disable consolidation in your project:
++
++      def project do
++        [
++          ...,
++          ash: [consolidate_signals: Mix.env() != :test]
++        ]
++      end
++
++  Without consolidation, listeners are searched for every time a signal is emitted.
++  """
++  use Mix.Task.Compiler
++
++  @recursive true
++
++  @impl true
++  def run(_args) do
++    Mix.Task.Compiler.after_compiler(:elixir, fn
++      {:noop, diagnostics} ->
++        {:noop, diagnostics}
++
++      {status, diagnostics} ->
++        path = Mix.Project.compile_path()
++
++        if Keyword.get(Mix.Project.config()[:ash] || [], :consolidate_signals, true) do
++          sweep(path, consolidate(Ash.Signals.Registry.signal_modules(), path))
++        else
++          sweep(path, [])
++        end
++
++        {status, diagnostics}
++    end)
++
++    :noop
++  end
++
++  @impl true
++  def clean do
++    sweep(Mix.Project.compile_path(), [])
++  end
++
++  @doc false
++  # Compiles and loads a dispatch module for each signal module, writing it to `path`, and
++  # returns the dispatch modules.
++  @spec consolidate([Ash.Signals.t()], Path.t()) :: [module]
++  def consolidate(signal_modules, path) do
++    listeners = Enum.group_by(Ash.Signals.Registry.discover_all(), & &1.signal_module)
++
++    Enum.map(signal_modules, fn signal_module ->
++      dispatch = Ash.Signals.Registry.dispatch_module(signal_module)
++      clauses = listener_clauses(Map.get(listeners, signal_module, []))
++
++      body =
++        quote do
++          @moduledoc false
++
++          @doc false
++          unquote_splicing(clauses)
++          def listeners(_signal), do: []
++        end
++
++      # removing the old beam too, or Elixir loads it again to warn that it is being redefined
++      unload(dispatch)
++      File.rm(beam_path(path, dispatch))
++
++      {:module, ^dispatch, binary, _} =
++        Module.create(dispatch, body, Macro.Env.location(__ENV__))
++
++      File.mkdir_p!(path)
++      File.write!(beam_path(path, dispatch), binary)
++
++      dispatch
++    end)
++  end
++
++  defp listener_clauses(listeners) do
++    listeners
++    |> Enum.group_by(& &1.signal)
++    |> Enum.sort()
++    |> Enum.map(fn {signal, listeners} ->
++      quote do
++        def listeners(unquote(signal)), do: unquote(Macro.escape(listeners))
++      end
++    end)
++  end
++
++  # Removes dispatch modules in `path` other than the ones just written. Elixir's compiler
++  # removes the modules defined while compiling a file when they are no longer defined, but
++  # dispatch modules are written after it, so it does not know about them. Without this they
++  # would be left behind when a signal module is removed, or when consolidation is disabled.
++  defp sweep(path, keep) do
++    prefix = "#{Ash.Signals.Dispatch}."
++
++    with {:ok, files} <- File.ls(path) do
++      for file <- files,
++          String.starts_with?(file, prefix),
++          String.ends_with?(file, ".beam"),
++          module = file |> String.trim_trailing(".beam") |> String.to_atom(),
++          module not in keep do
++        unload(module)
++        File.rm(Path.join(path, file))
++      end
++    end
++
++    :ok
++  end
++
++  defp beam_path(path, module), do: Path.join(path, "#{module}.beam")
++
++  defp unload(module) do
++    :code.purge(module)
++    :code.delete(module)
++    :code.purge(module)
++  end
++end
+diff --git a/mix.exs b/mix.exs
+index ac2c2ca42..4814fa0fb 100644
+--- a/mix.exs
++++ b/mix.exs
+@@ -53,6 +53,8 @@ defmodule Ash.MixProject do
+          search_data: Spark.Docs.search_data_for(Ash.Resource.Dsl)},
+         {"documentation/dsls/DSL-Ash.Domain.md",
+          search_data: Spark.Docs.search_data_for(Ash.Domain.Dsl)},
++        {"documentation/dsls/DSL-Ash.Signals.md",
++         search_data: Spark.Docs.search_data_for(Ash.Signals.Dsl)},
+         {"documentation/dsls/DSL-Ash.Notifier.PubSub.md",
+          search_data: Spark.Docs.search_data_for(Ash.Notifier.PubSub)},
+         {"documentation/dsls/DSL-Ash.Policy.Authorizer.md",
+@@ -90,6 +92,7 @@ defmodule Ash.MixProject do
+         "documentation/topics/resources/embedded-resources.md",
+         "documentation/topics/resources/identities.md",
+         "documentation/topics/resources/notifiers.md",
++        "documentation/topics/resources/signals.md",
+         "documentation/topics/actions/actions.md",
+         "documentation/topics/actions/read-actions.md",
+         "documentation/topics/actions/create-actions.md",
+@@ -215,7 +218,10 @@ defmodule Ash.MixProject do
+           Ash.Resource.ManualUpdate,
+           Ash.Resource.ManualDestroy,
+           Ash.Resource.ManualRelationship,
+-          Ash.Domain
++          Ash.Domain,
++          Ash.Signals,
++          Ash.Signals.Delivery,
++          Ash.Signals.Delivery.Inline
+         ],
+         Queries: [
+           Ash.Query,
+@@ -252,6 +258,7 @@ defmodule Ash.MixProject do
+         Introspection: [
+           Ash.Domain.Info,
+           Ash.Resource.Info,
++          Ash.Signals.Info,
+           Ash.Policy.Info,
+           Ash.DataLayer.Ets.Info,
+           Ash.DataLayer.Mnesia.Info,
+@@ -266,7 +273,8 @@ defmodule Ash.MixProject do
+         Testing: [
+           Ash.Generator,
+           Ash.Seed,
+-          Ash.Test
++          Ash.Test,
++          Ash.Signals.Test
+         ],
+         Builtins: [
+           ~r/Ash.Resource.Validation/,
+@@ -444,9 +452,9 @@ defmodule Ash.MixProject do
+       ],
+       format: "format --migrate",
+       "spark.formatter":
+-        "spark.formatter --extensions Ash.Resource.Dsl,Ash.Domain.Dsl,Ash.TypedStruct.Dsl,Ash.DataLayer.Ets,Ash.DataLayer.Mnesia,Ash.Notifier.PubSub,Ash.Policy.Authorizer,Ash.Reactor",
++        "spark.formatter --extensions Ash.Resource.Dsl,Ash.Domain.Dsl,Ash.Signals.Dsl,Ash.TypedStruct.Dsl,Ash.DataLayer.Ets,Ash.DataLayer.Mnesia,Ash.Notifier.PubSub,Ash.Policy.Authorizer,Ash.Reactor",
+       "spark.cheat_sheets":
+-        "spark.cheat_sheets --extensions Ash.Resource.Dsl,Ash.Domain.Dsl,Ash.TypedStruct.Dsl,Ash.DataLayer.Ets,Ash.DataLayer.Mnesia,Ash.Notifier.PubSub,Ash.Policy.Authorizer,Ash.Reactor"
++        "spark.cheat_sheets --extensions Ash.Resource.Dsl,Ash.Domain.Dsl,Ash.Signals.Dsl,Ash.TypedStruct.Dsl,Ash.DataLayer.Ets,Ash.DataLayer.Mnesia,Ash.Notifier.PubSub,Ash.Policy.Authorizer,Ash.Reactor"
+     ]
+   end
+ end
+diff --git a/test/signals_test.exs b/test/signals_test.exs
+new file mode 100644
+index 000000000..8cf2aad0e
+--- /dev/null
++++ b/test/signals_test.exs
+@@ -0,0 +1,1779 @@
++# SPDX-FileCopyrightText: 2019 ash contributors <https://github.com/ash-project/ash/graphs/contributors>
++#
++# SPDX-License-Identifier: MIT
++
++defmodule Ash.Test.SignalsTest do
++  @moduledoc false
++  use ExUnit.Case, async: true
++
++  import Ash.Signals.Test
++
++  alias Ash.Test.SignalsTest.{Comment, FeedItem, Post, Signals}
++
++  defmodule Signals do
++    @moduledoc false
++    use Ash.Signals
++
++    signals do
++      signal :post_created do
++        phase(:after_action)
++        argument :post_id, :uuid, allow_nil?: false
++        argument :title, :string
++      end
++
++      signal :post_archiving do
++        phase(:before_action)
++        argument :post_id, :uuid, allow_nil?: false
++      end
++    end
++  end
++
++  defmodule OrderSignals do
++    @moduledoc false
++    use Ash.Signals
++
++    signals do
++      signal :order_placed do
++        phase(:after_action)
++        argument :order_id, :uuid, allow_nil?: false
++        argument :customer_id, :uuid, allow_nil?: false
++        argument :note, :string
++      end
++    end
++  end
++
++  # only for listeners that fail verification, which would otherwise run when OrderSignals is
++  # emitted, since tests don't consolidate signals
++  defmodule VerifySignals do
++    @moduledoc false
++    use Ash.Signals
++
++    signals do
++      signal :order_placed do
++        phase(:after_action)
++        argument :order_id, :uuid, allow_nil?: false
++      end
++    end
++  end
++
++  # records what it is asked to deliver, instead of running the listeners
++  defmodule RecordingDelivery do
++    @moduledoc false
++    @behaviour Ash.Signals.Delivery
++
++    @impl true
++    def deliver(signals, listeners, opts, context) do
++      send(self(), {:delivered, signals, listeners, opts, context})
++      if opts[:fail?], do: {:error, "delivery failed"}, else: :ok
++    end
++
++    @impl true
++    def verify_signal(%{name: :rejected}, _opts, _dsl_state),
++      do: {:error, "the delivery rejects this signal"}
++
++    def verify_signal(_signal, _opts, _dsl_state), do: :ok
++
++    @impl true
++    def verify_listener(%{action: :rejected}, _signal, _opts, _dsl_state),
++      do: {:error, "the delivery rejects this listener"}
++
++    def verify_listener(_listener, _signal, _opts, _dsl_state), do: :ok
++  end
++
++  defmodule DeliverySignals do
++    @moduledoc false
++    use Ash.Signals
++
++    signals do
++      signal :queued do
++        phase(:after_action)
++        delivery({Ash.Test.SignalsTest.RecordingDelivery, queue: :orders})
++        argument :order_id, :uuid, allow_nil?: false
++      end
++
++      signal :failing do
++        phase(:after_action)
++        delivery({Ash.Test.SignalsTest.RecordingDelivery, fail?: true})
++      end
++
++      # only for listeners that fail verification
++      signal :verified do
++        phase(:after_action)
++        delivery(Ash.Test.SignalsTest.RecordingDelivery)
++        argument :order_id, :uuid
++      end
++    end
++  end
++
++  defmodule QueuedReceipt do
++    @moduledoc false
++    use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
++
++    ets do
++      private? true
++    end
++
++    attributes do
++      uuid_primary_key :id
++      attribute :order_id, :uuid, public?: true
++    end
++
++    signals_in do
++      from Ash.Test.SignalsTest.DeliverySignals do
++        on(:record, :queued)
++      end
++    end
++
++    actions do
++      defaults [:read]
++
++      create :record do
++        accept [:order_id]
++      end
++    end
++  end
++
++  # listens to the same signal twice with the same action, told apart by `key`
++  defmodule LedgerEntry do
++    @moduledoc false
++    use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
++
++    ets do
++      private? true
++    end
++
++    attributes do
++      uuid_primary_key :id
++      attribute :account_id, :uuid, public?: true
++    end
++
++    signals_in do
++      from Ash.Test.SignalsTest.OrderSignals do
++        on(:record_for_order, :order_placed,
++          action: :record,
++          inputs: [account_id: :order_id]
++        )
++
++        on(:record_for_customer, :order_placed,
++          action: :record,
++          inputs: [account_id: :customer_id]
++        )
++      end
++    end
++
++    actions do
++      defaults [:read]
++
++      create :record do
++        accept [:account_id]
++      end
++    end
++  end
++
++  # `signal_id` is only set from the signal when it's mapped explicitly
++  defmodule SignalLog do
++    @moduledoc false
++    use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
++
++    ets do
++      private? true
++    end
++
++    attributes do
++      uuid_primary_key :id
++      attribute :order_id, :uuid, public?: true
++      attribute :signal_id, :uuid, public?: true
++      attribute :source_signal_id, :uuid, public?: true
++    end
++
++    signals_in do
++      from Ash.Test.SignalsTest.OrderSignals do
++        on(:log_unmapped, :order_placed)
++        on(:log_mapped, :order_placed, inputs: [:order_id, source_signal_id: :signal_id])
++      end
++    end
++
++    actions do
++      defaults [:read]
++
++      create :log_unmapped do
++        accept [:order_id, :signal_id]
++      end
++
++      create :log_mapped do
++        accept [:order_id, :source_signal_id]
++      end
++    end
++  end
++
++  defmodule Receipt do
++    @moduledoc false
++    use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
++
++    ets do
++      private? true
++    end
++
++    attributes do
++      uuid_primary_key :id
++      attribute :order_id, :uuid, public?: true
++      attribute :note, :string, public?: true
++    end
++
++    # creates a receipt per signal, from the signal fields named like its inputs
++    signals_in do
++      from Ash.Test.SignalsTest.OrderSignals do
++        on(:record, :order_placed)
++      end
++    end
++
++    validations do
++      validate attribute_does_not_equal(:note, "fail")
++    end
++
++    actions do
++      defaults [:read]
++
++      create :record do
++        accept [:order_id, :note]
++      end
++    end
++  end
++
++  defmodule Reference do
++    @moduledoc false
++    use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
++
++    ets do
++      private? true
++    end
++
++    attributes do
++      uuid_primary_key :id
++      attribute :reference, :uuid, public?: true
++    end
++
++    signals_in do
++      from Ash.Test.SignalsTest.OrderSignals do
++        on(:record, :order_placed, inputs: [reference: :order_id])
++      end
++    end
++
++    actions do
++      defaults [:read]
++
++      create :record do
++        accept [:reference]
++      end
++    end
++  end
++
++  defmodule Customer do
++    @moduledoc false
++    use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
++
++    ets do
++      private? true
++    end
++
++    attributes do
++      uuid_primary_key :id
++      attribute :status, :string, public?: true, default: "new"
++    end
++
++    # banned customers are not marked, because the read action filters them out
++    signals_in do
++      from Ash.Test.SignalsTest.OrderSignals do
++        on(:mark_ordered, :order_placed, read_action: :active, get_by: [id: :customer_id])
++      end
++    end
++
++    actions do
++      defaults [:read, create: [:status]]
++
++      read :active do
++        filter expr(status != "banned")
++      end
++
++      update :mark_ordered do
++        change set_attribute(:status, "ordered")
++      end
++    end
++  end
++
++  defmodule CartItem do
++    @moduledoc false
++    use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
++
++    ets do
++      private? true
++    end
++
++    attributes do
++      uuid_primary_key :id
++      attribute :customer_id, :uuid, public?: true
++    end
++
++    signals_in do
++      from Ash.Test.SignalsTest.OrderSignals do
++        on(:clear, :order_placed, read_action: :for_customer, args: [:customer_id])
++      end
++    end
++
++    actions do
++      defaults [:read, create: [:customer_id]]
++
++      read :for_customer do
++        argument :customer_id, :uuid, allow_nil?: false
++        filter expr(customer_id == ^arg(:customer_id))
++      end
++
++      destroy :clear
++    end
++  end
++
++  defmodule OrderAudit do
++    @moduledoc false
++    use Ash.Resource, domain: Ash.Test.Domain
++
++    signals_in do
++      from Ash.Test.SignalsTest.OrderSignals do
++        on(:log, :order_placed, batch?: true)
++      end
++    end
++
++    actions do
++      action :log do
++        argument :signals, {:array, Ash.Test.SignalsTest.OrderSignals.OrderPlaced},
++          allow_nil?: false
++
++        run fn input, _ ->
++          send(self(), {:audited, Enum.map(input.arguments.signals, & &1.order_id)})
++          :ok
++        end
++      end
++    end
++  end
++
++  defmodule ArticleSignals do
++    @moduledoc false
++    use Ash.Signals
++
++    signals do
++      signal :article_published do
++        phase(:after_action)
++        argument :article_id, :uuid, allow_nil?: false
++        argument :title, :string
++        argument :previous_title, :string
++        argument :by, :string
++      end
++
++      signal :article_drafting do
++        phase(:before_action)
++        argument :title, :string, allow_nil?: false
++      end
++
++      signal :article_committed do
++        phase(:after_transaction)
++        argument :article_id, :uuid, allow_nil?: false
++      end
++
++      signal :digest_requested do
++        phase(:after_action)
++        argument :topic, :string, allow_nil?: false
++      end
++    end
++  end
++
++  # emits only with `emit_signal`, so it doesn't list `signals_out`
++  defmodule Article do
++    @moduledoc false
++    use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
++
++    ets do
++      private? true
++    end
++
++    attributes do
++      uuid_primary_key :id
++      attribute :title, :string, public?: true
++    end
++
++    actions do
++      defaults [:read]
++
++      create :publish do
++        primary? true
++        accept [:title]
++
++        change emit_signal(Ash.Test.SignalsTest.ArticleSignals, :article_published, :after_action,
++                 fields: [article_id: :id],
++                 values: [by: actor(:name)]
++               )
++      end
++
++      update :rename do
++        accept [:title]
++
++        change emit_signal(Ash.Test.SignalsTest.ArticleSignals, :article_published, :after_action,
++                 fields: [:title, article_id: :id]
++               )
++      end
++
++      update :retitle do
++        accept [:title]
++        require_atomic? false
++
++        change emit_signal(Ash.Test.SignalsTest.ArticleSignals, :article_published, :after_action,
++                 fields: [:title, article_id: :id],
++                 values: [previous_title: previous(:title)]
++               )
++      end
++
++      create :draft do
++        accept [:title]
++        change emit_signal(Ash.Test.SignalsTest.ArticleSignals, :article_drafting, :before_action)
++      end
++
++      create :commit do
++        accept [:title]
++
++        change emit_signal(
++                 Ash.Test.SignalsTest.ArticleSignals,
++                 :article_committed,
++                 :after_transaction,
++                 fields: [article_id: :id]
++               )
++      end
++
++      update :commit_update do
++        accept [:title]
++        require_atomic? false
++
++        change emit_signal(
++                 Ash.Test.SignalsTest.ArticleSignals,
++                 :article_committed,
++                 :after_transaction,
++                 fields: [article_id: :id]
++               )
++      end
++
++      destroy :retract do
++        require_atomic? false
++
++        change emit_signal(
++                 Ash.Test.SignalsTest.ArticleSignals,
++                 :article_committed,
++                 :after_transaction,
++                 fields: [article_id: :id]
++               )
++      end
++
++      action :request_digest do
++        argument :topic, :string, allow_nil?: false
++        prepare emit_signal(Ash.Test.SignalsTest.ArticleSignals, :digest_requested, :after_action)
++        run fn _, _ -> :ok end
++      end
++    end
++  end
++
++  defmodule EmitPostsCreated do
++    @moduledoc false
++    use Ash.Resource.Change
++
++    @impl true
++    def batch_change(changesets, _opts, _context), do: changesets
++
++    @impl true
++    def after_batch([{changeset, _} | _] = changesets_and_posts, _opts, _context) do
++      payloads =
++        Enum.map(changesets_and_posts, fn {_, post} -> %{post_id: post.id, title: post.title} end)
++
++      case Ash.Signals.emit_many(changeset, Ash.Test.SignalsTest.Signals, :post_created, payloads) do
++        :ok -> Enum.map(changesets_and_posts, fn {_, post} -> {:ok, post} end)
++        {:error, error} -> [{:error, error}]
++      end
++    end
++  end
++
++  defmodule Post do
++    @moduledoc false
++    use Ash.Resource,
++      domain: Ash.Test.Domain,
++      data_layer: Ash.DataLayer.Ets,
++      signals_out: [
++        Ash.Test.SignalsTest.Signals,
++        Ash.Test.SignalsTest.OrderSignals,
++        Ash.Test.SignalsTest.DeliverySignals
++      ]
++
++    ets do
++      private? true
++    end
++
++    attributes do
++      uuid_primary_key :id
++      attribute :title, :string, public?: true
++    end
++
++    actions do
++      defaults [:read]
++
++      create :create do
++        accept [:title]
++        argument :emit_opts, :term, default: []
++
++        # emitting from a hook that isn't the first one
++        change after_action(fn _changeset, post, _context -> {:ok, post} end)
++
++        change fn changeset, _ ->
++          Ash.Changeset.after_action(changeset, fn changeset, post ->
++            opts = Ash.Changeset.get_argument(changeset, :emit_opts)
++
++            with :ok <-
++                   Ash.Signals.emit(
++                     changeset,
++                     Ash.Test.SignalsTest.Signals,
++                     :post_created,
++                     %{post_id: post.id, title: post.title},
++                     opts
++                   ) do
++              {:ok, post}
++            end
++          end)
++        end
++      end
++
++      create :create_in_batches do
++        accept [:title]
++        change EmitPostsCreated
++      end
++
++      create :emit_in_wrong_phase do
++        accept [:title]
++
++        change fn changeset, _ ->
++          Ash.Changeset.before_action(changeset, fn changeset ->
++            Ash.Signals.emit(changeset, Ash.Test.SignalsTest.Signals, :post_created, %{
++              post_id: Ash.UUID.generate()
++            })
++
++            changeset
++          end)
++        end
++      end
++
++      action :announce, :string do
++        run fn _input, _ -> {:ok, "announced"} end
++      end
++
++      update :archive do
++        require_atomic? false
++
++        change fn changeset, _ ->
++          Ash.Changeset.before_action(changeset, fn changeset ->
++            :ok =
++              Ash.Signals.emit(changeset, Ash.Test.SignalsTest.Signals, :post_archiving, %{
++                post_id: changeset.data.id
++              })
++
++            changeset
++          end)
++        end
++      end
++    end
++  end
++
++  defmodule NotEmitter do
++    @moduledoc false
++    use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
++
++    ets do
++      private? true
++    end
++
++    attributes do
++      uuid_primary_key :id
++    end
++
++    actions do
++      create :create do
++        change fn changeset, _ ->
++          Ash.Changeset.after_action(changeset, fn changeset, record ->
++            Ash.Signals.emit(changeset, Ash.Test.SignalsTest.Signals, :post_created, %{
++              post_id: record.id
++            })
++
++            {:ok, record}
++          end)
++        end
++      end
++    end
++  end
++
++  defmodule Comment do
++    @moduledoc false
++    use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
++
++    ets do
++      private? true
++    end
++
++    attributes do
++      uuid_primary_key :id
++      attribute :post_id, :uuid, public?: true
++      attribute :body, :string, public?: true
++    end
++
++    signals_in do
++      from Ash.Test.SignalsTest.Signals do
++        on(:welcome, :post_created)
++      end
++    end
++
++    actions do
++      defaults [:read, create: [:post_id, :body]]
++
++      action :welcome do
++        argument :signal, Ash.Test.SignalsTest.Signals.PostCreated, allow_nil?: false
++
++        run fn input, context ->
++          signal = input.arguments.signal
++          send(self(), {:listened, :welcome, signal.title})
++          actor_name = if context.actor, do: context.actor.name, else: "nobody"
++          body = "Welcome to #{signal.title}, from #{actor_name}"
++
++          with {:ok, _comment} <-
++                 Comment
++                 |> Ash.Changeset.for_create(:create, %{post_id: signal.post_id, body: body})
++                 |> Ash.create() do
++            :ok
++          end
++        end
++      end
++    end
++  end
++
++  defmodule FeedItem do
++    @moduledoc false
++    use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
++
++    ets do
++      private? true
++    end
++
++    attributes do
++      uuid_primary_key :id
++      attribute :post_id, :uuid, public?: true
++    end
++
++    signals_in do
++      from Ash.Test.SignalsTest.Signals do
++        on(:add, :post_created)
++        on(:remove, :post_archiving)
++      end
++    end
++
++    actions do
++      defaults [:read, create: [:post_id]]
++
++      action :add do
++        argument :signal, Ash.Test.SignalsTest.Signals.PostCreated, allow_nil?: false
++
++        run fn input, _ ->
++          signal = input.arguments.signal
++          send(self(), {:listened, :add, signal.title})
++
++          if signal.title == "fail" do
++            {:error, "feed is closed"}
++          else
++            FeedItem
++            |> Ash.Changeset.for_create(:create, %{post_id: signal.post_id})
++            |> Ash.create!()
++
++            :ok
++          end
++        end
++      end
++
++      action :remove do
++        argument :signal, Ash.Test.SignalsTest.Signals.PostArchiving, allow_nil?: false
++
++        run fn input, _ ->
++          send(self(), {:archiving, input.arguments.signal.post_id})
++          :ok
++        end
++      end
++    end
++  end
++
++  defp create_post(title, opts \\ []) do
++    Post
++    |> Ash.Changeset.for_create(:create, %{title: title}, opts)
++    |> Ash.create()
++  end
++
++  # the messages `Ash.Signals.Test` sends, as opposed to the ones the listeners here send
++  defp signal_message?({:ash_signal_emitted, _, _, _, _}), do: true
++  defp signal_message?({ref, _, _, _}) when is_reference(ref), do: true
++  defp signal_message?(_), do: false
++
++  defp comment_bodies, do: Comment |> Ash.read!() |> Enum.map(& &1.body)
++
++  describe "signal modules" do
++    test "define a struct for their arguments, and a signal_id" do
++      signal_id = Ash.UUIDv7.generate()
++
++      assert {:ok, %Signals.PostCreated{title: "hi", signal_id: ^signal_id}} =
++               Signals.PostCreated.new(%{
++                 signal_id: signal_id,
++                 post_id: Ash.UUID.generate(),
++                 title: "hi"
++               })
++
++      assert {:error, _} = Signals.PostCreated.new(%{signal_id: signal_id, title: "no id"})
++      assert {:error, _} = Signals.PostCreated.new(%{post_id: Ash.UUID.generate()})
++    end
++
++    test "listeners are found without either side depending on the other" do
++      assert [
++               %{resource: Comment, action: :welcome},
++               %{resource: FeedItem, action: :add}
++             ] = Ash.Signals.Registry.listeners(Signals, :post_created)
++
++      assert [%{resource: FeedItem, action: :remove}] =
++               Ash.Signals.Registry.listeners(Signals, :post_archiving)
++    end
++  end
++
++  describe "emit" do
++    test "runs every listener" do
++      assert {:ok, post} = create_post("Signals")
++
++      assert [%{post_id: post_id}] = Ash.read!(FeedItem)
++      assert post_id == post.id
++      assert comment_bodies() == ["Welcome to Signals, from nobody"]
++    end
++
++    test "listeners run as the emitter's actor by default" do
++      assert {:ok, _post} = create_post("Signals", actor: %{name: "zach"})
++      assert comment_bodies() == ["Welcome to Signals, from zach"]
++    end
++
++    test "the emitter can choose the actor" do
++      assert {:ok, _post} =
++               Post
++               |> Ash.Changeset.for_create(
++                 :create,
++                 %{title: "Signals", emit_opts: [actor: %{name: "system"}]},
++                 actor: %{name: "zach"}
++               )
++               |> Ash.create()
++
++      assert comment_bodies() == ["Welcome to Signals, from system"]
++    end
++
++    test "the emitter can pass a scope" do
++      assert {:ok, _post} =
++               Post
++               |> Ash.Changeset.for_create(
++                 :create,
++                 %{title: "Signals", emit_opts: [scope: %{actor: %{name: "scoped"}}]},
++                 actor: %{name: "zach"}
++               )
++               |> Ash.create()
++
++      assert comment_bodies() == ["Welcome to Signals, from scoped"]
++    end
++
++    test "explicit options take precedence over the scope" do
++      assert {:ok, _post} =
++               Post
++               |> Ash.Changeset.for_create(
++                 :create,
++                 %{
++                   title: "Signals",
++                   emit_opts: [scope: %{actor: %{name: "scoped"}}, actor: %{name: "explicit"}]
++                 },
++                 actor: %{name: "zach"}
++               )
++               |> Ash.create()
++
++      assert comment_bodies() == ["Welcome to Signals, from explicit"]
++    end
++
++    test "a listener error fails the emitting action" do
++      assert {:error, error} = create_post("fail")
++      assert Exception.message(error) =~ "feed is closed"
++    end
++
++    test "signals can be emitted in before_action" do
++      {:ok, post} = create_post("Signals")
++      post |> Ash.Changeset.for_update(:archive) |> Ash.update!()
++      post_id = post.id
++      assert_received {:archiving, ^post_id}
++    end
++
++    test "generic actions can emit signals" do
++      post_id = Ash.UUID.generate()
++
++      assert "announced" =
++               Post
++               |> Ash.ActionInput.for_action(:announce, %{})
++               |> Ash.ActionInput.after_action(fn input, result ->
++                 with :ok <-
++                        Ash.Signals.emit(input, Signals, :post_created, %{
++                          post_id: post_id,
++                          title: "Generic"
++                        }) do
++                   {:ok, result}
++                 end
++               end)
++               |> Ash.run_action!()
++
++      assert [%{post_id: ^post_id}] = Ash.read!(FeedItem)
++      assert comment_bodies() == ["Welcome to Generic, from nobody"]
++    end
++
++    test "generic actions can only emit signals during the signal's phase" do
++      assert_raise Ash.Error.Unknown, ~r/the action input is in `:before_action`/, fn ->
++        Post
++        |> Ash.ActionInput.for_action(:announce, %{})
++        |> Ash.ActionInput.before_action(fn input ->
++          Ash.Signals.emit(input, Signals, :post_created, %{post_id: Ash.UUID.generate()})
++          input
++        end)
++        |> Ash.run_action!()
++      end
++    end
++
++    test "raises when emitted outside of the signal's phase" do
++      assert_raise Ash.Error.Unknown, ~r/can only be emitted during `:after_action`/, fn ->
++        Post
++        |> Ash.Changeset.for_create(:emit_in_wrong_phase, %{title: "x"})
++        |> Ash.create()
++      end
++    end
++
++    test "raises when the resource does not list the signal module in signals_out" do
++      assert_raise Ash.Error.Unknown, ~r/cannot emit signals from/, fn ->
++        NotEmitter |> Ash.Changeset.for_create(:create, %{}) |> Ash.create()
++      end
++    end
++  end
++
++  describe "assert_emits_signal and refute_emits_signal" do
++    test "assert the signals emitted by a function, and return its result" do
++      assert {:ok, %Post{title: "Signals"}} =
++               assert_emits_signal(Signals, :post_created, fn -> create_post("Signals") end)
++
++      assert {:ok, %Post{}} =
++               assert_emits_signal(Signals, :post_created, %{title: "Signals"}, fn ->
++                 create_post("Signals")
++               end)
++    end
++
++    test "patterns can bind variables" do
++      {:ok, post} =
++        assert_emits_signal(Signals, :post_created, %{post_id: post_id}, fn ->
++          create_post("Bound")
++        end)
++
++      assert post_id == post.id
++    end
++
++    test "patterns can use pins" do
++      title = "Pinned"
++
++      assert_emits_signal(Signals, :post_created, %{title: ^title}, fn ->
++        create_post("Pinned")
++      end)
++
++      assert_raise ExUnit.AssertionError, fn ->
++        assert_emits_signal(Signals, :post_created, %{title: ^title}, fn ->
++          create_post("Other")
++        end)
++      end
++    end
++
++    test "fail with the signals that were emitted" do
++      error =
++        assert_raise ExUnit.AssertionError, fn ->
++          assert_emits_signal(Signals, :post_created, %{title: "Other"}, fn ->
++            create_post("Signals")
++          end)
++        end
++
++      assert error.message =~ "none of the emitted :post_created signals matched"
++      assert error.message =~ ~s(title: "Signals")
++
++      assert_raise ExUnit.AssertionError, ~r/no :post_created signals were emitted/, fn ->
++        assert_emits_signal(Signals, :post_created, fn -> :ok end)
++      end
++    end
++
++    test "refute_emits_signal" do
++      assert :ok = refute_emits_signal(Signals, :post_created, fn -> :ok end)
++
++      refute_emits_signal(Signals, :post_created, %{title: "Other"}, fn ->
++        create_post("Signals")
++      end)
++
++      assert_raise ExUnit.AssertionError, ~r/not to be emitted, but got/, fn ->
++        refute_emits_signal(Signals, :post_created, fn -> create_post("Signals") end)
++      end
++    end
++
++    test "do not leave messages behind" do
++      assert_emits_signal(Signals, :post_created, fn -> create_post("Signals") end)
++
++      {:messages, messages} = Process.info(self(), :messages)
++      assert Enum.filter(messages, &signal_message?/1) == []
++    end
++
++    test "the retroactive helpers fail without capture_signals" do
++      assert_raise ExUnit.AssertionError, ~r/capture_signals/, fn ->
++        refute_signal_emitted(Signals, :post_created)
++      end
++
++      assert_raise ExUnit.AssertionError, ~r/capture_signals/, fn ->
++        assert_signal_emitted(Signals, :post_created)
++      end
++    end
++  end
++
++  describe "Ash.Signals.Test" do
++    setup :capture_signals
++
++    test "assert_signal_emitted matches emitted signals and returns them" do
++      assert {:ok, %{id: post_id}} = create_post("Signals", actor: %{name: "zach"})
++
++      assert %Signals.PostCreated{title: "Signals"} =
++               assert_signal_emitted(Signals, :post_created, %{post_id: ^post_id})
++
++      refute_signal_emitted(Signals, :post_created)
++    end
++
++    test "patterns can bind variables" do
++      assert {:ok, post} = create_post("Bound")
++
++      assert_signal_emitted(Signals, :post_created, %{post_id: post_id, title: title})
++      assert post_id == post.id
++      assert title == "Bound"
++    end
++
++    test "messages include who emitted the signal" do
++      assert {:ok, _post} = create_post("Signals", actor: %{name: "zach"})
++
++      assert_received {:ash_signal_emitted, Signals, :post_created, %Signals.PostCreated{},
++                       %{resource: Post, action: :create, actor: %{name: "zach"}}}
++    end
++
++    test "refute_signal_emitted fails when a matching signal was emitted" do
++      assert {:ok, _post} = create_post("Signals")
++
++      refute_signal_emitted(Signals, :post_created, %{title: "Other"})
++
++      assert_raise ExUnit.AssertionError, ~r/not to be emitted/, fn ->
++        refute_signal_emitted(Signals, :post_created, %{title: "Signals"})
++      end
++    end
++
++    test "assert_signal_emitted fails when no matching signal was emitted" do
++      refute_signal_emitted(Signals, :post_created)
++
++      assert_raise ExUnit.AssertionError,
++                   ~r/Expected signal :post_created .* to be emitted/,
++                   fn ->
++                     assert_signal_emitted(Signals, :post_created)
++                   end
++    end
++
++    test "signals emitted from processes started by the test are received" do
++      Task.async(fn -> create_post("From a task") end) |> Task.await()
++
++      assert_signal_emitted(Signals, :post_created, %{title: "From a task"})
++    end
++
++    test "unrelated processes are not sent anything" do
++      test_pid = self()
++
++      spawn(fn ->
++        {:ok, _} = create_post("Elsewhere")
++        {:messages, messages} = Process.info(self(), :messages)
++        send(test_pid, {:emitter_messages, Enum.filter(messages, &signal_message?/1)})
++      end)
++
++      assert_receive {:emitter_messages, []}
++      refute_signal_emitted(Signals, :post_created)
++    end
++  end
++
++  describe "emit_many" do
++    test "a bulk action emits a signal for each record" do
++      result =
++        Ash.bulk_create!(
++          [%{title: "one"}, %{title: "two"}, %{title: "three"}],
++          Post,
++          :create_in_batches,
++          return_records?: true,
++          actor: %{name: "zach"}
++        )
++
++      assert length(Ash.read!(FeedItem)) == 3
++
++      assert Enum.sort(comment_bodies()) == [
++               "Welcome to one, from zach",
++               "Welcome to three, from zach",
++               "Welcome to two, from zach"
++             ]
++
++      assert Enum.map(result.records, & &1.id) |> Enum.sort() ==
++               Ash.read!(FeedItem) |> Enum.map(& &1.post_id) |> Enum.sort()
++    end
++
++    test "a single action can emit from batch callbacks too" do
++      assert_emits_signal(Signals, :post_created, %{title: "single"}, fn ->
++        Post |> Ash.Changeset.for_create(:create_in_batches, %{title: "single"}) |> Ash.create!()
++      end)
++    end
++
++    test "each listener handles every signal before the next listener runs" do
++      Ash.bulk_create!([%{title: "one"}, %{title: "two"}], Post, :create_in_batches,
++        sorted?: true
++      )
++
++      {:messages, messages} = Process.info(self(), :messages)
++
++      assert for({:listened, listener, title} <- messages, do: {listener, title}) == [
++               welcome: "one",
++               welcome: "two",
++               add: "one",
++               add: "two"
++             ]
++    end
++
++    test "an invalid payload emits nothing" do
++      post_id = Ash.UUID.generate()
++
++      assert {:error, _} =
++               refute_emits_signal(Signals, :post_created, fn ->
++                 Post
++                 |> Ash.ActionInput.for_action(:announce, %{})
++                 |> Ash.ActionInput.after_action(fn input, _result ->
++                   Ash.Signals.emit_many(input, Signals, :post_created, [
++                     %{post_id: post_id},
++                     %{title: "missing post_id"}
++                   ])
++                 end)
++                 |> Ash.run_action()
++               end)
++
++      assert Ash.read!(FeedItem) == []
++    end
++  end
++
++  describe "emit_signal" do
++    test "adds the signal module to signals_out" do
++      assert ArticleSignals in Ash.Resource.Info.signals_out(Article)
++    end
++
++    test "fills signal fields from the record, fields and values" do
++      article =
++        assert_emits_signal(ArticleSignals, :article_published, %{title: "Hi", by: "zach"}, fn ->
++          Ash.create!(Article, %{title: "Hi"}, actor: %{name: "zach"})
++        end)
++
++      assert_emits_signal(ArticleSignals, :article_published, %{article_id: article_id}, fn ->
++        Ash.create!(Article, %{title: "Again"})
++      end)
++
++      assert is_binary(article_id)
++      assert article.id != article_id
++    end
++
++    test "previous/1 takes fields from the record before an update" do
++      article = Ash.create!(Article, %{title: "Old"})
++      article_id = article.id
++
++      assert_emits_signal(
++        ArticleSignals,
++        :article_published,
++        %{article_id: ^article_id, title: "New", previous_title: "Old"},
++        fn -> article |> Ash.Changeset.for_update(:retitle, %{title: "New"}) |> Ash.update!() end
++      )
++    end
++
++    test "bulk actions emit once per record" do
++      capture_signals()
++
++      Ash.bulk_create!([%{title: "a"}, %{title: "b"}], Article, :publish)
++
++      assert_signal_emitted(ArticleSignals, :article_published, %{title: "a"})
++      assert_signal_emitted(ArticleSignals, :article_published, %{title: "b"})
++      refute_signal_emitted(ArticleSignals, :article_published)
++    end
++
++    test "atomic bulk updates emit once per record" do
++      Ash.bulk_create!([%{title: "a"}, %{title: "b"}], Article, :publish)
++      capture_signals()
++
++      Ash.bulk_update!(Article, :rename, %{title: "c"}, strategy: :atomic)
++
++      assert_signal_emitted(ArticleSignals, :article_published, %{title: "c"})
++      assert_signal_emitted(ArticleSignals, :article_published, %{title: "c"})
++      refute_signal_emitted(ArticleSignals, :article_published)
++    end
++
++    test "previous/1 makes the change non-atomic" do
++      Ash.bulk_create!([%{title: "a"}], Article, :publish)
++
++      assert %Ash.BulkResult{status: :error} =
++               Ash.bulk_update(Article, :retitle, %{title: "c"}, strategy: :atomic)
++
++      assert_emits_signal(
++        ArticleSignals,
++        :article_published,
++        %{title: "c", previous_title: "a"},
++        fn -> Ash.bulk_update!(Article, :retitle, %{title: "c"}, strategy: :stream) end
++      )
++    end
++
++    test "before_action signals read the changeset" do
++      assert_emits_signal(ArticleSignals, :article_drafting, %{title: "Draft"}, fn ->
++        Article |> Ash.Changeset.for_create(:draft, %{title: "Draft"}) |> Ash.create!()
++      end)
++    end
++
++    test "after_transaction signals are emitted after the transaction" do
++      article =
++        assert_emits_signal(ArticleSignals, :article_committed, %{article_id: article_id}, fn ->
++          Article |> Ash.Changeset.for_create(:commit, %{title: "Done"}) |> Ash.create!()
++        end)
++
++      assert article.id == article_id
++    end
++
++    test "bulk actions emit after_transaction signals for every record" do
++      capture_signals()
++
++      Ash.bulk_create!([%{title: "a"}, %{title: "b"}], Article, :commit)
++
++      assert_signal_emitted(ArticleSignals, :article_committed)
++      assert_signal_emitted(ArticleSignals, :article_committed)
++      refute_signal_emitted(ArticleSignals, :article_committed)
++    end
++
++    test "bulk destroys emit after_transaction signals for every record" do
++      Ash.bulk_create!([%{title: "a"}, %{title: "b"}], Article, :publish)
++      capture_signals()
++
++      Ash.bulk_destroy!(Article, :retract, %{}, strategy: :stream)
++
++      assert_signal_emitted(ArticleSignals, :article_committed)
++      assert_signal_emitted(ArticleSignals, :article_committed)
++      refute_signal_emitted(ArticleSignals, :article_committed)
++    end
++
++    # atomic actions don't run the hooks that emit after the transaction
++    test "after_transaction signals make the change non-atomic" do
++      Ash.bulk_create!([%{title: "a"}, %{title: "b"}], Article, :publish)
++
++      assert %Ash.BulkResult{status: :error} =
++               Ash.bulk_update(Article, :commit_update, %{title: "c"}, strategy: :atomic)
++
++      capture_signals()
++      Ash.bulk_update!(Article, :commit_update, %{title: "c"}, strategy: [:atomic, :stream])
++
++      assert_signal_emitted(ArticleSignals, :article_committed)
++      assert_signal_emitted(ArticleSignals, :article_committed)
++      refute_signal_emitted(ArticleSignals, :article_committed)
++    end
++
++    test "generic actions emit with prepare, from their arguments" do
++      assert_emits_signal(ArticleSignals, :digest_requested, %{topic: "elixir"}, fn ->
++        Article
++        |> Ash.ActionInput.for_action(:request_digest, %{topic: "elixir"})
++        |> Ash.run_action!()
++      end)
++    end
++  end
++
++  describe "consolidation" do
++    test "compiles a dispatch module that emit uses instead of searching" do
++      tmp_dir = Path.join(System.tmp_dir!(), "ash_signals_#{System.unique_integer([:positive])}")
++
++      Code.compile_string("""
++      defmodule Ash.Test.SignalsTest.ConsolidatedSignals do
++        use Ash.Signals
++
++        signals do
++          signal :happened do
++            phase :after_action
++          end
++        end
++      end
++
++      for name <- [ConsolidatedA, ConsolidatedB] do
++        defmodule Module.concat(Ash.Test.SignalsTest, name) do
++          use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
++
++          attributes do
++            uuid_primary_key :id
++          end
++
++          signals_in do
++            from Ash.Test.SignalsTest.ConsolidatedSignals do
++              on :heard, :happened
++            end
++          end
++
++          actions do
++            action :heard do
++              argument :signal, Ash.Test.SignalsTest.ConsolidatedSignals.Happened
++              run fn _, _ -> :ok end
++            end
++          end
++        end
++      end
++      """)
++
++      signal_module = Ash.Test.SignalsTest.ConsolidatedSignals
++      dispatch = Ash.Signals.Registry.dispatch_module(signal_module)
++
++      on_exit(fn ->
++        :code.purge(dispatch)
++        :code.delete(dispatch)
++        File.rm_rf!(tmp_dir)
++      end)
++
++      assert [^dispatch] = Mix.Tasks.Compile.AshSignals.consolidate([signal_module], tmp_dir)
++      assert File.exists?(Path.join(tmp_dir, "#{dispatch}.beam"))
++
++      assert [
++               %{resource: Ash.Test.SignalsTest.ConsolidatedA, action: :heard},
++               %{resource: Ash.Test.SignalsTest.ConsolidatedB, action: :heard}
++             ] = dispatch.listeners(:happened)
++
++      assert dispatch.listeners(:unknown) == []
++
++      # listeners defined after consolidation are not found
++      Code.compile_string("""
++      defmodule Ash.Test.SignalsTest.ConsolidatedC do
++        use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
++
++        attributes do
++          uuid_primary_key :id
++        end
++
++        signals_in do
++          from Ash.Test.SignalsTest.ConsolidatedSignals do
++            on :heard, :happened
++          end
++        end
++
++        actions do
++          action :heard do
++            argument :signal, Ash.Test.SignalsTest.ConsolidatedSignals.Happened
++            run fn _, _ -> :ok end
++          end
++        end
++      end
++      """)
++
++      assert length(Ash.Signals.Registry.listeners(signal_module, :happened)) == 2
++      assert length(Ash.Signals.Registry.discover(signal_module)) == 3
++    end
++  end
++
++  describe "verification" do
++    # Verification happens outside the test process, so verifier errors are emitted as warnings.
++    defp compile_warnings(code) do
++      ExUnit.CaptureIO.capture_io(:stderr, fn -> Code.compile_string(code) end)
++    end
++
++    defp compile_listener(signals_in, actions) do
++      compile_warnings("""
++      defmodule Ash.Test.SignalsTest.Bad#{System.unique_integer([:positive])} do
++        use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
++
++        attributes do
++          uuid_primary_key :id
++          attribute :order_id, :uuid, public?: true
++        end
++
++        signals_in do
++          #{signals_in}
++        end
++
++        actions do
++          defaults [:read]
++          #{actions}
++        end
++      end
++      """)
++    end
++
++    defp compile_emitter(actions) do
++      compile_warnings("""
++      defmodule Ash.Test.SignalsTest.BadEmitter#{System.unique_integer([:positive])} do
++        use Ash.Resource, domain: Ash.Test.Domain, data_layer: Ash.DataLayer.Ets
++
++        attributes do
++          uuid_primary_key :id
++          attribute :title, :string, public?: true
++        end
++
++        actions do
++          defaults [:read]
++          #{actions}
++        end
++      end
++      """)
++    end
++
++    test "emit_signal checks the signal" do
++      assert compile_emitter("""
++             create :publish do
++               change emit_signal(Ash.Test.SignalsTest.ArticleSignals, :nope, :after_action)
++             end
++             """) =~ "has no signal named `:nope`"
++
++      assert compile_emitter("""
++             create :publish do
++               change emit_signal(Ash.Test.SignalsTest.Nope, :article_published, :after_action)
++             end
++             """) =~ "is not an `Ash.Signals` module"
++    end
++
++    test "emit_signal requires the signal's phase" do
++      assert compile_emitter("""
++             create :publish do
++               change emit_signal(Ash.Test.SignalsTest.ArticleSignals, :article_published,
++                        :before_action, fields: [article_id: :id])
++             end
++             """) =~
++               "the phase given to `emit_signal` must be `:after_action`, got: :before_action"
++    end
++
++    test "emit_signal checks fields" do
++      assert compile_emitter("""
++             create :publish do
++               change emit_signal(Ash.Test.SignalsTest.ArticleSignals, :article_published, :after_action,
++                        fields: [article_id: :id, nope: :title])
++             end
++             """) =~ "`fields` sets `:nope`, but signal `:article_published` has no field"
++
++      assert compile_emitter("""
++             create :publish do
++               change emit_signal(Ash.Test.SignalsTest.ArticleSignals, :article_published, :after_action,
++                        fields: [article_id: :nope])
++             end
++             """) =~ "`:nope` is not an attribute, calculation or aggregate"
++    end
++
++    test "emit_signal requires every required signal field" do
++      assert compile_emitter("""
++             create :publish do
++               change emit_signal(Ash.Test.SignalsTest.ArticleSignals, :article_published, :after_action)
++             end
++             """) =~ "requires `:article_id`, which is not an attribute"
++
++      assert compile_emitter("""
++             action :request do
++               prepare emit_signal(Ash.Test.SignalsTest.ArticleSignals, :digest_requested, :after_action)
++               run fn _, _ -> :ok end
++             end
++             """) =~ "requires `:topic`, which is not an argument of the action"
++    end
++
++    test "previous is only for update and destroy" do
++      assert compile_emitter("""
++             create :publish do
++               change emit_signal(Ash.Test.SignalsTest.ArticleSignals, :article_published, :after_action,
++                        fields: [article_id: :id], values: [previous_title: previous(:title)])
++             end
++             """) =~ "`previous/1` is only for update and destroy actions"
++    end
++
++    test "batch? is only for generic actions" do
++      assert compile_listener(
++               "from Ash.Test.SignalsTest.VerifySignals do on :record, :order_placed, batch?: true end",
++               "create :record, accept: [:order_id]"
++             ) =~ "`batch?` is only for generic actions"
++    end
++
++    test "a batch listener's argument must be an array" do
++      assert compile_listener(
++               "from Ash.Test.SignalsTest.VerifySignals do on :log, :order_placed, batch?: true end",
++               """
++               action :log do
++                 argument :signals, Ash.Test.SignalsTest.VerifySignals.OrderPlaced
++                 run fn _, _ -> :ok end
++               end
++               """
++             ) =~ "must be an array"
++    end
++
++    test "inputs must be inputs of the action, and fields of the signal" do
++      assert compile_listener(
++               "from Ash.Test.SignalsTest.VerifySignals do on :record, :order_placed, inputs: [nope: :order_id] end",
++               "create :record, accept: [:order_id]"
++             ) =~ "`:nope` is not an input of `:record`"
++
++      assert compile_listener(
++               "from Ash.Test.SignalsTest.VerifySignals do on :record, :order_placed, inputs: [order_id: :nope] end",
++               "create :record, accept: [:order_id]"
++             ) =~ "`inputs` uses `:nope`, but signal `:order_placed` has no field with that name"
++    end
++
++    test "update and destroy options are checked" do
++      assert compile_listener(
++               "from Ash.Test.SignalsTest.VerifySignals do on :touch, :order_placed, get_by: [nope: :order_id] end",
++               "update :touch"
++             ) =~ "`get_by` field `:nope` is not an attribute"
++
++      assert compile_listener(
++               "from Ash.Test.SignalsTest.VerifySignals do on :touch, :order_placed, read_action: :touch end",
++               "update :touch"
++             ) =~ "`:touch` is not a read action"
++
++      assert compile_listener(
++               "from Ash.Test.SignalsTest.VerifySignals do on :touch, :order_placed, args: [:nope] end",
++               "update :touch"
++             ) =~ "`:nope` is not an argument of the `:read` read action"
++    end
++
++    test "a signal's delivery must implement Ash.Signals.Delivery, and can verify it" do
++      assert compile_warnings("""
++             defmodule Ash.Test.SignalsTest.BadDelivery#{System.unique_integer([:positive])} do
++               use Ash.Signals
++
++               signals do
++                 signal :happened do
++                   phase :after_action
++                   delivery Ash.Test.SignalsTest.Nope
++                 end
++               end
++             end
++             """) =~ "`Ash.Test.SignalsTest.Nope` does not implement `Ash.Signals.Delivery`"
++
++      assert compile_warnings("""
++             defmodule Ash.Test.SignalsTest.BadDelivery#{System.unique_integer([:positive])} do
++               use Ash.Signals
++
++               signals do
++                 signal :rejected do
++                   phase :after_action
++                   delivery Ash.Test.SignalsTest.RecordingDelivery
++                 end
++               end
++             end
++             """) =~ "the delivery rejects this signal"
++    end
++
++    test "a signal's delivery can verify its listeners" do
++      assert compile_listener(
++               "from Ash.Test.SignalsTest.DeliverySignals do on :rejected, :verified end",
++               "create :rejected, accept: [:order_id]"
++             ) =~ "the delivery rejects this listener"
++    end
++
++    test "listener names are unique within a resource" do
++      assert compile_listener(
++               """
++               from Ash.Test.SignalsTest.VerifySignals do
++                 on :record, :order_placed
++               end
++
++               from Ash.Test.SignalsTest.DeliverySignals do
++                 on :record, :verified
++               end
++               """,
++               "create :record, accept: [:order_id]"
++             ) =~ "There is already a listener named `:record`"
++    end
++
++    test "the action defaults to the listener's name" do
++      assert compile_listener(
++               "from Ash.Test.SignalsTest.VerifySignals do on :nope, :order_placed end",
++               "create :record, accept: [:order_id]"
++             ) =~
++               "No action named `:nope`. The action defaults to the listener's name: set `action` to run a different one."
++    end
++
++    test "options for other action types are rejected" do
++      assert compile_listener(
++               "from Ash.Test.SignalsTest.VerifySignals do on :record, :order_placed, get_by: [:order_id] end",
++               "create :record, accept: [:order_id]"
++             ) =~ "`get_by` is only for update and destroy actions"
++
++      assert compile_listener(
++               "from Ash.Test.SignalsTest.VerifySignals do on :log, :order_placed, inputs: [:order_id] end",
++               """
++               action :log do
++                 argument :signal, Ash.Test.SignalsTest.VerifySignals.OrderPlaced
++                 run fn _, _ -> :ok end
++               end
++               """
++             ) =~ "`inputs` is only for create, update and destroy actions"
++    end
++  end
++
++  describe "create, update and destroy listeners" do
++    defp place_orders(orders) do
++      Post
++      |> Ash.ActionInput.for_action(:announce, %{})
++      |> Ash.ActionInput.after_action(fn input, result ->
++        with :ok <- Ash.Signals.emit_many(input, OrderSignals, :order_placed, orders) do
++          {:ok, result}
++        end
++      end)
++      |> Ash.run_action()
++    end
++
++    setup do
++      [active, other, banned, untouched] =
++        for status <- ["new", "new", "banned", "new"] do
++          Ash.create!(Customer, %{status: status})
++        end
++
++      for customer <- [active, other, untouched] do
++        Ash.create!(CartItem, %{customer_id: customer.id})
++      end
++
++      %{active: active, other: other, banned: banned, untouched: untouched}
++    end
++
++    test "run in bulk for every signal", customers do
++      orders =
++        for customer <- [customers.active, customers.other, customers.banned] do
++          %{order_id: Ash.UUID.generate(), customer_id: customer.id, note: "thanks"}
++        end
++
++      order_ids = Enum.map(orders, & &1.order_id)
++
++      assert {:ok, "announced"} = place_orders(orders)
++
++      # create, from the signal fields named like its inputs
++      assert Receipt |> Ash.read!() |> Enum.map(&{&1.order_id, &1.note}) |> Enum.sort() ==
++               Enum.sort(Enum.map(order_ids, &{&1, "thanks"}))
++
++      # create, with explicit inputs
++      assert Reference |> Ash.read!() |> Enum.map(& &1.reference) |> Enum.sort() ==
++               Enum.sort(order_ids)
++
++      # update, with a read action and get_by: the banned customer is filtered out
++      statuses = Customer |> Ash.read!() |> Map.new(&{&1.id, &1.status})
++      assert statuses[customers.active.id] == "ordered"
++      assert statuses[customers.other.id] == "ordered"
++      assert statuses[customers.banned.id] == "banned"
++      assert statuses[customers.untouched.id] == "new"
++
++      # destroy, with a read action and its arguments
++      assert [%{customer_id: untouched_id}] = Ash.read!(CartItem)
++      assert untouched_id == customers.untouched.id
++
++      # the same action, run by two listeners with different inputs
++      customer_ids = Enum.map(orders, & &1.customer_id)
++
++      assert LedgerEntry |> Ash.read!() |> Enum.map(& &1.account_id) |> Enum.sort() ==
++               Enum.sort(order_ids ++ customer_ids)
++
++      # a batched generic action, called once with every signal
++      assert_received {:audited, ^order_ids}
++      refute_received {:audited, _}
++    end
++
++    test "signals that match no records are handled", customers do
++      assert {:ok, _} =
++               place_orders([
++                 %{order_id: Ash.UUID.generate(), customer_id: customers.banned.id}
++               ])
++
++      assert length(Ash.read!(CartItem)) == 3
++    end
++
++    test "a failing bulk listener fails the emit", customers do
++      assert {:error, error} =
++               place_orders([
++                 %{order_id: Ash.UUID.generate(), customer_id: customers.active.id, note: "fail"}
++               ])
++
++      assert Exception.message(error) =~ "must not equal"
++    end
++  end
++
++  defp announce(signal_module, name, payloads, opts \\ []) do
++    Post
++    |> Ash.ActionInput.for_action(:announce, %{}, opts)
++    |> Ash.ActionInput.after_action(fn input, result ->
++      with :ok <- Ash.Signals.emit_many(input, signal_module, name, payloads) do
++        {:ok, result}
++      end
++    end)
++    |> Ash.run_action()
++  end
++
++  describe "signal_id" do
++    test "is generated for each signal when it is emitted" do
++      orders =
++        for _ <- 1..2 do
++          %{order_id: Ash.UUID.generate(), customer_id: Ash.UUID.generate()}
++        end
++
++      {:ok, _} = announce(OrderSignals, :order_placed, orders)
++
++      ids =
++        SignalLog
++        |> Ash.read!()
++        |> Enum.map(& &1.source_signal_id)
++        |> Enum.reject(&is_nil/1)
++        |> Enum.uniq()
++
++      assert length(ids) == 2
++      assert Enum.all?(ids, &match?(<<_::binary-size(14), "7", _::binary>>, &1))
++    end
++
++    test "can be given in the payload" do
++      signal_id = Ash.UUIDv7.generate()
++
++      assert_emits_signal(OrderSignals, :order_placed, %{signal_id: ^signal_id}, fn ->
++        {:ok, _} =
++          announce(OrderSignals, :order_placed, [
++            %{
++              signal_id: signal_id,
++              order_id: Ash.UUID.generate(),
++              customer_id: Ash.UUID.generate()
++            }
++          ])
++      end)
++    end
++
++    test "is only passed to listeners when mapped explicitly" do
++      order_id = Ash.UUID.generate()
++
++      {:ok, _} =
++        announce(OrderSignals, :order_placed, [
++          %{order_id: order_id, customer_id: Ash.UUID.generate()}
++        ])
++
++      assert [unmapped] = Enum.filter(Ash.read!(SignalLog), &is_nil(&1.source_signal_id))
++      assert [mapped] = Enum.reject(Ash.read!(SignalLog), &is_nil(&1.source_signal_id))
++      assert unmapped.order_id == order_id
++      assert unmapped.signal_id == nil
++      assert mapped.order_id == order_id
++    end
++
++    test "is reserved" do
++      assert_raise Spark.Error.DslError, ~r/`signal_id` is reserved/, fn ->
++        Code.compile_string("""
++        defmodule Ash.Test.SignalsTest.ReservedSignals do
++          use Ash.Signals
++
++          signals do
++            signal :happened do
++              phase :after_action
++              argument :signal_id, :uuid
++            end
++          end
++        end
++        """)
++      end
++    end
++  end
++
++  describe "delivery" do
++    test "receives the signals, their listeners and the emitting context" do
++      order_id = Ash.UUID.generate()
++
++      assert {:ok, "announced"} =
++               announce(DeliverySignals, :queued, [%{order_id: order_id}],
++                 actor: %{name: "zach"},
++                 context: %{shared: %{source: "test"}}
++               )
++
++      assert_received {:delivered, [%DeliverySignals.Queued{order_id: ^order_id}], listeners,
++                       [queue: :orders], context}
++
++      assert [%{resource: QueuedReceipt, action: :record}] = listeners
++
++      assert %Ash.Signals.Delivery.Context{
++               signal_module: DeliverySignals,
++               signal: %{name: :queued},
++               resource: Post,
++               action: :announce,
++               actor: %{name: "zach"},
++               source_context: %{shared: %{source: "test"}}
++             } = context
++
++      # the listener did not run
++      assert Ash.read!(QueuedReceipt) == []
++    end
++
++    test "can run listeners later, the way the inline delivery does" do
++      order_id = Ash.UUID.generate()
++      {:ok, _} = announce(DeliverySignals, :queued, [%{order_id: order_id}])
++      assert_received {:delivered, signals, [listener], _opts, context}
++
++      {:ok, dumped} = Ash.Signals.dump(DeliverySignals, :queued, signals)
++      assert [%{"order_id" => ^order_id, "signal_id" => _}] = Jason.decode!(Jason.encode!(dumped))
++      assert {:ok, ^signals} = Ash.Signals.load(DeliverySignals, :queued, dumped)
++
++      assert %{resource: QueuedReceipt, action: :record, action_type: :create} =
++               Ash.Resource.Info.signal_listener(QueuedReceipt, :record)
++
++      assert :ok = Ash.Signals.run_listener(listener, signals, Ash.Scope.to_opts(context))
++      assert [%{order_id: ^order_id}] = Ash.read!(QueuedReceipt)
++    end
++
++    test "loading ignores unknown fields and refuses missing required ones" do
++      signal_id = Ash.UUIDv7.generate()
++      order_id = Ash.UUID.generate()
++
++      assert {:ok, [%DeliverySignals.Queued{order_id: ^order_id}]} =
++               Ash.Signals.load(DeliverySignals, :queued, [
++                 %{"signal_id" => signal_id, "order_id" => order_id, "removed" => "value"}
++               ])
++
++      assert {:error, _} =
++               Ash.Signals.load(DeliverySignals, :queued, [
++                 %{"signal_id" => signal_id, "renamed_order_id" => order_id}
++               ])
++    end
++
++    test "is called even when the signal has no listeners, and can fail the emit" do
++      assert {:error, error} = announce(DeliverySignals, :failing, [%{}])
++      assert Exception.message(error) =~ "delivery failed"
++      assert_received {:delivered, [%DeliverySignals.Failing{}], [], [fail?: true], _}
++    end
++
++    test "listeners are found by name" do
++      assert %{action: :record, inputs: [account_id: :customer_id]} =
++               Ash.Resource.Info.signal_listener(LedgerEntry, :record_for_customer)
++
++      assert Ash.Resource.Info.signal_listener(LedgerEntry, :record) == nil
++    end
++
++    test "update and destroy listeners expose the queries they run" do
++      [customer, banned] =
++        for status <- ["new", "banned"], do: Ash.create!(Customer, %{status: status})
++
++      listener =
++        Ash.Resource.Info.signal_listener(Customer, :mark_ordered)
++
++      signals =
++        for customer <- [customer, banned] do
++          OrderSignals.OrderPlaced.new!(%{
++            signal_id: Ash.UUIDv7.generate(),
++            order_id: Ash.UUID.generate(),
++            customer_id: customer.id
++          })
++        end
++
++      assert [{query, %{}, ^signals}] = Ash.Signals.listener_queries(listener, signals, [])
++      assert [%{id: id}] = Ash.read!(query)
++      assert id == customer.id
++    end
++  end
++end

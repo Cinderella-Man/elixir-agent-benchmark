@@ -1,0 +1,778 @@
+diff --git a/config/config.exs b/config/config.exs
+index ad5febeab..508b9b685 100644
+--- a/config/config.exs
++++ b/config/config.exs
+@@ -54,7 +54,7 @@ config :pinchflat, Oban,
+     {Oban.Plugins.Cron,
+      crontab: [
+        {"0 1 * * *", Pinchflat.Downloading.MediaRetentionWorker},
+-       {"0 2 * * *", Pinchflat.Downloading.MediaRedownloadWorker}
++       {"0 2 * * *", Pinchflat.Downloading.MediaQualityUpgradeWorker}
+      ]}
+   ],
+   # TODO: consider making this an env var or something?
+diff --git a/lib/pinchflat/downloading/download_option_builder.ex b/lib/pinchflat/downloading/download_option_builder.ex
+index 5745012fe..a966e4bd2 100644
+--- a/lib/pinchflat/downloading/download_option_builder.ex
++++ b/lib/pinchflat/downloading/download_option_builder.ex
+@@ -15,11 +15,11 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+ 
+   Returns {:ok, [Keyword.t()]}
+   """
+-  def build(%MediaItem{} = media_item_with_preloads) do
++  def build(%MediaItem{} = media_item_with_preloads, override_opts \\ []) do
+     media_profile = media_item_with_preloads.source.media_profile
+ 
+     built_options =
+-      default_options() ++
++      default_options(override_opts) ++
+         subtitle_options(media_profile) ++
+         thumbnail_options(media_item_with_preloads) ++
+         metadata_options(media_profile) ++
+@@ -50,11 +50,12 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+     build_output_path_for(%MediaItem{source: source_with_preloads})
+   end
+ 
+-  defp default_options do
++  defp default_options(override_opts) do
++    overwrite_behaviour = Keyword.get(override_opts, :overwrite_behaviour, :force_overwrites)
++
+     [
+       :no_progress,
+-      # Add force-overwrites to make sure redownloading works
+-      :force_overwrites,
++      overwrite_behaviour,
+       # This makes the date metadata conform to what jellyfin expects
+       parse_metadata: "%(upload_date>%Y-%m-%d)s:(?P<meta_date>.+)"
+     ]
+diff --git a/lib/pinchflat/downloading/downloading_helpers.ex b/lib/pinchflat/downloading/downloading_helpers.ex
+index a7f64e328..d6f8966d1 100644
+--- a/lib/pinchflat/downloading/downloading_helpers.ex
++++ b/lib/pinchflat/downloading/downloading_helpers.ex
+@@ -7,6 +7,8 @@ defmodule Pinchflat.Downloading.DownloadingHelpers do
+ 
+   require Logger
+ 
++  use Pinchflat.Media.MediaQuery
++
+   alias Pinchflat.Repo
+   alias Pinchflat.Media
+   alias Pinchflat.Tasks
+@@ -64,4 +66,30 @@ defmodule Pinchflat.Downloading.DownloadingHelpers do
+       {:error, :should_not_download}
+     end
+   end
++
++  @doc """
++  For a given source, enqueues download jobs for all media items _that have already been downloaded_.
++
++  This is useful for when a source's download settings have changed and you want to run through all
++  existing media and retry the download. For instance, if the source didn't originally download thumbnails
++  and you've changed the source to download them, you can use this to download all the thumbnails for
++  existing media items.
++
++  NOTE: does not delete existing files whatsoever. Does not overwrite the existing media file if it exists
++  at the location it expects. Will cause a full redownload of everything if the output template has changed
++
++  NOTE: unrelated to the MediaQualityUpgradeWorker, which is for redownloading media items for quality upgrades
++  or improved sponsorblock segments
++
++  Returns [{:ok, %Task{}} | {:error, any()}]
++  """
++  def kickoff_redownload_for_existing_media(%Source{} = source) do
++    MediaQuery.new()
++    |> MediaQuery.for_source(source)
++    |> MediaQuery.with_media_downloaded_at()
++    |> MediaQuery.where_download_not_prevented()
++    |> MediaQuery.where_not_culled()
++    |> Repo.all()
++    |> Enum.map(&MediaDownloadWorker.kickoff_with_task/1)
++  end
+ end
+diff --git a/lib/pinchflat/downloading/media_download_worker.ex b/lib/pinchflat/downloading/media_download_worker.ex
+index c211977ce..fc1bc99df 100644
+--- a/lib/pinchflat/downloading/media_download_worker.ex
++++ b/lib/pinchflat/downloading/media_download_worker.ex
+@@ -33,12 +33,18 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+   Does not download media if its source is set to not download media
+   (unless forced).
+ 
++  Options:
++    - `force`: force download even if the source is set to not download media. Fully
++      re-downloads media, including the video
++    - `quality_upgrade?`: re-downloads media, including the video. Does not force download
++      if the source is set to not download media
++
+   Returns :ok | {:ok, %MediaItem{}} | {:error, any, ...any}
+   """
+   @impl Oban.Worker
+   def perform(%Oban.Job{args: %{"id" => media_item_id} = args}) do
+     should_force = Map.get(args, "force", false)
+-    is_redownload = Map.get(args, "redownload?", false)
++    is_quality_upgrade = Map.get(args, "quality_upgrade?", false)
+ 
+     media_item =
+       media_item_id
+@@ -47,7 +53,7 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+ 
+     # If the source or media item is set to not download media, perform a no-op unless forced
+     if (media_item.source.download_media && !media_item.prevent_download) || should_force do
+-      download_media_and_schedule_jobs(media_item, is_redownload)
++      download_media_and_schedule_jobs(media_item, is_quality_upgrade, should_force)
+     else
+       :ok
+     end
+@@ -56,13 +62,16 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+     Ecto.StaleEntryError -> Logger.info("#{__MODULE__} discarded: media item #{media_item_id} stale")
+   end
+ 
+-  defp download_media_and_schedule_jobs(media_item, is_redownload) do
+-    case MediaDownloader.download_for_media_item(media_item) do
++  defp download_media_and_schedule_jobs(media_item, is_quality_upgrade, should_force) do
++    overwrite_behaviour = if should_force || is_quality_upgrade, do: :force_overwrites, else: :no_force_overwrites
++    override_opts = [overwrite_behaviour: overwrite_behaviour]
++
++    case MediaDownloader.download_for_media_item(media_item, override_opts) do
+       {:ok, downloaded_media_item} ->
+         {:ok, updated_media_item} =
+           Media.update_media_item(downloaded_media_item, %{
+             media_size_bytes: compute_media_filesize(downloaded_media_item),
+-            media_redownloaded_at: get_redownloaded_at(is_redownload)
++            media_redownloaded_at: get_redownloaded_at(is_quality_upgrade)
+           })
+ 
+         :ok = run_user_script(updated_media_item)
+diff --git a/lib/pinchflat/downloading/media_downloader.ex b/lib/pinchflat/downloading/media_downloader.ex
+index b1fb91a72..7d4ab06be 100644
+--- a/lib/pinchflat/downloading/media_downloader.ex
++++ b/lib/pinchflat/downloading/media_downloader.ex
+@@ -29,11 +29,11 @@ defmodule Pinchflat.Downloading.MediaDownloader do
+ 
+   Returns {:ok, %MediaItem{}} | {:error, any, ...any}
+   """
+-  def download_for_media_item(%MediaItem{} = media_item) do
++  def download_for_media_item(%MediaItem{} = media_item, override_opts \\ []) do
+     output_filepath = FilesystemUtils.generate_metadata_tmpfile(:json)
+     media_with_preloads = Repo.preload(media_item, [:metadata, source: :media_profile])
+ 
+-    case download_with_options(media_item.original_url, media_with_preloads, output_filepath) do
++    case download_with_options(media_item.original_url, media_with_preloads, output_filepath, override_opts) do
+       {:ok, parsed_json} ->
+         update_media_item_from_parsed_json(media_with_preloads, parsed_json)
+ 
+@@ -103,8 +103,8 @@ defmodule Pinchflat.Downloading.MediaDownloader do
+     end
+   end
+ 
+-  defp download_with_options(url, item_with_preloads, output_filepath) do
+-    {:ok, options} = DownloadOptionBuilder.build(item_with_preloads)
++  defp download_with_options(url, item_with_preloads, output_filepath, override_opts) do
++    {:ok, options} = DownloadOptionBuilder.build(item_with_preloads, override_opts)
+ 
+     YtDlpMedia.download(url, options, output_filepath: output_filepath)
+   end
+diff --git a/lib/pinchflat/downloading/media_redownload_worker.ex b/lib/pinchflat/downloading/media_quality_upgrade_worker.ex
+similarity index 69%
+rename from lib/pinchflat/downloading/media_redownload_worker.ex
+rename to lib/pinchflat/downloading/media_quality_upgrade_worker.ex
+index b3b6d824f..ec325ef4e 100644
+--- a/lib/pinchflat/downloading/media_redownload_worker.ex
++++ b/lib/pinchflat/downloading/media_quality_upgrade_worker.ex
+@@ -1,4 +1,4 @@
+-defmodule Pinchflat.Downloading.MediaRedownloadWorker do
++defmodule Pinchflat.Downloading.MediaQualityUpgradeWorker do
+   @moduledoc false
+ 
+   use Oban.Worker,
+@@ -12,7 +12,9 @@ defmodule Pinchflat.Downloading.MediaRedownloadWorker do
+   alias Pinchflat.Downloading.MediaDownloadWorker
+ 
+   @doc """
+-  Redownloads media items that are eligible for redownload.
++  Redownloads media items that are eligible for redownload for the purpose
++  of upgrading the quality of the media or improving things like sponsorblock
++  segments.
+ 
+   This worker is scheduled to run daily via the Oban Cron plugin
+   and it should run _after_ the retention worker.
+@@ -25,7 +27,7 @@ defmodule Pinchflat.Downloading.MediaRedownloadWorker do
+     Logger.info("Redownloading #{length(redownloadable_media)} media items")
+ 
+     Enum.each(redownloadable_media, fn media_item ->
+-      MediaDownloadWorker.kickoff_with_task(media_item, %{redownload?: true})
++      MediaDownloadWorker.kickoff_with_task(media_item, %{quality_upgrade?: true})
+     end)
+   end
+ end
+diff --git a/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex b/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex
+index b12eff2ba..366357fb6 100644
+--- a/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex
++++ b/lib/pinchflat/fast_indexing/fast_indexing_helpers.ex
+@@ -7,10 +7,11 @@ defmodule Pinchflat.FastIndexing.FastIndexingHelpers do
+ 
+   require Logger
+ 
++  use Pinchflat.Media.MediaQuery
++
+   alias Pinchflat.Repo
+   alias Pinchflat.Media
+   alias Pinchflat.Sources.Source
+-  alias Pinchflat.Media.MediaQuery
+   alias Pinchflat.FastIndexing.YoutubeRss
+   alias Pinchflat.Downloading.DownloadingHelpers
+ 
+diff --git a/lib/pinchflat/lifecycle/notifications/source_notifications.ex b/lib/pinchflat/lifecycle/notifications/source_notifications.ex
+index 4d0cf28a6..29a139672 100644
+--- a/lib/pinchflat/lifecycle/notifications/source_notifications.ex
++++ b/lib/pinchflat/lifecycle/notifications/source_notifications.ex
+@@ -5,8 +5,9 @@ defmodule Pinchflat.Lifecycle.Notifications.SourceNotifications do
+ 
+   require Logger
+ 
++  use Pinchflat.Media.MediaQuery
++
+   alias Pinchflat.Repo
+-  alias Pinchflat.Media.MediaQuery
+ 
+   @doc """
+   Wraps a function that may change the number of pending  or downloaded
+diff --git a/lib/pinchflat/media/media.ex b/lib/pinchflat/media/media.ex
+index 9178a67e1..c5e9a381f 100644
+--- a/lib/pinchflat/media/media.ex
++++ b/lib/pinchflat/media/media.ex
+@@ -4,12 +4,12 @@ defmodule Pinchflat.Media do
+   """
+ 
+   import Ecto.Query, warn: false
++  use Pinchflat.Media.MediaQuery
+ 
+   alias Pinchflat.Repo
+   alias Pinchflat.Tasks
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.Media.MediaItem
+-  alias Pinchflat.Media.MediaQuery
+   alias Pinchflat.Utils.FilesystemUtils
+   alias Pinchflat.Metadata.MediaMetadata
+ 
+diff --git a/lib/pinchflat/media/media_item.ex b/lib/pinchflat/media/media_item.ex
+index f0ed06369..7018e39b7 100644
+--- a/lib/pinchflat/media/media_item.ex
++++ b/lib/pinchflat/media/media_item.ex
+@@ -4,6 +4,8 @@ defmodule Pinchflat.Media.MediaItem do
+   """
+ 
+   use Ecto.Schema
++  use Pinchflat.Media.MediaQuery
++
+   import Ecto.Changeset
+   import Pinchflat.Utils.ChangesetUtils
+ 
+@@ -12,7 +14,6 @@ defmodule Pinchflat.Media.MediaItem do
+   alias Pinchflat.Sources
+   alias Pinchflat.Tasks.Task
+   alias Pinchflat.Sources.Source
+-  alias Pinchflat.Media.MediaQuery
+   alias Pinchflat.Metadata.MediaMetadata
+   alias Pinchflat.Media.MediaItemsSearchIndex
+ 
+diff --git a/lib/pinchflat/media/media_query.ex b/lib/pinchflat/media/media_query.ex
+index 3fe57d474..0ae4777bb 100644
+--- a/lib/pinchflat/media/media_query.ex
++++ b/lib/pinchflat/media/media_query.ex
+@@ -12,6 +12,17 @@ defmodule Pinchflat.Media.MediaQuery do
+ 
+   alias Pinchflat.Media.MediaItem
+ 
++  # This allows the module to be aliased and query methods to be used
++  # all in one go
++  # usage: use Pinchflat.Media.MediaQuery
++  defmacro __using__(_opts) do
++    quote do
++      import Ecto.Query, warn: false
++
++      alias unquote(__MODULE__)
++    end
++  end
++
+   # Prefixes:
+   # - for_* - belonging to a certain record
+   # - join_* - for joining on a certain record
+diff --git a/lib/pinchflat/podcasts/podcast_helpers.ex b/lib/pinchflat/podcasts/podcast_helpers.ex
+index 33530708b..58abbe714 100644
+--- a/lib/pinchflat/podcasts/podcast_helpers.ex
++++ b/lib/pinchflat/podcasts/podcast_helpers.ex
+@@ -4,8 +4,9 @@ defmodule Pinchflat.Podcasts.PodcastHelpers do
+   or its media items
+   """
+ 
++  use Pinchflat.Media.MediaQuery
++
+   alias Pinchflat.Repo
+-  alias Pinchflat.Media.MediaQuery
+   alias Pinchflat.Metadata.MediaMetadata
+   alias Pinchflat.Metadata.SourceMetadata
+ 
+diff --git a/lib/pinchflat/sources/sources.ex b/lib/pinchflat/sources/sources.ex
+index ab6fc2e1f..9fd66377e 100644
+--- a/lib/pinchflat/sources/sources.ex
++++ b/lib/pinchflat/sources/sources.ex
+@@ -4,12 +4,12 @@ defmodule Pinchflat.Sources do
+   """
+ 
+   import Ecto.Query, warn: false
+-  alias Pinchflat.Repo
++  use Pinchflat.Media.MediaQuery
+ 
++  alias Pinchflat.Repo
+   alias Pinchflat.Media
+   alias Pinchflat.Tasks
+   alias Pinchflat.Sources.Source
+-  alias Pinchflat.Media.MediaQuery
+   alias Pinchflat.Profiles.MediaProfile
+   alias Pinchflat.YtDlp.MediaCollection
+   alias Pinchflat.Metadata.SourceMetadata
+diff --git a/lib/pinchflat_web/components/custom_components/table_components.ex b/lib/pinchflat_web/components/custom_components/table_components.ex
+index 532fba1f0..fa283d38d 100644
+--- a/lib/pinchflat_web/components/custom_components/table_components.ex
++++ b/lib/pinchflat_web/components/custom_components/table_components.ex
+@@ -27,21 +27,20 @@ defmodule PinchflatWeb.CustomComponents.TableComponents do
+ 
+   def table(assigns) do
+     ~H"""
+-    <table class={["w-full table-auto", @table_class]}>
++    <table class={["w-full table-auto bg-boxdark", @table_class]}>
+       <thead>
+-        <tr class="bg-gray-2 text-left dark:bg-meta-4">
+-          <th :for={col <- @col} class="px-4 py-4 font-medium text-black dark:text-white xl:pl-11">
++        <tr class="text-left bg-meta-4">
++          <th :for={col <- @col} class="px-4 py-4 font-medium text-white xl:pl-11">
+             <%= col[:label] %>
+           </th>
+         </tr>
+       </thead>
+       <tbody>
+-        <tr :for={{row, i} <- Enum.with_index(@rows)}>
++        <tr :for={row <- @rows} class="border-b border-boxdark hover:border-strokedark">
+           <td
+             :for={col <- @col}
+             class={[
+-              "px-4 py-5 pl-9 dark:border-strokedark xl:pl-11",
+-              i + 1 > length(@rows) && "border-b border-[#eee] dark:border-π",
++              "px-4 py-5 pl-9 xl:pl-11",
+               col[:class]
+             ]}
+           >
+diff --git a/lib/pinchflat_web/controllers/pages/page_controller.ex b/lib/pinchflat_web/controllers/pages/page_controller.ex
+index b66a96bc9..a6e36dad3 100644
+--- a/lib/pinchflat_web/controllers/pages/page_controller.ex
++++ b/lib/pinchflat_web/controllers/pages/page_controller.ex
+@@ -1,9 +1,9 @@
+ defmodule PinchflatWeb.Pages.PageController do
+   use PinchflatWeb, :controller
++  use Pinchflat.Media.MediaQuery
+ 
+   alias Pinchflat.Repo
+   alias Pinchflat.Sources.Source
+-  alias Pinchflat.Media.MediaQuery
+   alias Pinchflat.Profiles.MediaProfile
+ 
+   def home(conn, params) do
+diff --git a/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex b/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex
+index 10a81189f..34147efc7 100644
+--- a/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex
++++ b/lib/pinchflat_web/controllers/pages/page_html/history_table_live.ex
+@@ -1,9 +1,8 @@
+ defmodule Pinchflat.Pages.HistoryTableLive do
+   use PinchflatWeb, :live_view
+-  import Ecto.Query, warn: false
++  use Pinchflat.Media.MediaQuery
+ 
+   alias Pinchflat.Repo
+-  alias Pinchflat.Media.MediaQuery
+   alias Pinchflat.Utils.NumberUtils
+   alias PinchflatWeb.CustomComponents.TextComponents
+ 
+diff --git a/lib/pinchflat_web/controllers/podcasts/podcast_controller.ex b/lib/pinchflat_web/controllers/podcasts/podcast_controller.ex
+index 65e0ca7af..b310501f2 100644
+--- a/lib/pinchflat_web/controllers/podcasts/podcast_controller.ex
++++ b/lib/pinchflat_web/controllers/podcasts/podcast_controller.ex
+@@ -1,10 +1,10 @@
+ defmodule PinchflatWeb.Podcasts.PodcastController do
+   use PinchflatWeb, :controller
++  use Pinchflat.Media.MediaQuery
+ 
+   alias Pinchflat.Repo
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.Media.MediaItem
+-  alias Pinchflat.Media.MediaQuery
+   alias Pinchflat.Podcasts.RssFeedBuilder
+   alias Pinchflat.Podcasts.PodcastHelpers
+ 
+diff --git a/lib/pinchflat_web/controllers/sources/source_controller.ex b/lib/pinchflat_web/controllers/sources/source_controller.ex
+index 8de11f2cd..3b9c5b2ab 100644
+--- a/lib/pinchflat_web/controllers/sources/source_controller.ex
++++ b/lib/pinchflat_web/controllers/sources/source_controller.ex
+@@ -104,7 +104,7 @@ defmodule PinchflatWeb.Sources.SourceController do
+     |> redirect(to: ~p"/sources")
+   end
+ 
+-  def force_download(conn, %{"source_id" => id}) do
++  def force_download_pending(conn, %{"source_id" => id}) do
+     wrap_forced_action(
+       conn,
+       id,
+@@ -113,6 +113,15 @@ defmodule PinchflatWeb.Sources.SourceController do
+     )
+   end
+ 
++  def force_redownload(conn, %{"source_id" => id}) do
++    wrap_forced_action(
++      conn,
++      id,
++      "Forcing re-download of downloaded media items.",
++      &DownloadingHelpers.kickoff_redownload_for_existing_media/1
++    )
++  end
++
+   def force_index(conn, %{"source_id" => id}) do
+     wrap_forced_action(
+       conn,
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex b/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex
+index 617ddb100..ab5b7c109 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/actions_dropdown.html.heex
+@@ -31,11 +31,20 @@
+   </:option>
+   <:option :if={@source.download_media}>
+     <.link
+-      href={~p"/sources/#{@source}/force_download"}
++      href={~p"/sources/#{@source}/force_download_pending"}
+       method="post"
+       data-confirm="Are you sure you want to force a download of all *pending* media items? This isn't normally needed."
+     >
+-      Force Download
++      Download Pending
++    </.link>
++  </:option>
++  <:option :if={@source.download_media}>
++    <.link
++      href={~p"/sources/#{@source}/force_redownload"}
++      method="post"
++      data-confirm="Are you sure you want to re-download all currently downloaded media items? This isn't normally needed and won't change anything if the files already exist."
++    >
++      Redownload Existing
+     </.link>
+   </:option>
+   <:option>
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex b/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex
+index b6bfd762c..0b9868740 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex
++++ b/lib/pinchflat_web/controllers/sources/source_html/media_item_table_live.ex
+@@ -1,10 +1,9 @@
+ defmodule Pinchflat.Sources.MediaItemTableLive do
+   use PinchflatWeb, :live_view
+-  import Ecto.Query, warn: false
++  use Pinchflat.Media.MediaQuery
+ 
+   alias Pinchflat.Repo
+   alias Pinchflat.Sources
+-  alias Pinchflat.Media.MediaQuery
+   alias Pinchflat.Utils.NumberUtils
+ 
+   @limit 10
+diff --git a/lib/pinchflat_web/router.ex b/lib/pinchflat_web/router.ex
+index 2829315ea..e3dd14e4e 100644
+--- a/lib/pinchflat_web/router.ex
++++ b/lib/pinchflat_web/router.ex
+@@ -33,7 +33,8 @@ defmodule PinchflatWeb.Router do
+     resources "/settings", Settings.SettingController, only: [:show, :update], singleton: true
+ 
+     resources "/sources", Sources.SourceController do
+-      post "/force_download", Sources.SourceController, :force_download
++      post "/force_download_pending", Sources.SourceController, :force_download_pending
++      post "/force_redownload", Sources.SourceController, :force_redownload
+       post "/force_index", Sources.SourceController, :force_index
+       post "/force_metadata_refresh", Sources.SourceController, :force_metadata_refresh
+ 
+diff --git a/test/pinchflat/downloading/download_option_builder_test.exs b/test/pinchflat/downloading/download_option_builder_test.exs
+index c0b941a69..e356ec8f1 100644
+--- a/test/pinchflat/downloading/download_option_builder_test.exs
++++ b/test/pinchflat/downloading/download_option_builder_test.exs
+@@ -65,6 +65,13 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilderTest do
+       assert :force_overwrites in res
+       assert {:parse_metadata, "%(upload_date>%Y-%m-%d)s:(?P<meta_date>.+)"} in res
+     end
++
++    test "includes override options if specified", %{media_item: media_item} do
++      assert {:ok, res} = DownloadOptionBuilder.build(media_item, overwrite_behaviour: :no_force_overwrites)
++
++      refute :force_overwrites in res
++      assert :no_force_overwrites in res
++    end
+   end
+ 
+   describe "build/1 when testing subtitle options" do
+diff --git a/test/pinchflat/downloading/downloading_helpers_test.exs b/test/pinchflat/downloading/downloading_helpers_test.exs
+index 5148e50b8..23c493d63 100644
+--- a/test/pinchflat/downloading/downloading_helpers_test.exs
++++ b/test/pinchflat/downloading/downloading_helpers_test.exs
+@@ -110,4 +110,32 @@ defmodule Pinchflat.Downloading.DownloadingHelpersTest do
+       refute_enqueued(worker: MediaDownloadWorker)
+     end
+   end
++
++  describe "kickoff_redownload_for_existing_media/1" do
++    test "enqueues a download job for each downloaded media item" do
++      source = source_fixture()
++      media_item = media_item_fixture(source_id: source.id, media_downloaded_at: now())
++
++      assert [{:ok, _}] = DownloadingHelpers.kickoff_redownload_for_existing_media(source)
++
++      assert_enqueued(worker: MediaDownloadWorker, args: %{"id" => media_item.id})
++    end
++
++    test "doesn't enqueue jobs for media that should be ignored" do
++      source = source_fixture()
++      other_source = source_fixture()
++      _not_downloaded = media_item_fixture(source_id: source.id, media_downloaded_at: nil)
++      _other_source = media_item_fixture(source_id: other_source.id, media_downloaded_at: now())
++
++      _download_prevented =
++        media_item_fixture(source_id: source.id, media_downloaded_at: now(), prevent_download: true)
++
++      _culled =
++        media_item_fixture(source_id: source.id, media_downloaded_at: now(), culled_at: now())
++
++      assert [] = DownloadingHelpers.kickoff_redownload_for_existing_media(source)
++
++      refute_enqueued(worker: MediaDownloadWorker)
++    end
++  end
+ end
+diff --git a/test/pinchflat/downloading/media_download_worker_test.exs b/test/pinchflat/downloading/media_download_worker_test.exs
+index ea055ce07..e82b0b105 100644
+--- a/test/pinchflat/downloading/media_download_worker_test.exs
++++ b/test/pinchflat/downloading/media_download_worker_test.exs
+@@ -108,7 +108,7 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+       end)
+ 
+       Oban.Testing.with_testing_mode(:inline, fn ->
+-        {:ok, job} = Oban.insert(MediaDownloadWorker.new(%{id: media_item.id, redownload?: true}))
++        {:ok, job} = Oban.insert(MediaDownloadWorker.new(%{id: media_item.id, quality_upgrade?: true}))
+ 
+         assert job.state == "completed"
+       end)
+@@ -136,15 +136,6 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+       perform_job(MediaDownloadWorker, %{id: media_item.id})
+     end
+ 
+-    test "downloads anyway if forced", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl -> :ok end)
+-
+-      Sources.update_source(media_item.source, %{download_media: false})
+-      Media.update_media_item(media_item, %{prevent_download: true})
+-
+-      perform_job(MediaDownloadWorker, %{id: media_item.id, force: true})
+-    end
+-
+     test "it saves the file's size to the database", %{media_item: media_item} do
+       expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl ->
+         metadata = render_parsed_metadata(:media_metadata)
+@@ -159,18 +150,7 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+       assert media_item.media_size_bytes > 0
+     end
+ 
+-    test "saves redownloaded_at if this is for a redownload", %{media_item: media_item} do
+-      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl ->
+-        {:ok, render_metadata(:media_metadata)}
+-      end)
+-
+-      perform_job(MediaDownloadWorker, %{id: media_item.id, redownload?: true})
+-      media_item = Repo.reload(media_item)
+-
+-      assert media_item.media_redownloaded_at != nil
+-    end
+-
+-    test "doesn't save redownloaded_at if this is not for a redownload", %{media_item: media_item} do
++    test "does not set redownloaded_at by default", %{media_item: media_item} do
+       expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl ->
+         {:ok, render_metadata(:media_metadata)}
+       end)
+@@ -198,5 +178,62 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+     test "does not blow up if the record doesn't exist" do
+       assert :ok = perform_job(MediaDownloadWorker, %{id: 0})
+     end
++
++    test "sets the no_force_overwrites runner option", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, fn _url, opts, _ot, _addl ->
++        assert :no_force_overwrites in opts
++        refute :force_overwrites in opts
++
++        {:ok, render_metadata(:media_metadata)}
++      end)
++
++      perform_job(MediaDownloadWorker, %{id: media_item.id})
++    end
++  end
++
++  describe "perform/1 when testing forced downloads" do
++    test "ignores 'prevent_download' if forced", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl -> :ok end)
++
++      Sources.update_source(media_item.source, %{download_media: false})
++      Media.update_media_item(media_item, %{prevent_download: true})
++
++      perform_job(MediaDownloadWorker, %{id: media_item.id, force: true})
++    end
++
++    test "sets force_overwrites runner option", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, fn _url, opts, _ot, _addl ->
++        assert :force_overwrites in opts
++        refute :no_force_overwrites in opts
++
++        {:ok, render_metadata(:media_metadata)}
++      end)
++
++      perform_job(MediaDownloadWorker, %{id: media_item.id, force: true})
++    end
++  end
++
++  describe "perform/1 when testing re-downloads" do
++    test "sets redownloaded_at on the media_item", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl ->
++        {:ok, render_metadata(:media_metadata)}
++      end)
++
++      perform_job(MediaDownloadWorker, %{id: media_item.id, quality_upgrade?: true})
++      media_item = Repo.reload(media_item)
++
++      assert media_item.media_redownloaded_at != nil
++    end
++
++    test "sets force_overwrites runner option", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, fn _url, opts, _ot, _addl ->
++        assert :force_overwrites in opts
++        refute :no_force_overwrites in opts
++
++        {:ok, render_metadata(:media_metadata)}
++      end)
++
++      perform_job(MediaDownloadWorker, %{id: media_item.id, force: true})
++    end
+   end
+ end
+diff --git a/test/pinchflat/downloading/media_downloader_test.exs b/test/pinchflat/downloading/media_downloader_test.exs
+index 387a335be..463b7b85b 100644
+--- a/test/pinchflat/downloading/media_downloader_test.exs
++++ b/test/pinchflat/downloading/media_downloader_test.exs
+@@ -65,6 +65,21 @@ defmodule Pinchflat.Downloading.MediaDownloaderTest do
+     end
+   end
+ 
++  describe "download_for_media_item/3 when testing override options" do
++    test "includes override opts if specified", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, fn _url, opts, _ot, _addl ->
++        refute :force_overwrites in opts
++        assert :no_force_overwrites in opts
++
++        {:ok, render_metadata(:media_metadata)}
++      end)
++
++      override_opts = [overwrite_behaviour: :no_force_overwrites]
++
++      assert {:ok, _} = MediaDownloader.download_for_media_item(media_item, override_opts)
++    end
++  end
++
+   describe "download_for_media_item/3 when testing retries" do
+     test "returns a recovered tuple on recoverable errors", %{media_item: media_item} do
+       message = "Unable to communicate with SponsorBlock"
+diff --git a/test/pinchflat/downloading/media_redownload_worker_test.exs b/test/pinchflat/downloading/media_quality_upgrade_worker_test.exs
+similarity index 81%
+rename from test/pinchflat/downloading/media_redownload_worker_test.exs
+rename to test/pinchflat/downloading/media_quality_upgrade_worker_test.exs
+index 70d9cc0a1..3b8a35932 100644
+--- a/test/pinchflat/downloading/media_redownload_worker_test.exs
++++ b/test/pinchflat/downloading/media_quality_upgrade_worker_test.exs
+@@ -1,4 +1,4 @@
+-defmodule Pinchflat.Downloading.MediaRedownloadWorkerTest do
++defmodule Pinchflat.Downloading.MediaQualityUpgradeWorkerTest do
+   use Pinchflat.DataCase
+ 
+   import Pinchflat.MediaFixtures
+@@ -6,7 +6,7 @@ defmodule Pinchflat.Downloading.MediaRedownloadWorkerTest do
+   import Pinchflat.ProfilesFixtures
+ 
+   alias Pinchflat.Downloading.MediaDownloadWorker
+-  alias Pinchflat.Downloading.MediaRedownloadWorker
++  alias Pinchflat.Downloading.MediaQualityUpgradeWorker
+ 
+   describe "perform/1" do
+     test "kicks off a task for redownloadable media items" do
+@@ -20,9 +20,9 @@ defmodule Pinchflat.Downloading.MediaRedownloadWorkerTest do
+           media_downloaded_at: now_minus(5, :days)
+         })
+ 
+-      perform_job(MediaRedownloadWorker, %{})
++      perform_job(MediaQualityUpgradeWorker, %{})
+ 
+-      assert [_] = all_enqueued(worker: MediaDownloadWorker, args: %{id: media_item.id, redownload?: true})
++      assert [_] = all_enqueued(worker: MediaDownloadWorker, args: %{id: media_item.id, quality_upgrade?: true})
+     end
+ 
+     test "does not kickoff a task for non-redownloadable media items" do
+@@ -36,7 +36,7 @@ defmodule Pinchflat.Downloading.MediaRedownloadWorkerTest do
+           media_downloaded_at: now_minus(1, :day)
+         })
+ 
+-      perform_job(MediaRedownloadWorker, %{})
++      perform_job(MediaQualityUpgradeWorker, %{})
+ 
+       assert [] = all_enqueued(worker: MediaDownloadWorker)
+     end
+diff --git a/test/pinchflat_web/controllers/source_controller_test.exs b/test/pinchflat_web/controllers/source_controller_test.exs
+index 88cc772cd..b9d688238 100644
+--- a/test/pinchflat_web/controllers/source_controller_test.exs
++++ b/test/pinchflat_web/controllers/source_controller_test.exs
+@@ -166,20 +166,38 @@ defmodule PinchflatWeb.SourceControllerTest do
+     end
+   end
+ 
+-  describe "force_download" do
++  describe "force_download_pending" do
+     test "enqueues pending download tasks", %{conn: conn} do
+       source = source_fixture()
+       _media_item = media_item_fixture(%{source_id: source.id, media_filepath: nil})
+ 
+       assert [] = all_enqueued(worker: MediaDownloadWorker)
+-      post(conn, ~p"/sources/#{source.id}/force_download")
++      post(conn, ~p"/sources/#{source.id}/force_download_pending")
+       assert [_] = all_enqueued(worker: MediaDownloadWorker)
+     end
+ 
+     test "redirects to the source page", %{conn: conn} do
+       source = source_fixture()
+ 
+-      conn = post(conn, ~p"/sources/#{source.id}/force_download")
++      conn = post(conn, ~p"/sources/#{source.id}/force_download_pending")
++      assert redirected_to(conn) == ~p"/sources/#{source.id}"
++    end
++  end
++
++  describe "force_redownload" do
++    test "enqueues re-download tasks", %{conn: conn} do
++      source = source_fixture()
++      _media_item = media_item_fixture(source_id: source.id, media_downloaded_at: now())
++
++      assert [] = all_enqueued(worker: MediaDownloadWorker)
++      post(conn, ~p"/sources/#{source.id}/force_redownload")
++      assert [_] = all_enqueued(worker: MediaDownloadWorker)
++    end
++
++    test "redirects to the source page", %{conn: conn} do
++      source = source_fixture()
++
++      conn = post(conn, ~p"/sources/#{source.id}/force_redownload")
+       assert redirected_to(conn) == ~p"/sources/#{source.id}"
+     end
+   end

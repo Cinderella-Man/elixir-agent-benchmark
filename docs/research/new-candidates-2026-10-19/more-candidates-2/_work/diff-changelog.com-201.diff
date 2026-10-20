@@ -1,0 +1,467 @@
+diff --git a/lib/changelog/data/factory.ex b/lib/changelog/data/factory.ex
+index b2fffcb950..6457ff2362 100644
+--- a/lib/changelog/data/factory.ex
++++ b/lib/changelog/data/factory.ex
+@@ -22,6 +22,7 @@ defmodule Changelog.Factory do
+     %Changelog.Episode{
+       title: sequence(:title, &"Best Show Evar! #{&1}"),
+       slug: sequence(:slug, &"best-show-evar-#{&1}"),
++      bytes: 42,
+       podcast: build(:podcast)
+     }
+   end
+@@ -125,11 +126,19 @@ defmodule Changelog.Factory do
+     %{published_news_item_factory() | type: :audio, headline: episode.title, url: "https://changelog.com/episodes/#{episode.slug}", object_id: object_id}
+   end
+ 
++  def episode_news_item_with_story(episode, story) do
++    %{episode_news_item(episode) | story: story}
++  end
++
+   def post_news_item(post) do
+     object_id = "posts:#{post.slug}"
+     %{published_news_item_factory() | headline: post.title, url: "https://changelog.com/posts/#{post.slug}", object_id: object_id}
+   end
+ 
++  def post_news_item_with_story(post, story) do
++    %{post_news_item(post) | story: story}
++  end
++
+   def news_item_topic_factory do
+     %Changelog.NewsItemTopic{
+       news_item: build(:news_item),
+diff --git a/lib/changelog/data/news/news_item.ex b/lib/changelog/data/news/news_item.ex
+index 196c751787..5f9a907af2 100644
+--- a/lib/changelog/data/news/news_item.ex
++++ b/lib/changelog/data/news/news_item.ex
+@@ -149,4 +149,14 @@ defmodule Changelog.NewsItem do
+     |> change(%{impression_count: item.impression_count + 1})
+     |> Repo.update!
+   end
++
++  def latest_news_items do
++    __MODULE__
++    |> published
++    |> newest_first
++    |> preload_all
++    |> limit(50)
++    |> Repo.all
++    |> Enum.map(&load_object/1)
++  end
+ end
+diff --git a/lib/changelog_web/controllers/feed_controller.ex b/lib/changelog_web/controllers/feed_controller.ex
+index 7817b94f5a..11b49839ad 100644
+--- a/lib/changelog_web/controllers/feed_controller.ex
++++ b/lib/changelog_web/controllers/feed_controller.ex
+@@ -10,7 +10,7 @@ defmodule ChangelogWeb.FeedController do
+     conn
+     |> put_layout(false)
+     |> put_resp_content_type("application/xml")
+-    |> render("news.xml", items: get_news_items())
++    |> render("news.xml", items: NewsItem.latest_news_items)
+     |> cache_response
+   end
+ 
+@@ -18,7 +18,7 @@ defmodule ChangelogWeb.FeedController do
+     conn
+     |> put_layout(false)
+     |> put_resp_content_type("application/xml")
+-    |> render("news_titles.xml", items: get_news_items())
++    |> render("news_titles.xml", items: NewsItem.latest_news_items)
+     |> cache_response
+   end
+ 
+@@ -90,14 +90,4 @@ defmodule ChangelogWeb.FeedController do
+     |> render("sitemap.xml", news_items: news_items, news_sources: news_sources, episodes: episodes, podcasts: podcasts, posts: posts, topics: topics)
+     |> cache_response
+   end
+-
+-  defp get_news_items do
+-    NewsItem
+-    |> NewsItem.published
+-    |> NewsItem.newest_first
+-    |> NewsItem.preload_all
+-    |> NewsItem.limit(50)
+-    |> Repo.all
+-    |> Enum.map(&NewsItem.load_object/1)
+-  end
+ end
+diff --git a/lib/changelog_web/controllers/json_feed_controller.ex b/lib/changelog_web/controllers/json_feed_controller.ex
+new file mode 100644
+index 0000000000..1f7d9d6f01
+--- /dev/null
++++ b/lib/changelog_web/controllers/json_feed_controller.ex
+@@ -0,0 +1,16 @@
++defmodule ChangelogWeb.JsonFeedController do
++  use ChangelogWeb, :controller
++  use PlugEtsCache.Phoenix
++
++  alias Changelog.NewsItem
++
++  require Logger
++
++  def news(conn, _params) do
++    conn
++    |> put_layout(false)
++    |> put_resp_content_type("application/json")
++    |> render("news.json", items: NewsItem.latest_news_items)
++    |> cache_response
++  end
++end
+diff --git a/lib/changelog_web/router.ex b/lib/changelog_web/router.ex
+index 95cc7bd586..c2be8a49c3 100644
+--- a/lib/changelog_web/router.ex
++++ b/lib/changelog_web/router.ex
+@@ -24,6 +24,11 @@ defmodule ChangelogWeb.Router do
+     plug PlugEtsCache.Plug
+   end
+ 
++  pipeline :json_feed do
++    plug :accepts, ["json"]
++    plug PlugEtsCache.Plug
++  end
++
+   pipeline :api do
+     plug :accepts, ["json"]
+     plug PlugEtsCache.Plug
+@@ -109,6 +114,12 @@ defmodule ChangelogWeb.Router do
+     get "/:slug/feed", FeedController, :podcast
+   end
+ 
++  scope "/", ChangelogWeb do
++    pipe_through [:json_feed]
++
++    get "/feed.json", JsonFeedController, :news
++  end
++
+   scope "/", ChangelogWeb do
+     pipe_through [:browser, :public]
+ 
+diff --git a/lib/changelog_web/views/json_feed_view.ex b/lib/changelog_web/views/json_feed_view.ex
+new file mode 100644
+index 0000000000..f4d9a38c72
+--- /dev/null
++++ b/lib/changelog_web/views/json_feed_view.ex
+@@ -0,0 +1,60 @@
++defmodule ChangelogWeb.JsonFeedView do
++  use ChangelogWeb, :public_view
++
++  alias Changelog.{Episode, Post}
++  alias ChangelogWeb.{EpisodeView, NewsItemView,
++                      TimeView, Helpers.SharedHelpers}
++
++  def render("news.json", %{conn: conn, items: items}) do
++    %{
++      "version": "https://jsonfeed.org/version/1",
++      "title": "Changelog",
++      "home_page_url": root_url(conn, :index),
++      "description": "News and podcasts for developers",
++      "items": render_many(items, __MODULE__, "news_item.json", %{conn: conn})
++    }
++  end
++
++  def render("news_item.json", %{conn: conn, json_feed: item = %{object: nil}}) do
++    %{
++      "title": item.headline |> html_escape |> safe_to_string,
++      "url": news_item_url(conn, :show, NewsItemView.slug(item)),
++      "date_published": TimeView.rfc3339(item.published_at),
++      "author": %{
++        "name": item.logger.name
++      },
++      "content_html": SharedHelpers.md_to_html(item.story),
++      "content_text": SharedHelpers.md_to_text(item.story),
++    }
++  end
++
++  def render("news_item.json", %{conn: conn, json_feed: item = %{object: episode = %Episode{}}}) do
++    %{
++      "title": episode.podcast.name <> " " <> EpisodeView.numbered_title(episode, "") |> html_escape |> safe_to_string,
++      "url": episode_url(conn, :show, episode.podcast.slug, episode.slug),
++      "date_published": TimeView.rfc3339(episode.published_at),
++      "content_html": SharedHelpers.md_to_html(item.story),
++      "content_text": SharedHelpers.md_to_text(item.story),
++      "attachments": [
++        %{
++          "url": EpisodeView.audio_url(episode),
++          "mime_type": "audio/mpeg",
++          "length": episode.bytes
++        }
++      ]
++    }
++  end
++
++  def render("news_item.json", %{conn: conn, json_feed: item = %{object: post = %Post{}}}) do
++    %{
++      "title": post.title |> html_escape |> safe_to_string,
++      "author": %{
++        "name": post.author.name
++      },
++      "url": post_url(conn, :show, post.slug),
++      "date_published": TimeView.rfc3339(post.published_at),
++      "content_html": SharedHelpers.md_to_html(item.story),
++      "content_text": SharedHelpers.md_to_text(item.story)
++    }
++  end
++end
+diff --git a/lib/changelog_web/views/time_view.ex b/lib/changelog_web/views/time_view.ex
+index 1c3285958f..a3b5a40905 100644
+--- a/lib/changelog_web/views/time_view.ex
++++ b/lib/changelog_web/views/time_view.ex
+@@ -39,13 +39,15 @@ defmodule ChangelogWeb.TimeView do
+   end
+ 
+   def hours_ago(hours) do
+-    Timex.subtract(Timex.now, Duration.from_hours(hours))
++    Timex.subtract(Timex.now, Duration.from_hours(hours)) |> without_microseconds
+   end
+ 
+   def hours_from_now(hours) do
+-    Timex.add(Timex.now, Duration.from_hours(hours))
++    Timex.add(Timex.now, Duration.from_hours(hours)) |> without_microseconds
+   end
+ 
++  defp without_microseconds(datetime), do: %{datetime | microsecond: {0,0}}
++
+   def pretty_date(ts) when is_nil(ts), do: ""
+   def pretty_date(ts) when is_binary(ts) do
+     {:ok, result} = Timex.parse(ts, "{YYYY}-{0M}-{0D} {h24}:{m}:{s}")
+@@ -62,10 +64,13 @@ defmodule ChangelogWeb.TimeView do
+   end
+ 
+   def rss(ts) when is_nil(ts), do: ""
+-  def rss(ts) do
+-    {:ok, result} =
+-      ts
+-      |> Timex.format("{RFC1123}")
++  def rss(ts), do: ts |> format_to("{RFC1123}")
++
++  def rfc3339(ts) when is_nil(ts), do: ""
++  def rfc3339(ts), do: ts |> format_to("{RFC3339}")
++
++  defp format_to(ts, format) do
++    {:ok, result} = Timex.format(ts, format)
+     result
+   end
+ 
+diff --git a/test/changelog_web/controllers/feed_controller_test.exs b/test/changelog_web/controllers/feed_controller_test.exs
+index 3a036bb878..28fc5a01dd 100644
+--- a/test/changelog_web/controllers/feed_controller_test.exs
++++ b/test/changelog_web/controllers/feed_controller_test.exs
+@@ -11,7 +11,9 @@ defmodule ChangelogWeb.FeedControllerTest do
+     news_source = insert(:news_source)
+     news_item = insert(:published_news_item)
+     insert(:news_item_topic, news_item: news_item, topic: topic)
++
+     conn = get(conn, feed_path(conn, :sitemap))
++
+     assert conn.status == 200
+     assert conn.resp_body =~ post.slug
+     assert conn.resp_body =~ podcast.slug
+@@ -26,7 +28,9 @@ defmodule ChangelogWeb.FeedControllerTest do
+     post |> post_news_item() |> insert
+     episode = insert(:published_episode, summary: "zomg")
+     episode |> episode_news_item() |> insert
++
+     conn = get(conn, feed_path(conn, :news))
++
+     assert conn.status == 200
+     assert conn.resp_body =~ post.title
+     assert conn.resp_body =~ episode.title
+@@ -39,7 +43,9 @@ defmodule ChangelogWeb.FeedControllerTest do
+     post |> post_news_item() |> insert
+     episode = insert(:published_episode, summary: "zomg")
+     episode |> episode_news_item() |> insert
++
+     conn = get(conn, feed_path(conn, :news_titles))
++
+     assert conn.status == 200
+     assert conn.resp_body =~ post.title
+     assert conn.resp_body =~ episode.title
+@@ -50,7 +56,9 @@ defmodule ChangelogWeb.FeedControllerTest do
+   test "the podcast feed", %{conn: conn} do
+     p = insert(:podcast)
+     e = insert(:published_episode, podcast: p)
++
+     conn = get(conn, feed_path(conn, :podcast, p.slug))
++
+     assert conn.status == 200
+     assert conn.resp_body =~ e.title
+   end
+@@ -62,6 +70,7 @@ defmodule ChangelogWeb.FeedControllerTest do
+     e2 = insert(:published_episode, podcast: p2)
+ 
+     conn = get(conn, feed_path(conn, :podcast, "master"))
++
+     assert conn.status == 200
+     assert conn.resp_body =~ e1.title
+     assert conn.resp_body =~ e2.title
+@@ -73,6 +82,7 @@ defmodule ChangelogWeb.FeedControllerTest do
+     p3 = insert(:published_post)
+ 
+     conn = get(conn, feed_path(conn, :posts))
++
+     assert conn.status == 200
+     assert conn.resp_body =~ p1.title
+     refute conn.resp_body =~ p2.title
+diff --git a/test/changelog_web/controllers/json_feed_controller_test.exs b/test/changelog_web/controllers/json_feed_controller_test.exs
+new file mode 100644
+index 0000000000..6a3050c21f
+--- /dev/null
++++ b/test/changelog_web/controllers/json_feed_controller_test.exs
+@@ -0,0 +1,25 @@
++defmodule ChangelogWeb.JsonFeedControllerTest do
++  use ChangelogWeb.ConnCase
++
++  alias ChangelogWeb.Helpers.SharedHelpers
++
++  test "the news feed", %{conn: conn} do
++    post = insert(:published_post, body: "zomg")
++    post_news_item = post |> post_news_item_with_story("**a story**") |> insert
++    episode = insert(:published_episode, summary: "zomg")
++    episode_news_item = episode |> episode_news_item_with_story("**a story**") |> insert
++    news_item = insert(:published_news_item, story: "**a story**")
++
++    conn = conn
++    |> put_req_header("accept", "application/json")
++    |> get(json_feed_path(conn, :news))
++
++    assert conn.status == 200
++    assert conn.resp_body =~ post.title
++    assert conn.resp_body =~ episode.title
++    assert conn.resp_body =~ news_item.headline
++    assert conn.resp_body =~ SharedHelpers.md_to_text(post_news_item.story)
++    assert conn.resp_body =~ SharedHelpers.md_to_text(episode_news_item.story)
++    assert conn.resp_body =~ SharedHelpers.md_to_text(news_item.story)
++  end
++end
+diff --git a/test/changelog_web/views/json_feed_view_test.exs b/test/changelog_web/views/json_feed_view_test.exs
+new file mode 100644
+index 0000000000..1f7ec552b9
+--- /dev/null
++++ b/test/changelog_web/views/json_feed_view_test.exs
+@@ -0,0 +1,92 @@
++defmodule ChangelogWeb.JsonFeedViewTest do
++  use ChangelogWeb.ConnCase, async: true
++
++  alias Changelog.NewsItem
++  alias ChangelogWeb.{NewsItemView, TimeView, EpisodeView, Helpers.SharedHelpers}
++
++  import ChangelogWeb.JsonFeedView
++
++  setup_all do
++    {:ok, endpoint: ChangelogWeb.Endpoint}
++  end
++
++  describe "render" do
++    test "news.json is the header of the JSON feed", %{endpoint: endpoint} do
++      header = render("news.json", %{conn: endpoint, items: []})
++
++      assert header == %{
++        :version => "https://jsonfeed.org/version/1",
++        :title => "Changelog",
++        :home_page_url => "http://localhost:4001/",
++        :description => "News and podcasts for developers",
++        :items => []
++      }
++    end
++
++    test "news_item.json map a NewsItem to a JSON feed item", %{endpoint: endpoint} do
++      news_item =
++        insert(:published_news_item, story: "**a story**")
++        |> NewsItem.load_object
++
++      json = render("news_item.json", %{conn: endpoint, json_feed: news_item})
++
++      assert json == %{
++        :title => news_item.headline,
++        :url => news_item_url(endpoint, :show, NewsItemView.slug(news_item)),
++        :date_published => TimeView.rfc3339(news_item.published_at),
++        :author => %{
++          :name => news_item.logger.name
++        },
++        :content_html => SharedHelpers.md_to_html(news_item.story),
++        :content_text => SharedHelpers.md_to_text(news_item.story),
++      }
++    end
++
++    test "news_item.json map a NewsItem with an Episode to a JSON feed item", %{endpoint: endpoint} do
++      episode = insert(:published_episode, summary: "zomg")
++
++      news_item = episode
++        |> episode_news_item_with_story("**a story**")
++        |> insert
++        |> NewsItem.load_object
++
++      json = render("news_item.json", %{conn: endpoint, json_feed: news_item})
++
++      assert json == %{
++        :title => "#{episode.podcast.name} #{episode.title}",
++        :url => episode_url(endpoint, :show, episode.podcast.slug, episode.slug),
++        :date_published => TimeView.rfc3339(episode.published_at),
++        :content_html => SharedHelpers.md_to_html(news_item.story),
++        :content_text => SharedHelpers.md_to_text(news_item.story),
++        :attachments => [
++          %{
++            :url => EpisodeView.audio_url(episode),
++            :mime_type => "audio/mpeg",
++            :length => episode.bytes
++          }
++        ]
++      }
++    end
++
++    test "news_item.json map a NewsItem with a Post to a JSON feed item", %{endpoint: endpoint} do
++      post = insert(:published_post, body: "zomg")
++
++      news_item = post
++        |> post_news_item_with_story("**a story**")
++        |> NewsItem.load_object
++
++      json = render("news_item.json", %{conn: endpoint, json_feed: news_item})
++
++      assert json == %{
++        :title => post.title,
++        :author => %{
++          :name => post.author.name
++        },
++        :url => post_url(endpoint, :show, post.slug),
++        :date_published => TimeView.rfc3339(post.published_at),
++        :content_html => SharedHelpers.md_to_html(news_item.story),
++        :content_text => SharedHelpers.md_to_text(news_item.story)
++      }
++    end
++  end
++end
+diff --git a/test/changelog_web/views/time_view_test.exs b/test/changelog_web/views/time_view_test.exs
+index 46b93eaf3a..c1e799511c 100644
+--- a/test/changelog_web/views/time_view_test.exs
++++ b/test/changelog_web/views/time_view_test.exs
+@@ -101,4 +101,28 @@ defmodule ChangelogWeb.TimeViewTest do
+       assert html == "<span class='time' data-style='fancy'>2017-07-19T00:29:57Z</span>"
+     end
+   end
++
++  describe "rfc3339" do
++    test "when passed nil" do
++      assert rfc3339(nil) == ""
++    end
++
++    test "when passed a valid date time" do
++      datetime = Timex.to_datetime({{2018, 2, 26}, {19, 40, 00}}, "America/Chicago")
++
++      assert rfc3339(datetime) == "2018-02-26T19:40:00-06:00"
++    end
++  end
++
++  describe "rss" do
++    test "when passed nil" do
++      assert rss(nil) == ""
++    end
++
++    test "when passed a valid date time" do
++      datetime = Timex.to_datetime({{2018, 2, 26}, {19, 40, 00}}, "America/Chicago")
++
++      assert rss(datetime) == "Mon, 26 Feb 2018 19:40:00 -0600"
++    end
++  end
+ end

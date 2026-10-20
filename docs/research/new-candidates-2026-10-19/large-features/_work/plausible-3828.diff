@@ -1,0 +1,1788 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 22cc647a6aff..578715c9ff1e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,7 @@
+ All notable changes to this project will be documented in this file.
+ 
+ ### Added
++- County Block List in Site Settings
+ - Query the `views_per_visit` metric based on imported data as well if possible
+ - Group `operating_system_versions` by `operating_system` in Stats API breakdown
+ - Add `operating_system_versions.csv` into the CSV export
+diff --git a/assets/js/liveview/combo-box.js b/assets/js/liveview/combo-box.js
+index 7849e6db6d58..b9e9852bd7ee 100644
+--- a/assets/js/liveview/combo-box.js
++++ b/assets/js/liveview/combo-box.js
+@@ -18,8 +18,10 @@ export default (id) => ({
+     this.selectionInProgress = false;
+   },
+   open() {
+-    this.initFocus()
+-    this.isOpen = true
++    if (!this.isOpen) {
++      this.initFocus()
++      this.isOpen = true
++    }
+   },
+   suggestionsCount() {
+     return this.$refs.suggestions?.querySelectorAll('li').length
+@@ -65,7 +67,7 @@ export default (id) => ({
+   focusNext() {
+     const nextIndex = this.nextFocusableIndex()
+ 
+-    if (!this.isOpen) this.open()
++    this.open()
+ 
+     this.setFocus(nextIndex)
+     this.scrollTo(nextIndex)
+@@ -73,7 +75,7 @@ export default (id) => ({
+   focusPrev() {
+     const prevIndex = this.prevFocusableIndex()
+ 
+-    if (!this.isOpen) this.open()
++    this.open()
+ 
+     this.setFocus(prevIndex)
+     this.scrollTo(prevIndex)
+diff --git a/lib/plausible/application.ex b/lib/plausible/application.ex
+index 941649cec835..8f2b62215fc9 100644
+--- a/lib/plausible/application.ex
++++ b/lib/plausible/application.ex
+@@ -59,6 +59,21 @@ defmodule Plausible.Application do
+          interval: :timer.seconds(35),
+          warmer_fn: :refresh_updated_recently
+        ]},
++      {Plausible.Shield.CountryRuleCache, []},
++      {Plausible.Cache.Warmer,
++       [
++         child_name: Plausible.Shield.CountryRuleCache.All,
++         cache_impl: Plausible.Shield.CountryRuleCache,
++         interval: :timer.minutes(3) + Enum.random(1..:timer.seconds(10)),
++         warmer_fn: :refresh_all
++       ]},
++      {Plausible.Cache.Warmer,
++       [
++         child_name: Plausible.Shield.CountryRuleCache.RecentlyUpdated,
++         cache_impl: Plausible.Shield.CountryRuleCache,
++         interval: :timer.seconds(35),
++         warmer_fn: :refresh_updated_recently
++       ]},
+       {Plausible.Auth.TOTP.Vault, key: totp_vault_key()},
+       PlausibleWeb.Endpoint,
+       {Oban, Application.get_env(:plausible, Oban)},
+diff --git a/lib/plausible/ingestion/event.ex b/lib/plausible/ingestion/event.ex
+index 721411bba21f..78d988ba25ff 100644
+--- a/lib/plausible/ingestion/event.ex
++++ b/lib/plausible/ingestion/event.ex
+@@ -27,6 +27,7 @@ defmodule Plausible.Ingestion.Event do
+           | :invalid
+           | :dc_ip
+           | :site_ip_blocklist
++          | :site_country_blocklist
+ 
+   @type t() :: %__MODULE__{
+           domain: String.t() | nil,
+@@ -97,11 +98,12 @@ defmodule Plausible.Ingestion.Event do
+     [
+       &drop_datacenter_ip/1,
+       &drop_shield_rule_ip/1,
++      &put_geolocation/1,
++      &drop_shield_rule_country/1,
+       &put_user_agent/1,
+       &put_basic_info/1,
+       &put_referrer/1,
+       &put_utm_tags/1,
+-      &put_geolocation/1,
+       &put_props/1,
+       &put_revenue/1,
+       &put_salts/1,
+@@ -232,6 +234,21 @@ defmodule Plausible.Ingestion.Event do
+     end
+   end
+ 
++  defp drop_shield_rule_country(
++         %__MODULE__{domain: domain, clickhouse_event_attrs: %{country_code: cc}} = event
++       )
++       when is_binary(domain) and is_binary(cc) do
++    case Plausible.Shield.CountryRuleCache.get({domain, String.upcase(cc)}) do
++      %Plausible.Shield.CountryRule{action: :deny} ->
++        drop(event, :site_country_blocklist)
++
++      _ ->
++        event
++    end
++  end
++
++  defp drop_shield_rule_country(%__MODULE__{} = event), do: event
++
+   defp put_props(%__MODULE__{request: %{props: %{} = props}} = event) do
+     # defensive: ensuring the keys/values are always in the same order
+     {keys, values} = Enum.unzip(props)
+diff --git a/lib/plausible/shield/country_rule.ex b/lib/plausible/shield/country_rule.ex
+new file mode 100644
+index 000000000000..85bc73456bb0
+--- /dev/null
++++ b/lib/plausible/shield/country_rule.ex
+@@ -0,0 +1,38 @@
++defmodule Plausible.Shield.CountryRule do
++  @moduledoc """
++  Schema for Country Block List
++  """
++  use Ecto.Schema
++  import Ecto.Changeset
++
++  @type t() :: %__MODULE__{}
++
++  @primary_key {:id, :binary_id, autogenerate: true}
++  schema "shield_rules_country" do
++    belongs_to :site, Plausible.Site
++    field :country_code, :string
++    field :action, Ecto.Enum, values: [:deny, :allow], default: :deny
++    field :added_by, :string
++
++    # If `from_cache?` is set, the struct might be incomplete - see `Plausible.Site.Shield.Rules.Country.Cache`
++    field :from_cache?, :boolean, virtual: true, default: false
++    timestamps()
++  end
++
++  def changeset(rule, attrs) do
++    rule
++    |> cast(attrs, [:site_id, :country_code])
++    |> validate_required([:site_id, :country_code])
++    |> validate_length(:country_code, is: 2)
++    |> Ecto.Changeset.validate_change(:country_code, fn :country_code, cc ->
++      if cc in Enum.map(Location.Country.all(), & &1.alpha_2) do
++        []
++      else
++        [country_code: "is invalid"]
++      end
++    end)
++    |> unique_constraint(:country_code,
++      name: :shield_rules_country_site_id_country_code_index
++    )
++  end
++end
+diff --git a/lib/plausible/shield/country_rule_cache.ex b/lib/plausible/shield/country_rule_cache.ex
+new file mode 100644
+index 000000000000..ec42232b7279
+--- /dev/null
++++ b/lib/plausible/shield/country_rule_cache.ex
+@@ -0,0 +1,65 @@
++defmodule Plausible.Shield.CountryRuleCache do
++  @moduledoc """
++  Allows retrieving Country Rules by domain and country code
++  """
++  alias Plausible.Shield.CountryRule
++
++  import Ecto.Query
++  use Plausible.Cache
++
++  @cache_name :country_blocklist_by_domain
++
++  @cached_schema_fields ~w(
++    id
++    country_code
++    action
++  )a
++
++  @impl true
++  def name(), do: @cache_name
++
++  @impl true
++  def child_id(), do: :cachex_country_blocklist
++
++  @impl true
++  def count_all() do
++    Plausible.Repo.aggregate(CountryRule, :count)
++  end
++
++  @impl true
++  def base_db_query() do
++    from rule in CountryRule,
++      inner_join: s in assoc(rule, :site),
++      select: {
++        s.domain,
++        s.domain_changed_from,
++        %{struct(rule, ^@cached_schema_fields) | from_cache?: true}
++      }
++  end
++
++  @impl true
++  def get_from_source({domain, country_code}) do
++    query =
++      base_db_query()
++      |> where([rule, site], rule.country_code == ^country_code and site.domain == ^domain)
++
++    case Plausible.Repo.one(query) do
++      {_, _, rule} -> %CountryRule{rule | from_cache?: false}
++      _any -> nil
++    end
++  end
++
++  @impl true
++  def unwrap_cache_keys(items) do
++    Enum.reduce(items, [], fn
++      {domain, nil, object}, acc ->
++        [{{domain, String.upcase(object.country_code)}, object} | acc]
++
++      {domain, domain_changed_from, object}, acc ->
++        [
++          {{domain, String.upcase(object.country_code)}, object},
++          {{domain_changed_from, String.upcase(object.country_code)}, object} | acc
++        ]
++    end)
++  end
++end
+diff --git a/lib/plausible/shield/ip_rule.ex b/lib/plausible/shield/ip_rule.ex
+index d930262799ff..9f160f2f6d66 100644
+--- a/lib/plausible/shield/ip_rule.ex
++++ b/lib/plausible/shield/ip_rule.ex
+@@ -22,7 +22,7 @@ defmodule Plausible.Shield.IPRule do
+ 
+   def changeset(rule, attrs) do
+     rule
+-    |> cast(attrs, [:site_id, :inet, :description, :added_by])
++    |> cast(attrs, [:site_id, :inet, :description])
+     |> validate_required([:site_id, :inet])
+     |> disallow_netmask(:inet)
+     |> unique_constraint(:inet,
+diff --git a/lib/plausible/shields.ex b/lib/plausible/shields.ex
+index 9a0f1094adf7..25ba47d84cf2 100644
+--- a/lib/plausible/shields.ex
++++ b/lib/plausible/shields.ex
+@@ -5,38 +5,93 @@ defmodule Plausible.Shields do
+   import Ecto.Query
+   alias Plausible.Repo
+   alias Plausible.Shield
++  alias Plausible.Site
+ 
+   @maximum_ip_rules 30
+   def maximum_ip_rules(), do: @maximum_ip_rules
+ 
+-  @spec list_ip_rules(Plausible.Site.t() | non_neg_integer()) :: [Shield.IPRule.t()]
+-  def list_ip_rules(site_id) when is_integer(site_id) do
++  @maximum_country_rules 30
++  def maximum_country_rules(), do: @maximum_country_rules
++
++  @spec list_ip_rules(Site.t() | non_neg_integer()) :: [Shield.IPRule.t()]
++  def list_ip_rules(site_or_id) do
++    list(Shield.IPRule, site_or_id)
++  end
++
++  @spec add_ip_rule(Site.t() | non_neg_integer(), map(), Keyword.t()) ::
++          {:ok, Shield.IPRule.t()} | {:error, Ecto.Changeset.t()}
++  def add_ip_rule(site_or_id, params, opts \\ []) do
++    opts =
++      Keyword.put(opts, :limit, {:inet, @maximum_ip_rules})
++
++    add(Shield.IPRule, site_or_id, params, opts)
++  end
++
++  @spec remove_ip_rule(Site.t() | non_neg_integer(), String.t()) :: :ok
++  def remove_ip_rule(site_or_id, rule_id) do
++    remove(Shield.IPRule, site_or_id, rule_id)
++  end
++
++  @spec count_ip_rules(Site.t() | non_neg_integer()) :: non_neg_integer()
++  def count_ip_rules(site_or_id) do
++    count(Shield.IPRule, site_or_id)
++  end
++
++  @spec list_country_rules(Site.t() | non_neg_integer()) :: [Shield.CountryRule.t()]
++  def list_country_rules(site_or_id) do
++    list(Shield.CountryRule, site_or_id)
++  end
++
++  @spec add_country_rule(Site.t() | non_neg_integer(), map(), Keyword.t()) ::
++          {:ok, Shield.CountryRule.t()} | {:error, Ecto.Changeset.t()}
++  def add_country_rule(site_or_id, params, opts \\ []) do
++    opts = Keyword.put(opts, :limit, {:country_code, @maximum_country_rules})
++    add(Shield.CountryRule, site_or_id, params, opts)
++  end
++
++  @spec remove_country_rule(Site.t() | non_neg_integer(), String.t()) :: :ok
++  def remove_country_rule(site_or_id, rule_id) do
++    remove(Shield.CountryRule, site_or_id, rule_id)
++  end
++
++  @spec count_country_rules(Site.t() | non_neg_integer()) :: non_neg_integer()
++  def count_country_rules(site_or_id) do
++    count(Shield.CountryRule, site_or_id)
++  end
++
++  defp list(schema, %Site{id: id}) do
++    list(schema, id)
++  end
++
++  defp list(schema, site_id) when is_integer(site_id) do
+     Repo.all(
+-      from r in Shield.IPRule,
++      from r in schema,
+         where: r.site_id == ^site_id,
+         order_by: [desc: r.inserted_at]
+     )
+   end
+ 
+-  def list_ip_rules(%Plausible.Site{id: id}) do
+-    list_ip_rules(id)
++  defp add(schema, %Site{id: id}, params, opts) do
++    add(schema, id, params, opts)
+   end
+ 
+-  @spec add_ip_rule(Plausible.Site.t() | non_neg_integer(), map()) ::
+-          {:ok, Shield.IPRule.t()} | {:error, Ecto.Changeset.t()}
+-  def add_ip_rule(site_id, params) when is_integer(site_id) do
++  defp add(schema, site_id, params, opts) when is_integer(site_id) do
++    {field, max} = Keyword.fetch!(opts, :limit)
++
+     Repo.transaction(fn ->
+       result =
+-        if count_ip_rules(site_id) >= @maximum_ip_rules do
++        if count(schema, site_id) >= max do
+           changeset =
+-            %Shield.IPRule{}
+-            |> Shield.IPRule.changeset(Map.put(params, "site_id", site_id))
+-            |> Ecto.Changeset.add_error(:inet, "maximum reached")
++            schema
++            |> struct(site_id: site_id)
++            |> schema.changeset(params)
++            |> Ecto.Changeset.add_error(field, "maximum reached")
+ 
+           {:error, changeset}
+         else
+-          %Shield.IPRule{}
+-          |> Shield.IPRule.changeset(Map.put(params, "site_id", site_id))
++          schema
++          |> struct(site_id: site_id, added_by: format_added_by(opts[:added_by]))
++          |> schema.changeset(params)
+           |> Repo.insert()
+         end
+ 
+@@ -47,26 +102,23 @@ defmodule Plausible.Shields do
+     end)
+   end
+ 
+-  def add_ip_rule(%Plausible.Site{id: id}, params) do
+-    add_ip_rule(id, params)
++  defp remove(schema, %Site{id: id}, rule_id) do
++    remove(schema, id, rule_id)
+   end
+ 
+-  @spec remove_ip_rule(Plausible.Site.t() | non_neg_integer(), String.t()) :: :ok
+-  def remove_ip_rule(site_id, rule_id) when is_integer(site_id) do
+-    Repo.delete_all(from(r in Shield.IPRule, where: r.site_id == ^site_id and r.id == ^rule_id))
++  defp remove(schema, site_id, rule_id) when is_integer(site_id) do
++    Repo.delete_all(from(r in schema, where: r.site_id == ^site_id and r.id == ^rule_id))
+     :ok
+   end
+ 
+-  def remove_ip_rule(%Plausible.Site{id: site_id}, rule_id) do
+-    remove_ip_rule(site_id, rule_id)
++  defp count(schema, %Site{id: id}) do
++    count(schema, id)
+   end
+ 
+-  @spec count_ip_rules(Plausible.Site.t() | non_neg_integer()) :: non_neg_integer()
+-  def count_ip_rules(site_id) when is_integer(site_id) do
+-    Repo.aggregate(from(r in Shield.IPRule, where: r.site_id == ^site_id), :count)
++  defp count(schema, site_id) when is_integer(site_id) do
++    Repo.aggregate(from(r in schema, where: r.site_id == ^site_id), :count)
+   end
+ 
+-  def count_ip_rules(%Plausible.Site{id: id}) do
+-    count_ip_rules(id)
+-  end
++  defp format_added_by(nil), do: ""
++  defp format_added_by(%Plausible.Auth.User{} = user), do: "#{user.name} <#{user.email}>"
+ end
+diff --git a/lib/plausible/stats/breakdown.ex b/lib/plausible/stats/breakdown.ex
+index a0693310c522..d8c6ce7f9fdb 100644
+--- a/lib/plausible/stats/breakdown.ex
++++ b/lib/plausible/stats/breakdown.ex
+@@ -34,14 +34,20 @@ defmodule Plausible.Stats.Breakdown do
+ 
+     if !Keyword.get(opts, :skip_tracing), do: trace(query, property, metrics)
+ 
++    no_revenue = {nil, metrics -- @revenue_metrics}
++
+     {revenue_goals, metrics} =
+-      if full_build?() && Plausible.Billing.Feature.RevenueGoals.enabled?(site) do
+-        revenue_goals = Enum.filter(event_goals, &Plausible.Goal.Revenue.revenue?/1)
+-        metrics = if Enum.empty?(revenue_goals), do: metrics -- @revenue_metrics, else: metrics
++      on_full_build do
++        if Plausible.Billing.Feature.RevenueGoals.enabled?(site) do
++          revenue_goals = Enum.filter(event_goals, &Plausible.Goal.Revenue.revenue?/1)
++          metrics = if Enum.empty?(revenue_goals), do: metrics -- @revenue_metrics, else: metrics
+ 
+-        {revenue_goals, metrics}
++          {revenue_goals, metrics}
++        else
++          no_revenue
++        end
+       else
+-        {nil, metrics -- @revenue_metrics}
++        no_revenue
+       end
+ 
+     metrics_to_select = Util.maybe_add_visitors_metric(metrics) -- @computed_metrics
+diff --git a/lib/plausible/timezones.ex b/lib/plausible/timezones.ex
+index 03461e35e25c..9aa030e3dc9d 100644
+--- a/lib/plausible/timezones.ex
++++ b/lib/plausible/timezones.ex
+@@ -22,25 +22,13 @@ defmodule Plausible.Timezones do
+ 
+   @spec to_date_in_timezone(Date.t() | NaiveDateTime.t() | DateTime.t(), String.t()) :: Date.t()
+   def to_date_in_timezone(dt, timezone) do
+-    utc_dt =
+-      case dt do
+-        %Date{} ->
+-          Timex.to_datetime(dt, "UTC")
+-
+-        dt ->
+-          Timex.Timezone.convert(dt, "UTC")
+-      end
+-
+-    case Timex.Timezone.convert(utc_dt, timezone) do
+-      %DateTime{} = tz_dt ->
+-        Timex.to_date(tz_dt)
+-
+-      %Timex.AmbiguousDateTime{after: after_dt} ->
+-        Timex.to_date(after_dt)
++    to_datetime_in_timezone(dt, timezone) |> Timex.to_date()
++  end
+ 
+-      {:error, {:could_not_resolve_timezone, _, _, _}} ->
+-        dt
+-    end
++  @spec to_datetime_in_timezone(Date.t() | NaiveDateTime.t() | DateTime.t(), String.t()) ::
++          DateTime.t()
++  def to_datetime_in_timezone(dt, timezone) do
++    dt |> Timex.to_datetime("UTC") |> Timex.Timezone.convert(timezone)
+   end
+ 
+   defp build_option(timezone_code, acc, now) do
+diff --git a/lib/plausible_web/controllers/site_controller.ex b/lib/plausible_web/controllers/site_controller.ex
+index e34581302edb..1dcf679e8b1b 100644
+--- a/lib/plausible_web/controllers/site_controller.ex
++++ b/lib/plausible_web/controllers/site_controller.ex
+@@ -253,13 +253,15 @@ defmodule PlausibleWeb.SiteController do
+     )
+   end
+ 
+-  def settings_shields(conn, _params) do
++  def settings_shields(conn, %{"shield" => shield})
++      when shield in ["ip_addresses", "countries"] do
+     site = conn.assigns.site
+ 
+     conn
+     |> render("settings_shields.html",
+       site: site,
+-      dogfood_page_path: "/:dashboard/settings/shields",
++      shield: shield,
++      dogfood_page_path: "/:dashboard/settings/shields/#{shield}",
+       connect_live_socket: true,
+       layout: {PlausibleWeb.LayoutView, "site_settings.html"}
+     )
+diff --git a/lib/plausible_web/live/components/combo_box.ex b/lib/plausible_web/live/components/combo_box.ex
+index b0f12449c929..7da6ae301c8a 100644
+--- a/lib/plausible_web/live/components/combo_box.ex
++++ b/lib/plausible_web/live/components/combo_box.ex
+@@ -22,7 +22,7 @@ defmodule PlausibleWeb.Live.Components.ComboBox do
+   and updates the suggestions asynchronously. This way, you can render
+   the component without having to wait for suggestions to load.
+ 
+-  If you explicitly need to make the operation sychronous, you may
++  If you explicitly need to make the operation synchronous, you may
+   pass `async={false}` option.
+ 
+   If your initial `options` are not provided up-front at initial render,
+@@ -101,6 +101,7 @@ defmodule PlausibleWeb.Live.Components.ComboBox do
+             placeholder={@placeholder}
+             x-on:focus="open"
+             phx-change="search"
++            x-on:keydown="open"
+             phx-target={@myself}
+             phx-debounce={200}
+             value={@display_value}
+diff --git a/lib/plausible_web/live/components/modal.ex b/lib/plausible_web/live/components/modal.ex
+index f11c5ea16432..127e88ced640 100644
+--- a/lib/plausible_web/live/components/modal.ex
++++ b/lib/plausible_web/live/components/modal.ex
+@@ -134,7 +134,7 @@ defmodule PlausibleWeb.Live.Components.Modal do
+     ~H"""
+     <div
+       id={@id}
+-      class="relative z-50 [&[data-phx-ref]_div.modal-dialog]:hidden [&[data-phx-ref]_div.modal-loading]:block"
++      class="relative z-[49] [&[data-phx-ref]_div.modal-dialog]:hidden [&[data-phx-ref]_div.modal-loading]:block"
+       data-modal
+       x-cloak
+       x-data="{
+diff --git a/lib/plausible_web/live/shields/countries.ex b/lib/plausible_web/live/shields/countries.ex
+new file mode 100644
+index 000000000000..e26632456a81
+--- /dev/null
++++ b/lib/plausible_web/live/shields/countries.ex
+@@ -0,0 +1,53 @@
++defmodule PlausibleWeb.Live.Shields.Countries do
++  @moduledoc """
++  LiveView for IP Addresses Shield
++  """
++  use PlausibleWeb, :live_view
++  use Phoenix.HTML
++
++  alias Plausible.Shields
++  alias Plausible.Sites
++
++  def mount(
++        _params,
++        %{
++          "domain" => domain,
++          "current_user_id" => user_id
++        },
++        socket
++      ) do
++    socket =
++      socket
++      |> assign_new(:site, fn ->
++        Sites.get_for_user!(user_id, domain, [:owner, :admin, :super_admin])
++      end)
++      |> assign_new(:country_rules_count, fn %{site: site} ->
++        Shields.count_country_rules(site)
++      end)
++      |> assign_new(:current_user, fn ->
++        Plausible.Repo.get(Plausible.Auth.User, user_id)
++      end)
++
++    {:ok, socket}
++  end
++
++  def render(assigns) do
++    ~H"""
++    <div>
++      <.flash_messages flash={@flash} />
++      <.live_component
++        module={PlausibleWeb.Live.Shields.CountryRules}
++        current_user={@current_user}
++        country_rules_count={@country_rules_count}
++        site={@site}
++        id="country-rules-#{@current_user.id}"
++      />
++    </div>
++    """
++  end
++
++  def handle_info({:flash, kind, message}, socket) do
++    socket = put_live_flash(socket, kind, message)
++    {:noreply, socket}
++  end
++end
+diff --git a/lib/plausible_web/live/shields/country_rules.ex b/lib/plausible_web/live/shields/country_rules.ex
+new file mode 100644
+index 000000000000..895b49d3e0aa
+--- /dev/null
++++ b/lib/plausible_web/live/shields/country_rules.ex
+@@ -0,0 +1,251 @@
++defmodule PlausibleWeb.Live.Shields.CountryRules do
++  @moduledoc """
++  LiveView allowing Country Rules management
++  """
++
++  use Phoenix.LiveComponent, global_prefixes: ~w(x-)
++  use Phoenix.HTML
++
++  alias PlausibleWeb.Live.Components.Modal
++  alias Plausible.Shields
++  alias Plausible.Shield
++
++  def update(assigns, socket) do
++    socket =
++      socket
++      |> assign(
++        country_rules_count: assigns.country_rules_count,
++        site: assigns.site,
++        current_user: assigns.current_user,
++        form: new_form()
++      )
++      |> assign_new(:country_rules, fn %{site: site} ->
++        Shields.list_country_rules(site)
++      end)
++
++    {:ok, socket}
++  end
++
++  def render(assigns) do
++    ~H"""
++    <section class="shadow bg-white dark:bg-gray-800 sm:rounded-md sm:overflow-hidden">
++      <div class="py-6 px-4 sm:p-6">
++        <header class="relative">
++          <h2 class="text-lg leading-6 font-medium text-gray-900 dark:text-gray-100">
++            Country Block List
++          </h2>
++          <p class="mt-1 mb-4 text-sm leading-5 text-gray-500 dark:text-gray-200">
++            Reject incoming traffic from specific countries
++          </p>
++
++          <PlausibleWeb.Components.Generic.docs_info slug="countries" />
++        </header>
++        <div class="border-t border-gray-200 pt-4 grid">
++          <div
++            :if={@country_rules_count < Shields.maximum_country_rules()}
++            class="mt-4 sm:ml-4 sm:mt-0 justify-self-end"
++          >
++            <PlausibleWeb.Components.Generic.button
++              id="add-country-rule"
++              x-data
++              x-on:click={Modal.JS.open("country-rule-form-modal")}
++            >
++              + Add Country
++            </PlausibleWeb.Components.Generic.button>
++          </div>
++          <PlausibleWeb.Components.Generic.notice
++            :if={@country_rules_count >= Shields.maximum_country_rules()}
++            class="mt-4"
++            title="Maximum number of countries reached"
++          >
++            <p>
++              You've reached the maximum number of countries you can block (<%= Shields.maximum_country_rules() %>). Please remove one before adding another.
++            </p>
++          </PlausibleWeb.Components.Generic.notice>
++        </div>
++
++        <.live_component module={Modal} id="country-rule-form-modal">
++          <.form
++            :let={f}
++            for={@form}
++            phx-submit="save-country-rule"
++            phx-target={@myself}
++            class="max-w-md w-full mx-auto bg-white dark:bg-gray-800"
++          >
++            <h2 class="text-xl font-black dark:text-gray-100 mb-8">Add Country to Block List</h2>
++
++            <.live_component
++              submit_name="country_rule[country_code]"
++              submit_value={f[:country_code].value}
++              display_value=""
++              module={PlausibleWeb.Live.Components.ComboBox}
++              suggest_fun={&PlausibleWeb.Live.Components.ComboBox.StaticSearch.suggest/2}
++              id={f[:country_code].id}
++              suggestions_limit={300}
++              options={options(@country_rules)}
++            />
++
++            <p class="text-sm mt-2 text-gray-500 dark:text-gray-200">
++              Once added, we will start rejecting traffic from this country within a few minutes.
++            </p>
++            <div class="py-4 mt-8">
++              <PlausibleWeb.Components.Generic.button type="submit" class="w-full">
++                Add Country →
++              </PlausibleWeb.Components.Generic.button>
++            </div>
++          </.form>
++        </.live_component>
++
++        <p
++          :if={Enum.empty?(@country_rules)}
++          class="text-sm text-gray-800 dark:text-gray-200 mt-12 mb-8 text-center"
++        >
++          No Country Rules configured for this Site.
++        </p>
++        <div
++          :if={not Enum.empty?(@country_rules)}
++          class="mt-8 overflow-hidden border-b border-gray-200 shadow dark:border-gray-900 sm:rounded-lg"
++        >
++          <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-900">
++            <thead class="bg-gray-50 dark:bg-gray-900">
++              <tr>
++                <th
++                  scope="col"
++                  class="px-6 py-3 text-xs font-medium text-left text-gray-500 uppercase dark:text-gray-100"
++                >
++                  Country
++                </th>
++                <th
++                  scope="col"
++                  class="px-6 py-3 text-xs font-medium text-left text-gray-500 uppercase dark:text-gray-100"
++                >
++                  Status
++                </th>
++                <th scope="col" class="px-6 py-3">
++                  <span class="sr-only">Remove</span>
++                </th>
++              </tr>
++            </thead>
++            <tbody>
++              <%= for rule <- @country_rules do %>
++                <% country = Location.Country.get_country(rule.country_code) %>
++                <tr class="text-gray-900 dark:text-gray-100">
++                  <td class="px-6 py-4 text-sm font-medium">
++                    <div class="flex items-center">
++                      <span
++                        id={"country-#{rule.id}"}
++                        class="mr-4 cursor-help border-b border-dotted border-gray-400"
++                        title={"Added at #{format_added_at(rule.inserted_at, @site.timezone)} by #{rule.added_by}"}
++                      >
++                        <%= country.flag %> <%= country.name %>
++                      </span>
++                    </div>
++                  </td>
++                  <td class="px-6 py-4 text-sm text-gray-500">
++                    <span :if={rule.action == :deny}>
++                      Blocked
++                    </span>
++                    <span :if={rule.action == :allow}>
++                      Allowed
++                    </span>
++                  </td>
++                  <td class="px-6 py-4 text-sm font-medium text-right">
++                    <button
++                      id={"remove-country-rule-#{rule.id}"}
++                      phx-target={@myself}
++                      phx-click="remove-country-rule"
++                      phx-value-rule-id={rule.id}
++                      class="text-sm text-red-600"
++                      data-confirm="Are you sure you want to revoke this rule?"
++                    >
++                      Remove
++                    </button>
++                  </td>
++                </tr>
++              <% end %>
++            </tbody>
++          </table>
++        </div>
++      </div>
++    </section>
++    """
++  end
++
++  def handle_event("save-country-rule", %{"country_rule" => params}, socket) do
++    user = socket.assigns.current_user
++
++    case Shields.add_country_rule(
++           socket.assigns.site.id,
++           Map.put(params, "added_by", "#{user.name} <#{user.email}>")
++         ) do
++      {:ok, rule} ->
++        country_rules = [rule | socket.assigns.country_rules]
++
++        socket =
++          socket
++          |> Modal.close("country-rule-form-modal")
++          |> assign(
++            form: new_form(),
++            country_rules: country_rules,
++            country_rules_count: socket.assigns.country_rules_count + 1
++          )
++
++        # Make sure to clear the combobox input after adding a country rule, on subsequent modal reopening
++        send_update(PlausibleWeb.Live.Components.ComboBox,
++          id: "country_rule_country_code",
++          display_value: ""
++        )
++
++        send_flash(
++          :success,
++          "Country rule added successfully. Traffic will be rejected within a few minutes."
++        )
++
++        {:noreply, socket}
++
++      {:error, %Ecto.Changeset{} = changeset} ->
++        {:noreply, assign(socket, form: to_form(changeset))}
++    end
++  end
++
++  def handle_event("remove-country-rule", %{"rule-id" => rule_id}, socket) do
++    Shields.remove_country_rule(socket.assigns.site.id, rule_id)
++
++    send_flash(
++      :success,
++      "Country rule removed successfully. Traffic will be resumed within a few minutes."
++    )
++
++    {:noreply,
++     socket
++     |> assign(
++       country_rules_count: socket.assigns.country_rules_count - 1,
++       country_rules: Enum.reject(socket.assigns.country_rules, &(&1.id == rule_id))
++     )}
++  end
++
++  def send_flash(kind, message) do
++    send(self(), {:flash, kind, message})
++  end
++
++  defp new_form() do
++    %Shield.CountryRule{}
++    |> Shield.CountryRule.changeset(%{})
++    |> to_form()
++  end
++
++  defp options(country_rules) do
++    Location.Country.all()
++    |> Enum.sort_by(& &1.name)
++    |> Enum.map(fn c -> {c.alpha_2, c.flag <> " " <> c.name} end)
++    |> Enum.reject(fn {country_code, _} ->
++      country_code in Enum.map(country_rules, & &1.country_code)
++    end)
++  end
++
++  defp format_added_at(dt, tz) do
++    dt
++    |> Plausible.Timezones.to_datetime_in_timezone(tz)
++    |> Timex.format!("{YYYY}-{0M}-{0D} {h24}:{m}:{s}")
++  end
++end
+diff --git a/lib/plausible_web/live/shields/tabs.ex b/lib/plausible_web/live/shields/ip_addresses.ex
+similarity index 84%
+rename from lib/plausible_web/live/shields/tabs.ex
+rename to lib/plausible_web/live/shields/ip_addresses.ex
+index 130511352284..f0994a2193c4 100644
+--- a/lib/plausible_web/live/shields/tabs.ex
++++ b/lib/plausible_web/live/shields/ip_addresses.ex
+@@ -1,8 +1,6 @@
+-defmodule PlausibleWeb.Live.Shields.Tabs do
++defmodule PlausibleWeb.Live.Shields.IPAddresses do
+   @moduledoc """
+-  Currently only a placeholder module. Once more shields
+-  are implemented it will display tabs with counters,
+-  linking to their respective live views.
++  LiveView for IP Addresses Shield
+   """
+   use PlausibleWeb, :live_view
+   use Phoenix.HTML
+@@ -31,7 +29,6 @@ defmodule PlausibleWeb.Live.Shields.Tabs do
+         Plausible.Repo.get(Plausible.Auth.User, user_id)
+       end)
+       |> assign_new(:remote_ip, fn -> remote_ip end)
+-      |> assign(:current_tab, :ip_rules)
+ 
+     {:ok, socket}
+   end
+diff --git a/lib/plausible_web/live/shields/ip_rules.ex b/lib/plausible_web/live/shields/ip_rules.ex
+index e88c85cee3b7..e8dc20466ff5 100644
+--- a/lib/plausible_web/live/shields/ip_rules.ex
++++ b/lib/plausible_web/live/shields/ip_rules.ex
+@@ -62,7 +62,7 @@ defmodule PlausibleWeb.Live.Shields.IPRules do
+             title="Maximum number of addresses reached"
+           >
+             <p>
+-              You've reached the maximum number of IP addresses you can block. Please remove one before adding another.
++              You've reached the maximum number of IP addresses you can block (<%= Shields.maximum_ip_rules() %>). Please remove one before adding another.
+             </p>
+           </PlausibleWeb.Components.Generic.notice>
+         </div>
+@@ -144,7 +144,7 @@ defmodule PlausibleWeb.Live.Shields.IPRules do
+                 </th>
+                 <th
+                   scope="col"
+-                  class="px-6 py-3 text-xs font-medium text-left text-gray-500 uppercase dark:text-gray-100"
++                  class="px-6 py-3 text-xs font-medium text-left text-gray-500 uppercase dark:text-gray-100 md:block hidden"
+                 >
+                   Description
+                 </th>
+@@ -161,7 +161,7 @@ defmodule PlausibleWeb.Live.Shields.IPRules do
+                       <span
+                         id={"inet-#{rule.id}"}
+                         class="font-mono mr-4 cursor-help border-b border-dotted border-gray-400"
+-                        title={"Added at #{rule.updated_at} by #{rule.added_by}"}
++                        title={"Added at #{format_added_at(rule.inserted_at, @site.timezone)} by #{rule.added_by}"}
+                       >
+                         <%= rule.inet %>
+                       </span>
+@@ -185,7 +185,7 @@ defmodule PlausibleWeb.Live.Shields.IPRules do
+                       Allowed
+                     </span>
+                   </td>
+-                  <td class="px-6 py-4 text-sm font-normal whitespace-nowrap truncate max-w-xs">
++                  <td class="px-6 py-4 text-sm font-normal whitespace-nowrap truncate max-w-xs md:block hidden">
+                     <span :if={rule.description} title={rule.description}>
+                       <%= rule.description %>
+                     </span>
+@@ -232,7 +232,8 @@ defmodule PlausibleWeb.Live.Shields.IPRules do
+ 
+     case Shields.add_ip_rule(
+            socket.assigns.site.id,
+-           Map.put(params, "added_by", "#{user.name} <#{user.email}>")
++           params,
++           added_by: user
+          ) do
+       {:ok, rule} ->
+         socket =
+@@ -285,4 +286,10 @@ defmodule PlausibleWeb.Live.Shields.IPRules do
+   defp ip_rule_present?(rules, ip) do
+     not is_nil(Enum.find(rules, &(to_string(&1.inet) == ip)))
+   end
++
++  defp format_added_at(dt, tz) do
++    dt
++    |> Plausible.Timezones.to_datetime_in_timezone(tz)
++    |> Timex.format!("{YYYY}-{0M}-{0D} {h24}:{m}:{s}")
++  end
+ end
+diff --git a/lib/plausible_web/router.ex b/lib/plausible_web/router.ex
+index 9b422b608b04..a685701b2244 100644
+--- a/lib/plausible_web/router.ex
++++ b/lib/plausible_web/router.ex
+@@ -359,7 +359,7 @@ defmodule PlausibleWeb.Router do
+     get "/:website/settings/email-reports", SiteController, :settings_email_reports
+     get "/:website/settings/danger-zone", SiteController, :settings_danger_zone
+     get "/:website/settings/integrations", SiteController, :settings_integrations
+-    get "/:website/settings/shields", SiteController, :settings_shields
++    get "/:website/settings/shields/:shield", SiteController, :settings_shields
+ 
+     put "/:website/settings/features/visibility/:setting",
+         SiteController,
+diff --git a/lib/plausible_web/templates/layout/_settings_tab.html.heex b/lib/plausible_web/templates/layout/_settings_tab.html.heex
+index 560e6240dfee..da9f06d3eb08 100644
+--- a/lib/plausible_web/templates/layout/_settings_tab.html.heex
++++ b/lib/plausible_web/templates/layout/_settings_tab.html.heex
+@@ -1,13 +1,23 @@
+ <a
+-  href={"/" <> URI.encode_www_form(@site.domain) <> "/settings/" <> @this_tab}
++  href={@this_tab && "/" <> URI.encode_www_form(@site.domain) <> "/settings/" <> @this_tab}
+   class={[
+     "flex items-center px-3 py-2 text-sm leading-5 font-medium rounded-md outline-none focus:outline-none transition ease-in-out duration-150 cursor-default",
+     is_current_tab(@conn, @this_tab) &&
+       "cursor-default text-gray-900 dark:text-gray-100 bg-gray-100 dark:bg-gray-900 hover:text-gray-900 hover:bg-gray-100 focus:bg-gray-200 dark:focus:bg-gray-800",
+-    not is_current_tab(@conn, @this_tab) &&
+-      "cursor-pointer text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 hover:bg-gray-50 dark:hover:bg-gray-800 focus:text-gray-900 focus:bg-gray-50 dark:focus:text-gray-100 dark:focus:bg-gray-800"
++    @this_tab && not is_current_tab(@conn, @this_tab) &&
++      "cursor-pointer text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 hover:bg-gray-50 dark:hover:bg-gray-800 focus:text-gray-900 focus:bg-gray-50 dark:focus:text-gray-100 dark:focus:bg-gray-800",
++    !@this_tab && "text-gray-600 dark:text-gray-400",
++    @submenu? && "text-xs"
+   ]}
+ >
+-  <PlausibleWeb.Components.Generic.dynamic_icon name={@icon} class="h-4 w-4 mr-2" />
++  <PlausibleWeb.Components.Generic.dynamic_icon
++    :if={not @submenu? && @icon}
++    name={@icon}
++    class="h-4 w-4 mr-2"
++  />
+   <%= @text %>
++  <Heroicons.chevron_down
++    :if={is_nil(@this_tab)}
++    class="h-3 w-3 ml-2 text-gray-400 dark:text-gray-500"
++  />
+ </a>
+diff --git a/lib/plausible_web/templates/layout/site_settings.html.eex b/lib/plausible_web/templates/layout/site_settings.html.eex
+deleted file mode 100644
+index 3913f3b3cdbb..000000000000
+--- a/lib/plausible_web/templates/layout/site_settings.html.eex
++++ /dev/null
+@@ -1,26 +0,0 @@
+-<%= render_layout "app.html", assigns do %>
+-  <div class="container pt-6">
+-    <%= link("← Back to Stats", to: "/#{URI.encode_www_form(@site.domain)}", class: "text-sm text-indigo-600 font-bold") %>
+-    <div class="pb-5 border-b border-gray-200 dark:border-gray-500">
+-      <h2 class="text-2xl font-bold leading-7 text-gray-900 dark:text-gray-100 sm:text-3xl sm:leading-9 sm:truncate">
+-        Settings for <%= @site.domain %>
+-      </h2>
+-    </div>
+-    <div class="lg:grid lg:grid-cols-12 lg:gap-x-5 lg:mt-4">
+-      <div class="py-4 g:py-0 lg:col-span-3">
+-        <%= form_for @conn, "/sites/#{URI.encode_www_form(@site.domain)}/monthly-report/recipients", [class: "lg:hidden"], fn f -> %>
+-          <%= select f, :tab, settings_tabs(@conn), class: "dark:bg-gray-800 mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 dark:border-gray-500 outline-none focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md dark:text-gray-100", onchange: "location.href = location.href.replace(/[^\/\/]*$/, event.target.value)", selected: List.last(@conn.path_info)  %>
+-        <% end %>
+-        <div class="hidden lg:block">
+-          <%= for [key: key, value: val, icon: icon] <- settings_tabs(@conn) do %>
+-            <%= render("_settings_tab.html", icon: icon, this_tab: val, text: key, site: @site, conn: @conn) %>
+-          <% end %>
+-        </div>
+-      </div>
+-
+-      <div class="space-y-6 lg:col-span-9 lg:mt-4">
+-        <%= @inner_content %>
+-      </div>
+-    </div>
+-  </div>
+-<% end %>
+diff --git a/lib/plausible_web/templates/layout/site_settings.html.heex b/lib/plausible_web/templates/layout/site_settings.html.heex
+new file mode 100644
+index 000000000000..13c70b18a3dd
+--- /dev/null
++++ b/lib/plausible_web/templates/layout/site_settings.html.heex
+@@ -0,0 +1,64 @@
++<%= render_layout "app.html", assigns do %>
++  <div class="container pt-6">
++    <%= link("← Back to Stats",
++      to: "/#{URI.encode_www_form(@site.domain)}",
++      class: "text-sm text-indigo-600 font-bold"
++    ) %>
++    <div class="pb-5 border-b border-gray-200 dark:border-gray-500">
++      <h2 class="text-2xl font-bold leading-7 text-gray-900 dark:text-gray-100 sm:text-3xl sm:leading-9 sm:truncate">
++        Settings for <%= @site.domain %>
++      </h2>
++    </div>
++    <div class="lg:grid lg:grid-cols-12 lg:gap-x-5 lg:mt-4">
++      <div class="py-4 g:py-0 lg:col-span-3">
++        <%= form_for @conn, "/sites/#{URI.encode_www_form(@site.domain)}/monthly-report/recipients", [class: "lg:hidden"], fn f -> %>
++          <%= select(f, :tab, flat_settings_options(@conn),
++            class:
++              "dark:bg-gray-800 mt-1 block w-full pl-3 pr-10 py-2 text-base border-gray-300 dark:border-gray-500 outline-none focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm rounded-md dark:text-gray-100",
++            onchange: "location.href = location.href.replace(/[^\/\/]*$/, event.target.value)",
++            selected: List.last(@conn.path_info)
++          ) %>
++        <% end %>
++        <div class="hidden lg:block">
++          <%= for %{key: key, value: value, icon: icon} <- settings_tabs(@conn) do %>
++            <%= if is_binary(value) do %>
++              <%= render("_settings_tab.html",
++                icon: icon,
++                this_tab: value,
++                text: key,
++                site: @site,
++                conn: @conn,
++                submenu?: false
++              ) %>
++            <% else %>
++              <%= render("_settings_tab.html",
++                icon: icon,
++                this_tab: nil,
++                text: key,
++                site: @site,
++                conn: @conn,
++                submenu?: false
++              ) %>
++              <div class="ml-8">
++                <%= for %{key: key, value: val} <- value do %>
++                  <%= render("_settings_tab.html",
++                    icon: nil,
++                    this_tab: val,
++                    text: key,
++                    site: @site,
++                    conn: @conn,
++                    submenu?: true
++                  ) %>
++                <% end %>
++              </div>
++            <% end %>
++          <% end %>
++        </div>
++      </div>
++
++      <div class="space-y-6 lg:col-span-9 lg:mt-4">
++        <%= @inner_content %>
++      </div>
++    </div>
++  </div>
++<% end %>
+diff --git a/lib/plausible_web/templates/site/settings_shields.html.heex b/lib/plausible_web/templates/site/settings_shields.html.heex
+index 64ab4df6c95f..411c39fd3425 100644
+--- a/lib/plausible_web/templates/site/settings_shields.html.heex
++++ b/lib/plausible_web/templates/site/settings_shields.html.heex
+@@ -1,7 +1,17 @@
+-<%= live_render(@conn, PlausibleWeb.Live.Shields.Tabs,
+-  session: %{
+-    "site_id" => @site.id,
+-    "domain" => @site.domain,
+-    "remote_ip" => PlausibleWeb.RemoteIP.get(@conn)
+-  }
+-) %>
++<%= case @shield do %>
++  <% "ip_addresses" -> %>
++    <%= live_render(@conn, PlausibleWeb.Live.Shields.IPAddresses,
++      session: %{
++        "site_id" => @site.id,
++        "domain" => @site.domain,
++        "remote_ip" => PlausibleWeb.RemoteIP.get(@conn)
++      }
++    ) %>
++  <% "countries" -> %>
++    <%= live_render(@conn, PlausibleWeb.Live.Shields.Countries,
++      session: %{
++        "site_id" => @site.id,
++        "domain" => @site.domain
++      }
++    ) %>
++<% end %>
+diff --git a/lib/plausible_web/views/layout_view.ex b/lib/plausible_web/views/layout_view.ex
+index 7a531a9514c7..8bdd199bd66e 100644
+--- a/lib/plausible_web/views/layout_view.ex
++++ b/lib/plausible_web/views/layout_view.ex
+@@ -50,23 +50,44 @@ defmodule PlausibleWeb.LayoutView do
+ 
+   def settings_tabs(conn) do
+     [
+-      [key: "General", value: "general", icon: :rocket_launch],
+-      [key: "People", value: "people", icon: :users],
+-      [key: "Visibility", value: "visibility", icon: :eye],
+-      [key: "Goals", value: "goals", icon: :check_circle],
++      %{key: "General", value: "general", icon: :rocket_launch},
++      %{key: "People", value: "people", icon: :users},
++      %{key: "Visibility", value: "visibility", icon: :eye},
++      %{key: "Goals", value: "goals", icon: :check_circle},
+       on_full_build do
+-        [key: "Funnels", value: "funnels", icon: :funnel]
++        %{key: "Funnels", value: "funnels", icon: :funnel}
+       end,
+-      [key: "Custom Properties", value: "properties", icon: :document_text],
+-      [key: "Integrations", value: "integrations", icon: :arrow_path_rounded_square],
+-      if FunWithFlags.enabled?(:shields, for: conn.assigns[:current_user]) do
+-        [key: "Shields", value: "shields", icon: :shield_exclamation]
+-      end,
+-      [key: "Email Reports", value: "email-reports", icon: :envelope],
++      %{key: "Custom Properties", value: "properties", icon: :document_text},
++      %{key: "Integrations", value: "integrations", icon: :arrow_path_rounded_square},
++      %{
++        key: "Shields",
++        icon: :shield_exclamation,
++        value: [
++          %{key: "IP Addresses", value: "shields/ip_addresses"},
++          %{key: "Countries", value: "shields/countries"}
++        ]
++      },
++      %{key: "Email Reports", value: "email-reports", icon: :envelope},
+       if conn.assigns[:current_user_role] == :owner do
+-        [key: "Danger Zone", value: "danger-zone", icon: :exclamation_triangle]
++        %{key: "Danger Zone", value: "danger-zone", icon: :exclamation_triangle}
+       end
+     ]
++    |> Enum.reject(&is_nil/1)
++  end
++
++  def flat_settings_options(conn) do
++    conn
++    |> settings_tabs()
++    |> Enum.map(fn
++      %{value: value, key: key} when is_binary(value) ->
++        {key, value}
++
++      %{value: submenu_items, key: parent_key} when is_list(submenu_items) ->
++        Enum.map(submenu_items, fn submenu_item ->
++          {"#{parent_key}: #{submenu_item.key}", submenu_item.value}
++        end)
++    end)
++    |> List.flatten()
+   end
+ 
+   def trial_notificaton(user) do
+@@ -97,7 +118,11 @@ defmodule PlausibleWeb.LayoutView do
+     render(layout, Map.put(assigns, :inner_layout, content))
+   end
+ 
++  def is_current_tab(_, nil) do
++    false
++  end
++
+   def is_current_tab(conn, tab) do
+-    List.last(conn.path_info) == tab
++    String.ends_with?(Enum.join(conn.path_info, "/"), tab)
+   end
+ end
+diff --git a/priv/repo/seeds.exs b/priv/repo/seeds.exs
+index a5cbdf3a47ae..37b0b309eacf 100644
+--- a/priv/repo/seeds.exs
++++ b/priv/repo/seeds.exs
+@@ -50,6 +50,8 @@ site =
+   )
+ 
+ Plausible.Factory.insert_list(29, :ip_rule, site: site)
++Plausible.Factory.insert(:country_rule, site: site, country_code: "PL")
++Plausible.Factory.insert(:country_rule, site: site, country_code: "EE")
+ 
+ Plausible.Factory.insert(:google_auth,
+   user: user,
+@@ -82,7 +84,13 @@ put_random_time = fn
+   date, 0 ->
+     current_hour = Time.utc_now().hour
+     current_minute = Time.utc_now().minute
+-    random_time = Time.new!(:rand.uniform(current_hour), :rand.uniform(current_minute - 1), 0)
++
++    random_time =
++      Time.new!(
++        Enum.random(0..current_hour),
++        Enum.random(0..current_minute),
++        0
++      )
+ 
+     date
+     |> NaiveDateTime.new!(random_time)
+diff --git a/test/plausible/ingestion/event_test.exs b/test/plausible/ingestion/event_test.exs
+index ca6dba9199a4..e2162dfcb03e 100644
+--- a/test/plausible/ingestion/event_test.exs
++++ b/test/plausible/ingestion/event_test.exs
+@@ -137,6 +137,27 @@ defmodule Plausible.Ingestion.EventTest do
+     assert dropped.drop_reason == :site_ip_blocklist
+   end
+ 
++  test "event pipeline drops a request when country is on blocklist" do
++    site = insert(:site)
++
++    payload = %{
++      name: "pageview",
++      url: "http://dummy.site",
++      domain: site.domain
++    }
++
++    conn = build_conn(:post, "/api/events", payload)
++    conn = %{conn | remote_ip: {216, 160, 83, 56}}
++
++    %{country_code: cc} = Plausible.Ingestion.Geolocation.lookup("216.160.83.56")
++    {:ok, _} = Plausible.Shields.add_country_rule(site, %{"country_code" => cc})
++
++    assert {:ok, request} = Request.build(conn)
++
++    assert {:ok, %{buffered: [], dropped: [dropped]}} = Event.build_and_buffer(request)
++    assert dropped.drop_reason == :site_country_blocklist
++  end
++
+   test "event pipeline drops events for site with accept_trafic_until in the past" do
+     yesterday = Date.add(Date.utc_today(), -1)
+ 
+diff --git a/test/plausible/shield/country_rule_cache_test.exs b/test/plausible/shield/country_rule_cache_test.exs
+new file mode 100644
+index 000000000000..d0aee91f5e10
+--- /dev/null
++++ b/test/plausible/shield/country_rule_cache_test.exs
+@@ -0,0 +1,81 @@
++defmodule Plausible.Shield.CountryRuleCacheTest do
++  use Plausible.DataCase, async: true
++
++  alias Plausible.Shield.CountryRule
++  alias Plausible.Shield.CountryRuleCache
++  alias Plausible.Shields
++
++  describe "public cache interface" do
++    test "cache caches country rules", %{test: test} do
++      {:ok, _} =
++        Supervisor.start_link(
++          [{CountryRuleCache, [cache_name: test, child_id: :country_rules_cache_id]}],
++          strategy: :one_for_one,
++          name: :"cache_supervisor_#{test}"
++        )
++
++      site = insert(:site, domain: "site1.example.com")
++
++      {:ok, %{id: rid1}} = Shields.add_country_rule(site, %{"country_code" => "EE"})
++      {:ok, %{id: rid2}} = Shields.add_country_rule(site, %{"country_code" => "PL"})
++
++      :ok = CountryRuleCache.refresh_all(cache_name: test)
++
++      :ok = Shields.remove_country_rule(site, rid1)
++
++      assert CountryRuleCache.size(test) == 2
++
++      assert %CountryRule{from_cache?: true, id: ^rid1} =
++               CountryRuleCache.get({site.domain, "EE"}, force?: true, cache_name: test)
++
++      assert %CountryRule{from_cache?: true, id: ^rid2} =
++               CountryRuleCache.get({site.domain, "PL"}, force?: true, cache_name: test)
++
++      refute CountryRuleCache.get({site.domain, "RO"}, cache_name: test, force?: true)
++    end
++
++    test "cache allows lookups for countries on sites with changed domain", %{test: test} do
++      {:ok, _} = start_test_cache(test)
++      site = insert(:site, domain: "new.example.com", domain_changed_from: "old.example.com")
++
++      {:ok, _} = Shields.add_country_rule(site, %{"country_code" => "EE"})
++      :ok = CountryRuleCache.refresh_all(cache_name: test)
++
++      assert CountryRuleCache.get({"old.example.com", "EE"}, force?: true, cache_name: test)
++      assert CountryRuleCache.get({"new.example.com", "EE"}, force?: true, cache_name: test)
++    end
++
++    test "refreshes only recently added country rules", %{test: test} do
++      {:ok, _} = start_test_cache(test)
++
++      domain = "site1.example.com"
++      site = insert(:site, domain: domain)
++
++      cache_opts = [cache_name: test, force?: true]
++
++      yesterday = DateTime.utc_now() |> DateTime.add(-1 * 60 * 60 * 24)
++
++      insert(:country_rule,
++        site: site,
++        inserted_at: yesterday,
++        updated_at: yesterday,
++        country_code: "EE"
++      )
++
++      insert(:country_rule, site: site, country_code: "PL")
++
++      assert CountryRuleCache.get({domain, "EE"}, cache_opts) == nil
++      assert CountryRuleCache.get({domain, "PL"}, cache_opts) == nil
++
++      assert :ok = CountryRuleCache.refresh_updated_recently(cache_opts)
++
++      refute CountryRuleCache.get({domain, "EE"}, cache_opts)
++      assert %CountryRule{} = CountryRuleCache.get({domain, "PL"}, cache_opts)
++    end
++  end
++
++  defp start_test_cache(cache_name) do
++    %{start: {m, f, a}} = CountryRuleCache.child_spec(cache_name: cache_name)
++    apply(m, f, a)
++  end
++end
+diff --git a/test/plausible/shields_test.exs b/test/plausible/shields_test.exs
+index 80b17fc8aa52..c39da45871dd 100644
+--- a/test/plausible/shields_test.exs
++++ b/test/plausible/shields_test.exs
+@@ -80,8 +80,12 @@ defmodule Plausible.ShieldsTest do
+     end
+ 
+     test "with added_by", %{site: site} do
+-      assert {:ok, rule} = add_ip_rule(site, %{"inet" => "1.1.1.1", "added_by" => "test"})
+-      assert rule.added_by == "test"
++      assert {:ok, rule} =
++               add_ip_rule(site, %{"inet" => "1.1.1.1"},
++                 added_by: build(:user, name: "Joe", email: "joe@example.com")
++               )
++
++      assert rule.added_by == "Joe <joe@example.com>"
+     end
+   end
+ 
+@@ -138,4 +142,129 @@ defmodule Plausible.ShieldsTest do
+       refute rule.from_cache?
+     end
+   end
++
++  describe "add_country_rule/2" do
++    test "no input", %{site: site} do
++      assert {:error, changeset} = add_country_rule(site, %{})
++      assert changeset.errors == [country_code: {"can't be blank", [validation: :required]}]
++      refute changeset.valid?
++    end
++
++    test "unsupported country", %{site: site} do
++      assert {:error, changeset} = add_country_rule(site, %{"country_code" => "0X"})
++      assert changeset.errors == [country_code: {"is invalid", []}]
++      refute changeset.valid?
++    end
++
++    test "incorrect country format", %{site: site} do
++      assert {:error, changeset} = add_country_rule(site, %{"country_code" => "Germany"})
++
++      assert changeset.errors ==
++               [
++                 {:country_code, {"is invalid", []}},
++                 {:country_code,
++                  {"should be %{count} character(s)",
++                   [count: 2, validation: :length, kind: :is, type: :string]}}
++               ]
++
++      refute changeset.valid?
++    end
++
++    test "double insert", %{site: site} do
++      assert {:ok, _} = add_country_rule(site, %{"country_code" => "EE"})
++      assert {:error, changeset} = add_country_rule(site, %{"country_code" => "EE"})
++      refute changeset.valid?
++
++      assert changeset.errors == [
++               country_code:
++                 {"has already been taken",
++                  [
++                    {:constraint, :unique},
++                    {:constraint_name, "shield_rules_country_site_id_country_code_index"}
++                  ]}
++             ]
++    end
++
++    test "over limit", %{site: site} do
++      country_codes =
++        Location.Country.all()
++        |> Enum.take(Plausible.Shields.maximum_country_rules())
++        |> Enum.map(& &1.alpha_2)
++
++      for cc <- country_codes do
++        assert {:ok, _} =
++                 add_country_rule(site, %{"country_code" => cc})
++      end
++
++      assert count_country_rules(site) == maximum_country_rules()
++
++      assert {:error, changeset} =
++               add_country_rule(site, %{"country_code" => "US"})
++
++      refute changeset.valid?
++      assert changeset.errors == [country_code: {"maximum reached", []}]
++    end
++
++    test "with added_by", %{site: site} do
++      assert {:ok, rule} =
++               add_country_rule(site, %{"country_code" => "EE"},
++                 added_by: build(:user, name: "Joe", email: "joe@example.com")
++               )
++
++      assert rule.added_by == "Joe <joe@example.com>"
++    end
++  end
++
++  describe "remove_country_rule/2" do
++    test "is idempontent", %{site: site} do
++      {:ok, rule} = add_country_rule(site, %{"country_code" => "EE"})
++      assert remove_country_rule(site, rule.id) == :ok
++      refute Repo.get(Plausible.Shield.CountryRule, rule.id)
++      assert remove_country_rule(site, rule.id) == :ok
++    end
++  end
++
++  describe "list_country_rules/1" do
++    test "empty", %{site: site} do
++      assert(list_country_rules(site) == [])
++    end
++
++    @tag :slow
++    test "many", %{site: site} do
++      {:ok, r1} = add_country_rule(site, %{"country_code" => "EE"})
++      :timer.sleep(1000)
++      {:ok, r2} = add_country_rule(site, %{"country_code" => "PL"})
++      assert [^r2, ^r1] = list_country_rules(site)
++    end
++  end
++
++  describe "count_country_rules/1" do
++    test "counts", %{site: site} do
++      assert count_country_rules(site) == 0
++      {:ok, _} = add_country_rule(site, %{"country_code" => "EE"})
++      assert count_country_rules(site) == 1
++      {:ok, _} = add_country_rule(site, %{"country_code" => "PL"})
++      assert count_country_rules(site) == 2
++    end
++  end
++
++  describe "Country Rules" do
++    test "end to end", %{site: site} do
++      site2 = insert(:site)
++
++      assert count_country_rules(site.id) == 0
++      assert list_country_rules(site.id) == []
++
++      assert {:ok, rule} =
++               add_country_rule(site.id, %{"country_code" => "EE"})
++
++      add_country_rule(site2, %{"country_code" => "PL"})
++
++      assert count_country_rules(site) == 1
++      assert [^rule] = list_country_rules(site)
++      assert rule.country_code == "EE"
++      assert rule.action == :deny
++      refute rule.from_cache?
++    end
++  end
+ end
+diff --git a/test/plausible/timezones_test.exs b/test/plausible/timezones_test.exs
+index 44c7a34b4036..890d2e2f22e2 100644
+--- a/test/plausible/timezones_test.exs
++++ b/test/plausible/timezones_test.exs
+@@ -1,8 +1,10 @@
+ defmodule Plausible.TimezonesTest do
+   use ExUnit.Case, async: true
+ 
++  import Plausible.Timezones
++
+   test "options/0 returns a list of timezones" do
+-    options = Plausible.Timezones.options()
++    options = options()
+     refute Enum.empty?(options)
+ 
+     gmt12 = Enum.find(options, &(&1[:value] == "Etc/GMT+12"))
+@@ -13,7 +15,59 @@ defmodule Plausible.TimezonesTest do
+   end
+ 
+   test "options/0 does not fail during time changes" do
+-    options = Plausible.Timezones.options(~N[2021-10-03 02:31:07])
++    options = options(~N[2021-10-03 02:31:07])
+     refute Enum.empty?(options)
+   end
++
++  test "to_utc_datetime/2" do
++    assert to_utc_datetime(~N[2022-09-11 00:00:00], "Etc/UTC") == ~U[2022-09-11 00:00:00Z]
++
++    assert to_utc_datetime(~N[2022-09-11 00:00:00], "America/Santiago") ==
++             ~U[2022-09-11 00:00:00Z]
++
++    assert to_utc_datetime(~N[2023-10-29 00:00:00], "Atlantic/Azores") == ~U[2023-10-29 01:00:00Z]
++  end
++
++  test "to_date_in_timezone/1" do
++    assert to_date_in_timezone(~D[2021-01-03], "Etc/UTC") == ~D[2021-01-03]
++    assert to_date_in_timezone(~U[2015-01-13 13:00:07Z], "Etc/UTC") == ~D[2015-01-13]
++    assert to_date_in_timezone(~N[2015-01-13 13:00:07], "Etc/UTC") == ~D[2015-01-13]
++    assert to_date_in_timezone(~N[2015-01-13 19:00:07], "Etc/GMT+12") == ~D[2015-01-14]
++  end
++
++  test "to_datetime_in_timezone/1" do
++    assert to_datetime_in_timezone(~D[2021-01-03], "Etc/UTC") == ~U[2021-01-03 00:00:00Z]
++    assert to_datetime_in_timezone(~N[2015-01-13 13:00:07], "Etc/UTC") == ~U[2015-01-13 13:00:07Z]
++
++    assert to_datetime_in_timezone(~N[2015-01-13 19:00:07], "Etc/GMT+12") ==
++             %DateTime{
++               microsecond: {0, 0},
++               second: 7,
++               calendar: Calendar.ISO,
++               month: 1,
++               day: 14,
++               year: 2015,
++               minute: 0,
++               hour: 7,
++               time_zone: "Etc/GMT-12",
++               zone_abbr: "+12",
++               utc_offset: 43_200,
++               std_offset: 0
++             }
++
++    assert to_datetime_in_timezone(~N[2016-03-27 02:30:00], "Europe/Copenhagen") == %DateTime{
++             microsecond: {0, 0},
++             second: 0,
++             calendar: Calendar.ISO,
++             month: 3,
++             day: 27,
++             year: 2016,
++             minute: 30,
++             hour: 4,
++             time_zone: "Europe/Copenhagen",
++             zone_abbr: "CEST",
++             utc_offset: 3600,
++             std_offset: 3600
++           }
++  end
+ end
+diff --git a/test/plausible_web/live/shields/countries_test.exs b/test/plausible_web/live/shields/countries_test.exs
+new file mode 100644
+index 000000000000..bd9a3194429c
+--- /dev/null
++++ b/test/plausible_web/live/shields/countries_test.exs
+@@ -0,0 +1,126 @@
++defmodule PlausibleWeb.Live.Shields.CountriesTest do
++  use PlausibleWeb.ConnCase, async: true
++
++  import Phoenix.LiveViewTest
++  import Plausible.Test.Support.HTML
++
++  alias Plausible.Shields
++
++  setup [:create_user, :create_site, :log_in]
++
++  describe "Country Rules - static" do
++    test "renders country rules page with empty list", %{conn: conn, site: site} do
++      conn = get(conn, "/#{site.domain}/settings/shields/countries")
++      resp = html_response(conn, 200)
++
++      assert resp =~ "No Country Rules configured for this Site"
++      assert resp =~ "Country Block List"
++    end
++
++    test "lists country rules with remove actions", %{conn: conn, site: site} do
++      {:ok, r1} =
++        Shields.add_country_rule(site, %{"country_code" => "PL"})
++
++      {:ok, r2} =
++        Shields.add_country_rule(site, %{"country_code" => "EE"})
++
++      conn = get(conn, "/#{site.domain}/settings/shields/countries")
++      resp = html_response(conn, 200)
++
++      assert resp =~ "Poland"
++      assert resp =~ "Estonia"
++
++      assert remove_button_1 = find(resp, "#remove-country-rule-#{r1.id}")
++      assert remove_button_2 = find(resp, "#remove-country-rule-#{r2.id}")
++
++      assert text_of_attr(remove_button_1, "phx-click" == "remove-country-rule")
++      assert text_of_attr(remove_button_1, "phx-value-rule-id" == r1.id)
++      assert text_of_attr(remove_button_2, "phx-click" == "remove-country-rule")
++      assert text_of_attr(remove_button_2, "phx-value-rule-id" == r2.id)
++    end
++
++    test "add rule button is rendered", %{conn: conn, site: site} do
++      conn = get(conn, "/#{site.domain}/settings/shields/countries")
++      resp = html_response(conn, 200)
++
++      assert element_exists?(resp, ~s/button#add-country-rule[x-data]/)
++      attr = text_of_attr(resp, ~s/button#add-country-rule/, "x-on:click")
++
++      assert attr =~ "open-modal"
++      assert attr =~ "country-rule-form-modal"
++    end
++
++    test "add rule button is not rendered when maximum reached", %{conn: conn, site: site} do
++      country_codes =
++        Location.Country.all()
++        |> Enum.take(Shields.maximum_country_rules())
++        |> Enum.map(& &1.alpha_2)
++
++      for cc <- country_codes do
++        assert {:ok, _} =
++                 Shields.add_country_rule(site, %{"country_code" => "#{cc}"})
++      end
++
++      conn = get(conn, "/#{site.domain}/settings/shields/countries")
++      resp = html_response(conn, 200)
++
++      refute element_exists?(resp, ~s/button#add-country-rule[x-data]/)
++      assert resp =~ "Maximum number of countries reached"
++      assert resp =~ "You've reached the maximum number of countries you can block (30)"
++    end
++  end
++
++  describe "Country Rules - LiveView" do
++    test "modal contains form", %{site: site, conn: conn} do
++      lv = get_liveview(conn, site)
++      html = render(lv)
++
++      assert element_exists?(
++               html,
++               ~s/form[phx-submit="save-country-rule"] input[name="country_rule\[country_code\]"]/
++             )
++
++      assert submit_button(html, ~s/form[phx-submit="save-country-rule"]/)
++    end
++
++    test "submitting a valid country saves it", %{conn: conn, site: site} do
++      lv = get_liveview(conn, site)
++
++      lv
++      |> element("form")
++      |> render_submit(%{
++        "country_rule[country_code]" => "EE"
++      })
++
++      html = render(lv)
++
++      assert html =~ "Estonia"
++
++      assert [%{country_code: "EE"}] = Shields.list_country_rules(site)
++    end
++
++    test "clicking Remove deletes the rule", %{conn: conn, site: site} do
++      {:ok, _} =
++        Shields.add_country_rule(site, %{"country_code" => "EE"})
++
++      lv = get_liveview(conn, site)
++
++      html = render(lv)
++      assert text_of_element(html, "table tbody td") =~ "Estonia"
++
++      lv |> element(~s/button[phx-click="remove-country-rule"]/) |> render_click()
++
++      html = render(lv)
++      refute text_of_element(html, "table tbody td") =~ "Estonia"
++
++      assert Shields.count_country_rules(site) == 0
++    end
++
++    defp get_liveview(conn, site) do
++      conn = assign(conn, :live_module, PlausibleWeb.Live.Shields)
++      {:ok, lv, _html} = live(conn, "/#{site.domain}/settings/shields/countries")
++
++      lv
++    end
++  end
++end
+diff --git a/test/plausible_web/live/shields_test.exs b/test/plausible_web/live/shields/ip_addresses_test.exs
+similarity index 86%
+rename from test/plausible_web/live/shields_test.exs
+rename to test/plausible_web/live/shields/ip_addresses_test.exs
+index 355e52b39aff..fd11a431dc68 100644
+--- a/test/plausible_web/live/shields_test.exs
++++ b/test/plausible_web/live/shields/ip_addresses_test.exs
+@@ -1,4 +1,4 @@
+-defmodule PlausibleWeb.Live.ShieldsTest do
++defmodule PlausibleWeb.Live.Shields.IPAddressesTest do
+   use PlausibleWeb.ConnCase, async: true
+ 
+   import Phoenix.LiveViewTest
+@@ -10,7 +10,7 @@ defmodule PlausibleWeb.Live.ShieldsTest do
+ 
+   describe "IP Rules - static" do
+     test "renders ip rules page with empty list", %{conn: conn, site: site} do
+-      conn = get(conn, "/#{site.domain}/settings/shields")
++      conn = get(conn, "/#{site.domain}/settings/shields/ip_addresses")
+       resp = html_response(conn, 200)
+ 
+       assert resp =~ "No IP Rules configured for this Site"
+@@ -24,7 +24,7 @@ defmodule PlausibleWeb.Live.ShieldsTest do
+       {:ok, r2} =
+         Shields.add_ip_rule(site, %{"inet" => "127.0.0.2", "description" => "Bob"})
+ 
+-      conn = get(conn, "/#{site.domain}/settings/shields")
++      conn = get(conn, "/#{site.domain}/settings/shields/ip_addresses")
+       resp = html_response(conn, 200)
+ 
+       assert resp =~ "127.0.0.1"
+@@ -33,19 +33,17 @@ defmodule PlausibleWeb.Live.ShieldsTest do
+       assert resp =~ "127.0.0.2"
+       assert resp =~ "Bob"
+ 
+-      assert element_exists?(
+-               resp,
+-               ~s/button[phx-click="remove-ip-rule"][phx-value-rule-id="#{r1.id}"]#remove-ip-rule-#{r1.id}/
+-             )
++      assert remove_button_1 = find(resp, "#remove-ip-rule-#{r1.id}")
++      assert remove_button_2 = find(resp, "#remove-ip-rule-#{r2.id}")
+ 
+-      assert element_exists?(
+-               resp,
+-               ~s/button[phx-click="remove-ip-rule"][phx-value-rule-id="#{r2.id}"]#remove-ip-rule-#{r2.id}/
+-             )
++      assert text_of_attr(remove_button_1, "phx-click" == "remove-ip-rule")
++      assert text_of_attr(remove_button_1, "phx-value-rule-id" == r1.id)
++      assert text_of_attr(remove_button_2, "phx-click" == "remove-ip-rule")
++      assert text_of_attr(remove_button_2, "phx-value-rule-id" == r2.id)
+     end
+ 
+     test "add rule button is rendered", %{conn: conn, site: site} do
+-      conn = get(conn, "/#{site.domain}/settings/shields")
++      conn = get(conn, "/#{site.domain}/settings/shields/ip_addresses")
+       resp = html_response(conn, 200)
+ 
+       assert element_exists?(resp, ~s/button#add-ip-rule[x-data]/)
+@@ -61,11 +59,12 @@ defmodule PlausibleWeb.Live.ShieldsTest do
+                  Shields.add_ip_rule(site, %{"inet" => "1.1.1.#{i}"})
+       end
+ 
+-      conn = get(conn, "/#{site.domain}/settings/shields")
++      conn = get(conn, "/#{site.domain}/settings/shields/ip_addresses")
+       resp = html_response(conn, 200)
+ 
+       refute element_exists?(resp, ~s/button#add-ip-rule[x-data]/)
+       assert resp =~ "Maximum number of addresses reached"
++      assert resp =~ "You've reached the maximum number of IP addresses you can block (30)"
+     end
+   end
+ 
+@@ -200,7 +199,7 @@ defmodule PlausibleWeb.Live.ShieldsTest do
+ 
+     defp get_liveview(conn, site) do
+       conn = assign(conn, :live_module, PlausibleWeb.Live.Shields)
+-      {:ok, lv, _html} = live(conn, "/#{site.domain}/settings/shields")
++      {:ok, lv, _html} = live(conn, "/#{site.domain}/settings/shields/ip_addresses")
+ 
+       lv
+     end
+diff --git a/test/support/factory.ex b/test/support/factory.ex
+index 7c1ced73ef4d..a89478603e4c 100644
+--- a/test/support/factory.ex
++++ b/test/support/factory.ex
+@@ -286,6 +286,12 @@ defmodule Plausible.Factory do
+     }
+   end
+ 
++  def country_rule_factory do
++    %Plausible.Shield.CountryRule{
++      added_by: "Mr Seed <user@plausible.test>"
++    }
++  end
++
+   defp hash_key() do
+     Keyword.fetch!(
+       Application.get_env(:plausible, PlausibleWeb.Endpoint),
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index 7cbd300df15f..30f0ebbd59e8 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -2,7 +2,6 @@
+ Mox.defmock(Plausible.HTTPClient.Mock, for: Plausible.HTTPClient.Interface)
+ Application.ensure_all_started(:double)
+ FunWithFlags.enable(:window_time_on_page)
+-FunWithFlags.enable(:shields)
+ Ecto.Adapters.SQL.Sandbox.mode(Plausible.Repo, :manual)
+ 
+ if Mix.env() == :small_test do

@@ -1,0 +1,328 @@
+diff --git a/.sobelow-conf b/.sobelow-conf
+index 0c4088d99..bf1db34bb 100644
+--- a/.sobelow-conf
++++ b/.sobelow-conf
+@@ -16,7 +16,8 @@
+       "Config.HTTPS",
+       "Config.CSP",
+       "XSS.ContentType",
+-      "Traversal.SendFile"
++      "Traversal.SendFile",
++      "Traversal.SendDownload"
+     ],
+   ignore_files: [],
+   version: false
+diff --git a/config/runtime.exs b/config/runtime.exs
+index 6cb062fb3..8e47790ab 100644
+--- a/config/runtime.exs
++++ b/config/runtime.exs
+@@ -53,7 +53,7 @@ if config_env() == :prod do
+   # For testing alternate journal modes (see issue #137)
+   journal_mode = String.to_existing_atom(System.get_env("JOURNAL_MODE", "wal"))
+ 
+-  config :logger, level: String.to_existing_atom(System.get_env("LOG_LEVEL", "info"))
++  config :logger, level: String.to_existing_atom(System.get_env("LOG_LEVEL", "debug"))
+ 
+   config :pinchflat,
+     yt_dlp_executable: System.find_executable("yt-dlp"),
+@@ -64,7 +64,8 @@ if config_env() == :prod do
+     tmpfile_directory: Path.join([System.tmp_dir!(), "pinchflat", "data"]),
+     dns_cluster_query: System.get_env("DNS_CLUSTER_QUERY"),
+     expose_feed_endpoints: expose_feed_endpoints,
+-    timezone: System.get_env("TIMEZONE") || System.get_env("TZ") || "UTC"
++    timezone: System.get_env("TIMEZONE") || System.get_env("TZ") || "UTC",
++    log_path: log_path
+ 
+   config :tzdata, :data_dir, System.get_env("TZ_DATA_DIR", "/etc/elixir_tzdata_data")
+ 
+diff --git a/lib/pinchflat_web/components/layouts.ex b/lib/pinchflat_web/components/layouts.ex
+index 0efadc1fa..9d858981e 100644
+--- a/lib/pinchflat_web/components/layouts.ex
++++ b/lib/pinchflat_web/components/layouts.ex
+@@ -4,28 +4,107 @@ defmodule PinchflatWeb.Layouts do
+   embed_templates "layouts/*"
+   embed_templates "layouts/partials/*"
+ 
++  @doc """
++  Renders a sidebar menu item link
++
++  ## Examples
++
++      <.sidebar_link icon="hero-home" text="Home" href="/" />
++  """
+   attr :icon, :string, required: true
+   attr :text, :string, required: true
+   attr :href, :any, required: true
+   attr :target, :any, default: "_self"
+ 
+   def sidebar_item(assigns) do
+-    # I'm testing out grouping classes here. Tentative order: font, layout, color, animation, state-modifiers
+     ~H"""
+-    <li>
+-      <.link
+-        href={@href}
+-        target={@target}
++    <li class="text-bodydark1">
++      <.sidebar_link icon={@icon} text={@text} href={@href} target={@target} />
++    </li>
++    """
++  end
++
++  @doc """
++  Renders a sidebar menu item with a submenu
++
++  ## Examples
++
++      <.sidebar_submenu icon="hero-home" text="Home" current_path="/">
++        <:submenu icon="hero-home" text="Home" href="/" />
++      </.sidebar_submenu>
++  """
++
++  attr :icon, :string, required: true
++  attr :text, :string, required: true
++  attr :current_path, :string, required: true
++
++  slot :submenu do
++    attr :icon, :string
++    attr :text, :string
++    attr :href, :any
++    attr :target, :any
++  end
++
++  def sidebar_submenu(assigns) do
++    initially_selected = Enum.any?(assigns[:submenu], &(&1[:href] == assigns[:current_path]))
++    assigns = Map.put(assigns, :initially_selected, initially_selected)
++
++    ~H"""
++    <li class="text-bodydark1" x-data={"{ selected: #{@initially_selected} }"}>
++      <span
+         class={[
+-          "font-medium text-bodydark1",
+-          "group relative flex items-center gap-2.5 rounded-sm px-4 py-2 duration-300 ease-in-out",
++          "font-medium cursor-pointer",
++          "group relative flex items-center justify-between rounded-sm px-4 py-2 duration-300 ease-in-out",
+           "duration-300 ease-in-out",
+-          "hover:bg-graydark dark:hover:bg-meta-4"
++          "hover:bg-meta-4"
+         ]}
++        x-on:click="selected = !selected"
+       >
+-        <.icon name={@icon} /> <%= @text %>
+-      </.link>
++        <span class="flex items-center gap-2.5">
++          <.icon name={@icon} /> <%= @text %>
++        </span>
++        <span class="text-bodydark2">
++          <.icon name="hero-chevron-up" x-bind:class="{ 'rotate-180': selected }" />
++        </span>
++      </span>
++
++      <ul x-bind:class="selected ? 'block' :'hidden'">
++        <li :for={menu <- @submenu} class="text-bodydark2">
++          <.sidebar_link icon={menu[:icon]} text={menu[:text]} href={menu[:href]} target={menu[:target]} class="pl-10" />
++        </li>
++      </ul>
+     </li>
+     """
+   end
++
++  @doc """
++  Renders a sidebar menu item link
++
++  ## Examples
++
++      <.sidebar_link icon="hero-home" text="Home" href="/" />
++  """
++  attr :icon, :string
++  attr :text, :string, required: true
++  attr :href, :any, required: true
++  attr :target, :any, default: "_self"
++  attr :class, :string, default: ""
++
++  def sidebar_link(assigns) do
++    ~H"""
++    <.link
++      href={@href}
++      target={@target}
++      class={[
++        "font-medium",
++        "group relative flex items-center gap-2.5 rounded-sm px-4 py-2 duration-300 ease-in-out",
++        "duration-300 ease-in-out",
++        "hover:bg-meta-4",
++        @class
++      ]}
++    >
++      <.icon :if={@icon} name={@icon} /> <%= @text %>
++    </.link>
++    """
++  end
+ end
+diff --git a/lib/pinchflat_web/components/layouts/app.html.heex b/lib/pinchflat_web/components/layouts/app.html.heex
+index ffb79a699..63762ff4b 100644
+--- a/lib/pinchflat_web/components/layouts/app.html.heex
++++ b/lib/pinchflat_web/components/layouts/app.html.heex
+@@ -1,5 +1,5 @@
+ <div class="flex h-screen overflow-hidden">
+-  <.sidebar />
++  <.sidebar conn={@conn} />
+ 
+   <div class="relative flex flex-1 flex-col overflow-y-auto overflow-x-hidden">
+     <.header params={@conn.params} />
+diff --git a/lib/pinchflat_web/components/layouts/partials/sidebar.html.heex b/lib/pinchflat_web/components/layouts/partials/sidebar.html.heex
+index d8b8de96e..2d7ae0d23 100644
+--- a/lib/pinchflat_web/components/layouts/partials/sidebar.html.heex
++++ b/lib/pinchflat_web/components/layouts/partials/sidebar.html.heex
+@@ -26,7 +26,14 @@
+             <.sidebar_item icon="hero-home" text="Home" href={~p"/"} />
+             <.sidebar_item icon="hero-tv" text="Sources" href={~p"/sources"} />
+             <.sidebar_item icon="hero-adjustments-vertical" text="Media Profiles" href={~p"/media_profiles"} />
+-            <.sidebar_item icon="hero-cog-6-tooth" text="Settings" href={~p"/settings"} />
++            <.sidebar_submenu
++              icon="hero-cog-6-tooth"
++              text="Config"
++              current_path={Phoenix.Controller.current_path(@conn)}
++            >
++              <:submenu text="Settings" href={~p"/settings"} />
++              <:submenu text="App Info" href={~p"/app_info"} />
++            </.sidebar_submenu>
+           </ul>
+         </div>
+       </nav>
+diff --git a/lib/pinchflat_web/controllers/settings/setting_controller.ex b/lib/pinchflat_web/controllers/settings/setting_controller.ex
+index c87d51f42..5e009c1d4 100644
+--- a/lib/pinchflat_web/controllers/settings/setting_controller.ex
++++ b/lib/pinchflat_web/controllers/settings/setting_controller.ex
+@@ -23,4 +23,20 @@ defmodule PinchflatWeb.Settings.SettingController do
+         render(conn, "show.html", changeset: changeset)
+     end
+   end
++
++  def app_info(conn, _params) do
++    render(conn, "app_info.html")
++  end
++
++  def download_logs(conn, _params) do
++    log_path = Application.get_env(:pinchflat, :log_path)
++
++    if log_path && File.exists?(log_path) do
++      send_download(conn, {:file, log_path}, filename: "pinchflat-logs-#{Date.utc_today()}.txt")
++    else
++      conn
++      |> put_flash(:error, "Log file couldn't be found")
++      |> redirect(to: ~p"/app_info")
++    end
++  end
+ end
+diff --git a/lib/pinchflat_web/controllers/settings/setting_html.ex b/lib/pinchflat_web/controllers/settings/setting_html.ex
+index 392975d25..bb5e255c9 100644
+--- a/lib/pinchflat_web/controllers/settings/setting_html.ex
++++ b/lib/pinchflat_web/controllers/settings/setting_html.ex
+@@ -18,4 +18,14 @@ defmodule PinchflatWeb.Settings.SettingHTML do
+ 
+     ~s(Server endpoint for Apprise notifications when new media is found. See <a href="#{url}" class="#{classes}" target="_blank">Apprise docs</a> for more information)
+   end
++
++  def diagnostic_info_string do
++    """
++    App Version: #{Application.spec(:pinchflat)[:vsn]}
++    yt-dlp Version: #{Settings.get!(:yt_dlp_version)}
++    Apprise Version: #{Settings.get!(:apprise_version)}
++    System Architecture: #{to_string(:erlang.system_info(:system_architecture))}
++    Timezone: #{Application.get_env(:pinchflat, :timezone)}
++    """
++  end
+ end
+diff --git a/lib/pinchflat_web/controllers/settings/setting_html/app_info.html.heex b/lib/pinchflat_web/controllers/settings/setting_html/app_info.html.heex
+new file mode 100644
+index 000000000..d1628c3f4
+--- /dev/null
++++ b/lib/pinchflat_web/controllers/settings/setting_html/app_info.html.heex
+@@ -0,0 +1,26 @@
++<div class="mb-6 flex gap-3 flex-row items-center justify-between">
++  <div class="flex gap-3 items-center">
++    <h2 class="text-title-md2 font-bold text-white ml-4">
++      App Info
++    </h2>
++  </div>
++</div>
++<div class="rounded-sm border border-stroke bg-white px-5 py-5 shadow-default dark:border-strokedark dark:bg-boxdark sm:px-7.5">
++  <div class="max-w-full">
++    <.button color="bg-primary" rounding="rounded-lg" x-data="{ copied: false }" x-on:click={~s"
++        copyWithCallbacks(
++          `#{diagnostic_info_string()}`, 
++          () => copied = true, 
++          () => copied = false
++        )
++      "}>
++      Copy Diagnotic Info
++      <span x-show="copied" x-transition.duration.150ms><.icon name="hero-check" class="ml-2 h-4 w-4" /></span>
++    </.button>
++    <.link href={~p"/download_logs"}>
++      <.button color="bg-primary" rounding="rounded-lg" class="ml-4">
++        Download Logs
++      </.button>
++    </.link>
++  </div>
++</div>
+diff --git a/lib/pinchflat_web/router.ex b/lib/pinchflat_web/router.ex
+index e3dd14e4e..1e1ee7d09 100644
+--- a/lib/pinchflat_web/router.ex
++++ b/lib/pinchflat_web/router.ex
+@@ -30,7 +30,10 @@ defmodule PinchflatWeb.Router do
+ 
+     resources "/media_profiles", MediaProfiles.MediaProfileController
+     resources "/search", Searches.SearchController, only: [:show], singleton: true
++
+     resources "/settings", Settings.SettingController, only: [:show, :update], singleton: true
++    get "/app_info", Settings.SettingController, :app_info
++    get "/download_logs", Settings.SettingController, :download_logs
+ 
+     resources "/sources", Sources.SourceController do
+       post "/force_download_pending", Sources.SourceController, :force_download_pending
+diff --git a/test/pinchflat_web/controllers/setting_controller_test.exs b/test/pinchflat_web/controllers/setting_controller_test.exs
+index 0063ebcb8..24dea44b8 100644
+--- a/test/pinchflat_web/controllers/setting_controller_test.exs
++++ b/test/pinchflat_web/controllers/setting_controller_test.exs
+@@ -1,6 +1,8 @@
+ defmodule PinchflatWeb.SettingControllerTest do
+   use PinchflatWeb.ConnCase
+ 
++  alias Pinchflat.Utils.FilesystemUtils
++
+   describe "show settings" do
+     test "renders the page", %{conn: conn} do
+       conn = get(conn, ~p"/settings")
+@@ -20,4 +22,33 @@ defmodule PinchflatWeb.SettingControllerTest do
+       assert html_response(conn, 200) =~ update_attrs[:apprise_server]
+     end
+   end
++
++  describe "app_info" do
++    test "renders the page", %{conn: conn} do
++      conn = get(conn, ~p"/app_info")
++
++      assert html_response(conn, 200) =~ "App Info"
++    end
++  end
++
++  describe "download_logs" do
++    test "downloads logs", %{conn: conn} do
++      log_path = Path.join([System.tmp_dir!(), "pinchflat", "data", "pinchflat.log"])
++      FilesystemUtils.write_p(log_path, "test log data")
++      Application.put_env(:pinchflat, :log_path, log_path)
++
++      conn = get(conn, ~p"/download_logs")
++
++      assert response(conn, 200) =~ "test log data"
++
++      Application.put_env(:pinchflat, :log_path, nil)
++    end
++
++    test "redirects when log file is not found", %{conn: conn} do
++      conn = get(conn, ~p"/download_logs")
++
++      assert redirected_to(conn) == ~p"/app_info"
++      assert conn.assigns[:flash]["error"] == "Log file couldn't be found"
++    end
++  end
+ end

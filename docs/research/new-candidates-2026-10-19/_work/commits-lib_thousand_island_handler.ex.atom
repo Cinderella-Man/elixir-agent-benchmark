@@ -1,0 +1,565 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/" xml:lang="en-US">
+  <id>tag:github.com,2008:/mtrudel/thousand_island/commits/main/lib/thousand_island/handler.ex</id>
+  <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commits/main/lib/thousand_island/handler.ex"/>
+  <link type="application/atom+xml" rel="self" href="https://github.com/mtrudel/thousand_island/commits/main/lib/thousand_island/handler.ex.atom"/>
+  <title>Recent Commits to thousand_island:main</title>
+  <updated>2026-10-15T17:12:32Z</updated>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/9ef920e33a1ac8853bf92736c35759f5bc6c0680</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/9ef920e33a1ac8853bf92736c35759f5bc6c0680"/>
+    <title>
+        Cache the peername on the socket so it survives the client going away…
+    </title>
+    <updated>2026-10-15T17:12:32Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Cache the peername on the socket so it survives the client going away (#228)
+
+* Cache the peername on the socket so it survives the client going away
+
+Thousand Island already has to look up a connection&amp;#39;s peername when it starts the handler
+process (a failure there closes the connection cleanly), but it then discarded the result.
+ThousandIsland.Socket.peername/1 performed a second, live lookup on the underlying socket
+each time it was called. If the client reset the connection in between (ie: sent a few bytes
+and then aborted), that lookup fails with :enotconn or :einval, and a handler which treats
+the peername as always available (as Bandit&amp;#39;s does when it builds its conn_data) crashes the
+connection process in handle_connection/2.
+
+The socket now carries the peername captured at accept time and Socket.peername/1 returns it.
+Sockets created without one (via Socket.new/3, as custom handlers may do) keep looking it up
+on the underlying socket as before.
+
+Co-Authored-By: Claude Sonnet 5.5 &amp;lt;noreply@anthropic.com&amp;gt;
+
+* Make the peername a required argument to Socket.new
+
+Socket.new/3 is replaced by Socket.new/4, taking the peername as its second argument, and
+the peername is now an enforced key of ThousandIsland.Socket. Socket.peername/1 always
+returns the cached value; the fallback to a live lookup on the underlying socket is gone.
+
+This is a breaking change for handler implementations which build sockets themselves
+instead of using ThousandIsland.Handler. A search of Hex and GitHub found no users on Hex
+and two small GitHub projects, each of which needs a one-line change.
+
+Co-Authored-By: Claude Sonnet 5.5 &amp;lt;noreply@anthropic.com&amp;gt;
+
+---------
+
+Co-authored-by: Claude Sonnet 5.5 &amp;lt;noreply@anthropic.com&amp;gt;&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/7caea621e0afeeb2e92874796a7b8d3caf0e2a7b</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/7caea621e0afeeb2e92874796a7b8d3caf0e2a7b"/>
+    <title>
+        Fix: Emit telemetry exception events for handler callback exceptions …
+    </title>
+    <updated>2026-08-31T20:24:08Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/94031664?s=30&amp;v=4"/>
+    <author>
+      <name>mpettibone</name>
+      <uri>https://github.com/mpettibone</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Fix: Emit telemetry exception events for handler callback exceptions (#222)
+
+Note: I asked Claude to specifically look for spec non-conformance. It found below. Claude helped write the desc, test case and identification of the PR.
+
+## Summary
+
+- End connection spans with `[:thousand_island, :connection, :exception]` when `handle_connection/2` or `handle_data/3` raises, throws, or exits.
+- Include the conventional `duration` and `monotonic_time` measurements plus `kind`, `reason`, and `stacktrace` metadata.
+- Re-raise with the original exception class, reason, and stacktrace so handler process behavior is unchanged.
+- Preserve `[:thousand_island, :connection, :stop]` for ordinary `{:error, reason, state}` returns and all normal close paths.
+
+## Non-conformance
+
+**The rule.** The telemetry library&amp;#39;s span convention, which Thousand Island&amp;#39;s event documentation explicitly adopts for its listener, acceptor, and connection event pairs, is defined in [`telemetry.span/3`](https://hexdocs.pm/telemetry/telemetry.html#span/3): &amp;quot;Those events will be one of the following pairs: `EventPrefix ++ [start]` and `EventPrefix ++ [stop]` or `EventPrefix ++ [start]` and `EventPrefix ++ [exception]`&amp;quot;, where the exception event carries `kind =&amp;gt; throw | error | exit`, `reason =&amp;gt; term()`, and `stacktrace =&amp;gt; list()` in its metadata.
+
+**What Thousand Island does today.** No exception event exists anywhere in `lib/thousand_island/telemetry.ex`. When `handle_connection/2` or `handle_data/3` raises, throws, or exits, the crash propagates into the generated `terminate/2` in `lib/thousand_island/handler.ex`, whose catch-all clause reports it through `ThousandIsland.Telemetry.stop_span/3`: a `stop` event with the GenServer-normalized exit reason tucked into `error` metadata.
+
+**What goes wrong.** A crashed callback and an ordinary `{:error, reason, state}` return produce the same terminal event, so telemetry consumers cannot tell failures-by-contract from failures-by-crash. The exception class and stacktrace, which the convention places on the exception event, are lost by the time GenServer has normalized the termination reason. Error-tracking integrations built around the standard `exception` event see nothing at all.
+
+**What this PR makes it do.** Callback dispatch is wrapped: a raise, throw, or exit emits exactly one `[:thousand_island, :connection, :exception]` event with the conventional `duration`/`monotonic_time` measurements and `kind`/`reason`/`stacktrace` metadata, then re-raises through `:erlang.raise/3` so process and supervisor behavior are byte-for-byte unchanged. A process-local marker prevents the later `terminate/2` cleanup from also emitting `stop` for the same span. Ordinary error returns keep emitting `stop`, and never `exception`.
+
+## Test plan
+
+Verified on Elixir 1.18.4 / Erlang OTP 27.3.4 against current `main`:
+
+- `mix test test/thousand_island/handler_test.exs` passes.
+- `mix format --check-formatted`, `mix credo --strict`, and `mix dialyzer` pass.
+- The new assertions fail on unpatched `main` and pass with this change.
+
+Regression coverage verifies:
+
+- `:error`, `:throw`, and `:exit` classes produce one `connection.exception` event with conventional fields;
+- exceptions from both `handle_connection/2` and `handle_data/3` are covered;
+- ordinary `{:error, reason, state}` returns still produce `connection.stop` and never `connection.exception`.
+
+## Compatibility / risks
+
+- This adds a new telemetry event. Consumers interested in callback crashes should subscribe to `[:thousand_island, :connection, :exception]` in addition to `:stop`.
+- Consumers that previously counted callback exceptions through `connection.stop` will see them move to `connection.exception`. This is the intended convention correction.
+- Exception propagation and process exit behavior are preserved by re-raising with `:erlang.raise/3`.
+- The terminal-event marker is process-local and keyed by span context. This relies on the existing invariant that connection callbacks and connection cleanup run in the same handler process.&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/1ff4c2321399ceed777e6f76fc918028b9c9f20b</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/1ff4c2321399ceed777e6f76fc918028b9c9f20b"/>
+    <title>
+        Fix: Emit connection readiness only after handshake success (#221)
+    </title>
+    <updated>2026-08-31T20:22:54Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/94031664?s=30&amp;v=4"/>
+    <author>
+      <name>mpettibone</name>
+      <uri>https://github.com/mpettibone</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Fix: Emit connection readiness only after handshake success (#221)
+
+Note: I asked Claude to specifically look for spec non-conformance. It found below. Claude helped write the desc, test case and identification of the PR.
+
+## Summary
+
+- Move `[:thousand_island, :connection, :ready]` emission into the successful handshake branch.
+- Keep the event before `handle_connection/2` runs.
+- Add regression coverage for successful TLS handshakes, stalled handshake timeouts, event ordering, and callback ordering.
+
+## Non-conformance
+
+**The rule.** This one is Thousand Island&amp;#39;s own contract. The `ThousandIsland.Telemetry` module documentation defines the event: `[:thousand_island, :connection, :ready]` means &amp;quot;Thousand Island has completed setting up the client connection&amp;quot;. The [`ThousandIsland.Handler` lifecycle documentation](https://hexdocs.pm/thousand_island/ThousandIsland.Handler.html) counts the transport handshake, TLS negotiation included, as part of that setup.
+
+**What Thousand Island does today.** In the generated `handle_info({:thousand_island_ready, ...})` clause in `lib/thousand_island/handler.ex`, the event is emitted first and the handshake happens after:
+
+```elixir
+ThousandIsland.Telemetry.span_event(connection_span, :ready)
+
+case ThousandIsland.Socket.handshake(socket) do
+```
+
+**What goes wrong.** Every accepted TLS connection is announced as ready, including every one whose handshake then fails or times out. A failed handshake produces a span containing `ready` followed by a stop carrying a handshake error, so anything counting `ready` events counts successful setups that never happened, and the event cannot be used for what its documentation says it means.
+
+**What this PR makes it do.** Emit `ready` only in the `{:ok, socket}` branch of the handshake, still before `handle_connection/2` is scheduled. The event ordering for successful connections is unchanged (`start`, then `ready`); failed handshakes now emit no `ready` at all.
+
+## Test plan
+
+Verified on Elixir 1.18.4 / Erlang OTP 27.3.4 against current `main`:
+
+- `mix test test/thousand_island/handler_test.exs test/thousand_island/socket_test.exs` passes.
+- `mix format --check-formatted`, `mix credo --strict`, and `mix dialyzer` pass.
+- The new assertions fail on unpatched `main` and pass with this change.
+
+Regression coverage verifies:
+
+- connection events are ordered `start`, then `ready`;
+- `ready` is emitted before `handle_connection/2`;
+- a successful TLS handshake emits `ready`;
+- a stalled TLS handshake emits no `ready` before or after timing out.
+
+## Compatibility / risks
+
+- Plain TCP uses a no-op transport handshake, so its readiness timing changes only by a function return.
+- TLS consumers will no longer receive false-positive readiness events for failed or timed-out handshakes.
+- Dashboards that treated `ready` as &amp;quot;accepted but not yet handshaken&amp;quot; will see different counts, but that interpretation contradicted the documented contract.&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/795b15eecbd513d7a8a684d545aef05744d55349</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/795b15eecbd513d7a8a684d545aef05744d55349"/>
+    <title>
+        Handler performance: reset the read timer lazily instead of on every …
+    </title>
+    <updated>2026-08-21T13:16:41Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/94031664?s=30&amp;v=4"/>
+    <author>
+      <name>mpettibone</name>
+      <uri>https://github.com/mpettibone</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Handler performance: reset the read timer lazily instead of on every message (#213)
+
+#202 gave connections precise network timeout semantics, but the enforcement runs on the hottest path in the library: every `{:continue, ...}` return, meaning every piece of data on every connection, cancels a timer, flushes the mailbox, and arms a fresh one, all to police a deadline that almost never expires. That is per-message cost for a per-idle-period concern, and eprof puts it at roughly 10% of handler CPU on receive-heavy connections, with the mailbox flush scaling with mailbox depth, so the busiest handlers pay the most.
+
+This PR moves the work to where the rare event is: continuations just record the new deadline, and a firing timer checks it, stopping the connection if it has truly expired and re-arming for the remainder if data moved it forward. A timer is armed once per timeout interval instead of once per message. A deadline that moves earlier (a shorter one-shot) still cancels and re-arms eagerly, so nothing ever fires late.
+
+Behaviour is unchanged: `handle_timeout` still fires at last-data-plus-timeout with the same millisecond precision, the one-shot, `{:persistent, timeout}`, and `:infinity` variants all act identically, and the #202 guarantee that local messages never reset the network timeout is untouched. All existing timeout tests pass unmodified. The two tests added here (a one-shot longer than the pending timeout is honored in full, a one-shot `:infinity` disables it) also pass on current main, since they pin behaviour rather than implementation.
+
+On a loopback echo bench (OTP 27.3 / Elixir 1.18.4, medians of interleaved runs) this is worth about +14% on streaming-style traffic and +3% on small keepalive request/response.
+
+`ThousandIsland.Socket` gains two internal fields (`read_deadline`, `timer_deadline`) beside `read_timer`, the same home #202 chose for the timer itself.&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/a190ae2c02c31c261c1ca8f19bfc1ae57702bef4</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/a190ae2c02c31c261c1ca8f19bfc1ae57702bef4"/>
+    <title>
+        Repoint hexdocs links
+    </title>
+    <updated>2026-06-03T23:55:08Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Repoint hexdocs links&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/68b287208fa396e4abf42b556722c2b3c97e28f2</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/68b287208fa396e4abf42b556722c2b3c97e28f2"/>
+    <title>
+        Separate out network timeout timer from GenServer message timer (#202)
+    </title>
+    <updated>2026-06-01T13:43:32Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Separate out network timeout timer from GenServer message timer (#202)&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/b652f6c794494edbf71d0a72837488fdb396778a</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/b652f6c794494edbf71d0a72837488fdb396778a"/>
+    <title>
+        Update Handler moduledoc, add &quot;the&quot; (#197)
+    </title>
+    <updated>2026-04-15T22:28:00Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/6637105?s=30&amp;v=4"/>
+    <author>
+      <name>matt-savvy</name>
+      <uri>https://github.com/matt-savvy</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Update Handler moduledoc, add &amp;quot;the&amp;quot; (#197)&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/0bb2e1b8804812a37dcf0eef209c68db227ff87a</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/0bb2e1b8804812a37dcf0eef209c68db227ff87a"/>
+    <title>
+        `Process.set_label/1` support (#188)
+    </title>
+    <updated>2025-12-12T16:36:07Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/27267603?s=30&amp;v=4"/>
+    <author>
+      <name>NelsonVides</name>
+      <uri>https://github.com/NelsonVides</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;`Process.set_label/1` support (#188)
+
+* Compile-time conditional Process.set_label/1 support
+
+What was implemented:
+
+1. ThousandIsland.ProcessLabel module
+   (lib/thousand_island/process_label.ex)
+- Uses Version.match?(System.version(), &amp;quot;&amp;gt;= 1.17.0&amp;quot;) for compile-time
+  checks
+- Conditionally calls Process.set_label/1 on Elixir 1.17+
+- No-op on earlier versions (backward compatible with Elixir 1.13+)
+- Accepts any term or list of terms as labels
+- Automatically prefixes labels with :thousand_island
+
+2. Process labels added to all key process types:
+- Server: [:thousand_island, :server, configured_port, handler_module]
+- Listener: [:thousand_island, :listener, actual_port, handler_module]
+- Acceptor: [:thousand_island, :acceptor, configured_port,
+  handler_module, acceptor_id]
+- Connection/Handler: [:thousand_island, :connection, configured_port,
+  handler_module, {remote_ip, remote_port}]
+- ShutdownListener: [:thousand_island, :shutdown_listener, listener_pid]
+
+3. Comprehensive test suite
+   (test/thousand_island/process_label_test.exs)
+- 6 new tests covering all process types
+- Conditional testing based on Elixir version
+- Tests pass on both Elixir 1.17+ (with labels) and &amp;lt; 1.17 (without
+  labels)
+- Tests verify label format and content
+
+* Keep support for labels on OTP &amp;gt;27
+
+* Rework naming convention
+
+* Fix setting label in connection process&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/807d61a0a66739ffbe30303a2f1fba38c402be50</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/807d61a0a66739ffbe30303a2f1fba38c402be50"/>
+    <title>
+        Revert &quot;`Process.set_label/1` support (#183)&quot;
+    </title>
+    <updated>2025-12-11T23:09:34Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Revert &amp;quot;`Process.set_label/1` support (#183)&amp;quot;
+
+This reverts commit 8c17e99dda9507fcfa6f521d6077d0b619817985.&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/9470db5e08b2e70a0b17b155a617e62794569c1b</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/9470db5e08b2e70a0b17b155a617e62794569c1b"/>
+    <title>
+        Socket performance: reduce allocations on connection lifecycle (#182)
+    </title>
+    <updated>2025-12-11T22:42:37Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/27267603?s=30&amp;v=4"/>
+    <author>
+      <name>NelsonVides</name>
+      <uri>https://github.com/NelsonVides</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Socket performance: reduce allocations on connection lifecycle (#182)
+
+* Socket performance: reduce allocations on connection lifecycle
+
+Optimize connection handling to minimize memory allocations and message
+passing overhead during connection accept and close operations.
+
+Changes:
+
+1. Optimised socket stats collection in do_socket_close/2
+ - Replaced Keyword.take/2 + Enum.into/2 with a single map comprehension
+ - Reduces from 2 iterations and 2 allocations to 1 pass with direct map
+   construction
+ - Called on every connection close
+
+2. Minimised ServerConfig message passing on connection accept
+   (`:thousand_island_ready` message)
+ - Changed from sending entire ServerConfig struct (potentially very
+   big) to a plain map of 3 values, only the needed ones
+ - Reduces message copying overhead
+ - Called on every connection accept
+
+* Optimise further after review suggestions
+
+* Precalculate the connection config only once in the acceptor start&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/8c17e99dda9507fcfa6f521d6077d0b619817985</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/8c17e99dda9507fcfa6f521d6077d0b619817985"/>
+    <title>
+        `Process.set_label/1` support (#183)
+    </title>
+    <updated>2025-12-11T14:24:30Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/27267603?s=30&amp;v=4"/>
+    <author>
+      <name>NelsonVides</name>
+      <uri>https://github.com/NelsonVides</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;`Process.set_label/1` support (#183)
+
+* Compile-time conditional Process.set_label/1 support
+
+What was implemented:
+
+1. ThousandIsland.ProcessLabel module
+   (lib/thousand_island/process_label.ex)
+- Uses Version.match?(System.version(), &amp;quot;&amp;gt;= 1.17.0&amp;quot;) for compile-time
+  checks
+- Conditionally calls Process.set_label/1 on Elixir 1.17+
+- No-op on earlier versions (backward compatible with Elixir 1.13+)
+- Accepts any term or list of terms as labels
+- Automatically prefixes labels with :thousand_island
+
+2. Process labels added to all key process types:
+- Server: [:thousand_island, :server, configured_port, handler_module]
+- Listener: [:thousand_island, :listener, actual_port, handler_module]
+- Acceptor: [:thousand_island, :acceptor, configured_port,
+  handler_module, acceptor_id]
+- Connection/Handler: [:thousand_island, :connection, configured_port,
+  handler_module, {remote_ip, remote_port}]
+- ShutdownListener: [:thousand_island, :shutdown_listener, listener_pid]
+
+3. Comprehensive test suite
+   (test/thousand_island/process_label_test.exs)
+- 6 new tests covering all process types
+- Conditional testing based on Elixir version
+- Tests pass on both Elixir 1.17+ (with labels) and &amp;lt; 1.17 (without
+  labels)
+- Tests verify label format and content
+
+* Keep support for labels on OTP &amp;gt;27
+
+* Rework naming convention&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/1590f7145ed4371717cca87d88462c80c2d4adb7</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/1590f7145ed4371717cca87d88462c80c2d4adb7"/>
+    <title>
+        Fix doc typo (#178)
+    </title>
+    <updated>2025-09-04T13:47:18Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/27267603?s=30&amp;v=4"/>
+    <author>
+      <name>NelsonVides</name>
+      <uri>https://github.com/NelsonVides</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Fix doc typo (#178)&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/3d6b64bfd57ef332e431a7e3400a29643a586fd8</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/3d6b64bfd57ef332e431a7e3400a29643a586fd8"/>
+    <title>
+        Support handle_continue callback returns (#166)
+    </title>
+    <updated>2025-04-29T17:49:20Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Support handle_continue callback returns (#166)&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/73cee85ddbc01a10300164827684ae5999bb5086</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/73cee85ddbc01a10300164827684ae5999bb5086"/>
+    <title>
+        Explicitly ignore returns
+    </title>
+    <updated>2025-01-06T20:24:41Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Explicitly ignore returns&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/830f571dc6aba2b9ecfe3117f132c92adb5e35c1</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/830f571dc6aba2b9ecfe3117f132c92adb5e35c1"/>
+    <title>
+        Use behavior stacking for handler implementation (#146)
+    </title>
+    <updated>2025-01-05T18:09:40Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/695307?s=30&amp;v=4"/>
+    <author>
+      <name>mruoss</name>
+      <uri>https://github.com/mruoss</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Use behavior stacking for handler implementation (#146)
+
+* use behavior stacking for handler implementation
+
+* refactor to use modular macros approach
+
+* Add credo filter
+
+---------
+
+Co-authored-by: Mat Trudel &amp;lt;mat@geeky.net&amp;gt;&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/786b4639fe6fb692b625b608618e13776ed0aea7</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/786b4639fe6fb692b625b608618e13776ed0aea7"/>
+    <title>
+        Don&#39;t consider remote closure as an error condition for telemetry
+    </title>
+    <updated>2024-11-13T19:19:54Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Don&amp;#39;t consider remote closure as an error condition for telemetry&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/c1b524614fb2ce4f3dbe07b67818f4f7fc369a65</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/c1b524614fb2ce4f3dbe07b67818f4f7fc369a65"/>
+    <title>
+        Improve docs for &#39;When Handler Isn&#39;t Enough&#39;
+    </title>
+    <updated>2024-04-10T23:41:48Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Improve docs for &amp;#39;When Handler Isn&amp;#39;t Enough&amp;#39;
+
+Fixes #118&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/38ec7688b0242d8bf5db659e912d1862b93a9713</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/38ec7688b0242d8bf5db659e912d1862b93a9713"/>
+    <title>
+        Hide &#39;private&#39; macro from docs
+    </title>
+    <updated>2024-04-10T23:38:11Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Hide &amp;#39;private&amp;#39; macro from docs&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/6140b0cb08404df3437c106f97e9a5251e1f6666</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/6140b0cb08404df3437c106f97e9a5251e1f6666"/>
+    <title>
+        typo (#117)
+    </title>
+    <updated>2024-03-21T15:13:13Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/2451508?s=30&amp;v=4"/>
+    <author>
+      <name>feng19</name>
+      <uri>https://github.com/feng19</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;typo (#117)
+
+handle_cast/3 -&amp;gt; handle_call/3&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/87f287f51b44fffc3e5488bd03314e3ebf6c5230</id>
+    <link type="text/html" rel="alternate" href="https://github.com/mtrudel/thousand_island/commit/87f287f51b44fffc3e5488bd03314e3ebf6c5230"/>
+    <title>
+        Move handle_info fallback handler to end of compilation to allow over…
+    </title>
+    <updated>2023-12-31T17:29:55Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/79646?s=30&amp;v=4"/>
+    <author>
+      <name>mtrudel</name>
+      <uri>https://github.com/mtrudel</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;Move handle_info fallback handler to end of compilation to allow override (#105)&lt;/pre&gt;
+    </content>
+  </entry>
+</feed>

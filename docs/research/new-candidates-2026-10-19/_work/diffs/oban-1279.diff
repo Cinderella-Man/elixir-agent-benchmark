@@ -1,0 +1,106 @@
+diff --git a/guides/upgrading/v2.20.md b/guides/upgrading/v2.20.md
+new file mode 100644
+index 00000000..a02a06b8
+--- /dev/null
++++ b/guides/upgrading/v2.20.md
+@@ -0,0 +1,38 @@
++# Upgrading to v2.20
++
++This Oban release includes an optional, but recommended migration.
++
++## Bump Your Deps
++
++Update Oban (and optionally Pro) to the latest versions:
++
++```elixir
++[
++  {:oban, "~> 2.20"},
++]
++```
++
++## Run Oban.Migrations for v13 (Optional)
++
++The v13 migration adds compound indexes for `cancelled_at` and `discarded_at` columns. This is
++done to improve `Oban.Plugins.Pruner` performance for cancelled and discarded jobs.
++
++To get started, create a migration to create the table:
++
++```bash
++$ mix ecto.gen.migration upgrade_oban_jobs_to_v13
++```
++
++Within the generated migration module:
++
++```elixir
++use Ecto.Migration
++
++def up, do: Oban.Migrations.up(version: 13)
++
++def down, do: Oban.Migrations.down(version: 13)
++```
++
++If you have multiple Oban instances, or use an alternate prefix, you'll need to run the migration
++for each prefix.
++
+diff --git a/lib/oban/migration.ex b/lib/oban/migration.ex
+index 84022455..cf1965f7 100644
+--- a/lib/oban/migration.ex
++++ b/lib/oban/migration.ex
+@@ -43,19 +43,19 @@ defmodule Oban.Migration do
+   additional migrations. To do this, generate a new migration:
+ 
+   ```bash
+-  mix ecto.gen.migration upgrade_oban_to_v12
++  mix ecto.gen.migration upgrade_oban_to_v13
+   ```
+ 
+   Open the generated migration in your editor and call the `up` and `down` functions on
+   `Oban.Migration`, passing a version number:
+ 
+   ```elixir
+-  defmodule MyApp.Repo.Migrations.UpgradeObanToV11 do
++  defmodule MyApp.Repo.Migrations.UpgradeObanToV13 do
+     use Ecto.Migration
+ 
+-    def up, do: Oban.Migrations.up(version: 12)
++    def up, do: Oban.Migrations.up(version: 13)
+ 
+-    def down, do: Oban.Migrations.down(version: 12)
++    def down, do: Oban.Migrations.down(version: 13)
+   end
+   ```
+ 
+diff --git a/lib/oban/migrations/postgres.ex b/lib/oban/migrations/postgres.ex
+index 27741f49..bceccc91 100644
+--- a/lib/oban/migrations/postgres.ex
++++ b/lib/oban/migrations/postgres.ex
+@@ -6,7 +6,7 @@ defmodule Oban.Migrations.Postgres do
+   use Ecto.Migration
+ 
+   @initial_version 1
+-  @current_version 12
++  @current_version 13
+   @default_prefix "public"
+ 
+   @doc false
+diff --git a/lib/oban/migrations/postgres/v13.ex b/lib/oban/migrations/postgres/v13.ex
+new file mode 100644
+index 00000000..7de5430e
+--- /dev/null
++++ b/lib/oban/migrations/postgres/v13.ex
+@@ -0,0 +1,15 @@
++defmodule Oban.Migrations.Postgres.V13 do
++  @moduledoc false
++
++  use Ecto.Migration
++
++  def up(%{prefix: prefix}) do
++    create_if_not_exists index(:oban_jobs, [:state, :cancelled_at], prefix: prefix)
++    create_if_not_exists index(:oban_jobs, [:state, :discarded_at], prefix: prefix)
++  end
++
++  def down(%{prefix: prefix}) do
++    drop_if_exists index(:oban_jobs, [:state, :discarded_at], prefix: prefix)
++    drop_if_exists index(:oban_jobs, [:state, :cancelled_at], prefix: prefix)
++  end
++end

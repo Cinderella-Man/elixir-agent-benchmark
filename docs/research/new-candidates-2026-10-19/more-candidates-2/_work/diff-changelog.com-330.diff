@@ -1,0 +1,2828 @@
+diff --git a/assets/admin/admin.js b/assets/admin/admin.js
+index c230a83610..6573bec905 100644
+--- a/assets/admin/admin.js
++++ b/assets/admin/admin.js
+@@ -2,6 +2,7 @@ import "phoenix_html";
+ 
+ import benefitView from "views/benefitView";
+ import episodeView from "views/episodeView";
++import metacastView from "views/metacastView";
+ import newsIssueView from "views/newsIssueView";
+ import newsItemView from "views/newsItemView";
+ import newsItemCommentView from "views/newsItemCommentView";
+@@ -18,6 +19,7 @@ import FormUI from "components/formUI";
+ let views = {
+   "BenefitView": benefitView,
+   "EpisodeView": episodeView,
++  "MetacastView": metacastView,
+   "NewsItemView": newsItemView,
+   "NewsItemCommentView": newsItemCommentView,
+   "NewsIssueView": newsIssueView,
+diff --git a/assets/admin/components/listWidget.js b/assets/admin/components/listWidget.js
+index b0b86ed372..432fadf4b8 100644
+--- a/assets/admin/components/listWidget.js
++++ b/assets/admin/components/listWidget.js
+@@ -2,8 +2,8 @@ import Sortable from "sortablejs";
+ import linkItem from "templates/linkItem.hbs";
+ 
+ export default class ListWidget {
+-  constructor(parentType, relationType) {
+-    let $members = $(`.js-${relationType}`);
++  constructor(parentType, attrName) {
++    let $members = $(`.js-${attrName}`);
+     let $add = $members.siblings(".js-add");
+ 
+     let setPositions = function() {
+@@ -21,7 +21,7 @@ export default class ListWidget {
+       let index = $members.find(".item").length;
+       let context = {
+         parentType: parentType,
+-        relationType: relationType,
++        attrName: attrName,
+         index: index,
+         position: index + 1
+       }
+diff --git a/assets/admin/components/searchWidget.js b/assets/admin/components/searchWidget.js
+index 62b233b293..3e34c5adf8 100644
+--- a/assets/admin/components/searchWidget.js
++++ b/assets/admin/components/searchWidget.js
+@@ -2,12 +2,13 @@ import Sortable from "sortablejs";
+ import autosize from "autosize";
+ 
+ import personItem from "templates/personItem.hbs";
++import podcastItem from "templates/podcastItem.hbs";
+ import topicItem from "templates/topicItem.hbs";
+ import sponsorItem from "templates/sponsorItem.hbs";
+ 
+ export default class SearchWidget {
+-  constructor(type, parentType, relationType) {
+-    let $members = $(`.js-${relationType}`);
++  constructor(type, parentType, attrName) {
++    let $members = $(`.js-${attrName}`);
+ 
+     if (!$members.length) return;
+ 
+@@ -26,6 +27,9 @@ export default class SearchWidget {
+         case "person":
+           return "<a href='/admin/people/new' target='_blank'>Add a Person</a>";
+           break;
++        case "podcast":
++          return "<a href='/admin/podcast/new' target='_blank'>Add a Podcast</a>";
++          break;
+         case "sponsor":
+           return "<a href='/admin/sponsors/new' target='_blank'>Add a Sponsor</a>";
+           break
+@@ -49,7 +53,7 @@ export default class SearchWidget {
+ 
+         let context = {
+           parentType: parentType,
+-          relationType: relationType,
++          attrName: attrName,
+           id: selected.id,
+           name: selected.title,
+           handle: selected.description,
+@@ -63,6 +67,9 @@ export default class SearchWidget {
+           case "person":
+             $list.append(personItem(context));
+             break;
++          case "podcast":
++            $list.append(podcastItem(context));
++            break;
+           case "sponsor":
+             $list.append(sponsorItem(context));
+             break;
+diff --git a/assets/admin/templates/linkItem.hbs b/assets/admin/templates/linkItem.hbs
+index 456ebda7cd..74b32cd36e 100644
+--- a/assets/admin/templates/linkItem.hbs
++++ b/assets/admin/templates/linkItem.hbs
+@@ -1,7 +1,7 @@
+ <div class="item">
+   <input
+     class="js-position"
+-    name="{{parentType}}[{{parentType}}_{{relationType}}][{{index}}][position]"
++    name="{{parentType}}[{{attrName}}][{{index}}][position]"
+     type="hidden"
+     value="{{position}}"
+   >
+@@ -18,7 +18,7 @@
+     <div class="required field">
+       <label>Title</label>
+       <input
+-        name="{{parentType}}[{{parentType}}_{{relationType}}][{{index}}][title]"
++        name="{{parentType}}[{{attrName}}][{{index}}][title]"
+         placeholder="Project Website"
+       >
+     </div>
+@@ -26,7 +26,7 @@
+     <div class="required field">
+       <label>Url</label>
+       <input
+-        name="{{parentType}}[{{parentType}}_{{relationType}}][{{index}}][url]"
++        name="{{parentType}}[{{attrName}}][{{index}}][url]"
+         placeholder="http://semantic-ui.com/"
+       >
+     </div>
+diff --git a/assets/admin/templates/personItem.hbs b/assets/admin/templates/personItem.hbs
+index 47f709cefd..982a4c78dd 100644
+--- a/assets/admin/templates/personItem.hbs
++++ b/assets/admin/templates/personItem.hbs
+@@ -1,6 +1,6 @@
+ <div class="item">
+-  <input name="{{parentType}}[{{parentType}}_{{relationType}}][{{index}}][person_id]" type="hidden" value="{{id}}">
+-  <input class="js-position" name="{{parentType}}[{{parentType}}_{{relationType}}][{{index}}][position]" type="hidden">
++  <input name="{{parentType}}[{{attrName}}][{{index}}][person_id]" type="hidden" value="{{id}}">
++  <input class="js-position" name="{{parentType}}[{{attrName}}][{{index}}][position]" type="hidden">
+   <img class="ui avatar image" src="{{avatarUrl}}">
+   <div class="content">
+     <div class="header">{{name}} {{handle}}</div>
+diff --git a/assets/admin/templates/podcastItem.hbs b/assets/admin/templates/podcastItem.hbs
+new file mode 100644
+index 0000000000..814f4bd4c9
+--- /dev/null
++++ b/assets/admin/templates/podcastItem.hbs
+@@ -0,0 +1,12 @@
++<div class="item">
++  <input name="{{parentType}}[{{attrName}}][{{index}}][podcast_id]" type="hidden" value="{{id}}">
++  <input class="js-position" name="{{parentType}}[{{attrName}}][{{index}}][position]" type="hidden">
++  <img class="ui tiny image" src="{{avatarUrl}}">
++  <div class="content">
++    <div class="header">{{name}}</div>
++  </div>
++
++  <div class="right floated content">
++    <div class="ui tiny icon button js-remove"><i class="remove icon"></i></div>
++  </div>
++</div>
+\ No newline at end of file
+diff --git a/assets/admin/templates/sponsorItem.hbs b/assets/admin/templates/sponsorItem.hbs
+index b3e71e7ede..cab6f84897 100644
+--- a/assets/admin/templates/sponsorItem.hbs
++++ b/assets/admin/templates/sponsorItem.hbs
+@@ -1,6 +1,6 @@
+ <div class="item">
+-  <input name="{{parentType}}[{{parentType}}_{{relationType}}][{{index}}][sponsor_id]" type="hidden" value="{{id}}">
+-  <input class="js-position" name="{{parentType}}[{{parentType}}_{{relationType}}][{{index}}][position]" type="hidden">
++  <input name="{{parentType}}[{{attrName}}][{{index}}][sponsor_id]" type="hidden" value="{{id}}">
++  <input class="js-position" name="{{parentType}}[{{attrName}}][{{index}}][position]" type="hidden">
+ 
+   <div class="right floated content">
+     <div class="ui tiny icon button js-remove"><i class="remove icon"></i></div>
+@@ -15,7 +15,7 @@
+     <div class="required field six wide">
+       <label>Title</label>
+       <input
+-        name="{{parentType}}[{{parentType}}_{{relationType}}][{{index}}][title]"
++        name="{{parentType}}[{{attrName}}][{{index}}][title]"
+         value="{{extras.title}}"
+       >
+     </div>
+@@ -23,7 +23,7 @@
+     <div class="required field ten wide">
+       <label>Link</label>
+       <input
+-        name="{{parentType}}[{{parentType}}_{{relationType}}][{{index}}][link_url]"
++        name="{{parentType}}[{{attrName}}][{{index}}][link_url]"
+         value="{{extras.link_url}}"
+       >
+     </div>
+@@ -32,7 +32,7 @@
+   <div class="field">
+     <label>Description</label>
+     <textarea
+-      name="{{parentType}}[{{parentType}}_{{relationType}}][{{index}}][description]"
++      name="{{parentType}}[{{attrName}}][{{index}}][description]"
+       value=""
+       placeholder="Markdown enabled."
+       rows="1"
+diff --git a/assets/admin/templates/topicItem.hbs b/assets/admin/templates/topicItem.hbs
+index ecb6f82f92..19a5e4de97 100644
+--- a/assets/admin/templates/topicItem.hbs
++++ b/assets/admin/templates/topicItem.hbs
+@@ -1,6 +1,6 @@
+ <div class="item">
+-  <input name="{{parentType}}[{{parentType}}_{{relationType}}][{{index}}][topic_id]" type="hidden" value="{{id}}">
+-  <input class="js-position" name="{{parentType}}[{{parentType}}_{{relationType}}][{{index}}][position]" type="hidden">
++  <input name="{{parentType}}[{{attrName}}][{{index}}][topic_id]" type="hidden" value="{{id}}">
++  <input class="js-position" name="{{parentType}}[{{attrName}}][{{index}}][position]" type="hidden">
+   <div class="content">
+     <a class="ui label">
+       {{name}}
+diff --git a/assets/admin/views/metacastView.js b/assets/admin/views/metacastView.js
+new file mode 100644
+index 0000000000..a505efd035
+--- /dev/null
++++ b/assets/admin/views/metacastView.js
+@@ -0,0 +1,15 @@
++import SearchWidget from "components/searchWidget";
++
++export default class MetacastView {
++  new() {
++    new SearchWidget("podcast", "metacast", "included_podcasts");
++    new SearchWidget("topic", "metacast", "included_topics");
++
++    new SearchWidget("podcast", "metacast", "excluded_podcasts");
++    new SearchWidget("topic", "metacast", "excluded_topics");
++  }
++
++  edit() {
++    this.new();
++  }
++}
+\ No newline at end of file
+diff --git a/assets/admin/views/newsItemView.js b/assets/admin/views/newsItemView.js
+index f7c4f3f225..ce2edaf602 100644
+--- a/assets/admin/views/newsItemView.js
++++ b/assets/admin/views/newsItemView.js
+@@ -33,7 +33,7 @@ export default class newsItemView {
+   }
+ 
+   new() {
+-    new SearchWidget("topic", "news_item", "topics");
++    new SearchWidget("topic", "news_item", "news_item_topics");
+     new BelongsToWidget("logger", "person");
+     new BelongsToWidget("author", "person");
+     new BelongsToWidget("source", "news_source");
+diff --git a/assets/admin/views/podcastView.js b/assets/admin/views/podcastView.js
+index 50aa287de8..a1b5dbf870 100644
+--- a/assets/admin/views/podcastView.js
++++ b/assets/admin/views/podcastView.js
+@@ -2,8 +2,8 @@ import SearchWidget from "components/searchWidget";
+ 
+ export default class PodcastView {
+   new() {
+-    new SearchWidget("person", "podcast", "hosts");
+-    new SearchWidget("topic", "podcast", "topics");
++    new SearchWidget("person", "podcast", "podcast_hosts");
++    new SearchWidget("topic", "podcast", "podcast_topics");
+   }
+ 
+   edit() {
+diff --git a/assets/admin/views/postView.js b/assets/admin/views/postView.js
+index 66b6604007..00589f8302 100644
+--- a/assets/admin/views/postView.js
++++ b/assets/admin/views/postView.js
+@@ -9,7 +9,7 @@ export default class PostView {
+     new BelongsToWidget("author", "person");
+     new BelongsToWidget("editor", "person");
+     new Slugifier("#post_title", "#post_slug");
+-    new SearchWidget("topic", "post", "topics");
++    new SearchWidget("topic", "post", "post_topics");
+     new CalendarField(".ui.calendar");
+   }
+ 
+diff --git a/lib/changelog/application.ex b/lib/changelog/application.ex
+index ba6de486e9..22a84f3562 100644
+--- a/lib/changelog/application.ex
++++ b/lib/changelog/application.ex
+@@ -21,7 +21,9 @@ defmodule Changelog.Application do
+           global_ttl: :timer.seconds(60)
+         ]
+       ]),
+-      worker(Changelog.Scheduler, [])
++      worker(Changelog.Scheduler, []),
++      worker(Changelog.EpisodeTracker, []),
++      worker(Changelog.Metacasts.Filterer.Cache, [])
+     ]
+ 
+     # See http://elixir-lang.org/docs/stable/elixir/Supervisor.html
+diff --git a/lib/changelog/cache.ex b/lib/changelog/cache.ex
+index b81bc4f966..5984300114 100644
+--- a/lib/changelog/cache.ex
++++ b/lib/changelog/cache.ex
+@@ -4,7 +4,7 @@ defmodule Changelog.Cache do
+   """
+   require Logger
+ 
+-  alias Changelog.{Episode, NewsItem, Podcast, Post, Repo}
++  alias Changelog.{Episode, Metacast, NewsItem, Podcast, Post, Repo}
+ 
+   def cache_name, do: :app_cache
+ 
+@@ -27,6 +27,11 @@ defmodule Changelog.Cache do
+     delete(item.object)
+   end
+ 
++  def delete(metacast = %Metacast{}) do
++    delete("metacasts")
++    delete_prefix("/#{metacast.slug}")
++  end
++
+   def delete(podcast = %Podcast{}) do
+     delete("podcasts")
+     delete_prefix("/#{podcast.slug}")
+diff --git a/lib/changelog/episode_tracker.ex b/lib/changelog/episode_tracker.ex
+new file mode 100644
+index 0000000000..1d1ff32a08
+--- /dev/null
++++ b/lib/changelog/episode_tracker.ex
+@@ -0,0 +1,131 @@
++defmodule Changelog.EpisodeTracker do
++    use GenServer
++
++    alias Changelog.{Episode, NewsItem}
++    alias Changelog.Metacasts.Filterer.Cache
++
++    # 3 hour reset, to make sure this doesn't end up out of sync accidentally
++    @reset_period_timeout 3 * 60 * 60 * 1000
++
++    def start_link do
++        GenServer.start_link(__MODULE__, nil, name: __MODULE__)
++    end
++
++    def list do
++        GenServer.call(__MODULE__, :list)
++    end
++
++    # This is advantageous to avoid passing a copy of a thousand episode list
++    # across the process boundary, it filters on the GenServer side
++    def filter(filter_string) do
++        GenServer.call(__MODULE__, {:filter, filter_string})
++    end
++
++    # Allow further stripping out of information my running an Enum.map with
++    # the passed callback before crossing the process boundary
++    def filter(filter_string, map_callback) do
++        GenServer.call(__MODULE__, {:filter, filter_string, map_callback})
++    end
++
++    def get_episodes_as_ids(filter_string) do
++        filter(filter_string, fn episode -> episode.id end)
++    end
++
++    def refresh do
++        GenServer.cast(__MODULE__, :refresh)
++    end
++
++    def track(%{type: type, object_id: _object_id} = item) do
++      if type == :audio do
++        %{object: episode} = NewsItem.load_object(item)
++        track(episode)
++      end
++    end
++
++    def track(episode) do
++        if Episode.is_public(episode) do
++            GenServer.cast(__MODULE__, {:track, episode})
++        end
++    end
++
++    def untrack(episode_id) do
++        GenServer.cast(__MODULE__, {:untrack, episode_id})
++    end
++
++    @impl true
++    def init(_) do
++        episodes = refresh_episodes()
++        schedule_reset()
++        {:ok, episodes}
++    end
++
++    @impl true
++    def handle_call(_, _, [] = episodes) do
++        {:reply, {:error, :no_episodes}, episodes}
++    end
++
++    @impl true
++    def handle_call(:list, _from, episodes) do
++        {:reply, {:ok, episodes}, episodes}
++    end
++
++    @impl true
++    def handle_call({:filter, filter_string}, _from, episodes) do
++        filtered = case Cache.filter(episodes, filter_string) do
++            {:ok, episode_stream} -> {:ok, Enum.to_list(episode_stream)}
++            error -> error
++        end
++        {:reply, filtered, episodes}
++    end
++
++    @impl true
++    def handle_call({:filter, filter_string, map_callback}, _from, episodes) do
++        filtered = case Cache.filter(episodes, filter_string) do
++            {:ok, episode_stream} -> {:ok, Enum.map(episode_stream, map_callback)}
++            error -> error
++        end
++        {:reply, filtered, episodes}
++    end
++
++    @impl true
++    def handle_cast(:refresh, _episodes) do
++        episodes = refresh_episodes()
++        {:noreply, episodes}
++    end
++
++    @impl true
++    def handle_cast({:track, episode}, episodes) do
++        %{id: id} = flat = Episode.flatten_episode_for_filtering(episode)
++        # Remove episode if already in episode list
++        episodes = untrack(episodes, id)
++
++        # Add the flattened episode, episode tracked
++        {:noreply, [flat | episodes]}
++    end
++
++    @impl true
++    def handle_cast({:untrack, episode_id}, episodes) do
++        episodes = untrack(episodes, episode_id)
++        {:noreply, episodes}
++    end
++
++    @impl true
++    def handle_info(:periodic_reset, episodes) do
++        schedule_reset()
++        handle_cast(:refresh, episodes)
++    end
++
++    defp untrack(episodes, id) do
++        # Remove episode if already in episode list
++        Enum.reject(episodes, fn episode ->
++            episode.id == id
++        end)
++    end
++
++    defp refresh_episodes do
++        {:ok, episodes} = Episode.flatten_for_filtering()
++        episodes
++    end
++
++    defp schedule_reset, do: Process.send_after(self(), :periodic_reset, @reset_period_timeout)
++end
+\ No newline at end of file
+diff --git a/lib/changelog/files/cover.ex b/lib/changelog/files/cover.ex
+index c99151307a..3a2b28bedd 100644
+--- a/lib/changelog/files/cover.ex
++++ b/lib/changelog/files/cover.ex
+@@ -6,7 +6,7 @@ defmodule Changelog.Files.Cover do
+   @versions [:original, :medium, :small]
+ 
+   def storage_dir(_, _), do: expanded_dir("/covers")
+-  def filename(version, {_, scope}), do: "#{PodcastView.dasherized_name(scope)}-#{version}"
++  def filename(version, {_, %{name: _} = scope}), do: "#{PodcastView.dasherized_name(scope)}-#{version}"
+ 
+   def transform(:original, _), do: :noaction
+ 
+diff --git a/lib/changelog/metacasts/filterer.ex b/lib/changelog/metacasts/filterer.ex
+new file mode 100644
+index 0000000000..b53d46c319
+--- /dev/null
++++ b/lib/changelog/metacasts/filterer.ex
+@@ -0,0 +1,56 @@
++defmodule Changelog.Metacasts.Filterer do
++  require Logger
++
++  alias Changelog.Metacasts.Filterer.{FiltererError, Parser, Generator}
++
++  @moduledoc """
++  This module allows filtering of simple datasets with a useful small DSL built
++  specifically to filter podcast episodes. Especially to make custom feeds, so
++  called metacasts.
++
++  iex> Changelog.Metacasts.Filterer.filter!([%{podcast: "changelog"}, %{podcast: "gotime"}], "only podcast: changelog")
++  ...> |> Enum.to_list()
++  [%{podcast: "changelog"}]
++
++  iex> Changelog.Metacasts.Filterer.filter!([%{podcast: "changelog"}, %{podcast: "gotime"}], "except podcast: changelog")
++  ...> |> Enum.to_list()
++  [%{podcast: "gotime"}]
++  """
++
++  @statement_limit 256
++
++  def compile(filter_string) do
++    case Parser.parse(filter_string) do
++      {:ok, representation} -> 
++        if length(representation.statements) > @statement_limit do
++          {:error, :too_many_statements}
++        else
++          {:ok, Generator.generate_stream_filters(representation)}
++        end
++      {:error, error} -> {:error, error}
++      error -> error
++    end
++  end
++
++  def filter!(items, filter_string) when is_binary(filter_string) do
++    case filter(items, filter_string) do
++      {:ok, result} -> result
++      {:error, error} -> raise FiltererError, {:result_error, error}
++      error -> raise FiltererError, {:result_error, error}
++    end
++  end
++
++  def filter!(items, stream_filter) when is_function(stream_filter), do: stream_filter.(items)
++
++  def filter(items, filter_string) when is_binary(filter_string) do
++    case compile(filter_string) do
++      {:ok, stream_filter} -> {:ok, stream_filter.(items)}
++      {:error, error} -> {:error, error}
++      error -> {:error, error}
++    end
++  end
++
++  def filter(items, stream_filter) when is_function(stream_filter), do: {:ok, stream_filter.(items)}
++
++  def statement_limit, do: @statement_limit
++end
+diff --git a/lib/changelog/metacasts/filterer/cache.ex b/lib/changelog/metacasts/filterer/cache.ex
+new file mode 100644
+index 0000000000..924731708c
+--- /dev/null
++++ b/lib/changelog/metacasts/filterer/cache.ex
+@@ -0,0 +1,78 @@
++defmodule Changelog.Metacasts.Filterer.Cache do
++    use GenServer
++
++    alias Changelog.Metacasts.Filterer
++
++    def start_link do
++        GenServer.start_link(__MODULE__, nil, name: __MODULE__)
++    end
++
++    def compile(filter_string) do
++        case Filterer.compile(filter_string) do
++            {:ok, stream_filter} -> 
++                :ok = GenServer.call(__MODULE__, {:set, filter_string, stream_filter})
++                {:ok, stream_filter}
++            error -> error
++        end
++    end
++
++    def filter!(items, filter_string) do
++        case get_or_compile(filter_string) do
++            {:ok, stream_filter} -> Filterer.filter!(items, stream_filter)
++            error -> raise Filterer.FiltererError, {:result_error, error}
++        end
++    end
++
++    def filter(items, filter_string) do
++        case get_or_compile(filter_string) do
++            {:ok, stream_filter} -> Filterer.filter(items, stream_filter)
++            error -> error
++        end
++    end
++
++    def stat do
++        GenServer.call(__MODULE__, :stat)
++    end
++
++    def clear do
++        GenServer.cast(__MODULE__, :clear)
++    end
++
++    defp get_or_compile(filter_string) do
++        case GenServer.call(__MODULE__, {:get, filter_string}) do
++            :not_found -> compile(filter_string)
++            {:ok, stream_filter} -> {:ok, stream_filter}
++            error -> error
++        end
++    end
++
++    @impl true
++    def init(_) do
++        {:ok, %{}}
++    end
++
++    @impl true
++    def handle_call(:stat, _from, cache) do
++        {:reply, cache, cache}
++    end
++
++    @impl true
++    def handle_call({:set, filter_string, stream_filter}, _from, cache) do
++        cache = Map.put(cache, filter_string, stream_filter)
++        {:reply, :ok, cache}
++    end
++
++    @impl true
++    def handle_call({:get, filter_string}, _from, cache) do
++        result = case Map.get(cache, filter_string, nil) do
++            nil -> :not_found
++            stream_filter -> {:ok, stream_filter}
++        end
++        {:reply, result, cache}
++    end
++
++    @impl true
++    def handle_cast(:clear, _cache) do
++        {:noreply, %{}}
++    end
++end
+\ No newline at end of file
+diff --git a/lib/changelog/metacasts/filterer/facet_statement.ex b/lib/changelog/metacasts/filterer/facet_statement.ex
+new file mode 100644
+index 0000000000..342c9d6b3a
+--- /dev/null
++++ b/lib/changelog/metacasts/filterer/facet_statement.ex
+@@ -0,0 +1,7 @@
++defmodule Changelog.Metacasts.Filterer.FacetStatement do
++  defstruct repr: nil,
++            type: nil,
++            logic: nil,
++            items: [],
++            mode: :open
++end
+diff --git a/lib/changelog/metacasts/filterer/filterer_error.ex b/lib/changelog/metacasts/filterer/filterer_error.ex
+new file mode 100644
+index 0000000000..d5af784553
+--- /dev/null
++++ b/lib/changelog/metacasts/filterer/filterer_error.ex
+@@ -0,0 +1,25 @@
++defmodule Changelog.Metacasts.Filterer.FiltererError do
++    alias Changelog.Metacasts.Filterer.FiltererError
++    defexception [:message]
++
++
++    @impl true
++    def exception({:result_error, error}) do
++        %FiltererError{message: "An error occurred during filtering: #{inspect(error)}"}
++    end
++
++    @impl true
++    def exception({:bad_statement, statement}) do
++        %FiltererError{message: "A bad statement was encountered during filter generation: #{inspect(statement)}"}
++    end
++
++    @impl true
++    def exception({:bad_nesting, message}) do
++        %FiltererError{message: message}
++    end
++
++    @impl true
++    def exception(_) do
++        %FiltererError{message: "A generic error occured. Weird."}
++    end
++end
+\ No newline at end of file
+diff --git a/lib/changelog/metacasts/filterer/generator.ex b/lib/changelog/metacasts/filterer/generator.ex
+new file mode 100644
+index 0000000000..651b3c282e
+--- /dev/null
++++ b/lib/changelog/metacasts/filterer/generator.ex
+@@ -0,0 +1,175 @@
++defmodule Changelog.Metacasts.Filterer.Generator do
++  alias Changelog.Metacasts.Filterer.{FacetStatement, FiltererError}
++
++  require Logger
++  def generate_stream_filters(%{start: :except, statements: statements}) do
++    filters = generate_filters(statements)
++    fn items ->
++      Stream.reject(items, &any_filter(filters, &1))
++    end
++  end
++
++  def generate_stream_filters(%{start: :only, statements: statements}) do
++    filters = generate_filters(statements)
++    fn items ->
++      Stream.filter(items, &any_filter(filters, &1))
++    end
++  end
++
++  defp any_filter(filters, item) do
++    Enum.any?(filters, fn filter ->
++      filter.(item)
++    end)
++  end
++
++  defp all_filter(filters, item) do
++    Enum.all?(filters, fn filter ->
++      filter.(item)
++    end)
++  end
++
++  defp generate_filters(statements) do
++    generate_filters(statements, [])
++  end
++
++  defp generate_filters([], filters) do
++    Enum.reverse(filters)
++  end
++
++  defp generate_filters([statement | statements], filters) do
++    {filter, statements} = generate_filter(statement, statements)
++    generate_filters(statements, [filter | filters])
++  end
++
++  # Final statement is FacetStatement, no sub_facet
++  defp generate_filter(%FacetStatement{repr: repr, logic: logic, items: items}, [] = statements) do
++    facet_filter = generate_facet_filter(repr, logic, items)
++    {fn item ->
++      facet_filter.(item)
++    end, statements}
++  end
++
++  defp generate_filter(%FacetStatement{repr: repr, logic: logic, items: items}, [look_ahead | ahead_statements] = statements) do
++    sub_facet? = has_sub_facet?(look_ahead)
++    facet_filter = generate_facet_filter(repr, logic, items)
++    if sub_facet? do
++      {sub_facet_filter, statements} = generate_sub_facet_filter(look_ahead, ahead_statements)
++      {fn item ->
++        facet_filter.(item) and sub_facet_filter.(item)
++      end, statements}
++    else
++      {fn item ->
++        facet_filter.(item)
++      end, statements}
++    end
++  end
++
++  defp generate_filter(statement, _) do
++    Logger.error("An unrecognized statement was encountered, filter generation failed: #{inspect(statement)}")
++    raise FiltererError, {:bad_statement, statement}
++  end
++
++  defp generate_facet_filter(repr, logic, items) do
++    case logic do
++      :or ->
++        fn item ->
++          item_has_option?(item, repr, items)
++        end
++      :and ->
++        fn item ->
++          item_has_requirements?(item, repr, items)
++        end
++    end
++  end
++
++  defp generate_sub_facet_filter({:sub_facet_start, type}, [{:sub_facet_logic, logic} | statements]) do
++    {sub_statements, statements, depth} = Enum.reduce(statements, {[], [], 1}, fn statement, {sub, rem, depth} ->
++      {sub, rem} = if depth > 0 do
++        {[statement | sub], rem}
++      else
++        {sub, [statement | rem]}
++      end
++
++      depth = case statement do
++        {:sub_facet_start, _} -> depth + 1
++        :sub_facet_end -> depth - 1
++        _ -> depth
++      end
++
++      {sub, rem, depth}
++    end)
++
++    [_stripped_end | sub_statements] = sub_statements
++    sub_statements = Enum.reverse(sub_statements)
++    statements = Enum.reverse(statements)
++
++    if depth > 0 do
++      raise FiltererError, {:bad_nesting, "Bad nesting encountered, ended sub-faceting with depth > 1"}
++    end
++
++    sub_filters = generate_filters(sub_statements)
++    {invert?, enumerator_function} = case {type, logic} do
++      {:unless, :or} -> {true, &any_filter/2}
++      {:unless, :and} -> {true, &all_filter/2}
++      {:if, :or} -> {false, &any_filter/2}
++      {:if, :and} -> {false, &all_filter/2}
++    end
++
++    filter_function = if invert? do
++      fn item ->
++        not enumerator_function.(sub_filters, item)
++      end
++    else
++      fn item ->
++        enumerator_function.(sub_filters, item)
++      end
++    end
++
++    {filter_function, statements}
++  end
++
++  defp item_has_option?(item, repr, options) do
++    case Map.get(item, repr, nil) do
++      nil ->
++        Logger.warn("Item being filtered missing attribute: #{repr}")
++        false
++      item_attr when is_list(item_attr) ->
++        Enum.any?(item_attr, fn attr ->
++          Enum.any?(options, fn option ->
++            attr == option
++          end)
++        end)
++      item_attr when is_binary(item_attr) ->
++        Enum.any?(options, fn option ->
++          item_attr == option
++        end)
++      _ ->
++        Logger.error("Item being filtered has a bad type for attribute: #{repr}")
++        false
++    end
++  end
++
++  defp item_has_requirements?(item, repr, requirements) do
++    case Map.get(item, repr, nil) do
++      nil ->
++        Logger.warn("Item being filtered missing attribute: #{repr}")
++        false
++      item_attr when is_list(item_attr) ->
++        Enum.all?(requirements, fn req ->
++          Enum.any?(item_attr, fn attr ->
++            attr == req
++          end)
++        end)
++      item_attr when is_binary(item_attr) ->
++        Enum.all?(requirements, fn req ->
++          item_attr == req
++        end)
++      _ ->
++          Logger.error("Item being filtered has a bad type for attribute: #{repr}")
++          false
++    end
++  end
++
++  defp has_sub_facet?({:sub_facet_start, _}), do: true
++  defp has_sub_facet?(_), do: false
++end
+diff --git a/lib/changelog/metacasts/filterer/parser.ex b/lib/changelog/metacasts/filterer/parser.ex
+new file mode 100644
+index 0000000000..f5a7e9ce8b
+--- /dev/null
++++ b/lib/changelog/metacasts/filterer/parser.ex
+@@ -0,0 +1,253 @@
++defmodule Changelog.Metacasts.Filterer.Parser do
++  require Logger
++  alias Changelog.Metacasts.Filterer.{Representation, FacetStatement, Statements}
++
++  @facets %{
++    "podcast" => {:podcast, :slugs},
++    "topic" => {:topic, :slugs},
++    "guest" => {:guest, :strings},
++    "host" => {:host, :strings}
++  }
++
++  @list_closers ["or", "and"]
++  @sub_facet_logics ["any", "all"]
++
++  def parse(filter_string) do
++    representation = filter_string
++      |> loosen_tight_parens()
++      |> normalize_whitespace()
++      |> String.trim()
++      |> String.graphemes()
++      |> tokenize()
++      |> parse_tokens()
++
++    errors = Enum.filter(representation.statements, &match?({:error, _}, &1))
++    cond do
++      length(errors) > 0 -> {:error, errors}
++      is_nil(representation.start) -> {:error, :no_start}
++      true -> {:ok, representation}
++    end
++  end
++
++  def tokenize(graphemes) do
++    {last_token, tokens, _} =
++      Enum.reduce(graphemes, {"", [], nil}, fn grapheme, {current_token, tokens, meta} ->
++        case {current_token, grapheme, meta} do
++          # Continuing string over space
++          {_, " ", :keep_space} -> {current_token <> grapheme, tokens, :keep_space}
++          # Closing string
++          {_, "\"", :keep_space} -> {"", [current_token | tokens], nil}
++          # Closing token on space
++          {_, " ", _} -> {"", [current_token | tokens], nil}
++          # Opening string, setting space behavior
++          {"", "\"" <> string_start, nil} -> {string_start, tokens, :keep_space}
++          # Default, add grapheme to token
++          {_, grapheme, _} -> {current_token <> grapheme, tokens, meta}
++        end
++      end)
++
++    Enum.reverse([:end | [last_token | tokens]])
++    |> Enum.reject(fn token ->
++      token == ""
++    end)
++  end
++
++  def parse_tokens(tokens) do
++    {_, %{statements: statements} = repr} =
++      Enum.reduce(tokens, {nil, %Representation{}}, fn token, {current, repr} ->
++        {current, repr} = parse_token(token, current, repr)
++        {current, repr}
++      end)
++
++    %{repr | statements: Enum.reverse(statements)}
++  end
++
++  defp parse_token("only", nil, %{start: nil} = repr) do
++    {nil, %{repr | start: :only}}
++  end
++
++  defp parse_token("except", nil, %{start: nil} = repr) do
++    {nil, %{repr | start: :except}}
++  end
++
++  # Capture facet filter contents as a list of values
++  # Examples:
++  # podcast: gotime, rfc or afk
++  # guest: "Jason Fried" or "Steve Jobs"
++  # topic: svelte
++  defp parse_token(token, %FacetStatement{mode: :open, items: items} = current, repr) do
++    current =
++      cond do
++        # Capture member of list, with comma
++        String.ends_with?(token, ",") ->
++          token = String.trim_trailing(token, ",")
++          %{current | items: [token | items]}
++
++        # Add single item or possibly two-item list
++        length(items) == 0 ->
++          %{current | mode: :single, items: [token | items]}
++
++        # Add item without trailing comma, requires closer
++        true ->
++          %{current | mode: :closable, items: [token | items]}
++      end
++    parsed(repr, current)
++  end
++
++  defp parse_token(token, %FacetStatement{mode: :single, items: items} = current, repr) do
++    cond do
++      # Capture closer for list, such as "or", okay if a single item
++      length(items) == 1 and token in @list_closers ->
++        parsed(repr, %{current | mode: :closing, logic: list_closer(token)})
++      # No closer found to turn single into two-item list, closing and reparsing token
++      true ->
++        # Update representation
++        repr = add_statement(repr, %{current | mode: :closed, logic: :and})
++        # Re-run token parsing so this doesn't swallow the token entirely
++        parse_token(token, nil, repr)
++    end
++  end
++
++  defp parse_token(token, %FacetStatement{mode: :closable, items: items} = current, repr) do
++    current = cond do
++      # Capture closer for list, such as "or", okay if a single item without comma or list of commad items
++      length(items) > 0 and token in @list_closers ->
++        %{current | mode: :closing, logic: list_closer(token)}
++      # No closer found to turn single into two-item list, closing
++      true ->
++        {:error, "Unexpected value '#{token}' while building list, mode: #{current.mode}, facet: #{current.repr}, type: #{current.type}: #{inspect(items)}"}
++    end
++
++    case current do
++      %FacetStatement{} -> parsed(repr, current)
++      {:error, _} ->
++        repr
++        |> add_statement(current)
++        |> parsed(nil)
++    end
++  end
++
++  defp parse_token(token, %FacetStatement{mode: :closing, items: items} = current, repr) do
++    # Add final item to closing list
++    current = %{current | mode: :closed, items: Enum.reverse([token | items])}
++
++    repr
++    |> add_statement(current)
++    |> parsed(nil)
++  end
++
++  defp parse_token(token, %FacetStatement{} = current, repr) do
++    repr
++    |> add_statement({:error, "Unexpected value '#{token}' while building list, mode: #{current.mode}, facet: #{current.repr}, type: #{current.type}: #{inspect(current.items)}"})
++    |> parsed(nil)
++  end
++
++  defp parse_token("unless" = token, nil, %{statements: [%FacetStatement{mode: :closed} | _]} = repr) do
++    repr
++    |> add_statement(Statements.sub_facet_start(token))
++    |> parsed(nil)
++  end
++
++  defp parse_token("if" = token, nil, %{statements: [%FacetStatement{mode: :closed} | _]} = repr) do
++    repr
++    |> add_statement(Statements.sub_facet_start(token))
++    |> parsed(nil)
++  end
++
++  # This macro generates functions that look like:
++  # def parse_token("podcast:", current, repr) do
++  #   parse_facet_token("podcast", current, repr)
++  # end
++  Enum.each(@facets, fn {facet, _type} ->
++    match = facet <> ":"
++
++    Module.eval_quoted(
++      __MODULE__,
++      quote do
++        defp parse_token(unquote(match), current, repr) do
++          parse_facet_token(unquote(facet), current, repr)
++        end
++      end
++    )
++  end)
++
++  defp parse_token("unless", _, repr) do
++    repr
++    |> add_statement(
++      {:error,
++        "Unexpected unless, should follow on a facet filter."}
++    )
++    |> parsed(nil)
++  end
++
++  defp parse_token("if", _, repr) do
++    repr
++    |> add_statement(
++      {:error,
++        "Unexpected if, should follow on a facet filter."}
++    )
++    |> parsed(nil)
++  end
++
++  defp parse_token(token, nil, %{statements: [{:sub_facet_start, _} | _]} = repr)
++        when token in @sub_facet_logics do
++    repr
++    |> add_statement(Statements.sub_facet_logic(token))
++    |> parsed(nil)
++  end
++
++  defp parse_token("(", nil, %{statements: [{:sub_facet_logic, _} | _]} = repr),
++    do: parsed(repr, nil)
++
++  defp parse_token("(", current, repr) do
++    repr
++    |> add_statement(
++      {:error,
++        "Unexpected '(' not after sub facet logic marker, should follow 'unless any', 'if any', 'unless all' or 'if all'."}
++    )
++    |> parsed(current)
++  end
++
++  defp parse_token(")", nil, repr) do
++    repr
++    |> add_statement(Statements.sub_facet_end())
++    |> parsed(nil)
++  end
++
++  defp parse_token(:end, _, repr) do
++    {nil, repr}
++  end
++
++  defp parse_token(token, current, repr) do
++    Logger.info("not implemented: #{token}")
++    parsed(repr, current)
++  end
++
++  defp parse_facet_token(facet, _current, repr) do
++    {facet_repr, facet_type} = @facets[facet]
++    current = %FacetStatement{repr: facet_repr, type: facet_type, mode: :open}
++    parsed(repr, current)
++  end
++
++  defp add_statement(%{statements: statements} = repr, statement) do
++    %{repr | statements: [statement | statements]}
++  end
++
++  defp parsed(repr, new_current), do: {new_current, repr}
++
++  defp loosen_tight_parens(binary) do
++    binary
++    |> String.replace("(", " ( ")
++    |> String.replace(")", " ) ")
++  end
++
++  defp normalize_whitespace(binary) do
++    # All whitespace will be spaces and only single spaces
++    # This assumes this is okay for our strings which it probably is
++    binary
++    |> String.replace(~r/\s+/, " ")
++  end
++
++  defp list_closer("or"), do: :or
++  defp list_closer("and"), do: :and
++end
+diff --git a/lib/changelog/metacasts/filterer/representation.ex b/lib/changelog/metacasts/filterer/representation.ex
+new file mode 100644
+index 0000000000..359093e6eb
+--- /dev/null
++++ b/lib/changelog/metacasts/filterer/representation.ex
+@@ -0,0 +1,3 @@
++defmodule Changelog.Metacasts.Filterer.Representation do
++  defstruct start: nil, statements: []
++end
+diff --git a/lib/changelog/metacasts/filterer/statements.ex b/lib/changelog/metacasts/filterer/statements.ex
+new file mode 100644
+index 0000000000..bf4cf6ba15
+--- /dev/null
++++ b/lib/changelog/metacasts/filterer/statements.ex
+@@ -0,0 +1,13 @@
++defmodule Changelog.Metacasts.Filterer.Statements do
++  alias Changelog.Metacasts.Filterer.FacetStatement
++  def sub_facet_start("unless"), do: {:sub_facet_start, :unless}
++  def sub_facet_start("if"), do: {:sub_facet_start, :if}
++
++  def sub_facet_logic("any"), do: {:sub_facet_logic, :or}
++
++  def sub_facet_logic("all"), do: {:sub_facet_logic, :and}
++
++  def sub_facet_end, do: :sub_facet_end
++
++  def facet(facet), do: %FacetStatement{repr: facet}
++end
+diff --git a/lib/changelog/schema/episode/episode.ex b/lib/changelog/schema/episode/episode.ex
+index 96ee747665..9c94a14f92 100644
+--- a/lib/changelog/schema/episode/episode.ex
++++ b/lib/changelog/schema/episode/episode.ex
+@@ -311,6 +311,29 @@ defmodule Changelog.Episode do
+     updated
+   end
+ 
++  def flatten_for_filtering(query \\ __MODULE__) do
++    query
++    |> exclude_transcript()
++    |> published()
++    |> to_stream()
++    |> flatten_stream()
++  end
++
++  def flatten_episode_for_filtering(episode) do
++      episode = Repo.preload(episode, [:podcast, :hosts, :guests, :topics])
++      %{
++        id: episode.id,
++        slug: episode.slug,
++        title: episode.title,
++        type: episode.type,
++        published_at: episode.published_at,
++        podcast: episode.podcast.slug,
++        host: Enum.map(episode.hosts, fn host -> host.name end),
++        guest: Enum.map(episode.guests, fn guest -> guest.name end),
++        topic: Enum.map(episode.topics, fn topic -> topic.slug end)
++      }
++  end
++
+   defp derive_audio_bytes_and_duration(changeset = %{changes: %{audio_file: _}}) do
+     new_file = get_change(changeset, :audio_file)
+     tagged_file = EpisodeView.audio_local_path(%{changeset.data | audio_file: new_file})
+@@ -353,6 +376,20 @@ defmodule Changelog.Episode do
+     end
+   end
+ 
++  defp flatten_stream(stream) do
++    stream = Stream.map(stream, fn episode ->
++      flatten_episode_for_filtering(episode)
++    end)
++
++    Repo.transaction(fn () ->
++      Enum.to_list(stream)
++    end)
++  end
++
++  defp to_stream(query) do
++    Repo.stream(query)
++  end
++
+   defp validate_published_has_published_at(changeset) do
+     published = get_field(changeset, :published)
+     published_at = get_field(changeset, :published_at)
+diff --git a/lib/changelog/schema/factory.ex b/lib/changelog/schema/factory.ex
+index 0b7cd60548..59c81ea066 100644
+--- a/lib/changelog/schema/factory.ex
++++ b/lib/changelog/schema/factory.ex
+@@ -94,6 +94,12 @@ defmodule Changelog.Factory do
+     %Changelog.Episode{episode_factory() | published: true, published_at: hours_from_now(1)}
+   end
+ 
++  def metacast_factory do
++    %Changelog.Metacast{
++      name: sequence(:name, &"Metacast #{&1}")
++    }
++  end
++
+   def news_ad_factory do
+     %Changelog.NewsAd{
+       url: "https://apple.com",
+diff --git a/lib/changelog/schema/metacast.ex b/lib/changelog/schema/metacast.ex
+new file mode 100644
+index 0000000000..3f4bb03d43
+--- /dev/null
++++ b/lib/changelog/schema/metacast.ex
+@@ -0,0 +1,69 @@
++defmodule Changelog.Metacast do
++    use Changelog.Schema
++
++    alias Changelog.EpisodeTracker
++    alias Changelog.Files
++    alias Changelog.Metacasts.Filterer
++    alias Changelog.Metacasts.Filterer.Cache
++
++    schema "metacasts" do
++        field :name, :string
++        field :description, :string
++        field :keywords, :string
++        field :slug, :string
++        field :is_official, :boolean, default: false
++
++        field :cover, Files.Cover.Type
++        field :filter_query, :string
++
++        timestamps()
++    end
++
++    @minimal_filter_query "except"
++
++    def file_changeset(metacast, attrs \\ %{}), do: cast_attachments(metacast, attrs, [:cover])
++
++    def insert_changeset(metacast, attrs \\ %{}) do
++        metacast
++        |> cast(attrs, ~w(name description keywords slug is_official filter_query)a)
++        |> ensure_minimal_filter_query()
++        |> validate_required([:name, :slug, :is_official, :filter_query])
++        |> validate_filter_query()
++    end
++
++    def update_changeset(metacast, attrs \\ %{}) do
++        metacast
++        |> insert_changeset(attrs)
++        |> file_changeset(attrs)
++    end
++
++    def get_by_slug!(slug) do
++        Repo.get_by!(__MODULE__, slug: slug)
++    end
++
++    def get_episode_ids!(metacast) do
++        {:ok, episodes} = EpisodeTracker.get_episodes_as_ids(metacast.filter_query)
++        episodes
++    end
++
++    defp ensure_minimal_filter_query(%{changes: %{filter_query: nil}} = changeset) do
++        change(changeset, filter_query: @minimal_filter_query)
++    end
++
++    defp ensure_minimal_filter_query(%{changes: %{filter_query: ""}} = changeset) do
++        change(changeset, filter_query: @minimal_filter_query)
++    end
++
++    defp ensure_minimal_filter_query(changeset), do: changeset
++
++    defp validate_filter_query(%{changes: %{filter_query: filter_query}} = changeset) do
++        case Cache.compile(filter_query) do
++            {:ok, _} -> changeset
++            {:error, :no_start} -> add_error(changeset, :filter_query, "Your filter doesn't have a start statement. Start is either 'only' or 'except'.")
++            {:error, :too_many_statements} -> add_error(changeset, :filter_query, "Your filter has too many statements. Statement limit: #{Filterer.statement_limit()}")
++            {:error, error} -> add_error(changeset, :filter_query, "Error in filter parsing: #{error}")
++        end
++    end
++
++    defp validate_filter_query(changeset), do: changeset
++end
+\ No newline at end of file
+diff --git a/lib/changelog/schema/news/news_queue.ex b/lib/changelog/schema/news/news_queue.ex
+index 65d4171ebe..4bf1a1f8b9 100644
+--- a/lib/changelog/schema/news/news_queue.ex
++++ b/lib/changelog/schema/news/news_queue.ex
+@@ -3,7 +3,16 @@ defmodule Changelog.NewsQueue do
+ 
+   require Logger
+ 
+-  alias Changelog.{Buffer, Cache, HN, NewsItem, NewsQueue, Notifier, Search}
++  alias Changelog.{
++    Buffer,
++    Cache,
++    EpisodeTracker,
++    HN,
++    NewsItem,
++    NewsQueue,
++    Notifier,
++    Search
++  }
+ 
+   schema "news_queue" do
+     field :position, :float
+@@ -153,6 +162,7 @@ defmodule Changelog.NewsQueue do
+     Task.start_link(fn -> Buffer.queue(item) end)
+     Task.start_link(fn -> Notifier.notify(item) end)
+     Task.start_link(fn -> HN.submit(item) end)
++    Task.start_link(fn -> EpisodeTracker.track(item) end)
+     Cache.delete(item)
+     Logger.info("News: Published ##{item.id}")
+     true
+diff --git a/lib/changelog_web/controllers/admin/episode_controller.ex b/lib/changelog_web/controllers/admin/episode_controller.ex
+index f5d95bcf63..0374ddddb5 100644
+--- a/lib/changelog_web/controllers/admin/episode_controller.ex
++++ b/lib/changelog_web/controllers/admin/episode_controller.ex
+@@ -6,6 +6,7 @@ defmodule ChangelogWeb.Admin.EpisodeController do
+     Episode,
+     EpisodeNewsItem,
+     EpisodeTopic,
++    EpisodeTracker,
+     EpisodeGuest,
+     EpisodeHost,
+     EpisodeRequest,
+@@ -166,6 +167,7 @@ defmodule ChangelogWeb.Admin.EpisodeController do
+ 
+     case Repo.insert(changeset) do
+       {:ok, episode} ->
++
+         conn
+         |> put_flash(:result, "success")
+         |> redirect_next(
+@@ -239,6 +241,7 @@ defmodule ChangelogWeb.Admin.EpisodeController do
+       |> Repo.get_by!(slug: slug)
+ 
+     Repo.delete!(episode)
++    EpisodeTracker.untrack(episode.id)
+     EpisodeNewsItem.delete(episode)
+     Cache.delete(episode)
+ 
+diff --git a/lib/changelog_web/controllers/admin/metacast_controller.ex b/lib/changelog_web/controllers/admin/metacast_controller.ex
+new file mode 100644
+index 0000000000..6081ffbae1
+--- /dev/null
++++ b/lib/changelog_web/controllers/admin/metacast_controller.ex
+@@ -0,0 +1,75 @@
++defmodule ChangelogWeb.Admin.MetacastController do
++  use ChangelogWeb, :controller
++
++  alias Changelog.{Cache, Metacast}
++
++  plug :assign_metacast when action in [:edit, :update, :delete]
++  plug Authorize, [Policies.AdminsOnly, :metacast]
++  plug :scrub_params, "metacast" when action in [:create, :update]
++
++  def index(conn, _params) do
++    metacasts = Repo.all(Metacast)
++
++    conn
++    |> assign(:metacasts, metacasts)
++    |> render(:index)
++  end
++
++  def new(conn, _params) do
++    meta = %Metacast{}
++    changeset = Metacast.insert_changeset(meta)
++    render(conn, :new, changeset: changeset)
++  end
++
++  def create(conn, params = %{"metacast" => metacast_params}) do
++    changeset = Metacast.insert_changeset(%Metacast{}, metacast_params)
++
++    case Repo.insert(changeset) do
++      {:ok, metacast} ->
++        Repo.update(Metacast.file_changeset(metacast, metacast_params))
++        Cache.delete(metacast)
++
++        conn
++        |> put_flash(:result, "success")
++        |> redirect_next(params, Routes.admin_metacast_path(conn, :edit, metacast))
++      {:error, changeset} ->
++        conn
++        |> put_flash(:result, "failure")
++        |> render(:new, changeset: changeset)
++    end
++  end
++
++  def edit(conn = %{assigns: %{metacast: metacast}}, _params) do
++    changeset = Metacast.update_changeset(metacast)
++    render(conn, :edit, metacast: metacast, changeset: changeset)
++  end
++
++  def update(conn = %{assigns: %{metacast: metacast}}, params = %{"metacast" => metacast_params}) do
++    changeset = Metacast.update_changeset(metacast, metacast_params)
++
++    case Repo.update(changeset) do
++      {:ok, metacast} ->
++        Cache.delete(metacast)
++        params = replace_next_edit_path(params, Routes.admin_metacast_path(conn, :edit, metacast))
++
++        conn
++        |> put_flash(:result, "success")
++        |> redirect_next(params, Routes.admin_metacast_path(conn, :index))
++      {:error, changeset} ->
++        render(conn, :edit, metacast: metacast, changeset: changeset)
++    end
++  end
++
++  def delete(conn = %{assigns: %{metacast: metacast}}, _params) do
++    Repo.delete!(metacast)
++
++    conn
++    |> put_flash(:result, "success")
++    |> redirect(to: Routes.admin_metacast_path(conn, :index))
++  end
++
++  defp assign_metacast(conn = %{params: %{"id" => id}}, _) do
++    metacast = Repo.get!(Metacast, id)
++    assign(conn, :metacast, metacast)
++  end
++end
+\ No newline at end of file
+diff --git a/lib/changelog_web/controllers/admin/search_controller.ex b/lib/changelog_web/controllers/admin/search_controller.ex
+index 906faab8f3..265f90a248 100644
+--- a/lib/changelog_web/controllers/admin/search_controller.ex
++++ b/lib/changelog_web/controllers/admin/search_controller.ex
+@@ -1,7 +1,7 @@
+ defmodule ChangelogWeb.Admin.SearchController do
+   use ChangelogWeb, :controller
+ 
+-  alias Changelog.{Episode, NewsItem, NewsSource, Person, Sponsor, Post, Topic}
++  alias Changelog.{Episode, NewsItem, NewsSource, Person, Podcast, Sponsor, Post, Topic}
+ 
+   plug :assign_type when action in [:one]
+   plug Authorize, [Policies.Search, :type]
+@@ -13,6 +13,7 @@ defmodule ChangelogWeb.Admin.SearchController do
+         news_items: search_news_items(query),
+         news_sources: search_news_sources(query),
+         people: search_people(query),
++        podcasts: search_podcasts(query),
+         posts: search_posts(query),
+         sponsors: search_sponsors(query),
+         topics: search_topics(query)
+@@ -28,6 +29,7 @@ defmodule ChangelogWeb.Admin.SearchController do
+         "news_item" -> search_news_items(query)
+         "news_source" -> search_news_sources(query)
+         "person" -> search_people(query)
++        "podcast" -> search_podcasts(query)
+         "post" -> search_posts(query)
+         "sponsor" -> search_sponsors(query)
+         "topic" -> search_topics(query)
+@@ -66,6 +68,9 @@ defmodule ChangelogWeb.Admin.SearchController do
+     |> Repo.all()
+   end
+ 
++  defp search_podcasts(""), do: []
++  defp search_podcasts(q), do: Repo.all(from(q in Podcast, where: ilike(q.name, ^"%#{q}%")))
++
+   defp search_posts(""), do: []
+ 
+   defp search_posts(q),
+diff --git a/lib/changelog_web/controllers/feed_controller.ex b/lib/changelog_web/controllers/feed_controller.ex
+index dc9505a8bc..105f0f202d 100644
+--- a/lib/changelog_web/controllers/feed_controller.ex
++++ b/lib/changelog_web/controllers/feed_controller.ex
+@@ -3,7 +3,7 @@ defmodule ChangelogWeb.FeedController do
+ 
+   require Logger
+ 
+-  alias Changelog.{AgentKit, Episode, NewsItem, NewsSource, Person, Podcast, Post, Topic}
++  alias Changelog.{AgentKit, Episode, Metacast, NewsItem, NewsSource, Person, Podcast, Post, Topic}
+   alias ChangelogWeb.Plug.ResponseCache
+ 
+   plug :log_subscribers, "log podcast subscribers" when action in [:podcast]
+@@ -45,6 +45,15 @@ defmodule ChangelogWeb.FeedController do
+     end
+   end
+ 
++  def metacast(conn, %{"slug" => slug}) do
++    metacast = Metacast.get_by_slug!(slug)
++    if metacast.is_official do
++      render_feed_for_metacast(conn, metacast)
++    else
++      send_resp(conn, :not_found, "")
++    end
++  end
++
+   defp render_feed_for_podcast(conn, podcast, template \\ "podcast") do
+     episodes =
+       podcast
+@@ -65,6 +74,26 @@ defmodule ChangelogWeb.FeedController do
+     |> render("#{template}.xml")
+   end
+ 
++  defp render_feed_for_metacast(conn, metacast, template \\ "podcast") do
++    episodes =
++      metacast
++      |> Metacast.get_episode_ids!()
++      |> Episode.with_ids()
++      |> Episode.published()
++      |> Episode.newest_first()
++      |> Episode.exclude_transcript()
++      |> Episode.preload_all()
++      |> Repo.all()
++
++    conn
++    |> put_layout(false)
++    |> put_resp_content_type("application/xml")
++    |> assign(:podcast, metacast)
++    |> assign(:episodes, episodes)
++    |> ResponseCache.cache_public()
++    |> render("#{template}.xml")
++  end
++
+   defp log_subscribers(conn = %{params: %{"slug" => slug}}, _) do
+     ua = ChangelogWeb.Plug.Conn.get_agent(conn)
+ 
+diff --git a/lib/changelog_web/router.ex b/lib/changelog_web/router.ex
+index fc2ec6a9fd..bbb870fa1c 100644
+--- a/lib/changelog_web/router.ex
++++ b/lib/changelog_web/router.ex
+@@ -81,6 +81,8 @@ defmodule ChangelogWeb.Router do
+     resources "/people", PersonController
+     post "/people/:id/slack", PersonController, :slack, as: :person
+ 
++    resources "/metacasts", MetacastController
++
+     resources "/podcasts", PodcastController do
+       resources "/episodes", EpisodeController
+       post "/episodes/:id/publish", EpisodeController, :publish, as: :episode
+@@ -133,6 +135,7 @@ defmodule ChangelogWeb.Router do
+     get "/sitemap.xml", FeedController, :sitemap
+     get "/:slug/feed", FeedController, :podcast
+     get "/plusplus/:slug/feed", FeedController, :plusplus
++    get "/metacast/:slug/feed", FeedController, :metacast
+   end
+ 
+   scope "/", ChangelogWeb do
+diff --git a/lib/changelog_web/templates/admin/episode/_form.html.eex b/lib/changelog_web/templates/admin/episode/_form.html.eex
+index 3eb314b467..37155dbbbe 100644
+--- a/lib/changelog_web/templates/admin/episode/_form.html.eex
++++ b/lib/changelog_web/templates/admin/episode/_form.html.eex
+@@ -58,7 +58,7 @@
+   <div class="required field">
+     <%= label(f, :hosts) %>
+ 
+-    <div class="ui middle aligned selection list js-hosts">
++    <div class="ui middle aligned selection list js-episode_hosts">
+       <%= inputs_for f, :episode_hosts, fn i -> %>
+         <% host = AdminHelpers.load_from_form(i, Person, :person) %>
+         <div class="item <%= if AdminHelpers.is_persisted(i.data), do: "persisted" %>">
+@@ -89,7 +89,7 @@
+   <div class="field">
+     <%= label(f, :guests) %>
+ 
+-    <div class="ui middle aligned selection list js-guests">
++    <div class="ui middle aligned selection list js-episode_guests">
+       <%= inputs_for f, :episode_guests, fn i -> %>
+         <% guest = AdminHelpers.load_from_form(i, Person, :person) %>
+         <div class="item <%= if AdminHelpers.is_persisted(i.data), do: "persisted" %>">
+@@ -120,7 +120,7 @@
+   <div class="field">
+     <%= label(f, :sponsors) %>
+ 
+-    <div class="ui middle aligned selection list js-sponsors">
++    <div class="ui middle aligned selection list js-episode_sponsors">
+       <%= inputs_for f, :episode_sponsors, fn i -> %>
+         <% sponsor = AdminHelpers.load_from_form(i, Sponsor, :sponsor) %>
+         <div class="item <%= if AdminHelpers.is_persisted(i.data), do: "persisted" %>">
+@@ -170,7 +170,7 @@
+   <div class="field">
+     <%= label(f, :topics) %>
+ 
+-    <div class="ui horizontal selection list js-topics">
++    <div class="ui horizontal selection list js-topics js-episode_topics">
+       <%= inputs_for f, :episode_topics, fn i -> %>
+         <% topic = AdminHelpers.load_from_form(i, Topic, :topic) %>
+         <div class="item <%= if AdminHelpers.is_persisted(i.data), do: "persisted" %>">
+diff --git a/lib/changelog_web/templates/admin/metacast/_form.html.eex b/lib/changelog_web/templates/admin/metacast/_form.html.eex
+new file mode 100644
+index 0000000000..57e8165752
+--- /dev/null
++++ b/lib/changelog_web/templates/admin/metacast/_form.html.eex
+@@ -0,0 +1,64 @@
++  <%= form_for @changeset, @action, [multipart: true, class: "ui form"], fn f -> %>
++  <div class="field required <%= AdminHelpers.error_class(f, :name) %>">
++    <%= label(f, :name, "Name") %>
++    <%= text_input(f, :name, placeholder: "The Kubernetes") %>
++    <%= AdminHelpers.error_message(f, :name) %>
++  </div>
++
++  <div class="field required <%= AdminHelpers.error_class(f, :slug) %>">
++    <%= label(f, :slug) %>
++    <%= text_input(f, :slug, placeholder: "kubernetes") %>
++    <%= AdminHelpers.error_message(f, :slug) %>
++  </div>
++
++  <div class="field <%= AdminHelpers.error_class(f, :is_official) %>">
++    <%= label(f, :is_official) %>
++    <%= checkbox(f, :is_official) %>
++    <%= AdminHelpers.error_message(f, :is_official) %>
++  </div>
++
++  <div class="two fields">
++    <div class="fourteen wide field">
++      <label for="cover">
++        Cover
++        <%= AdminHelpers.help_icon("Ideal size is 3000px by 3000px") %>
++      </label>
++      <%= AdminHelpers.error_message(f, :cover) %>
++      <%= file_input(f, :cover) %>
++    </div>
++
++    <div class="two wide field">
++      <img src="<%= MetacastView.cover_url(f.data, :small) %>" height=66>
++    </div>
++  </div>
++
++  <div class="field <%= AdminHelpers.error_class(f, :description) %>">
++    <%= label(f, :description) %>
++    <%= textarea(f, :description, placeholder: "Markdown enabled.") %>
++    <%= AdminHelpers.error_message(f, :description) %>
++  </div>
++
++  <div class="field <%= AdminHelpers.error_class(f, :keywords) %>">
++    <%= label(f, :keywords) %>
++    <%= text_input(f, :keywords, placeholder: "changelog, open source, software, development") %>
++    <%= AdminHelpers.error_message(f, :keywords) %>
++  </div>
++
++  <div class="field <%= AdminHelpers.error_class(f, :filter_query) %>">
++    <%= label(f, :filter_query) %>
++    <%= textarea(f, :filter_query) %>
++    <%= AdminHelpers.error_message(f, :filter_query) %>
++  </div>
++
++  <div class="ui hidden divider"></div>
++  <div class="ui equal width stackable grid">
++  <%= if !AdminHelpers.is_persisted(f.data) do %>
++    <div class="column"><%= AdminHelpers.submit_button(:primary, "Create") %></div>
++    <div class="column"><%= AdminHelpers.submit_button(:secondary, "Create and Close", AdminHelpers.next_param(@conn, Routes.admin_metacast_path(@conn, :index))) %></div>
++  <% else %>
++    <div class="column"><%= AdminHelpers.submit_button(:primary, "Save", "edit") %></div>
++    <div class="column"><%= AdminHelpers.submit_button(:secondary, "Save and Close", AdminHelpers.next_param(@conn)) %></div>
++  <% end %>
++    <div class="column"></div>
++  </div>
++<% end %>
+\ No newline at end of file
+diff --git a/lib/changelog_web/templates/admin/metacast/_table.html.eex b/lib/changelog_web/templates/admin/metacast/_table.html.eex
+new file mode 100644
+index 0000000000..0f73df164e
+--- /dev/null
++++ b/lib/changelog_web/templates/admin/metacast/_table.html.eex
+@@ -0,0 +1,28 @@
++<table class="ui celled striped table">
++  <thead>
++    <tr>
++      <th>Name</th>
++      <th>Cover</th>
++      <th></th>
++    </tr>
++  </thead>
++
++  <tbody>
++  <%= for metacast <- @metacasts do %>
++    <tr>
++      <td><%= metacast.name %></td>
++      <td class="center aligned">
++        <h2 class="ui image header">
++          <img src="<%= MetacastView.cover_url(metacast, :small) %>" class="ui image" />
++        </h2>
++      </td>
++      <td class="center aligned">
++        <div class="ui small basic buttons">
++          <%= AdminHelpers.icon_link("edit", to: Routes.admin_metacast_path(@conn, :edit, metacast)) %>
++          <%= AdminHelpers.icon_link("trash", to: Routes.admin_metacast_path(@conn, :delete, metacast), method: :delete, data: [confirm: "Are you sure?"]) %>
++        </div>
++      </td>
++    </tr>
++  <% end %>
++  </tbody>
++</table>
+\ No newline at end of file
+diff --git a/lib/changelog_web/templates/admin/metacast/edit.html.eex b/lib/changelog_web/templates/admin/metacast/edit.html.eex
+new file mode 100644
+index 0000000000..35b81fdcfb
+--- /dev/null
++++ b/lib/changelog_web/templates/admin/metacast/edit.html.eex
+@@ -0,0 +1,8 @@
++<div class="ui basic segment text container">
++  <h1 class="ui dividing header">
++    <%= link "Metacasts", to: Routes.admin_metacast_path(@conn, :index) %>
++    &raquo; Edit
++  </h1>
++
++  <%= render("_form.html", Map.merge(assigns, %{action: Routes.admin_metacast_path(@conn, :update, @metacast)})) %>
++</div>
+\ No newline at end of file
+diff --git a/lib/changelog_web/templates/admin/metacast/index.html.eex b/lib/changelog_web/templates/admin/metacast/index.html.eex
+new file mode 100644
+index 0000000000..a55e440957
+--- /dev/null
++++ b/lib/changelog_web/templates/admin/metacast/index.html.eex
+@@ -0,0 +1,20 @@
++<div class="ui basic segment">
++  <h1 class="ui dividing header">
++    Metacasts
++    <div class="sub header">Sneaky, sneaky</div>
++  </h1>
++
++  <div class="actions">
++    <%= link to: Routes.admin_metacast_path(@conn, :new), class: "ui right floated primary basic button" do %>
++      <i class="icon unmute"></i>
++      Add Metacast
++    <% end %>
++  </div>
++</div>
++
++<div class="ui basic segment">
++<%= if Enum.any?(@metacasts) do %>
++  <h2 class="ui header">Metacasts</h2>
++  <%= render("_table.html", assigns) %>
++<% end %>
++</div>
+\ No newline at end of file
+diff --git a/lib/changelog_web/templates/admin/metacast/new.html.eex b/lib/changelog_web/templates/admin/metacast/new.html.eex
+new file mode 100644
+index 0000000000..a1c39b155c
+--- /dev/null
++++ b/lib/changelog_web/templates/admin/metacast/new.html.eex
+@@ -0,0 +1,8 @@
++<div class="ui basic segment text container">
++  <h1 class="ui dividing header">
++    <%= link "Metacasts", to: Routes.admin_metacast_path(@conn, :index) %>
++    &raquo; New
++  </h1>
++
++  <%= render("_form.html", Map.merge(assigns, %{action: Routes.admin_metacast_path(@conn, :create)})) %>
++</div>
+\ No newline at end of file
+diff --git a/lib/changelog_web/templates/admin/news_item/_form.html.eex b/lib/changelog_web/templates/admin/news_item/_form.html.eex
+index d8371fa499..cc0ecdd7b7 100644
+--- a/lib/changelog_web/templates/admin/news_item/_form.html.eex
++++ b/lib/changelog_web/templates/admin/news_item/_form.html.eex
+@@ -108,7 +108,7 @@
+       <% end %>
+     </div>
+   <% else %>
+-    <div class="ui horizontal selection list js-topics">
++    <div class="ui horizontal selection list js-news_item_topics">
+       <%= inputs_for f, :news_item_topics, fn i -> %>
+         <% topic = AdminHelpers.load_from_form(i, Topic, :topic) %>
+         <div class="item <%= if AdminHelpers.is_persisted(i.data), do: "persisted" %>">
+diff --git a/lib/changelog_web/templates/admin/podcast/_form.html.eex b/lib/changelog_web/templates/admin/podcast/_form.html.eex
+index cf997b14f2..c48fc738cb 100644
+--- a/lib/changelog_web/templates/admin/podcast/_form.html.eex
++++ b/lib/changelog_web/templates/admin/podcast/_form.html.eex
+@@ -48,14 +48,14 @@
+     </div>
+ 
+     <div class="two wide field">
+-      <img src="<%= PodcastView.cover_url(f.data, :small) %>" height=66>
++      <img src="<%= cover_url(f.data, :small) %>" height=66>
+     </div>
+   </div>
+ 
+   <div class="required field">
+     <%= label(f, :hosts) %>
+ 
+-    <div class="ui middle aligned selection list js-hosts">
++    <div class="ui middle aligned selection list js-podcast_hosts">
+       <%= inputs_for f, :podcast_hosts, fn i -> %>
+         <div class="item <%= if AdminHelpers.is_persisted(i.data), do: "persisted" %>">
+           <%= hidden_input i, :person_id %>
+@@ -85,7 +85,7 @@
+   <div class="field">
+     <%= label(f, :topics) %>
+ 
+-    <div class="ui horizontal selection list js-topics">
++    <div class="ui horizontal selection list js-podcast_topics">
+       <%= inputs_for f, :podcast_topics, fn i -> %>
+         <% topic = AdminHelpers.load_from_form(i, Topic, :topic) %>
+         <div class="item <%= if AdminHelpers.is_persisted(i.data), do: "persisted" %>">
+diff --git a/lib/changelog_web/templates/admin/podcast/_table.html.eex b/lib/changelog_web/templates/admin/podcast/_table.html.eex
+index a2e9c95102..8f5dc2a469 100644
+--- a/lib/changelog_web/templates/admin/podcast/_table.html.eex
++++ b/lib/changelog_web/templates/admin/podcast/_table.html.eex
+@@ -21,7 +21,7 @@
+       <td class="center aligned">
+         <%= link to: Routes.admin_podcast_episode_path(@conn, :index, podcast.slug) do %>
+         <h2 class="ui image header">
+-          <img src="<%= PodcastView.cover_url(podcast, :small) %>" class="ui image" />
++          <img src="<%= cover_url(podcast, :small) %>" class="ui image" />
+         </h2>
+         <% end %>
+       </td>
+diff --git a/lib/changelog_web/templates/admin/post/_form.html.eex b/lib/changelog_web/templates/admin/post/_form.html.eex
+index 2045a96b1f..1af1c01102 100644
+--- a/lib/changelog_web/templates/admin/post/_form.html.eex
++++ b/lib/changelog_web/templates/admin/post/_form.html.eex
+@@ -56,7 +56,7 @@
+   <div class="field">
+     <%= label f, :topics %>
+ 
+-    <div class="ui horizontal selection list js-topics">
++    <div class="ui horizontal selection list js-post_topics">
+       <%= inputs_for f, :post_topics, fn i -> %>
+         <% topic = AdminHelpers.load_from_form(i, Topic, :topic) %>
+         <div class="item <%= if AdminHelpers.is_persisted(i.data), do: "persisted" %>">
+diff --git a/lib/changelog_web/templates/feed/podcast.xml.eex b/lib/changelog_web/templates/feed/podcast.xml.eex
+index f2b32ea1cf..ac72548751 100644
+--- a/lib/changelog_web/templates/feed/podcast.xml.eex
++++ b/lib/changelog_web/templates/feed/podcast.xml.eex
+@@ -12,9 +12,9 @@
+     <atom:link href="<%= Routes.feed_url(@conn, :podcast, @podcast.slug) %>" rel="self" type="application/rss+xml" />
+     <atom:link href="<%= Routes.podcast_url(@conn, :show, @podcast.slug) %>" rel="alternate" type="text/html" />
+     <language>en-us</language>
+-    <description><%= SharedHelpers.md_to_text(@podcast.description) %> <%= @podcast.extended_description %></description>
++    <description><%= SharedHelpers.md_to_text(@podcast.description) %> <%= Map.get(@podcast, :extended_description, "") %></description>
+     <itunes:author>Changelog Media</itunes:author>
+-    <itunes:summary><%= SharedHelpers.md_to_text(@podcast.description) %> <%= @podcast.extended_description %></itunes:summary>
++    <itunes:summary><%= SharedHelpers.md_to_text(@podcast.description) %> <%= Map.get(@podcast, :extended_description, "") %></itunes:summary>
+     <itunes:explicit>no</itunes:explicit>
+     <itunes:image href="<%= PodcastView.cover_url(@podcast) %>"/>
+     <itunes:keywords><%= @podcast.keywords %></itunes:keywords>
+diff --git a/lib/changelog_web/templates/layout/admin.html.eex b/lib/changelog_web/templates/layout/admin.html.eex
+index 53e4f8abc8..6ad2a9d582 100644
+--- a/lib/changelog_web/templates/layout/admin.html.eex
++++ b/lib/changelog_web/templates/layout/admin.html.eex
+@@ -24,6 +24,12 @@
+       <% end %>
+     <% end %>
+ 
++    <%= if Policies.Podcast.index(@current_user) do %>
++      <%= link(to: Routes.admin_metacast_path(@conn, :index), class: "item #{SharedHelpers.active_class(@conn, ["metacast"], "active")}") do %>
++        <i class="mute icon"></i>Metacasts
++      <% end %>
++    <% end %>
++
+     <%= if Policies.NewsItem.index(@current_user) do %>
+       <%= link(to: Routes.admin_news_item_path(@conn, :index), class: "item #{SharedHelpers.active_class(@conn, ["news_item", "news_source"], "active")}") do %>
+         <i class="newspaper icon"></i>News</a>
+diff --git a/lib/changelog_web/views/admin/metacast_view.ex b/lib/changelog_web/views/admin/metacast_view.ex
+new file mode 100644
+index 0000000000..467f57e2d6
+--- /dev/null
++++ b/lib/changelog_web/views/admin/metacast_view.ex
+@@ -0,0 +1,5 @@
++defmodule ChangelogWeb.Admin.MetacastView do
++  use ChangelogWeb, :admin_view
++
++  alias ChangelogWeb.MetacastView
++end
+\ No newline at end of file
+diff --git a/lib/changelog_web/views/admin/podcast_view.ex b/lib/changelog_web/views/admin/podcast_view.ex
+index 4d09f36f88..9f2b9f93f6 100644
+--- a/lib/changelog_web/views/admin/podcast_view.ex
++++ b/lib/changelog_web/views/admin/podcast_view.ex
+@@ -5,8 +5,13 @@ defmodule ChangelogWeb.Admin.PodcastView do
+   alias ChangelogWeb.{PodcastView}
+   alias ChangelogWeb.Admin.EpisodeView
+ 
++  def cover_url(podcast), do: PodcastView.cover_url(podcast)
++  def cover_url(podcast, version), do: PodcastView.cover_url(podcast, version)
++
+   def episode_count(podcast), do: PodcastView.episode_count(podcast)
+ 
++  def download_count(podcast), do: podcast.download_count |> round()
++
+   def last_stat(podcast) do
+     podcast
+     |> Ecto.assoc(:episode_stats)
+diff --git a/lib/changelog_web/views/admin/search_view.ex b/lib/changelog_web/views/admin/search_view.ex
+index dd3bb6aece..5ba9560029 100644
+--- a/lib/changelog_web/views/admin/search_view.ex
++++ b/lib/changelog_web/views/admin/search_view.ex
+@@ -10,6 +10,7 @@ defmodule ChangelogWeb.Admin.SearchView do
+     NewsItemView,
+     NewsSourceView,
+     PersonView,
++    PodcastView,
+     PostView,
+     SponsorView
+   }
+@@ -33,6 +34,7 @@ defmodule ChangelogWeb.Admin.SearchView do
+           results: process_results(results.news_sources, &news_source_result/1)
+         },
+         people: %{name: "People", results: process_results(results.people, &person_result/1)},
++        podcasts: %{name: "Podcasts", results: process_results(results.podcasts, &podcast_result/1)},
+         posts: %{name: "Posts", results: process_results(results.posts, &post_result/1)},
+         sponsors: %{
+           name: "Sponsors",
+@@ -53,38 +55,30 @@ defmodule ChangelogWeb.Admin.SearchView do
+     end
+   end
+ 
+-  def render("topic.json", _params = %{results: results, query: _query}) do
+-    %{results: Enum.map(results, &topic_result/1)}
+-  end
+-
+-  def render("news_item.json", _params = %{results: results, query: _query}) do
+-    %{results: Enum.map(results, &news_item_result/1)}
+-  end
+-
+-  def render("news_source.json", _params = %{results: results, query: _query}) do
+-    %{results: Enum.map(results, &news_source_result/1)}
+-  end
+-
+-  def render("person.json", _params = %{results: results, query: _query}) do
+-    %{results: Enum.map(results, &person_result/1)}
+-  end
++  def render(json_template, _params = %{results: results, query: _query}) do
++    process_fn = case json_template do
++      "news_item.json" -> &news_item_result/1
++      "news_source.json" -> &news_source_result/1
++      "person.json" -> &person_result/1
++      "podcast.json" -> &podcast_result/1
++      "sponsor.json" -> &sponsor_result/1
++      "topic.json" -> &topic_result/1
++    end
+ 
+-  def render("sponsor.json", _params = %{results: results, query: _query}) do
+-    %{results: Enum.map(results, &sponsor_result/1)}
++    %{results: Enum.map(results, process_fn)}
+   end
+ 
+-  defp process_results(records, processFn) do
++  defp process_results(records, process_fn) do
+     records
+     |> Enum.take(@limit)
+-    |> Enum.map(processFn)
++    |> Enum.map(process_fn)
+   end
+ 
+-  defp topic_result(topic) do
++  defp episode_result(episode) do
+     %{
+-      id: topic.id,
+-      title: topic.name,
+-      image: TopicView.icon_url(topic),
+-      url: Routes.admin_topic_path(Endpoint, :edit, topic.slug)
++      id: episode.id,
++      title: EpisodeView.numbered_title(episode),
++      url: Routes.admin_podcast_episode_path(Endpoint, :show, episode.podcast.slug, episode.slug)
+     }
+   end
+ 
+@@ -105,14 +99,6 @@ defmodule ChangelogWeb.Admin.SearchView do
+     }
+   end
+ 
+-  defp episode_result(episode) do
+-    %{
+-      id: episode.id,
+-      title: EpisodeView.numbered_title(episode),
+-      url: Routes.admin_podcast_episode_path(Endpoint, :show, episode.podcast.slug, episode.slug)
+-    }
+-  end
+-
+   defp person_result(person) do
+     {title, description} =
+       if Enum.member?(Faker.names(), person.name) do
+@@ -130,8 +116,21 @@ defmodule ChangelogWeb.Admin.SearchView do
+     }
+   end
+ 
++  defp podcast_result(podcast) do
++    %{
++      id: podcast.id,
++      title: podcast.name,
++      image: PodcastView.cover_url(podcast, :small),
++      url: Routes.admin_podcast_path(Endpoint, :edit, podcast.slug)
++    }
++  end
++
+   defp post_result(post) do
+-    %{title: post.title, url: Routes.admin_post_path(Endpoint, :edit, post)}
++    %{
++      id: post.id,
++      title: post.title,
++      url: Routes.admin_post_path(Endpoint, :edit, post)
++    }
+   end
+ 
+   defp sponsor_result(sponsor) do
+@@ -157,4 +156,13 @@ defmodule ChangelogWeb.Admin.SearchView do
+       extras: extras
+     }
+   end
++
++  defp topic_result(topic) do
++    %{
++      id: topic.id,
++      title: topic.name,
++      image: TopicView.icon_url(topic),
++      url: Routes.admin_topic_path(Endpoint, :edit, topic.slug)
++    }
++  end
+ end
+diff --git a/lib/changelog_web/views/metacast_view.ex b/lib/changelog_web/views/metacast_view.ex
+new file mode 100644
+index 0000000000..347473c67c
+--- /dev/null
++++ b/lib/changelog_web/views/metacast_view.ex
+@@ -0,0 +1,37 @@
++defmodule ChangelogWeb.MetacastView do
++  use ChangelogWeb, :public_view
++
++  alias ChangelogWeb.{Endpoint}
++  alias Changelog.Files.Cover
++
++  def cover_path(metacast, version) do
++    {metacast.cover, metacast}
++    |> Cover.url(version)
++    |> String.replace_leading("/priv", "")
++  end
++
++  def cover_local_path(metacast) do
++    path =
++      metacast
++      |> cover_path(:original)
++      |> String.split("?")
++      |> List.first()
++
++    arc_dir = Application.get_env(:arc, :storage_dir)
++
++    if String.starts_with?(path, arc_dir) do
++      path
++    else
++      Application.app_dir(:changelog, "priv#{path}")
++    end
++  end
++
++  def cover_url(metacast), do: cover_url(metacast, :original)
++  def cover_url(metacast, version) do
++    if metacast.cover do
++      Routes.static_url(Endpoint, cover_path(metacast, version))
++    else
++      "/images/defaults/black.png"
++    end
++  end
++end
+\ No newline at end of file
+diff --git a/lib/changelog_web/views/podcast_view.ex b/lib/changelog_web/views/podcast_view.ex
+index 56a76371ed..068c4d26e2 100644
+--- a/lib/changelog_web/views/podcast_view.ex
++++ b/lib/changelog_web/views/podcast_view.ex
+@@ -40,7 +40,7 @@ defmodule ChangelogWeb.PodcastView do
+     end
+   end
+ 
+-  def dasherized_name(podcast), do: StringKit.dasherize(podcast.name)
++  def dasherized_name(%{name: name}), do: StringKit.dasherize(name)
+ 
+   def is_master(podcast), do: Podcast.is_master(podcast)
+   def episode_count(podcast), do: Podcast.episode_count(podcast)
+diff --git a/priv/repo/migrations/20200818052249_create_metacasts.exs b/priv/repo/migrations/20200818052249_create_metacasts.exs
+new file mode 100644
+index 0000000000..3988f222a1
+--- /dev/null
++++ b/priv/repo/migrations/20200818052249_create_metacasts.exs
+@@ -0,0 +1,18 @@
++defmodule Changelog.Repo.Migrations.CreateMetacasts do
++  use Ecto.Migration
++
++  def change do
++    create table(:metacasts) do
++      add :name, :string, null: false
++      add :description, :text
++      add :keywords, :string
++      add :slug, :string, null: false
++      add :is_official, :boolean, null: false
++      add :cover, :string
++
++      add :filter_query, :text
++      
++      timestamps()
++    end
++  end
++end
+diff --git a/test/changelog/episode_tracker_test.exs b/test/changelog/episode_tracker_test.exs
+new file mode 100644
+index 0000000000..eef9b621ee
+--- /dev/null
++++ b/test/changelog/episode_tracker_test.exs
+@@ -0,0 +1,60 @@
++defmodule Changelog.MetacastsTest do
++  use Changelog.SchemaCase
++
++  alias Changelog.EpisodeTracker
++
++  setup do
++    gotime = insert(:podcast, slug: "gotime")
++    changelog = insert(:podcast, slug: "podcast")
++    jsparty = insert(:podcast, slug: "jsparty")
++    {:ok,
++    podcasts: [gotime, changelog, jsparty],
++    episodes: [
++            insert(:published_episode,
++                id: 1,
++                slug: "phoenix-liveview-episode",
++                title: "Phoenix LiveView",
++                summary: "A web framework for Elixir",
++                notes: "Chris McCord",
++                podcast: jsparty
++            ),
++            insert(:published_episode,
++                id: 2,
++                slug: "rails-episode",
++                title: "Rails",
++                summary: "A web framework for Ruby",
++                notes: "DHH",
++                podcast: changelog
++            )
++        ]
++    }
++  end
++
++  test "filter" do
++    EpisodeTracker.refresh()
++    assert {:ok, [%{slug: "rails-episode"}]} = EpisodeTracker.filter("only podcast: podcast")
++    assert {:ok, ["rails-episode"]} = EpisodeTracker.filter(
++      "only podcast: podcast",
++      fn episode ->
++        episode.slug
++    end)
++    assert {:ok, [2]} = EpisodeTracker.get_episodes_as_ids("only podcast: podcast")
++  end
++
++  test "track new episode then untrack", %{podcasts: [_, changelog, _]} do
++    EpisodeTracker.refresh()
++    episode = insert(:published_episode,
++        id: 3,
++        slug: "django-episode",
++        title: "Django",
++        summary: "A web framework for Python",
++        notes: "?",
++        podcast: changelog
++    )
++    assert {:ok, [%{slug: "rails-episode"}]} = EpisodeTracker.filter("only podcast: podcast")
++    EpisodeTracker.track(episode)
++    assert {:ok, [%{slug: "django-episode"}, %{slug: "rails-episode"}]} = EpisodeTracker.filter("only podcast: podcast")
++    EpisodeTracker.untrack(episode.id)
++    assert {:ok, [%{slug: "rails-episode"}]} = EpisodeTracker.filter("only podcast: podcast")
++  end
++end
+\ No newline at end of file
+diff --git a/test/changelog/metacasts/filterer/cache_test.exs b/test/changelog/metacasts/filterer/cache_test.exs
+new file mode 100644
+index 0000000000..c13011aa4b
+--- /dev/null
++++ b/test/changelog/metacasts/filterer/cache_test.exs
+@@ -0,0 +1,45 @@
++defmodule Changelog.Metacasts.Filterer.CacheTest do
++  use ExUnit.Case
++
++  alias Changelog.Metacasts.Filterer.Cache
++
++  @episodes [
++      %{
++        id: 1,
++        podcast: "rfc",
++        host: [],
++        guest: [],
++        topic: []
++    },
++    %{
++        id: 2,
++        podcast: "afk",
++        host: [],
++        guest: [],
++        topic: []
++    },
++    %{
++        id: 3,
++        podcast: "gotime",
++        host: [],
++        guest: [],
++        topic: []
++    }
++  ]
++
++  test "basic operations" do
++    filter_string = "only podcast: rfc"
++    assert {:ok, compiled} = Cache.compile(filter_string)
++    assert %{"only podcast: rfc" => ^compiled} = Cache.stat()
++    assert [%{id: 1}] = Cache.filter!(@episodes, filter_string) |> Enum.to_list()
++    assert {:ok, stream} = Cache.filter(@episodes, filter_string)
++    assert [%{id: 1}] = Enum.to_list(stream)
++
++    second_filter = "except podcast: rfc"
++    assert [%{id: 2}, %{id: 3}] = Cache.filter!(@episodes, second_filter) |> Enum.to_list()
++    assert [%{id: 2}, %{id: 3}] = Cache.filter!(@episodes, second_filter) |> Enum.to_list()
++    assert %{"only podcast: rfc" => _, "except podcast: rfc" => _} = Cache.stat()
++  end
++
++  
++end
+\ No newline at end of file
+diff --git a/test/changelog/metacasts/filterer/generator_test.exs b/test/changelog/metacasts/filterer/generator_test.exs
+new file mode 100644
+index 0000000000..ade9bc8ef8
+--- /dev/null
++++ b/test/changelog/metacasts/filterer/generator_test.exs
+@@ -0,0 +1,248 @@
++defmodule Changelog.Metacasts.Filterer.GeneratorTest do
++  use ExUnit.Case
++  doctest Changelog.Metacasts.Filterer.Generator
++
++  alias Changelog.Metacasts.Filterer.{Generator, Representation, FacetStatement, Parser}
++
++  @except %Representation{
++    start: :except,
++    statements: [
++      %FacetStatement{
++        items: ["gotime", "rfc", "afk"],
++        logic: :or,
++        repr: :podcast
++      },
++      %FacetStatement{
++        items: ["react", "react-native", "typescript"],
++        logic: :or,
++        repr: :topic
++      },
++      %FacetStatement{
++        items: ["Jason Fried", "Steve Jobs"],
++        logic: :or,
++        repr: :guest
++      },
++      %FacetStatement{items: ["jsparty"], logic: :and, repr: :podcast},
++      {:sub_facet_start, :unless},
++      {:sub_facet_logic, :or},
++      %FacetStatement{items: ["Suz Hinton", "KBall"], logic: :or, repr: :host},
++      {:sub_facet_start, :if},
++      {:sub_facet_logic, :or},
++      %FacetStatement{
++        items: ["webrtc", "streaming"],
++        logic: :or,
++        repr: :topic
++      },
++      %FacetStatement{items: ["golf"], logic: :and, repr: :topic},
++      %FacetStatement{items: ["code"], logic: :and, repr: :topic},
++      :sub_facet_end,
++      %FacetStatement{items: ["svelte"], logic: :and, repr: :topic},
++      %FacetStatement{
++        items: ["phoenix", "liveview"],
++        logic: :and,
++        repr: :topic
++      },
++      :sub_facet_end,
++      %FacetStatement{items: ["changelog"], logic: :and, repr: :podcast}
++    ]
++  }
++
++  @only %Representation{
++    start: :only,
++    statements: [
++      %FacetStatement{
++        items: ["gotime", "rfc", "afk"],
++        logic: :and,
++        repr: :podcast
++      },
++      %FacetStatement{
++        items: ["react", "react-native", "typescript"],
++        logic: :or,
++        repr: :topic
++      },
++      %FacetStatement{
++        items: ["Jason Fried", "Steve Jobs"],
++        logic: :or,
++        repr: :guest
++      },
++      %FacetStatement{items: ["jsparty"], logic: :and, repr: :podcast},
++      {:sub_facet_start, :unless},
++      {:sub_facet_logic, :or},
++      %FacetStatement{items: ["Suz Hinton", "KBall"], logic: :or, repr: :host},
++      {:sub_facet_start, :if},
++      {:sub_facet_logic, :or},
++      %FacetStatement{
++        items: ["webrtc", "streaming"],
++        logic: :or,
++        repr: :topic
++      },
++      %FacetStatement{items: ["golf"], logic: :and, repr: :topic},
++      %FacetStatement{items: ["code"], logic: :and, repr: :topic},
++      :sub_facet_end,
++      %FacetStatement{items: ["svelte"], logic: :and, repr: :topic},
++      %FacetStatement{
++        items: ["phoenix", "liveview"],
++        logic: :and,
++        repr: :topic
++      },
++      :sub_facet_end,
++      %FacetStatement{items: ["changelog"], logic: :and, repr: :podcast}
++    ]
++  }
++
++  @samples [
++    %{
++      id: :weird_one,
++      podcast: "somethingelse",
++      topic: ["entirelydifferent"],
++      host: ["No one you know"],
++      guest: ["Unknown entity"]
++    },
++    %{
++      id: :weird_two,
++      podcast: "somethingelser",
++      topic: ["entirelydifferent"],
++      host: ["No one you know"],
++      guest: ["Unknown entity"]
++    },
++    %{
++      id: :jobs_only,
++      podcast: "somethingelse",
++      topic: [],
++      host: [],
++      guest: ["Steve Jobs"]
++    },
++    %{
++      id: :gotime_only,
++      podcast: "gotime",
++      topic: [],
++      host: [],
++      guest: []
++    },
++    %{
++      id: :jsparty_only,
++      podcast: "jsparty",
++      topic: [],
++      host: [],
++      guest: []
++    },
++    %{
++      id: :jsparty_jerod_only,
++      podcast: "jsparty",
++      topic: [],
++      host: "Jerod Santo",
++      guest: []
++    },
++    %{
++      id: :jsparty_suz_only,
++      podcast: "jsparty",
++      topic: [],
++      host: "Suz Hinton",
++      guest: []
++    },
++    %{
++      id: :jsparty_suz_webrtc,
++      podcast: "jsparty",
++      topic: ["webrtc"],
++      host: "Suz Hinton",
++      guest: []
++    },
++    %{
++      id: :jsparty_kball_golf,
++      podcast: "jsparty",
++      topic: ["golf"],
++      host: ["KBall"],
++      guest: []
++    },
++    %{
++      id: :jsparty_svelte,
++      podcast: "jsparty",
++      topic: ["svelte"],
++      host: [],
++      guest: []
++    },
++    %{
++      id: :jsparty_svelte_angular,
++      podcast: "jsparty",
++      topic: ["svelte", "angular"],
++      host: [],
++      guest: []
++    },
++    %{
++      id: :jsparty_phoenix_liveview,
++      podcast: "jsparty",
++      topic: ["phoenix", "liveview"],
++      host: [],
++      guest: []
++    },
++    %{
++      id: :jsparty_phoenix_only,
++      podcast: "jsparty",
++      topic: ["phoenix"],
++      host: [],
++      guest: []
++    },
++    %{
++      id: :kubernetes_only,
++      podcast: "doesntmatter",
++      topic: ["kubernetes"],
++      host: [],
++      guest: []
++    }
++  ]
++
++  @minimal %Representation{
++    start: :except,
++    statements: []
++  }
++
++  test "except" do
++    stream_filter = Generator.generate_stream_filters(@except)
++    assert [
++      :weird_one,
++      :weird_two,
++      :jsparty_suz_webrtc,
++      :jsparty_kball_golf,
++      :jsparty_svelte,
++      :jsparty_svelte_angular,
++      :jsparty_phoenix_liveview,
++      :kubernetes_only
++    ] = filter_to_ids(@samples, stream_filter)
++  end
++
++  test "only" do
++    stream_filter = Generator.generate_stream_filters(@only)
++    assert [
++      :jobs_only,
++      :jsparty_only,
++      :jsparty_jerod_only,
++      :jsparty_suz_only,
++      :jsparty_phoenix_only
++    ] = filter_to_ids(@samples, stream_filter)
++  end
++
++  test "kubernetes, end-to-end" do
++    stream_filter = "only topic: kubernetes"
++    |> Parser.parse()
++    |> elem(1)
++    |> Generator.generate_stream_filters()
++
++    assert [
++      :kubernetes_only
++    ] = filter_to_ids(@samples, stream_filter)
++  end
++
++  test "minimal" do
++    stream_filter = Generator.generate_stream_filters(@minimal)
++    assert @samples = stream_filter.(@samples) |> Enum.to_list()
++  end
++
++  defp filter_to_ids(samples, filter) do
++    samples
++    |> filter.()
++    |> Enum.to_list()
++    |> Enum.map(fn item ->
++      Map.get(item, :id, nil)
++    end)
++  end
++end
+diff --git a/test/changelog/metacasts/filterer/parser_test.exs b/test/changelog/metacasts/filterer/parser_test.exs
+new file mode 100644
+index 0000000000..6c80753041
+--- /dev/null
++++ b/test/changelog/metacasts/filterer/parser_test.exs
+@@ -0,0 +1,224 @@
++defmodule Changelog.Metacasts.Filterer.ParserTest do
++  use ExUnit.Case
++  doctest Changelog.Metacasts.Filterer.Parser
++
++  alias Changelog.Metacasts.Filterer
++  alias Changelog.Metacasts.Filterer.Parser
++  
++
++  @except """
++  except
++  podcast: gotime, rfc or afk
++  topic: react, react-native or typescript
++  guest: "Jason Fried" or "Steve Jobs"
++  podcast: jsparty
++  unless any (
++    host: "Suz Hinton" or "KBall" if any (
++      topic: webrtc or streaming
++      topic: golf
++      topic: code
++    )
++    topic: svelte
++    topic: phoenix and liveview
++  )
++  podcast: changelog
++  """
++
++  @only """
++  only
++  podcast: gotime, rfc and afk
++  topic: react, react-native or typescript
++  guest: "Jason Fried" or "Steve Jobs"
++  podcast: jsparty
++  unless any (
++    host: "Suz Hinton" or "KBall" if any (
++      topic: webrtc or streaming
++      topic: golf
++      topic: code
++    )
++    topic: svelte
++    topic: phoenix and liveview
++  )
++  podcast: changelog
++  """
++
++  @inline "only podcast: gotime, rfc and afk topic: react, react-native or typescript guest: \"Jason Fried\" or \"Steve Jobs\" podcast: jsparty unless any ( host: \"Suz Hinton\" or \"KBall\" topic: svelte topic: phoenix and liveview ) podcast: changelog"
++  @inline_tight_parens "only podcast: gotime, rfc and afk topic: react, react-native or typescript guest: \"Jason Fried\" or \"Steve Jobs\" podcast: jsparty unless any (host: \"Suz Hinton\" or \"KBall\" topic: svelte topic: phoenix and liveview) podcast: changelog"
++  @minimal "except"
++  @empty ""
++
++  test "except" do
++    assert {:ok,
++            %Filterer.Representation{
++              start: :except,
++              statements: [
++                %Filterer.FacetStatement{
++                  items: ["gotime", "rfc", "afk"],
++                  logic: :or,
++                  repr: :podcast
++                },
++                %Filterer.FacetStatement{
++                  items: ["react", "react-native", "typescript"],
++                  logic: :or,
++                  repr: :topic
++                },
++                %Filterer.FacetStatement{
++                  items: ["Jason Fried", "Steve Jobs"],
++                  logic: :or,
++                  repr: :guest
++                },
++                %Filterer.FacetStatement{items: ["jsparty"], logic: :and, repr: :podcast},
++                {:sub_facet_start, :unless},
++                {:sub_facet_logic, :or},
++                %Filterer.FacetStatement{items: ["Suz Hinton", "KBall"], logic: :or, repr: :host},
++                {:sub_facet_start, :if},
++                {:sub_facet_logic, :or},
++                %Filterer.FacetStatement{
++                  items: ["webrtc", "streaming"],
++                  logic: :or,
++                  repr: :topic
++                },
++                %Filterer.FacetStatement{items: ["golf"], logic: :and, repr: :topic},
++                %Filterer.FacetStatement{items: ["code"], logic: :and, repr: :topic},
++                :sub_facet_end,
++                %Filterer.FacetStatement{items: ["svelte"], logic: :and, repr: :topic},
++                %Filterer.FacetStatement{
++                  items: ["phoenix", "liveview"],
++                  logic: :and,
++                  repr: :topic
++                },
++                :sub_facet_end,
++                %Filterer.FacetStatement{items: ["changelog"], logic: :and, repr: :podcast}
++              ]
++            }} = Parser.parse(@except)
++  end
++
++  test "only" do
++    assert {:ok,
++    %Filterer.Representation{
++      start: :only,
++      statements: [
++        %Filterer.FacetStatement{
++          items: ["gotime", "rfc", "afk"],
++          logic: :and,
++          repr: :podcast
++        },
++        %Filterer.FacetStatement{
++          items: ["react", "react-native", "typescript"],
++          logic: :or,
++          repr: :topic
++        },
++        %Filterer.FacetStatement{
++          items: ["Jason Fried", "Steve Jobs"],
++          logic: :or,
++          repr: :guest
++        },
++        %Filterer.FacetStatement{items: ["jsparty"], logic: :and, repr: :podcast},
++        {:sub_facet_start, :unless},
++        {:sub_facet_logic, :or},
++        %Filterer.FacetStatement{items: ["Suz Hinton", "KBall"], logic: :or, repr: :host},
++        {:sub_facet_start, :if},
++        {:sub_facet_logic, :or},
++        %Filterer.FacetStatement{
++          items: ["webrtc", "streaming"],
++          logic: :or,
++          repr: :topic
++        },
++        %Filterer.FacetStatement{items: ["golf"], logic: :and, repr: :topic},
++        %Filterer.FacetStatement{items: ["code"], logic: :and, repr: :topic},
++        :sub_facet_end,
++        %Filterer.FacetStatement{items: ["svelte"], logic: :and, repr: :topic},
++        %Filterer.FacetStatement{
++          items: ["phoenix", "liveview"],
++          logic: :and,
++          repr: :topic
++        },
++        :sub_facet_end,
++        %Filterer.FacetStatement{items: ["changelog"], logic: :and, repr: :podcast}
++      ]
++    }} = Parser.parse(@only)
++  end
++
++  test "inline" do
++    assert {:ok,
++    %Filterer.Representation{
++      start: :only,
++      statements: [
++        %Filterer.FacetStatement{
++          items: ["gotime", "rfc", "afk"],
++          logic: :and,
++          repr: :podcast
++        },
++        %Filterer.FacetStatement{
++          items: ["react", "react-native", "typescript"],
++          logic: :or,
++          repr: :topic
++        },
++        %Filterer.FacetStatement{
++          items: ["Jason Fried", "Steve Jobs"],
++          logic: :or,
++          repr: :guest
++        },
++        %Filterer.FacetStatement{items: ["jsparty"], logic: :and, repr: :podcast},
++        {:sub_facet_start, :unless},
++        {:sub_facet_logic, :or},
++        %Filterer.FacetStatement{items: ["Suz Hinton", "KBall"], logic: :or, repr: :host},
++        %Filterer.FacetStatement{items: ["svelte"], logic: :and, repr: :topic},
++        %Filterer.FacetStatement{
++          items: ["phoenix", "liveview"],
++          logic: :and,
++          repr: :topic
++        },
++        :sub_facet_end,
++        %Filterer.FacetStatement{items: ["changelog"], logic: :and, repr: :podcast}
++      ]
++    }} = Parser.parse(@inline)
++  end
++
++  test "inline tight parens" do
++    assert {:ok,
++    %Filterer.Representation{
++      start: :only,
++      statements: [
++        %Filterer.FacetStatement{
++          items: ["gotime", "rfc", "afk"],
++          logic: :and,
++          repr: :podcast
++        },
++        %Filterer.FacetStatement{
++          items: ["react", "react-native", "typescript"],
++          logic: :or,
++          repr: :topic
++        },
++        %Filterer.FacetStatement{
++          items: ["Jason Fried", "Steve Jobs"],
++          logic: :or,
++          repr: :guest
++        },
++        %Filterer.FacetStatement{items: ["jsparty"], logic: :and, repr: :podcast},
++        {:sub_facet_start, :unless},
++        {:sub_facet_logic, :or},
++        %Filterer.FacetStatement{items: ["Suz Hinton", "KBall"], logic: :or, repr: :host},
++        %Filterer.FacetStatement{items: ["svelte"], logic: :and, repr: :topic},
++        %Filterer.FacetStatement{
++          items: ["phoenix", "liveview"],
++          logic: :and,
++          repr: :topic
++        },
++        :sub_facet_end,
++        %Filterer.FacetStatement{items: ["changelog"], logic: :and, repr: :podcast}
++      ]
++    }} = Parser.parse(@inline_tight_parens)
++  end
++
++  test "minimal" do
++    assert {:ok, %Filterer.Representation{
++      start: :except,
++      statements: []
++    }} = Parser.parse(@minimal)
++  end
++
++  test "empty" do
++    assert {:error, :no_start} = Parser.parse(@empty)
++  end
++end
+diff --git a/test/changelog/metacasts/filterer_test.exs b/test/changelog/metacasts/filterer_test.exs
+new file mode 100644
+index 0000000000..acc0b9d679
+--- /dev/null
++++ b/test/changelog/metacasts/filterer_test.exs
+@@ -0,0 +1,52 @@
++defmodule Changelog.Metacasts.FiltererTest do
++  use Changelog.SchemaCase
++  doctest Changelog.Metacasts.Filterer
++
++  @statement_limit 256
++  alias Changelog.Episode
++  alias Changelog.Metacasts.Filterer
++
++  setup do
++    gotime = insert(:podcast, slug: "gotime")
++    changelog = insert(:podcast, slug: "podcast")
++    jsparty = insert(:podcast, slug: "jsparty")
++    {:ok,
++    podcasts: [gotime, changelog, jsparty],
++    episodes: [
++            insert(:published_episode,
++                id: 1,
++                slug: "phoenix-liveview-episode",
++                title: "Phoenix LiveView",
++                summary: "A web framework for Elixir",
++                notes: "Chris McCord",
++                podcast: jsparty
++            ),
++            insert(:published_episode,
++                id: 2,
++                slug: "rails-episode",
++                title: "Rails",
++                summary: "A web framework for Ruby",
++                notes: "DHH",
++                podcast: changelog
++            )
++        ]
++    }
++  end
++
++  test "flatten episodes and filter them" do
++    assert {:ok, episodes} = Episode.flatten_for_filtering()
++    assert length(episodes) == 2
++
++    assert [_] = Filterer.filter!(episodes, "only podcast: podcast") |> Enum.to_list()
++    assert [] = Filterer.filter!(episodes, "only podcast: gotime") |> Enum.to_list()
++    assert [_, _] = Filterer.filter!(episodes, "except topic: react") |> Enum.to_list()
++  end
++
++  test "filter statement abuse limit" do
++    too_many_statements = Enum.reduce(0..@statement_limit, "except ", fn num, query ->
++      query <> " podcast: podcast-#{num}"
++    end)
++
++    assert {:error, :too_many_statements} = Filterer.compile(too_many_statements)
++  end
++end
+diff --git a/test/changelog_web/controllers/admin/metacast_controller_text.exs b/test/changelog_web/controllers/admin/metacast_controller_text.exs
+new file mode 100644
+index 0000000000..756b64b488
+--- /dev/null
++++ b/test/changelog_web/controllers/admin/metacast_controller_text.exs
+@@ -0,0 +1,90 @@
++defmodule ChangelogWeb.Admin.MetacastControllerTest do
++  use ChangelogWeb.ConnCase
++
++  alias Changelog.Metacast
++  alias ChangelogWeb.Router.Helpers
++
++  @valid_attrs %{name: "Polyglot", filter_query: "except"}
++  @invalid_attrs %{name: ""}
++
++  defp valid_attrs(slug), do: Map.put(@valid_attrs, :slug, slug)
++
++  @tag :as_admin
++  test "lists all metacasts", %{conn: conn} do
++    p1 = insert(:metacast, slug: "list-all-1")
++    p2 = insert(:metacast, slug: "list-all-2")
++
++    conn = get(conn, Helpers.admin_metacast_path(conn, :index))
++
++    assert html_response(conn, 200) =~ ~r/Metacasts/
++    assert String.contains?(conn.resp_body, p1.name)
++    assert String.contains?(conn.resp_body, p2.name)
++  end
++
++  @tag :as_admin
++  test "renders form to create new metacast", %{conn: conn} do
++    conn = get(conn, Helpers.admin_metacast_path(conn, :new))
++    assert html_response(conn, 200) =~ ~r/new/
++  end
++
++  @tag :as_admin
++  test "creates metacast and redirects", %{conn: conn} do
++    conn = post(conn, Helpers.admin_metacast_path(conn, :create), metacast: valid_attrs("creates-metacast-and-redirects"), next: Helpers.admin_metacast_path(conn, :index))
++
++    assert redirected_to(conn) == Helpers.admin_metacast_path(conn, :index)
++    assert count(Metacast) == 1
++  end
++
++  @tag :as_admin
++  test "does not create with invalid attributes", %{conn: conn} do
++    count_before = count(Metacast)
++    conn = post(conn, Helpers.admin_metacast_path(conn, :create), metacast: @invalid_attrs)
++
++    assert html_response(conn, 200) =~ ~r/error/
++    assert count(Metacast) == count_before
++  end
++
++  @tag :as_admin
++  test "renders form to edit metacast", %{conn: conn} do
++    metacast = insert(:metacast, slug: "render-form-to-edit-metacast")
++
++    conn = get(conn, Helpers.admin_metacast_path(conn, :edit, metacast))
++    assert html_response(conn, 200) =~ ~r/edit/i
++  end
++
++  @tag :as_admin
++  test "updates metacast and redirects", %{conn: conn} do
++    metacast = insert(:metacast, slug: "updates-metacast-and-redirects")
++
++    conn = put(conn, Helpers.admin_metacast_path(conn, :update, metacast), metacast: valid_attrs("updates-metacast-and-redirects"))
++
++    assert redirected_to(conn) == Helpers.admin_metacast_path(conn, :index)
++    assert count(Metacast) == 1
++  end
++
++  @tag :as_admin
++  test "does not update with invalid attributes", %{conn: conn} do
++    metacast = insert(:metacast, slug: "does-not-update-with-invalid-attributes")
++    count_before = count(Metacast)
++
++    conn = put(conn, Helpers.admin_metacast_path(conn, :update, metacast), metacast: @invalid_attrs)
++
++    assert html_response(conn, 200) =~ ~r/error/
++    assert count(Metacast) == count_before
++  end
++
++  test "requires user auth on all actions", %{conn: conn} do
++    metacast = insert(:metacast, slug: "requires-user-auth-on-all-actions")
++
++    Enum.each([
++      get(conn, Helpers.admin_metacast_path(conn, :index)),
++      get(conn, Helpers.admin_metacast_path(conn, :new)),
++      post(conn, Helpers.admin_metacast_path(conn, :create), metacast: valid_attrs("requires-user-auth-1")),
++      get(conn, Helpers.admin_metacast_path(conn, :edit, metacast)),
++      put(conn, Helpers.admin_metacast_path(conn, :update, metacast), metacast: valid_attrs("requires-user-auth-2"))
++    ], fn conn ->
++      assert html_response(conn, 302)
++      assert conn.halted
++    end)
++  end
++end
+\ No newline at end of file

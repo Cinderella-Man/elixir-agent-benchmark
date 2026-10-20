@@ -1,0 +1,2165 @@
+diff --git a/.iex.exs b/.iex.exs
+index 4f7cc5e4ac..61af4fd843 100644
+--- a/.iex.exs
++++ b/.iex.exs
+@@ -1,6 +1,6 @@
+-alias Changelog.{Buffer, Repo, Person, Episode, EpisodeHost, EpisodeGuest, NewsAd,
+-                 NewsItem, NewsItemComment, NewsSource, NewsSponsorship,
+-                 NewsQueue, Podcast, Topic, Sponsor, Post, Github}
++alias Changelog.{Buffer, Repo, Person, Episode, EpisodeHost, EpisodeGuest, Github,
++                 NewsAd, NewsItem, NewsItemComment, NewsSource, NewsSponsorship,
++                 NewsQueue, Podcast, Post, Sponsor, Subscription, Topic}
+ 
+ import Ecto
+ import Ecto.Changeset
+diff --git a/assets/app/app.js b/assets/app/app.js
+index 31469ba9e2..9fe3a3804b 100644
+--- a/assets/app/app.js
++++ b/assets/app/app.js
+@@ -57,6 +57,22 @@ window.App = {
+     u(".js-flash").each(el => { el.flash.remove(); });
+   },
+ 
++  deepLink(href) {
++    let linkTime = parseTime(gup("t", (href || location.href), "#"));
++    if (!linkTime) return false;
++
++    if (this.player.isPlaying()) {
++      this.player.scrubEnd(linkTime);
++    } else {
++      let playable = u("[data-play]");
++      this.player.load(playable.attr("href"), playable.data("play"), _ => {
++        this.player.scrubEnd(linkTime);
++      });
++    }
++
++    return true;
++  },
++
+   formatTimes() {
+     u("span.time").each(el => {
+       let span = u(el);
+@@ -69,25 +85,13 @@ window.App = {
+     });
+   },
+ 
++  getCsrf() {
++    return u("[property=csrf]").attr("content");
++  },
++
+   isExternalLink(a) {
+     let href = a.attr("href");
+     return (a.attr("rel") == "external" || (href[0] != "/" && !href.match(location.hostname)));
+-  },
+-
+-  deepLink(href) {
+-    let linkTime = parseTime(gup("t", (href || location.href), "#"));
+-    if (!linkTime) return false;
+-
+-    if (this.player.isPlaying()) {
+-      this.player.scrubEnd(linkTime);
+-    } else {
+-      let playable = u("[data-play]");
+-      this.player.load(playable.attr("href"), playable.data("play"), _ => {
+-        this.player.scrubEnd(linkTime);
+-      });
+-    }
+-
+-    return true;
+   }
+ }
+ 
+@@ -107,6 +111,14 @@ u(document).handle("click", ".js-toggle-nav", function(event) {
+   }, 50);
+ });
+ 
++// Toggle podcast subscriptions via ajax
++u(document).on("change", ".js-toggle-subscription", function(event) {
++  let checkBox = u(event.target);
++  let slug = checkBox.data("slug");
++  let action = checkBox.is(":checked") ? "subscribe" : "unsubscribe";
++  ajax(`~/${action}`, {method: "POST", headers: {"x-csrf-token": App.getCsrf()}, body: {"slug": slug}});
++});
++
+ u(document).handle("click", ".js-toggle_element", function(event) {
+   const href = u(event.target).attr("href");
+   u(href).toggleClass("is-hidden");
+@@ -170,8 +182,7 @@ const observer = new IntersectionObserver(function(entries) {
+     let el = u(entry.target);
+     let type = el.data("news-type");
+     let id = el.data("news-id");
+-    let csrf = u("[property=csrf]").attr("content");
+-    ajax(`/${type}/impress`, {method: "POST", headers: {"x-csrf-token": csrf}, body: {"ids": id}});
++    ajax(`/${type}/impress`, {method: "POST", headers: {"x-csrf-token": App.getCsrf()}, body: {"ids": id}});
+     observer.unobserve(entry.target);
+   });
+ });
+diff --git a/assets/app/components/account/account_subscriptions.scss b/assets/app/components/account/account_subscriptions.scss
+index b0ea2540cd..5a34b9d761 100644
+--- a/assets/app/components/account/account_subscriptions.scss
++++ b/assets/app/components/account/account_subscriptions.scss
+@@ -3,12 +3,12 @@
+     border-bottom: 1px solid $border-color;
+     padding: $base-spacing 0;
+ 
+-    &:first-child {
+-      padding-top: 0;
+-    }
++    &:first-child { padding-top: 0; }
++    &:last-child { border-bottom: 0; }
+ 
+     @include breakpoint(mobile) {
+       display: flex;
++      flex-wrap: wrap;
+     }
+ 
+     &-info {
+@@ -22,6 +22,7 @@
+ 
+       p {
+         margin-bottom: 0;
++        max-width: 600px;
+       }
+ 
+       &-meta {
+@@ -51,4 +52,59 @@
+       }
+     }
+   }
++
++  &-list {
++    margin: 1em 0 0;
++
++    @include breakpoint(mobile) {
++      display: flex;
++      flex-wrap: wrap;
++    }
++
++    &-item {
++      $gap: 1em;
++      $width: calc(50% - #{$gap});
++      border-bottom: 1px solid $border-color;
++      align-items: center;
++      display: flex;
++      flex: 1 0 $width;
++      padding: 0.5em 0;
++
++      @include breakpoint(mobile) {
++        max-width: $width;
++
++        &:nth-of-type(odd) {
++          margin-right: $gap;
++        }
++
++        &:nth-of-type(even) {
++          margin-left: $gap;
++        }
++      }
++
++      &-icon {
++        background: $black;
++        border-radius: 2px;
++        margin-right: 0.5em;
++        min-width: 50px;
++
++        @include breakpoint(mobile) {
++          margin-right: $gap;
++        }
++      }
++
++      &-title {
++        color: $dark-grey;
++        font-size: 0.875em;
++        flex: 0 1 auto;
++        font-weight: bold;
++        margin: 0 0.5em 0;
++      }
++
++      &-toggle {
++        margin-left: auto;
++        min-width: 40px;
++      }
++    }
++  }
+ }
+diff --git a/assets/app/components/overlay.scss b/assets/app/components/overlay.scss
+index 1d393eea5c..1e9d8ae178 100644
+--- a/assets/app/components/overlay.scss
++++ b/assets/app/components/overlay.scss
+@@ -175,6 +175,17 @@
+   box-shadow: inset 0 0 2px 1px rgba(0,0,0,.05);
+   position: relative;
+ 
++  &--light {
++    background: $lightest-grey;
++
++    .switch {
++      background-color: $light-grey !important;
++    }
++    .check:checked ~ .switch {
++      background-color: $green !important;
++    }
++  }
++
+   .check {
+     position: absolute;
+     display: block;
+diff --git a/assets/app/components/signup.scss b/assets/app/components/signup.scss
+index 1547eb86b8..59d950b9e8 100644
+--- a/assets/app/components/signup.scss
++++ b/assets/app/components/signup.scss
+@@ -9,7 +9,7 @@
+   &-content {
+     color: $white;
+     margin: 0 auto;
+-    max-width: 760px;
++    max-width: 640px;
+     padding: 40px 0;
+     text-align: center;
+     width: 100%;
+@@ -22,6 +22,10 @@
+     }
+   }
+ 
++  &-art img {
++    margin: 0 auto $base-spacing;
++  }
++
+   &-icons {
+     display: flex;
+     flex-wrap: nowrap;
+@@ -59,7 +63,7 @@
+   &-form {
+     background-color: $white;
+     height: 44px;
+-    margin: 0 auto;
++    margin: 30px auto 0;
+     max-width: 520px;
+     position: relative;
+     width: 100%;
+diff --git a/assets/app/layout/show.scss b/assets/app/layout/show.scss
+index 2ff62fa974..813035a0e2 100644
+--- a/assets/app/layout/show.scss
++++ b/assets/app/layout/show.scss
+@@ -104,6 +104,7 @@
+           &--overcast { background-image: url('/images/icons/podcast_icon-overcast.png'); }
+           &--android { background-image: url('/images/icons/podcast_icon-android.png'); }
+           &--rss { background-image: url('/images/icons/podcast_icon-rss.png'); }
++          &--email { background-image: url('/images/icons/podcast_icon-email.png'); }
+         }
+       }
+     }
+diff --git a/assets/assets/images/icons/podcast_icon-email.png b/assets/assets/images/icons/podcast_icon-email.png
+new file mode 100644
+index 0000000000..76f5750247
+Binary files /dev/null and b/assets/assets/images/icons/podcast_icon-email.png differ
+diff --git a/lib/changelog/data/factory.ex b/lib/changelog/data/factory.ex
+index 8645c47805..a1d9640b36 100644
+--- a/lib/changelog/data/factory.ex
++++ b/lib/changelog/data/factory.ex
+@@ -220,6 +220,30 @@ defmodule Changelog.Factory do
+     }
+   end
+ 
++  def subscription_on_item_factory do
++    %Changelog.Subscription{
++      person: build(:person),
++      item: build(:news_item),
++      context: "you got it from a factory"
++    }
++  end
++
++  def unsubscribed_subscription_on_item_factory do
++    %Changelog.Subscription{subscription_on_item_factory() | unsubscribed_at: hours_ago(24)}
++  end
++
++  def subscription_on_podcast_factory do
++    %Changelog.Subscription{
++      person: build(:person),
++      podcast: build(:podcast),
++      context: "you got it from a factory"
++    }
++  end
++
++  def unsubscribed_subscription_on_podcast_factory do
++    %Changelog.Subscription{subscription_on_podcast_factory() | unsubscribed_at: hours_ago(24)}
++  end
++
+   defp hours_ago(count) do
+     count
+     |> ChangelogWeb.TimeView.hours_ago()
+diff --git a/lib/changelog/data/news/news_item.ex b/lib/changelog/data/news/news_item.ex
+index be3f429d89..d16f28cd72 100644
+--- a/lib/changelog/data/news/news_item.ex
++++ b/lib/changelog/data/news/news_item.ex
+@@ -2,7 +2,7 @@ defmodule Changelog.NewsItem do
+   use Changelog.Data, default_sort: :published_at
+ 
+   alias Changelog.{Episode, Files, NewsItemComment, NewsItemTopic, NewsIssue,
+-                   NewsQueue, NewsSource, Person, Post, Regexp, UrlKit}
++                   NewsQueue, NewsSource, Person, Post, Regexp, Subscription, UrlKit}
+ 
+   defenum Status, declined: -1, draft: 0, queued: 1, submitted: 2, published: 3
+   defenum Type, link: 0, audio: 1, video: 2, project: 3, announcement: 4
+@@ -32,6 +32,7 @@ defmodule Changelog.NewsItem do
+     has_many :news_item_topics, NewsItemTopic, foreign_key: :item_id, on_delete: :delete_all
+     has_many :topics, through: [:news_item_topics, :topic]
+     has_many :comments, NewsItemComment, foreign_key: :item_id, on_delete: :delete_all
++    has_many :subscriptions, Subscription, where: [unsubscribed_at: nil], foreign_key: :item_id
+ 
+     timestamps()
+   end
+@@ -49,6 +50,7 @@ defmodule Changelog.NewsItem do
+   def similar_to(query \\ __MODULE__, item),           do: from(q in query, where: q.id != ^item.id, where: ilike(q.url, ^"%#{UrlKit.sans_scheme(item.url)}%"))
+   def similar_url(query \\ __MODULE__, url),           do: from(q in query, where: ilike(q.url, ^"%#{UrlKit.sans_scheme(url)}%"))
+   def submitted(query \\ __MODULE__),                  do: from(q in query, where: q.status == ^:submitted)
++  def with_author(query \\ __MODULE__),                do: from(q in query, where: not(is_nil(q.author_id)))
+   def with_episode(query \\ __MODULE__, episode),      do: from(q in query, where: q.object_id == ^Episode.object_id(episode))
+   def with_episodes(query \\ __MODULE__, episodes),    do: from(q in query, where: q.object_id in ^Enum.map(episodes, &Episode.object_id/1))
+   def with_person(query \\ __MODULE__, person),        do: from(q in query, where: fragment("submitter_id=? or author_id=?", ^person.id, ^person.id))
+diff --git a/lib/changelog/data/person.ex b/lib/changelog/data/person.ex
+index 24c0f1e3f9..56339c0f65 100644
+--- a/lib/changelog/data/person.ex
++++ b/lib/changelog/data/person.ex
+@@ -1,9 +1,8 @@
+ defmodule Changelog.Person do
+   use Changelog.Data
+ 
+-  alias Changelog.{EpisodeHost, EpisodeGuest, Faker, Files, NewsItem, NewsItemComment,
+-                   PodcastHost, Post, Regexp}
+-  alias Timex.Duration
++  alias Changelog.{EpisodeHost, EpisodeGuest, Faker, Files, NewsItem,
++                   NewsItemComment, PodcastHost, Post, Regexp, Subscription}
+ 
+   defmodule Settings do
+     use Changelog.Data
+@@ -18,6 +17,14 @@ defmodule Changelog.Person do
+     def changeset(struct, attrs) do
+       cast(struct, attrs, [:email_on_authored_news, :email_on_submitted_news, :email_on_comment_replies])
+     end
++
++    def is_valid(name) when is_binary(name) do
++      __MODULE__.__struct__
++      |> Map.keys()
++      |> Enum.map(&Atom.to_string/1)
++      |> Enum.any?(&(&1 == name))
++    end
++    def is_valid(_), do: false
+   end
+ 
+   schema "people" do
+@@ -52,6 +59,7 @@ defmodule Changelog.Person do
+     has_many :logged_news_items, NewsItem, foreign_key: :logger_id
+     has_many :submitted_news_items, NewsItem, foreign_key: :submitter_id
+     has_many :comments, NewsItemComment, foreign_key: :author_id
++    has_many :subscriptions, Subscription, where: [unsubscribed_at: nil]
+ 
+     timestamps()
+   end
+@@ -62,7 +70,7 @@ defmodule Changelog.Person do
+   def faked(query \\ __MODULE__),           do: from(q in query, where: q.name in ^Changelog.Faker.names())
+ 
+   def joined_today(query \\ __MODULE__) do
+-    today = Timex.subtract(Timex.now, Duration.from_days(1))
++    today = Timex.subtract(Timex.now, Timex.Duration.from_days(1))
+     from(p in query, where: p.joined_at > ^today)
+   end
+ 
+@@ -144,7 +152,7 @@ defmodule Changelog.Person do
+ 
+   def refresh_auth_token(person, expires_in \\ 30) do
+     auth_token = Base.encode16(:crypto.strong_rand_bytes(8))
+-    expires_at = Timex.add(Timex.now, Duration.from_minutes(expires_in))
++    expires_at = Timex.add(Timex.now, Timex.Duration.from_minutes(expires_in))
+     changeset = auth_changeset(person, %{auth_token: auth_token, auth_token_expires_at: expires_at})
+     {:ok, person} = Repo.update(changeset)
+     person
+@@ -170,6 +178,9 @@ defmodule Changelog.Person do
+     Repo.count(from(p in Post, where: p.author_id == ^person.id))
+   end
+ 
++  def preload_subscriptions(query = %Ecto.Query{}), do: Ecto.Query.preload(query, :subscriptions)
++  def preload_subscriptions(person), do: Repo.preload(person, :subscriptions)
++
+   def with_fake_data(person \\ %__MODULE__{}) do
+     fake_name = Faker.name()
+     fake_handle = Faker.handle(fake_name)
+diff --git a/lib/changelog/data/podcast/podcast.ex b/lib/changelog/data/podcast/podcast.ex
+index cba3febe6f..411e5a3040 100644
+--- a/lib/changelog/data/podcast/podcast.ex
++++ b/lib/changelog/data/podcast/podcast.ex
+@@ -2,7 +2,7 @@ defmodule Changelog.Podcast do
+   use Changelog.Data
+ 
+   alias Changelog.{Episode, EpisodeStat, Files, NewsItem, PodcastTopic,
+-                   PodcastHost, Regexp}
++                   PodcastHost, Regexp, Subscription}
+ 
+   require Logger
+ 
+@@ -35,6 +35,7 @@ defmodule Changelog.Podcast do
+     has_many :podcast_hosts, PodcastHost, on_delete: :delete_all
+     has_many :hosts, through: [:podcast_hosts, :person]
+     has_many :episode_stats, EpisodeStat
++    has_many :subscriptions, Subscription, where: [unsubscribed_at: nil]
+ 
+     timestamps()
+   end
+@@ -159,6 +160,9 @@ defmodule Changelog.Podcast do
+     |> Repo.preload(:topics)
+   end
+ 
++  def preload_subscriptions(query = %Ecto.Query{}), do: Ecto.Query.preload(query, :subscriptions)
++  def preload_subscriptions(podcast), do: Repo.preload(podcast, :subscriptions)
++
+   def update_stat_counts(podcast) do
+     episodes = Repo.all(assoc(podcast, :episodes))
+ 
+diff --git a/lib/changelog/data/subscription.ex b/lib/changelog/data/subscription.ex
+new file mode 100644
+index 0000000000..086035bbcc
+--- /dev/null
++++ b/lib/changelog/data/subscription.ex
+@@ -0,0 +1,71 @@
++defmodule Changelog.Subscription do
++  use Changelog.Data
++
++  alias Changelog.{NewsItem, Person, Podcast}
++
++  schema "subscriptions" do
++    field :unsubscribed_at, :utc_datetime
++    field :context, :string
++
++    belongs_to :person, Person
++    belongs_to :podcast, Podcast
++    belongs_to :item, NewsItem
++
++    timestamps()
++  end
++
++  def subscribed(query \\ __MODULE__), do: from(q in query, where: is_nil(q.unsubscribed_at))
++  def unsubscribed(query \\ __MODULE__), do: from(q in query, where: not(is_nil(q.unsubscribed_at)))
++
++  def is_subscribed(%__MODULE__{unsubscribed_at: ts}), do: is_nil(ts)
++  def is_subscribed(_), do: false
++
++  def preload_all(sub) do
++    sub
++    |> preload_item()
++    |> preload_person()
++    |> preload_podcast()
++  end
++
++  def preload_item(query = %Ecto.Query{}), do: Ecto.Query.preload(query, :item)
++  def preload_item(sub), do: Repo.preload(sub, :item)
++
++  def preload_person(query = %Ecto.Query{}), do: Ecto.Query.preload(query, :person)
++  def preload_person(sub), do: Repo.preload(sub, :person)
++
++  def preload_podcast(query = %Ecto.Query{}), do: Ecto.Query.preload(query, :podcast)
++  def preload_podcast(sub), do: Repo.preload(sub, :podcast)
++
++  def subscribe(person = %Person{}, to, context \\ "") do
++    attrs = case to do
++      %NewsItem{id: id} -> %{person_id: person.id, item_id: id}
++      %Podcast{id: id} -> %{person_id: person.id, podcast_id: id}
++    end
++
++    case Repo.get_by(__MODULE__, attrs) do
++      nil -> Map.merge(%__MODULE__{}, attrs)
++      sub -> sub
++    end
++    |> change(unsubscribed_at: nil)
++    |> change(context: context)
++    |> Repo.insert_or_update()
++  end
++
++  def subscribed_to(%{item_id: id}) when not is_nil(id), do: Repo.get(NewsItem, id)
++  def subscribed_to(%{podcast_id: id}) when not is_nil(id), do: Repo.get(Podcast, id)
++
++  def unsubscribe(nil), do: false
++  def unsubscribe(sub = %__MODULE__{}), do: sub |> change(unsubscribed_at: now_in_seconds()) |> Repo.update()
++  def unsubscribe(person = %Person{}, from) do
++    attrs = case from do
++      %NewsItem{id: id} -> %{person_id: person.id, item_id: id}
++      %Podcast{id: id} -> %{person_id: person.id, podcast_id: id}
++    end
++
++    __MODULE__.subscribed
++    |> Repo.get_by(attrs)
++    |> unsubscribe()
++
++    :ok
++  end
++end
+diff --git a/lib/changelog/newsletters.ex b/lib/changelog/newsletters.ex
+new file mode 100644
+index 0000000000..0c4fa91a2a
+--- /dev/null
++++ b/lib/changelog/newsletters.ex
+@@ -0,0 +1,42 @@
++defmodule Changelog.Newsletters do
++  alias Changelog.Cache
++
++  defmodule Newsletter do
++    defstruct name: nil, slug: nil, list_id: nil, web_id: nil, stats: %{}
++  end
++
++  def all, do: [weekly(), nightly()]
++
++  def slugs, do: Enum.map(all(), &(&1.slug))
++
++  def get_by_slug(slug) do
++    Enum.find(all(), fn(newsletter) -> newsletter.slug == slug end)
++  end
++
++  def nightly do
++    %Newsletter{
++      name: "Changelog Nightly",
++      slug: "nightly",
++      list_id: "95a8fbc221a2240ac7469d661bac650a",
++      web_id: "82E49C221D20C4F7"
++    }
++  end
++
++  def weekly do
++    %Newsletter{
++      name: "Changelog Weekly",
++      slug: "weekly",
++      list_id: "eddd53c07cf9e23029fe8a67fe84731f",
++      web_id: "82E49C221D20C4F7"
++    }
++  end
++
++  def get_stats(newsletter) do
++    cache_key = "newsletter_#{newsletter.list_id}_stats"
++    stats = Cache.get_or_store(cache_key, :timer.hours(1), fn ->
++      Craisin.List.stats(newsletter.list_id)
++    end)
++
++    %Newsletter{newsletter | stats: stats}
++  end
++end
+diff --git a/lib/changelog/newsletters/newsletter.ex b/lib/changelog/newsletters/newsletter.ex
+deleted file mode 100644
+index 04d01a5686..0000000000
+--- a/lib/changelog/newsletters/newsletter.ex
++++ /dev/null
+@@ -1,3 +0,0 @@
+-defmodule Changelog.Newsletters.Newsletter do
+-  defstruct name: nil, list_id: nil, web_id: nil, stats: %{}
+-end
+diff --git a/lib/changelog/newsletters/newsletters.ex b/lib/changelog/newsletters/newsletters.ex
+deleted file mode 100644
+index 970b13ae38..0000000000
+--- a/lib/changelog/newsletters/newsletters.ex
++++ /dev/null
+@@ -1,67 +0,0 @@
+-defmodule Changelog.Newsletters do
+-
+-  alias Changelog.Cache
+-  alias Changelog.Newsletters.Newsletter
+-  alias Craisin.List
+-
+-  def get_by_slug(slug) do
+-    apply(__MODULE__, String.to_existing_atom(slug), [])
+-  end
+-
+-  def afk do
+-    %Newsletter{
+-      name: "Away from Keyboard",
+-      list_id: "8c8c5f024909b9627f26ec8fc9fd7f65",
+-      web_id: "41EF5A7A3399E7C1"
+-    }
+-  end
+-
+-  def gotime do
+-    %Newsletter{
+-      name: "Go Time",
+-      list_id: "96f7328735b814e82d384ce1ddaf8420",
+-      web_id: "B4546FE361E47720"
+-    }
+-  end
+-
+-  def jsparty do
+-    %Newsletter{
+-      name: "JS Party",
+-      list_id: "20e33901de0aaa012a2cb03a4b5022ae",
+-      web_id: "7BE6863044968997"
+-    }
+-  end
+-
+-  def nightly do
+-    %Newsletter{
+-      name: "Changelog Nightly",
+-      list_id: "95a8fbc221a2240ac7469d661bac650a",
+-      web_id: "82E49C221D20C4F7"
+-    }
+-  end
+-
+-  def practicalai do
+-    %Newsletter{
+-      name: "Practical AI",
+-      list_id: "c0eb1761eecd798741fb35e6487e6582",
+-      web_id: "E4ECF69A983F08FB"
+-    }
+-  end
+-
+-  def weekly do
+-    %Newsletter{
+-      name: "Changelog Weekly",
+-      list_id: "eddd53c07cf9e23029fe8a67fe84731f",
+-      web_id: "82E49C221D20C4F7"
+-    }
+-  end
+-
+-  def get_stats(newsletter) do
+-    cache_key = "newsletter_#{newsletter.list_id}_stats"
+-    stats = Cache.get_or_store(cache_key, :timer.hours(1), fn ->
+-      List.stats(newsletter.list_id)
+-    end)
+-
+-    %Newsletter{newsletter | stats: stats}
+-  end
+-end
+diff --git a/lib/changelog/notifier.ex b/lib/changelog/notifier.ex
+index 4b774539e7..7c4fb656d8 100644
+--- a/lib/changelog/notifier.ex
++++ b/lib/changelog/notifier.ex
+@@ -1,5 +1,6 @@
+ defmodule Changelog.Notifier do
+-  alias Changelog.{Mailer, Episode, NewsItem, NewsItemComment, Slack}
++  alias Changelog.{Mailer, Episode, NewsItem, NewsItemComment, Podcast,
++                   Subscription, Slack}
+   alias ChangelogWeb.Email
+ 
+   def notify(item = %NewsItem{type: :audio}) do
+@@ -10,6 +11,7 @@ defmodule Changelog.Notifier do
+       |> Episode.preload_all()
+ 
+     deliver_guest_thanks_emails(episode)
++    deliver_podcast_subscription_emails(episode)
+     deliver_slack_new_episode_message(episode.podcast, item.url)
+   end
+   def notify(item = %NewsItem{}) do
+@@ -36,21 +38,37 @@ defmodule Changelog.Notifier do
+   defp deliver_author_email(nil, _item), do: false
+   defp deliver_author_email(person, item) do
+     if person.settings.email_on_authored_news do
+-      Email.authored_news_published(person, item) |> Mailer.deliver_later()
++      person
++      |> Email.authored_news_published(item)
++      |> Mailer.deliver_later()
+     end
+   end
+ 
+   defp deliver_comment_reply_email(nil, _reply), do: false
+   defp deliver_comment_reply_email(person, reply) do
+     if person.settings.email_on_comment_replies do
+-      Email.comment_reply(person, reply) |> Mailer.deliver_later()
++      person
++      |> Email.comment_reply(reply)
++      |> Mailer.deliver_later()
+     end
+   end
+ 
+-
+   defp deliver_guest_thanks_emails(episode) do
+     for eg <- Enum.filter(episode.episode_guests, &(&1.thanks)) do
+-      Email.guest_thanks(eg.person, episode) |> Mailer.deliver_later()
++      eg.person
++      |> Email.guest_thanks(episode)
++      |> Mailer.deliver_later()
++    end
++  end
++
++  defp deliver_podcast_subscription_emails(episode) do
++    podcast = Podcast.preload_subscriptions(episode.podcast)
++
++    for subscription <- podcast.subscriptions do
++      subscription
++      |> Subscription.preload_all()
++      |> Email.episode_published(episode)
++      |> Mailer.deliver_later()
+     end
+   end
+ 
+@@ -67,7 +85,9 @@ defmodule Changelog.Notifier do
+   defp deliver_submitter_email(nil, _item), do: false
+   defp deliver_submitter_email(person, item) do
+     if person.settings.email_on_submitted_news do
+-      Email.submitted_news_published(person, item) |> Mailer.deliver_later()
++      person
++      |> Email.submitted_news_published(item)
++      |> Mailer.deliver_later()
+     end
+   end
+ end
+diff --git a/lib/changelog_web.ex b/lib/changelog_web.ex
+index 1478e49b37..41e91bd6e2 100644
+--- a/lib/changelog_web.ex
++++ b/lib/changelog_web.ex
+@@ -6,6 +6,7 @@ defmodule ChangelogWeb do
+ 
+       alias Changelog.{Policies, Repo}
+       alias ChangelogWeb.Plug.{Authorize, PublicEtsCache, RequireUser, RequireGuest}
++
+       import Ecto
+       import Ecto.Query
+ 
+diff --git a/lib/changelog_web/controllers/admin/mailer_preview_controller.ex b/lib/changelog_web/controllers/admin/mailer_preview_controller.ex
+new file mode 100644
+index 0000000000..8e927c3b50
+--- /dev/null
++++ b/lib/changelog_web/controllers/admin/mailer_preview_controller.ex
+@@ -0,0 +1,53 @@
++defmodule ChangelogWeb.Admin.MailerPreviewController do
++  use ChangelogWeb, :controller
++
++  alias Changelog.{Episode, NewsItem, Person, Repo, Subscription}
++  alias ChangelogWeb.Email
++
++  def index(conn, _params) do
++    previews =
++      :functions
++      |> __MODULE__.__info__()
++      |> Enum.map(fn({name, _arity}) -> Atom.to_string(name) end)
++      |> Enum.filter(fn(name) -> String.match?(name, ~r/_email/) end)
++      |> Enum.map(fn(name) -> String.replace(name, "_email", "") end)
++
++    render(conn, :index, previews: previews)
++  end
++
++  def show(conn, %{"id" => id}) do
++    email = apply(__MODULE__, String.to_existing_atom("#{id}_email"), [])
++
++    conn
++    |> put_layout(false)
++    |> assign(:email, email)
++    |> render(:show)
++  end
++
++  def community_welcome_email do
++    person =
++      Person.newest_first() |>
++      Person.limit(1) |>
++      Repo.one()
++
++    Email.community_welcome(person)
++  end
++
++  def authored_news_published_email do
++    item =
++      NewsItem.published()
++      |> NewsItem.with_author()
++      |> NewsItem.newest_first()
++      |> NewsItem.limit(1)
++      |> NewsItem.preload_all()
++      |> Repo.one()
++
++    Email.authored_news_published(item.author, item)
++  end
++
++  def episode_published_email do
++    sub = Subscription |> Repo.get(1) |> Subscription.preload_all()
++    ep =  Episode |> Repo.get(654) |> Episode.preload_podcast()
++    Email.episode_published(sub, ep)
++  end
++end
+diff --git a/lib/changelog_web/controllers/admin/page_controller.ex b/lib/changelog_web/controllers/admin/page_controller.ex
+index b5bbb608d4..fb09a09223 100644
+--- a/lib/changelog_web/controllers/admin/page_controller.ex
++++ b/lib/changelog_web/controllers/admin/page_controller.ex
+@@ -7,11 +7,7 @@ defmodule ChangelogWeb.Admin.PageController do
+ 
+   def index(conn = %{assigns: %{current_user: me = %{admin: true}}}, _params) do
+     newsletters =
+-      [Newsletters.weekly(),
+-       Newsletters.nightly(),
+-       Newsletters.gotime(),
+-       Newsletters.jsparty(),
+-       Newsletters.practicalai()]
++      Newsletters.all()
+       |> Enum.map(&Newsletters.get_stats/1)
+ 
+     render(conn, :index,
+diff --git a/lib/changelog_web/controllers/home_controller.ex b/lib/changelog_web/controllers/home_controller.ex
+index 1d812fa2cd..f5144413da 100644
+--- a/lib/changelog_web/controllers/home_controller.ex
++++ b/lib/changelog_web/controllers/home_controller.ex
+@@ -1,8 +1,8 @@
+ defmodule ChangelogWeb.HomeController do
+   use ChangelogWeb, :controller
+ 
+-  alias Changelog.{Person, Slack}
+-  alias Craisin.Subscriber
++  alias Changelog.{NewsItem, Person, Podcast, Slack, Subscription}
++  alias ChangelogWeb.NewsItemView
+ 
+   plug RequireUser, "except from email links" when action not in [:opt_out]
+   plug :scrub_params, "person" when action in [:update]
+@@ -35,20 +35,31 @@ defmodule ChangelogWeb.HomeController do
+   end
+ 
+   def subscribe(conn = %{assigns: %{current_user: me}}, %{"id" => newsletter_id}) do
+-    Subscriber.subscribe(newsletter_id, Person.sans_fake_data(me))
++    Craisin.Subscriber.subscribe(newsletter_id, Person.sans_fake_data(me))
+ 
+     conn
+     |> put_flash(:success, "You're subscribed! You'll get the next issue in your inbox 📥")
+     |> redirect(to: home_path(conn, :show, subscribed: newsletter_id))
+   end
++  def subscribe(conn = %{assigns: %{current_user: me}}, %{"slug" => slug}) do
++    podcast = Podcast.get_by_slug!(slug)
++    context = "you toggled on email notifications for #{podcast.name} in your changelog.com settings"
++    Subscription.subscribe(me, podcast, context)
++    send_resp(conn, 200, "")
++  end
+ 
+   def unsubscribe(conn = %{assigns: %{current_user: me}}, %{"id" => newsletter_id}) do
+-    Subscriber.unsubscribe(newsletter_id, me.email)
++    Craisin.Subscriber.unsubscribe(newsletter_id, me.email)
+ 
+     conn
+     |> put_flash(:success, "You're no longer subscribed. Resubscribe any time 🤗")
+     |> redirect(to: home_path(conn, :show, unsubscribed: newsletter_id))
+   end
++  def unsubscribe(conn = %{assigns: %{current_user: me}}, %{"slug" => slug}) do
++    podcast = Podcast.get_by_slug!(slug)
++    Subscription.unsubscribe(me, podcast)
++    send_resp(conn, 200, "")
++  end
+ 
+   def slack(conn = %{assigns: %{current_user: me}}, _params) do
+     {updated_user, flash} = case Slack.Client.invite(me.email) do
+@@ -67,15 +78,47 @@ defmodule ChangelogWeb.HomeController do
+   end
+ 
+   def opt_out(conn, %{"token" => token, "notification" => notification}) do
+-    if person = Person.get_by_encoded_id(token) do
+-      person
+-      |> Person.update_changeset(%{settings: %{notification => false}})
+-      |> Repo.update()
++    person = Person.get_by_encoded_id(token)
++
++    if Person.Settings.is_valid(notification) do
++      opt_out_of_setting(conn, person, notification)
++    else
++      opt_out_of_subscription(conn, person, notification)
+     end
++  end
++
++  defp opt_out_of_setting(conn, person, notification) do
++    change = %{settings: %{notification => false}}
++
++    person
++    |> Person.update_changeset(change)
++    |> Repo.update()
+ 
+     render(conn, :opt_out)
+   end
+ 
++  defp opt_out_of_subscription(conn, person, id) do
++    sub =
++      person
++      |> assoc(:subscriptions)
++      |> Repo.get!(id)
++
++    Subscription.unsubscribe(sub)
++
++    {message, path} = case Subscription.subscribed_to(sub) do
++      podcast = %Podcast{} ->
++        {"You're unsubscribed! Resubscribe any time 🤗",
++        podcast_path(conn, :show, podcast.slug)}
++      item = %NewsItem{} ->
++        {"You've muted this discussion. 🤐",
++        news_item_path(conn, :show, NewsItemView.slug(item))}
++    end
++
++    conn
++    |> put_flash(:success, message)
++    |> redirect(to: path)
++  end
++
+   defp set_slack_id(person) do
+     if person.slack_id do
+       person
+diff --git a/lib/changelog_web/controllers/person_controller.ex b/lib/changelog_web/controllers/person_controller.ex
+index e6bc2fc5d4..f92d2c9e92 100755
+--- a/lib/changelog_web/controllers/person_controller.ex
++++ b/lib/changelog_web/controllers/person_controller.ex
+@@ -1,26 +1,38 @@
+ defmodule ChangelogWeb.PersonController do
+   use ChangelogWeb, :controller
+ 
+-  alias Changelog.{Mailer, Newsletters, Person, Repo}
++  alias Changelog.{Mailer, Newsletters, Person, Podcast, Subscription}
+   alias ChangelogWeb.Email
+-  alias Craisin.Subscriber
+ 
+   plug RequireGuest, "before joining" when action in [:join]
+ 
++  def subscribe(conn = %{method: "GET"}, %{"to" => to}) when to in ["weekly", "nightly"] do
++    newsletter = Newsletters.get_by_slug(to)
++
++    conn
++    |> assign(:newsletter, newsletter)
++    |> render(:subscribe_newsletter)
++  end
++  def subscribe(conn = %{method: "GET"}, %{"to" => to}) when is_binary(to) do
++    podcast = Podcast.get_by_slug!(to)
++
++    conn
++    |> assign(:podcast, podcast)
++    |> render(:subscribe_podcast)
++  end
+   def subscribe(conn = %{method: "GET"}, _params) do
+     render(conn, :subscribe)
+   end
+-
+   def subscribe(conn = %{method: "POST"}, %{"gotcha" => robo}) when byte_size(robo) > 0 do
+     conn
+     |> put_flash(:error, "Something smells fishy. 🤖")
+     |> redirect(to: person_path(conn, :subscribe))
+   end
+   def subscribe(conn = %{method: "POST"}, params = %{"email" => email}) do
+-    list = Map.get(params, "list", "weekly")
++    subscribe_to = Map.get(params, "to", "weekly")
+ 
+     if person = Repo.get_by(Person, email: email) do
+-      welcome_subscriber(conn, person, list)
++      welcome_subscriber(conn, person, subscribe_to)
+     else
+       changeset =
+         Person.with_fake_data()
+@@ -28,7 +40,7 @@ defmodule ChangelogWeb.PersonController do
+ 
+       case Repo.insert(changeset) do
+         {:ok, person} ->
+-          welcome_subscriber(conn, person, list)
++          welcome_subscriber(conn, person, subscribe_to)
+         {:error, _changeset} ->
+           conn
+           |> put_flash(:error, "Something went wrong. 😭")
+@@ -37,13 +49,13 @@ defmodule ChangelogWeb.PersonController do
+     end
+   end
+ 
+-  defp welcome_subscriber(conn, person, list) do
++  defp welcome_subscriber(conn, person, subscribe_to) do
+     person = Person.refresh_auth_token(person)
+-    newsletter = Newsletters.get_by_slug(list)
+ 
+-    Subscriber.subscribe(newsletter.list_id, Person.sans_fake_data(person))
+-
+-    Email.subscriber_welcome(person, newsletter) |> Mailer.deliver_later
++    case Newsletters.get_by_slug(subscribe_to) do
++      nil -> subscribe_to_podcast(person, subscribe_to)
++      newsletter -> subscribe_to_newsletter(person, newsletter)
++    end
+ 
+     conn
+     |> put_resp_cookie("hide_subscribe_cta", "true", http_only: false)
+@@ -52,6 +64,18 @@ defmodule ChangelogWeb.PersonController do
+     |> redirect(to: root_path(conn, :index))
+   end
+ 
++  defp subscribe_to_newsletter(person, newsletter) do
++    Craisin.Subscriber.subscribe(newsletter.list_id, Person.sans_fake_data(person))
++    Email.subscriber_welcome(person, newsletter) |> Mailer.deliver_later()
++  end
++
++  defp subscribe_to_podcast(person, slug) do
++    podcast = Podcast.get_by_slug!(slug)
++    context = "you signed up for email notifications for #{podcast.name} on changelog.com"
++    Subscription.subscribe(person, podcast, context)
++    Email.subscriber_welcome(person, podcast) |> Mailer.deliver_later()
++  end
++
+   def join(conn = %{method: "GET"}, params) do
+     person = %Person{
+       name: Map.get(params, "name"),
+@@ -90,7 +114,7 @@ defmodule ChangelogWeb.PersonController do
+   defp welcome_community(conn, person) do
+     person = Person.refresh_auth_token(person)
+ 
+-    Email.community_welcome(person) |> Mailer.deliver_later
++    Email.community_welcome(person) |> Mailer.deliver_later()
+ 
+     conn
+     |> put_resp_cookie("hide_subscribe_cta", "true", http_only: false)
+diff --git a/lib/changelog_web/email.ex b/lib/changelog_web/email.ex
+index d958243cee..f06aa05d37 100644
+--- a/lib/changelog_web/email.ex
++++ b/lib/changelog_web/email.ex
+@@ -1,6 +1,46 @@
+ defmodule ChangelogWeb.Email do
+   use Bamboo.Phoenix, view: ChangelogWeb.EmailView
+ 
++  def authored_news_published(person, item) do
++    styled_email()
++    |> put_header("X-CMail-GroupName", "Authored News")
++    |> to(person)
++    |> subject("You're on Changelog News!")
++    |> assign(:person, person)
++    |> assign(:item, item)
++    |> render(:authored_news_published)
++  end
++
++  def comment_reply(person, reply) do
++    styled_email()
++    |> put_header("X-CMail-GroupName", "Comment Reply")
++    |> to(person)
++    |> subject("Someone replied to your comment on Changelog News!")
++    |> assign(:person, person)
++    |> assign(:reply, reply)
++    |> render(:comment_reply)
++  end
++
++  def community_welcome(person) do
++    styled_email()
++    |> put_header("X-CMail-GroupName", "Community Welcome")
++    |> to(person)
++    |> subject("Welcome! Confirm your address")
++    |> assign(:person, person)
++    |> render(:community_welcome)
++  end
++
++  def episode_published(subscription, episode) do
++    styled_email()
++    |> put_header("X-CMail-GroupName", "#{episode.podcast.name} #{episode.slug}")
++    |> to(subscription.person)
++    |> subject("New episode of #{episode.podcast.name}!")
++    |> assign(:subscription, subscription)
++    |> assign(:person, subscription.person)
++    |> assign(:episode, episode)
++    |> render(:episode_published)
++  end
++
+   def guest_thanks(person, episode) do
+     personal_email()
+     |> put_header("X-CMail-GroupName", "Guest Thanks")
+@@ -30,35 +70,16 @@ defmodule ChangelogWeb.Email do
+     |> render(:sign_in)
+   end
+ 
+-  def community_welcome(person) do
++  def subscriber_welcome(person, subscribed_to) do
+     styled_email()
+-    |> put_header("X-CMail-GroupName", "Welcome")
++    |> put_header("X-CMail-GroupName", "Subscriber Welcome")
+     |> to(person)
+     |> subject("Welcome! Confirm your address")
+     |> assign(:person, person)
+-    |> render(:community_welcome)
+-  end
+-
+-  def subscriber_welcome(person, newsletter) do
+-    styled_email()
+-    |> put_header("X-CMail-GroupName", "Welcome")
+-    |> to(person)
+-    |> subject("Welcome! Confirm your address")
+-    |> assign(:person, person)
+-    |> assign(:newsletter, newsletter)
++    |> assign(:subscribed_to, subscribed_to)
+     |> render(:subscriber_welcome)
+   end
+ 
+-  def authored_news_published(person, item) do
+-    styled_email()
+-    |> put_header("X-CMail-GroupName", "Authored News")
+-    |> to(person)
+-    |> subject("You're on Changelog News!")
+-    |> assign(:person, person)
+-    |> assign(:item, item)
+-    |> render(:authored_news_published)
+-  end
+-
+   def submitted_news_published(person, item) do
+     styled_email()
+     |> put_header("X-CMail-GroupName", "Submitted News")
+@@ -69,19 +90,9 @@ defmodule ChangelogWeb.Email do
+     |> render(:submitted_news_published)
+   end
+ 
+-  def comment_reply(person, reply) do
+-    styled_email()
+-    |> put_header("X-CMail-GroupName", "Comment Reply")
+-    |> to(person)
+-    |> subject("Someone replied to your comment on Changelog News!")
+-    |> assign(:person, person)
+-    |> assign(:reply, reply)
+-    |> render(:comment_reply)
+-  end
+-
+   defp email_from_logbot do
+     new_email()
+-    |> from("logbot@changelog.com")
++    |> from({"Logbot", "logbot@changelog.com"})
+     |> put_header("Reply-To", "editors@changelog.com")
+   end
+ 
+diff --git a/lib/changelog_web/router.ex b/lib/changelog_web/router.ex
+index d0f40384c0..a059035cf8 100644
+--- a/lib/changelog_web/router.ex
++++ b/lib/changelog_web/router.ex
+@@ -82,6 +82,7 @@ defmodule ChangelogWeb.Router do
+     end
+     resources "/posts", PostController, except: [:show]
+     resources "/sponsors", SponsorController
++    resources "/mailers", MailerPreviewController, only: [:index, :show]
+   end
+ 
+   scope "/api", ChangelogWeb, as: :api do
+@@ -134,8 +135,8 @@ defmodule ChangelogWeb.Router do
+     get "/~/nope/:token/:notification", HomeController, :opt_out
+ 
+     post "/~/slack", HomeController, :slack
+-    post "/~/subscribe/:id", HomeController, :subscribe
+-    post "/~/unsubscribe/:id", HomeController, :unsubscribe
++    post "/~/subscribe", HomeController, :subscribe
++    post "/~/unsubscribe", HomeController, :unsubscribe
+ 
+     get "/in", AuthController, :new, as: :sign_in
+     post "/in", AuthController, :new, as: :sign_in
+diff --git a/lib/changelog_web/templates/admin/mailer_preview/index.html.eex b/lib/changelog_web/templates/admin/mailer_preview/index.html.eex
+new file mode 100644
+index 0000000000..ee8158e350
+--- /dev/null
++++ b/lib/changelog_web/templates/admin/mailer_preview/index.html.eex
+@@ -0,0 +1,12 @@
++<div class="ui basic segment">
++  <h1 class="ui dividing header">
++    Mailers
++    <div class="sub header">For your previewing pleasure</div>
++  </h1>
++
++  <div class="ui ordered large list">
++  <%= for preview <- @previews do %>
++    <div class="item"><%= link(preview, to: admin_mailer_preview_path(@conn, :show, preview)) %></div>
++  <% end %>
++  </div>
++</div>
+diff --git a/lib/changelog_web/templates/admin/mailer_preview/show.html.eex b/lib/changelog_web/templates/admin/mailer_preview/show.html.eex
+new file mode 100644
+index 0000000000..f5cbbbfc76
+--- /dev/null
++++ b/lib/changelog_web/templates/admin/mailer_preview/show.html.eex
+@@ -0,0 +1,75 @@
++<!DOCTYPE html>
++<html><head>
++<meta name="viewport" content="width=device-width" />
++<style type="text/css">
++  html, body, iframe {
++    height: 100%;
++  }
++
++  body {
++    margin: 0;
++  }
++
++  header {
++    width: 100%;
++    padding: 10px 0 0 0;
++    margin: 0;
++    background: white;
++    font: 12px "Lucida Grande", sans-serif;
++    border-bottom: 1px solid #dedede;
++    overflow: hidden;
++  }
++
++  dl {
++    margin: 0 0 10px 0;
++    padding: 0;
++  }
++
++  dt {
++    width: 80px;
++    padding: 1px;
++    float: left;
++    clear: left;
++    text-align: right;
++    color: #7f7f7f;
++  }
++
++  dd {
++    margin-left: 90px; /* 80px + 10px */
++    padding: 1px;
++  }
++
++  dd:empty:before {
++    content: "\00a0"; // &nbsp;
++  }
++
++  iframe {
++    border: 0;
++    width: 100%;
++  }
++</style>
++</head>
++
++<body>
++  <header>
++    <dl>
++      <dt>From:</dt>
++      <dd><%= format_email_address(@email.from) %></dd>
++
++    <%= if reply_to(@email) do %>
++      <dt>Reply-To:</dt>
++      <dd><%= reply_to(@email) %></dd>
++    <% end %>
++
++      <dt>To:</dt>
++      <dd><%= email_addresses(@email) %></dd>
++
++
++      <dt>Subject:</dt>
++      <dd><strong><%= @email.subject %></strong></dd>
++    </dl>
++  </header>
++
++  <iframe seamless srcdoc="<%= @email.html_body %>"></iframe>
++</body>
++</html>
+diff --git a/lib/changelog_web/templates/email/episode_published.html.eex b/lib/changelog_web/templates/email/episode_published.html.eex
+new file mode 100644
+index 0000000000..5bc11d9c5f
+--- /dev/null
++++ b/lib/changelog_web/templates/email/episode_published.html.eex
+@@ -0,0 +1,25 @@
++<tr>
++  <td class="content-block" itemprop="handler" itemscope itemtype="http://schema.org/HttpActionHandler">
++    <p><%= greeting(@person) %></p>
++
++    <p>Hot off the press! Here’s the latest episode of <%= link(@episode.podcast.name, to: podcast_url(Endpoint, :show, @episode.podcast.slug)) %> for you.</p>
++
++    <p>
++      <%= link(to: episode_url(Endpoint, :show, @episode.podcast.slug, @episode.slug)) do %>
++        <%= EpisodeView.podcast_name_and_number(@episode) %>: <%= @episode.title %>
++      <% end %>
++    </p>
++
++    <blockquote><%= @episode.summary |> md_to_html() |> raw()  %></blockquote>
++
++    <%= link("Listen here", to: episode_url(Endpoint, :show, @episode.podcast.slug, @episode.slug), class: "btn-primary", itemprop: "url") %>
++
++    <p>Don't want these notifications? <em><%= link("Disable 'em", to: PersonView.opt_out_url(Endpoint, @person, @subscription.id)) %></em></p>
++
++    <p>💚, Logbot</p>
++
++  <%= if String.length(@subscription.context) > 0 do %>
++    <p class="footnote">(You received this email because <%= @subscription.context %>)</p>
++  <% end %>
++  </td>
++</tr>
+diff --git a/lib/changelog_web/templates/email/episode_published.text.eex b/lib/changelog_web/templates/email/episode_published.text.eex
+new file mode 100644
+index 0000000000..3f3b205818
+--- /dev/null
++++ b/lib/changelog_web/templates/email/episode_published.text.eex
+@@ -0,0 +1,20 @@
++<%= greeting(@person) %>
++
++
++Hot off the press! Here’s the latest episode of <%= @episode.podcast.name %> for you.
++
++<%= EpisodeView.podcast_name_and_number(@episode) %>: <%= @episode.title %>
++
++<%= @episode.summary |> md_to_text()  %>
++
++
++Listen here: <%= episode_url(Endpoint, :show, @episode.podcast.slug, @episode.slug) %>
++
++Don't want these notifications? Disable 'em: <%= PersonView.opt_out_url(Endpoint, @person, @subscription.id) %>
++
++
++💚, Logbot
++
++<%= if String.length(@subscription.context) > 0 do %>
++(You received this email because <%= @subscription.context %>)
++<% end %>
+diff --git a/lib/changelog_web/templates/email/subscriber_welcome.html.eex b/lib/changelog_web/templates/email/subscriber_welcome.html.eex
+index 48a3af8930..26579569af 100644
+--- a/lib/changelog_web/templates/email/subscriber_welcome.html.eex
++++ b/lib/changelog_web/templates/email/subscriber_welcome.html.eex
+@@ -2,7 +2,7 @@
+   <td class="content-block" itemprop="handler" itemscope itemtype="http://schema.org/HttpActionHandler">
+     <p><%= greeting(@person) %></p>
+ 
+-    <p>You're subscribed to <%= @newsletter.name %>!</p>
++    <p>You're subscribed to <strong><%= @subscribed_to.name %></strong>!</p>
+ 
+     <p>Sign in to your account to access our Slack, manage your email subscriptions, and complete your profile.</p>
+ 
+diff --git a/lib/changelog_web/templates/email/subscriber_welcome.text.eex b/lib/changelog_web/templates/email/subscriber_welcome.text.eex
+index c198502e7a..c3b39260b1 100644
+--- a/lib/changelog_web/templates/email/subscriber_welcome.text.eex
++++ b/lib/changelog_web/templates/email/subscriber_welcome.text.eex
+@@ -1,7 +1,7 @@
+ <%= greeting(@person) %>
+ 
+ 
+-You subscribed to <%= @newsletter.name %>!
++You subscribed to <%= @subscribed_to.name %>!
+ 
+ Sign in to your account to access our Slack, manage your email subscriptions, and complete your profile.
+ 
+diff --git a/lib/changelog_web/templates/home/_nav.html.eex b/lib/changelog_web/templates/home/_nav.html.eex
+index 4aa76d29bc..5de01a2744 100644
+--- a/lib/changelog_web/templates/home/_nav.html.eex
++++ b/lib/changelog_web/templates/home/_nav.html.eex
+@@ -5,7 +5,7 @@
+     </li>
+     <li class="subnav-list-item <%= active_class(@conn, ["home-profile"]) %>">
+       <%= link to: home_path(@conn, :profile) do %>
+-        Public Profile <small><em>(inactive)</em></small>
++        Public profile <small><em>(inactive)</em></small>
+       <% end %>
+     </li>
+     <li class="subnav-list-item <%= active_class(@conn, ["home-account"]) %>">
+diff --git a/lib/changelog_web/templates/home/show.html.eex b/lib/changelog_web/templates/home/show.html.eex
+index e8d0ae227a..638af4a0c3 100644
+--- a/lib/changelog_web/templates/home/show.html.eex
++++ b/lib/changelog_web/templates/home/show.html.eex
+@@ -1,12 +1,28 @@
+ <div class="page_basic">
+   <%= render("_nav.html", assigns) %>
+ 
++  <div class="account_ctas">
++    <div class="account_ctas-item">
++      <img class="account_ctas-item-icon" src='<%= static_url(@conn, "/images/content/community/slack-mark.svg") %>' width="50" height="50" alt="Slack Logomark"></i>
++
++      <div class="account_ctas-item-info">
++        <h3>Changelog Slack</h3>
++        <p>Connect with like-minded developers from all over the world. Hang with us and Slack in realtime during our live shows. Be the first to hear about upcoming shows and projects. This is your all-access pass to everything we do.</p>
++
++        <div class="account_ctas-item-info-buttons">
++          <%= link "Request Invite", to: home_path(@conn, :slack), method: :post %>
++          <%= link "Launch Slack", to: "https://changelog.slack.com", target: "_blank" %>
++        </div>
++      </div>
++    </div>
++  </div>
++
+   <div class="account_subscriptions">
+     <div class="account_subscriptions-item">
+       <div class="account_subscriptions-item-info">
+         <h3>Changelog Weekly</h3>
+         <p>Our editorialized take covering this week in dev culture, software development, open source, building startups, creative work, and the people involved.</p>
+-        <p class="account_subscriptions-item-info-meta">1 Email Per Week — Delivered on Sundays - <%= link "Archive", to: page_path(@conn, :weekly_archive) %></p>
++        <p class="account_subscriptions-item-info-meta">1 email per week — Delivered on Sundays - <%= link "Archive", to: page_path(@conn, :weekly_archive) %></p>
+       </div>
+       <div class="account_subscriptions-item-button">
+         <%= newsletter_link(Changelog.Newsletters.weekly(), assigns) %>
+@@ -16,50 +32,38 @@
+       <div class="account_subscriptions-item-info">
+         <h3>Changelog Nightly</h3>
+         <p>Our automated nightly email powered by GitHub Archive that unearths the hottest new repos trending on GitHub before they blow up.</p>
+-        <p class="account_subscriptions-item-info-meta">7 Emails Per Week — Delivered Daily at 10pm US Central</p>
++        <p class="account_subscriptions-item-info-meta">7 emails per week — Delivered daily at 10pm US Central</p>
+       </div>
+       <div class="account_subscriptions-item-button">
+         <%= newsletter_link(Changelog.Newsletters.nightly(), assigns) %>
+       </div>
+     </div>
+-  </div>
+-
+-  <div class="account_ctas">
+-    <div class="account_ctas-item">
+-      <%= lazy_image(static_url(@conn, "/images/brand/changelog-logomark.svg"), "Changelog Logo", class: "account_ctas-item-icon", width: 50, height: 50) %>
+-
+-      <div class="account_ctas-item-info">
+-        <h3>Changelog.com Profiles</h3>
+-        <p>Public profiles are launching soon. Add your info today to reserve your username.</p>
+-
+-        <div class="account_ctas-item-info-buttons">
+-          <%= link "Manage Profile", to: home_path(@conn, :profile) %>
+-        </div>
++    <div class="account_subscriptions-item">
++      <div class="account_subscriptions-item-info">
++        <a id="podcasts" class="anchor"></a>
++        <h3>Podcast emails</h3>
++        <p>Get notified as soon as an episode is published. Subscribe to as many as you’d like.</p>
++        <p class="account_subscriptions-item-info-meta">Delivered each time a new episode is published</p>
+       </div>
+-    </div>
+-    <div class="account_ctas-item">
+-      <%= lazy_image(static_url(@conn, "/images/brand/podcasts.svg"), "Podcasts Logo", class: "account_ctas-item-icon", width: 50, height: 50) %>
+-
+-      <div class="account_ctas-item-info">
+-        <h3>Changelog Podcasts</h3>
+-        <p>Prefer not to listen on the web? Subscribe to Changelog podcasts from your app of choice.</p>
+-
+-        <div class="account_ctas-item-info-buttons">
+-          <%= link "Subscribe to Podcasts", to: podcast_path(@conn, :index) %>
+-        </div>
++      <div class="account_subscriptions-item-button">
++        <%#= link("Subscribe to All", to: home_path(@conn, :profile)) %>
+       </div>
+-    </div>
+-    <div class="account_ctas-item">
+-      <%= lazy_image(static_url(@conn, "/images/content/community/slack-mark.svg"), "Slack Logo", class: "account_ctas-item-icon", width: 50, height: 50) %>
+-
+-      <div class="account_ctas-item-info">
+-        <h3>Changelog Slack</h3>
+-        <p>Connect with like-minded developers from all over the world. Hang with us and Slack in realtime during our live shows. Be the first to hear about upcoming shows and projects. This is your all-access pass to everything we do.</p>
+-
+-        <div class="account_ctas-item-info-buttons">
+-          <%= link "Request Invite", to: home_path(@conn, :slack), method: :post %>
+-          <%= link "Launch Slack", to: "https://changelog.slack.com", target: "_blank" %>
+-        </div>
++      <div class="account_subscriptions-list">
++        <%= for podcast <- @podcasts do %>
++          <div class="account_subscriptions-list-item">
++            <img class="account_subscriptions-list-item-icon" src="<%= PodcastView.cover_url(podcast, :medium) %>" width="50" height="50" alt="<%= podcast.name %>">
++            <p class="account_subscriptions-list-item-title"><%= podcast.name %></p>
++            <div class="account_subscriptions-list-item-toggle toggle toggle--light">
++              <input
++                type="checkbox"
++                class="check js-toggle-subscription"
++                data-slug="<%= podcast.slug %>"
++                <%= if is_subscribed(@current_user, podcast), do: "checked" %>
++              />
++              <div class="switch"></div>
++            </div>
++          </div>
++        <% end %>
+       </div>
+     </div>
+   </div>
+diff --git a/lib/changelog_web/templates/layout/email_styled.html.eex b/lib/changelog_web/templates/layout/email_styled.html.eex
+index 855c9ae1be..862bd54686 100644
+--- a/lib/changelog_web/templates/layout/email_styled.html.eex
++++ b/lib/changelog_web/templates/layout/email_styled.html.eex
+@@ -84,6 +84,13 @@
+     padding: 20px;
+   }
+ 
++  .footnote {
++    text-align: center;
++    color: #999;
++    font-size: 12px;
++    margin-bottom: 0;
++  }
++
+   .footer p, .footer a, .footer td {
+     color: #999;
+     font-size: 12px;
+@@ -203,10 +210,6 @@
+     .content-wrap {
+       padding: 10px !important;
+     }
+-
+-    .invoice {
+-      width: 100% !important;
+-    }
+   }
+ </style>
+ </head>
+diff --git a/lib/changelog_web/templates/page/nightly.html.eex b/lib/changelog_web/templates/page/nightly.html.eex
+index 8c8df27da8..ab2cc80474 100644
+--- a/lib/changelog_web/templates/page/nightly.html.eex
++++ b/lib/changelog_web/templates/page/nightly.html.eex
+@@ -4,11 +4,11 @@
+       <h1>Subscribe to Changelog Nightly</h1>
+ 
+       <div class="marketing-button_group" style="--max-width-group: 260px;">
+-        <%= if @current_user do %>
+-          <%= link "Manage Subscriptions", to: home_path(@conn, :show), class: "button_large" %>
+-        <% else %>
+-          <%= link "Subscribe", to: person_path(@conn, :subscribe, list: "nightly"), class: "button_large" %>
+-        <% end %>
++      <%= if @current_user do %>
++        <%= link("Manage Subscriptions", to: home_path(@conn, :show), class: "button_large") %>
++      <% else %>
++        <%= link("Subscribe", to: person_path(@conn, :subscribe, to: "nightly"), class: "button_large") %>
++      <% end %>
+       </div>
+     </header>
+   </section>
+diff --git a/lib/changelog_web/templates/page/weekly.html.eex b/lib/changelog_web/templates/page/weekly.html.eex
+index 1c036cfa7e..7d82054492 100644
+--- a/lib/changelog_web/templates/page/weekly.html.eex
++++ b/lib/changelog_web/templates/page/weekly.html.eex
+@@ -4,11 +4,11 @@
+       <h1>Subscribe to Changelog Weekly</h1>
+ 
+       <div class="marketing-button_group" style="--max-width-group: 260px;">
+-        <%= if @current_user do %>
+-          <%= link "Manage Subscriptions", to: home_path(@conn, :show), class: "button_large" %>
+-        <% else %>
+-          <%= link "Subscribe", to: person_path(@conn, :subscribe, list: "weekly"), class: "button_large" %>
+-        <% end %>
++      <%= if @current_user do %>
++        <%= link("Manage Subscriptions", to: home_path(@conn, :show), class: "button_large") %>
++      <% else %>
++        <%= link("Subscribe", to: person_path(@conn, :subscribe, to: "weekly"), class: "button_large") %>
++      <% end %>
+       </div>
+     </header>
+   </section>
+diff --git a/lib/changelog_web/templates/person/subscribe_newsletter.html.eex b/lib/changelog_web/templates/person/subscribe_newsletter.html.eex
+new file mode 100644
+index 0000000000..c817cec006
+--- /dev/null
++++ b/lib/changelog_web/templates/person/subscribe_newsletter.html.eex
+@@ -0,0 +1,18 @@
++<section class="signup">
++  <div class="signup-content">
++    <div class="signup-icons">
++      <div class="signup-icons-item signup-icons-item--news"></div>
++      <div class="signup-icons-item signup-icons-item--podcasts"></div>
++    </div>
++    <h1 class="signup-heading">You&rsquo;re subscribing to <%= @newsletter.name %>.</h1>
++    <%= if @newsletter.slug == "weekly" do %>
++      <p class="signup-text">Our editorialized take covering this week in dev culture, software development, open source, building startups, creative work, and the people involved.</p>
++      <%= render(SharedView, "_subscribe_form.html", conn: @conn) %>
++      <p class="signup-sign_in">1 email per week — Delivered on Sundays - <%= link "Archive", to: page_path(@conn, :weekly_archive) %></p>
++    <% else %>
++      <p class="signup-text">Our automated nightly email powered by GitHub Archive that unearths the hottest new repos trending on GitHub before they blow up.</p>
++      <%= render(SharedView, "_subscribe_form.html", conn: @conn) %>
++      <p class="signup-sign_in">7 emails per week — Delivered daily at 10pm US Central</p>
++    <% end %>
++  </div>
++</section>
+diff --git a/lib/changelog_web/templates/person/subscribe_podcast.html.eex b/lib/changelog_web/templates/person/subscribe_podcast.html.eex
+new file mode 100644
+index 0000000000..a188f4255e
+--- /dev/null
++++ b/lib/changelog_web/templates/person/subscribe_podcast.html.eex
+@@ -0,0 +1,11 @@
++<section class="signup">
++  <div class="signup-content">
++    <div class="signup-art">
++      <%= lazy_image(PodcastView.cover_url(@podcast, :medium), "#{@podcast.name} Artwork", width: 180, height: 180) %>
++    </div>
++    <h1 class="signup-heading">You&rsquo;re subscribing to <%= @podcast.name %>.</h1>
++    <p class="signup-text"><%= @podcast.description %></p>
++
++    <%= render(SharedView, "_subscribe_form.html", conn: @conn) %>
++  </div>
++</section>
+diff --git a/lib/changelog_web/templates/podcast/_header.html.eex b/lib/changelog_web/templates/podcast/_header.html.eex
+index 3a1a3469da..780672ea45 100644
+--- a/lib/changelog_web/templates/podcast/_header.html.eex
++++ b/lib/changelog_web/templates/podcast/_header.html.eex
+@@ -8,11 +8,11 @@
+   </div>
+ 
+   <div class="show-header-description">
+-    <%= @podcast.description |> no_widowed_words |> md_to_html |> raw %>
+-    <%= @podcast.schedule_note |> md_to_html |> raw %>
+-    <%= if Podcast.has_feed(@podcast) do %><% else %>
++    <%= @podcast.description |> no_widowed_words() |> md_to_html() |> raw() %>
++    <%= @podcast.schedule_note |> md_to_html() |> raw() %>
++  <%= if !Podcast.has_feed(@podcast) do %>
+     <p>You can only subscribe to this podcast via the <%= link("Master Feed", to: podcast_path(@conn, :show, "master")) %></p>
+-    <% end %>
++  <% end %>
+   </div>
+ 
+   <%= if (@podcast.status == :soon) do %>
+diff --git a/lib/changelog_web/templates/podcast/_subscribe_buttons.html.eex b/lib/changelog_web/templates/podcast/_subscribe_buttons.html.eex
+index aad45d6a10..926512bd95 100644
+--- a/lib/changelog_web/templates/podcast/_subscribe_buttons.html.eex
++++ b/lib/changelog_web/templates/podcast/_subscribe_buttons.html.eex
+@@ -2,11 +2,12 @@
+ <div class="show-header-subscribe">
+   <div class="show-header-subscribe-buttons">
+   <%= if @podcast.itunes_url do %>
+-    <%= link "Apple", to: @podcast.itunes_url, class: "show-header-subscribe-buttons-item show-header-subscribe-buttons-item--apple", title: "Subscribe on Apple" %>
+-    <%= link "Overcast", to: subscribe_on_overcast_url(@podcast), class: "show-header-subscribe-buttons-item show-header-subscribe-buttons-item--overcast", title: "Subscribe on Overcast" %>
++    <%= link("Apple", to: @podcast.itunes_url, class: "show-header-subscribe-buttons-item show-header-subscribe-buttons-item--apple", title: "Subscribe on Apple") %>
++    <%= link("Overcast", to: subscribe_on_overcast_url(@podcast), class: "show-header-subscribe-buttons-item show-header-subscribe-buttons-item--overcast", title: "Subscribe on Overcast") %>
+   <% end %>
+-    <%= link "Android", to: subscribe_on_android_url(@podcast), class: "show-header-subscribe-buttons-item show-header-subscribe-buttons-item--android", title: "Subscribe on Android" %>
+-    <%= link "RSS", to: feed_path(@conn, :podcast, @podcast.slug), class: "show-header-subscribe-buttons-item show-header-subscribe-buttons-item--rss", title: "Subscribe via RSS", data: [turbolinks: false] %>
++    <%= link("Android", to: subscribe_on_android_url(@podcast), class: "show-header-subscribe-buttons-item show-header-subscribe-buttons-item--android", title: "Subscribe on Android") %>
++    <%= link("RSS", to: feed_path(@conn, :podcast, @podcast.slug), class: "show-header-subscribe-buttons-item show-header-subscribe-buttons-item--rss", title: "Subscribe via RSS", data: [turbolinks: false]) %>
++    <%= link("Email", to: subscribe_via_email_path(@conn, @podcast), class: "show-header-subscribe-buttons-item show-header-subscribe-buttons-item--email", title: "Subscribe via Email") %>
+   </div>
+ 
+   <button class="show-header-subscribe-mobile has-tooltip">Subscribe</button>
+@@ -15,11 +16,12 @@
+     <div class="tooltip-wrap">
+       <ul class="tooltip-list tooltip-list--centered">
+       <%= if @podcast.itunes_url do %>
+-        <li class="tooltip-list-item"><%= link "Apple", to: @podcast.itunes_url, title: "Subscribe on Apple" %></li>
+-        <li class="tooltip-list-item"><%= link "Overcast", to: subscribe_on_overcast_url(@podcast), title: "Subscribe on Overcast" %></li>
++        <li class="tooltip-list-item"><%= link("Apple", to: @podcast.itunes_url, title: "Subscribe on Apple") %></li>
++        <li class="tooltip-list-item"><%= link("Overcast", to: subscribe_on_overcast_url(@podcast), title: "Subscribe on Overcast") %></li>
+       <% end %>
+-        <li class="tooltip-list-item"><%= link "Android", to: subscribe_on_android_url(@podcast), title: "Subscribe on Android" %></li>
+-        <li class="tooltip-list-item"><%= link "RSS", to: feed_path(@conn, :podcast, @podcast.slug), title: "Subscribe via RSS", data: [turbolinks: false] %></li>
++        <li class="tooltip-list-item"><%= link("Android", to: subscribe_on_android_url(@podcast), title: "Subscribe on Android") %></li>
++        <li class="tooltip-list-item"><%= link("RSS", to: feed_path(@conn, :podcast, @podcast.slug), title: "Subscribe via RSS", data: [turbolinks: false]) %></li>
++        <li class="tooltip-list-item"><%= link("Email", to: subscribe_via_email_path(@conn, @podcast), title: "Subscribe via Email") %></li>
+       </ul>
+     </div>
+   </div>
+diff --git a/lib/changelog_web/templates/podcast/_subscribe_tooltip.html.eex b/lib/changelog_web/templates/podcast/_subscribe_tooltip.html.eex
+index 4c9fc808ea..0d41084dd5 100644
+--- a/lib/changelog_web/templates/podcast/_subscribe_tooltip.html.eex
++++ b/lib/changelog_web/templates/podcast/_subscribe_tooltip.html.eex
+@@ -13,6 +13,7 @@
+       <%= if @podcast.twitter_handle do %>
+         <li><%= link("Twitter", to: twitter_url(@podcast.twitter_handle)) %></li>
+       <% end %>
++        <li><%= link("Email", to: subscribe_via_email_path(@conn, @podcast), title: "Subscribe via Email") %></li>
+     <% else %>
+       <li><%= link("Via Master", to: podcast_path(@conn, :show, "master")) %></li>
+     <% end %>
+diff --git a/lib/changelog_web/templates/shared/_subscribe_form.html.eex b/lib/changelog_web/templates/shared/_subscribe_form.html.eex
+index c5c1c3008d..bb1d0f89c4 100644
+--- a/lib/changelog_web/templates/shared/_subscribe_form.html.eex
++++ b/lib/changelog_web/templates/shared/_subscribe_form.html.eex
+@@ -1,5 +1,5 @@
+ <%= form_tag person_path(@conn, :subscribe), class: "signup-form" do %>
+-  <input name="list" type="hidden" value="<%= get_assigns_or_param(@conn, "list", "weekly") %>">
++  <input name="to" type="hidden" value="<%= get_assigns_or_param(@conn, "to", "weekly") %>">
+   <input name="email" class="signup-form-input" placeholder="you@example.com" aria-label="you@example.com" required/>
+   <noscript>
+     <input name="gotcha" class="signup-form-input" value="Delete this if you're human"/>
+diff --git a/lib/changelog_web/views/admin/mailer_preview_view.ex b/lib/changelog_web/views/admin/mailer_preview_view.ex
+new file mode 100644
+index 0000000000..d59032008b
+--- /dev/null
++++ b/lib/changelog_web/views/admin/mailer_preview_view.ex
+@@ -0,0 +1,20 @@
++defmodule ChangelogWeb.Admin.MailerPreviewView do
++  use ChangelogWeb, :admin_view
++
++  def email_addresses(email) do
++    email
++    |> Bamboo.Mailer.normalize_addresses()
++    |> Bamboo.Email.all_recipients()
++    |> Enum.map(&Bamboo.Email.get_address/1)
++    |> Enum.join(", ")
++  end
++
++  def format_email_address(address) when is_binary(address), do: address
++  def format_email_address({nil, address}), do: address
++  def format_email_address({name, address}) do
++    "#{name} <#{address}>"
++  end
++
++  def reply_to(%{headers: %{"Reply-To" => to}}) when is_binary(to), do: to
++  def reply_to(_else), do: nil
++end
+diff --git a/lib/changelog_web/views/home_view.ex b/lib/changelog_web/views/home_view.ex
+index dab7854823..a6c5e93f04 100644
+--- a/lib/changelog_web/views/home_view.ex
++++ b/lib/changelog_web/views/home_view.ex
+@@ -1,23 +1,24 @@
+ defmodule ChangelogWeb.HomeView do
+   use ChangelogWeb, :public_view
+ 
+-  alias ChangelogWeb.PersonView
++  import ChangelogWeb.PersonView, only: [is_subscribed: 2]
++  alias ChangelogWeb.{PodcastView}
+ 
+   def newsletter_link(newsletter, assigns) do
+     list = newsletter.list_id
+     cond do
+       assigns.subscribed == list -> unsubscribe_link(assigns.conn, list)
+       assigns.unsubscribed == list -> subscribe_link(assigns.conn, list)
+-      PersonView.is_subscribed(assigns.current_user, newsletter) -> unsubscribe_link(assigns.conn, list)
++      is_subscribed(assigns.current_user, newsletter) -> unsubscribe_link(assigns.conn, list)
+       true -> subscribe_link(assigns.conn, list)
+     end
+   end
+ 
+   def subscribe_link(conn, list) do
+-    link("Subscribe", to: home_path(conn, :subscribe, list), method: :post)
++    link("Subscribe", to: home_path(conn, :subscribe, id: list), method: :post)
+   end
+ 
+   def unsubscribe_link(conn, list) do
+-    link("Subscribed", to: home_path(conn, :unsubscribe, list), method: :post, class: "is-subscribed")
++    link("Subscribed", to: home_path(conn, :unsubscribe, id: list), method: :post, class: "is-subscribed")
+   end
+ end
+diff --git a/lib/changelog_web/views/person_view.ex b/lib/changelog_web/views/person_view.ex
+index da11a7511d..7294a8163b 100644
+--- a/lib/changelog_web/views/person_view.ex
++++ b/lib/changelog_web/views/person_view.ex
+@@ -1,7 +1,7 @@
+ defmodule ChangelogWeb.PersonView do
+   use ChangelogWeb, :public_view
+ 
+-  alias Changelog.{Files, Person, Podcast}
++  alias Changelog.{Files, NewsItem, Person, Podcast}
+   alias ChangelogWeb.{Endpoint, SharedView, PodcastView}
+ 
+   def avatar_path(person, version) do
+@@ -65,6 +65,18 @@ defmodule ChangelogWeb.PersonView do
+     !!(person.bio && person.website && person.location)
+   end
+ 
++  def is_subscribed(person, %NewsItem{id: id}) do
++    person
++    |> Person.preload_subscriptions()
++    |> Map.get(:subscriptions)
++    |> Enum.any?(&(&1.item_id == id))
++  end
++  def is_subscribed(person, %Podcast{id: id}) do
++    person
++    |> Person.preload_subscriptions()
++    |> Map.get(:subscriptions)
++    |> Enum.any?(&(&1.podcast_id == id))
++  end
+   def is_subscribed(person, newsletter) do
+     case Craisin.Subscriber.details(newsletter.list_id, person.email) do
+       %{"State" => "Active"} -> true
+diff --git a/lib/changelog_web/views/podcast_view.ex b/lib/changelog_web/views/podcast_view.ex
+index e7e88c248c..86a6895296 100644
+--- a/lib/changelog_web/views/podcast_view.ex
++++ b/lib/changelog_web/views/podcast_view.ex
+@@ -47,7 +47,7 @@ defmodule ChangelogWeb.PodcastView do
+     feed_url_sans_protocol =
+       feed_url(Endpoint, :podcast, podcast.slug)
+       |> String.replace(~r/\Ahttps?:\/\//, "")
+-    "http://www.subscribeonandroid.com/#{feed_url_sans_protocol}"
++    "https://www.subscribeonandroid.com/#{feed_url_sans_protocol}"
+   end
+ 
+   def subscribe_on_overcast_url(podcast) do
+@@ -55,6 +55,14 @@ defmodule ChangelogWeb.PodcastView do
+     "https://overcast.fm/itunes#{id}/#{name}"
+   end
+ 
++  def subscribe_via_email_path(conn, podcast) do
++    if conn.assigns.current_user do
++      home_path(conn, :show) <> "#podcasts"
++    else
++      person_path(conn, :subscribe, to: podcast.slug)
++    end
++  end
++
+   def vanity_domain_with_fallback_url(podcast) do
+     if podcast.vanity_domain do
+       podcast.vanity_domain
+diff --git a/priv/repo/migrations/20181217215447_create_subscriptions.exs b/priv/repo/migrations/20181217215447_create_subscriptions.exs
+new file mode 100644
+index 0000000000..92aa30bfe6
+--- /dev/null
++++ b/priv/repo/migrations/20181217215447_create_subscriptions.exs
+@@ -0,0 +1,19 @@
++defmodule Changelog.Repo.Migrations.CreateSubscriptions do
++  use Ecto.Migration
++
++  def change do
++    create table(:subscriptions) do
++      add :unsubscribed_at, :naive_datetime
++      add :person_id, references(:people, on_delete: :delete_all)
++      add :podcast_id, references(:podcasts, on_delete: :delete_all)
++      add :item_id, references(:news_items, on_delete: :delete_all)
++      add :context, :text, default: ""
++      timestamps()
++    end
++
++    create index(:subscriptions, [:person_id])
++    create index(:subscriptions, [:podcast_id])
++    create index(:subscriptions, [:item_id])
++    create index(:subscriptions, [:unsubscribed_at])
++  end
++end
+diff --git a/test/changelog/data/subscription_test.exs b/test/changelog/data/subscription_test.exs
+new file mode 100644
+index 0000000000..13b5e0084a
+--- /dev/null
++++ b/test/changelog/data/subscription_test.exs
+@@ -0,0 +1,127 @@
++defmodule Changelog.SubscriptionTest do
++  use Changelog.DataCase
++
++  alias Changelog.Subscription
++
++  describe "is_subscribed/1" do
++    test "is false when unsubscribed_at is set" do
++      sub = %Subscription{unsubscribed_at: Timex.now()}
++      refute Subscription.is_subscribed(sub)
++    end
++
++    test "is false when sent not a subscription" do
++      refute Subscription.is_subscribed(nil)
++    end
++
++    test "is true when not unsubscribed_at is not set" do
++      sub = %Subscription{}
++      assert Subscription.is_subscribed(sub)
++    end
++  end
++
++  describe "subscribe/2 with news item" do
++    setup do
++      {:ok, person: insert(:person), item: insert(:news_item)}
++    end
++
++    test "when person has never subscribed", %{person: person, item: item} do
++      {:ok, subscription} = Subscription.subscribe(person, item)
++      assert subscription.person_id == person.id
++      assert subscription.item_id == item.id
++    end
++
++    test "when person has unsubscribed", %{person: person, item: item} do
++      insert(:unsubscribed_subscription_on_item, person: person, item: item)
++      {:ok, subscription} = Subscription.subscribe(person, item)
++      assert subscription.person_id == person.id
++      assert subscription.item_id == item.id
++      assert Repo.count(Subscription) == 1
++    end
++
++    test "when person is already subscribed", %{person: person, item: item} do
++      insert(:subscription_on_item, person: person, item: item)
++      {:ok, subscription} = Subscription.subscribe(person, item)
++      assert subscription.person_id == person.id
++      assert subscription.item_id == item.id
++      assert Repo.count(Subscription) == 1
++    end
++  end
++
++  describe "subscribe/2 with podcast" do
++    setup do
++      {:ok, person: insert(:person), podcast: insert(:podcast)}
++    end
++
++    test "when person has never subscribed", %{person: person, podcast: podcast} do
++      {:ok, subscription} = Subscription.subscribe(person, podcast)
++      assert subscription.person_id == person.id
++      assert subscription.podcast_id == podcast.id
++    end
++
++    test "when person has unsubscribed", %{person: person, podcast: podcast} do
++      insert(:unsubscribed_subscription_on_podcast, person: person, podcast: podcast)
++      {:ok, subscription} = Subscription.subscribe(person, podcast)
++      assert subscription.person_id == person.id
++      assert subscription.podcast_id == podcast.id
++      assert Repo.count(Subscription) == 1
++    end
++
++    test "when person is already subscribed", %{person: person, podcast: podcast} do
++      insert(:subscription_on_podcast, person: person, podcast: podcast)
++      {:ok, subscription} = Subscription.subscribe(person, podcast)
++      assert subscription.person_id == person.id
++      assert subscription.podcast_id == podcast.id
++      assert Repo.count(Subscription) == 1
++    end
++  end
++
++  describe "unsubcribe/2 with item" do
++    setup do
++      {:ok, person: insert(:person), item: insert(:news_item)}
++    end
++
++    test "when person has never subscribed", %{person: person, item: item} do
++      :ok = Subscription.unsubscribe(person, item)
++      assert Repo.count(Subscription) == 0
++    end
++
++    test "when person has already unsubscribed", %{person: person, item: item} do
++      insert(:unsubscribed_subscription_on_item, person: person, item: item)
++      :ok = Subscription.unsubscribe(person, item)
++      assert Repo.count(Subscription) == 1
++      assert Repo.count(Subscription.unsubscribed) == 1
++    end
++
++    test "when person is subscribed", %{person: person, item: item} do
++      insert(:subscription_on_item, person: person, item: item)
++      :ok = Subscription.unsubscribe(person, item)
++      assert Repo.count(Subscription) == 1
++      assert Repo.count(Subscription.unsubscribed) == 1
++    end
++  end
++
++  describe "unsubcribe/2 with podcast" do
++    setup do
++      {:ok, person: insert(:person), podcast: insert(:podcast)}
++    end
++
++    test "when person has never subscribed", %{person: person, podcast: podcast} do
++      :ok = Subscription.unsubscribe(person, podcast)
++      assert Repo.count(Subscription) == 0
++    end
++
++    test "when person has already unsubscribed", %{person: person, podcast: podcast} do
++      insert(:unsubscribed_subscription_on_podcast, person: person, podcast: podcast)
++      :ok = Subscription.unsubscribe(person, podcast)
++      assert Repo.count(Subscription) == 1
++      assert Repo.count(Subscription.unsubscribed) == 1
++    end
++
++    test "when person is subscribed", %{person: person, podcast: podcast} do
++      insert(:subscription_on_podcast, person: person, podcast: podcast)
++      :ok = Subscription.unsubscribe(person, podcast)
++      assert Repo.count(Subscription) == 1
++      assert Repo.count(Subscription.unsubscribed) == 1
++    end
++  end
++end
+diff --git a/test/changelog/notifier_test.exs b/test/changelog/notifier_test.exs
+index 7a335b96ca..551b1effe0 100644
+--- a/test/changelog/notifier_test.exs
++++ b/test/changelog/notifier_test.exs
+@@ -91,6 +91,17 @@ defmodule Changelog.NotifierTest do
+       assert_delivered_email Email.guest_thanks(g3, episode)
+       assert called Slack.Client.message("#main", :_)
+     end
++
++    test "when podcast has subscriptions" do
++      podcast = insert(:podcast)
++      s1 = insert(:subscription_on_podcast, podcast: podcast)
++      s2 = insert(:subscription_on_podcast, podcast: podcast)
++      episode = insert(:published_episode, podcast: podcast)
++      item = episode |> episode_news_item() |> insert()
++      Notifier.notify(item)
++      assert_delivered_email Email.episode_published(s1, episode)
++      assert_delivered_email Email.episode_published(s2, episode)
++    end
+   end
+ 
+   describe "notify with regular item" do
+diff --git a/test/changelog_web/controllers/home_controller_test.exs b/test/changelog_web/controllers/home_controller_test.exs
+index 03dd58ddcc..539861a245 100644
+--- a/test/changelog_web/controllers/home_controller_test.exs
++++ b/test/changelog_web/controllers/home_controller_test.exs
+@@ -1,7 +1,8 @@
+ defmodule ChangelogWeb.HomeControllerTest do
+   use ChangelogWeb.ConnCase
+ 
+-  alias Changelog.Person
++  alias Changelog.{Person, Subscription}
++  alias ChangelogWeb.NewsItemView
+ 
+   @tag :as_user
+   test "renders the home page", %{conn: conn} do
+@@ -42,6 +43,44 @@ defmodule ChangelogWeb.HomeControllerTest do
+     refute Repo.get(Person, person.id).settings.email_on_authored_news
+   end
+ 
++  test "opting out of podcast subscriptions", %{conn: conn} do
++    person = insert(:person)
++    podcast = insert(:podcast)
++    sub = insert(:subscription_on_podcast, person: person, podcast: podcast)
++    {:ok, token} = Person.encoded_id(person)
++    conn = get(conn, home_path(conn, :opt_out, token, sub.id))
++    assert redirected_to(conn) == podcast_path(conn, :show, podcast.slug)
++    refute Subscription.is_subscribed(Repo.get(Subscription, sub.id))
++  end
++
++  test "opting out of news subscriptions", %{conn: conn} do
++    person = insert(:person)
++    item = insert(:news_item)
++    sub = insert(:subscription_on_podcast, person: person, item: item)
++    {:ok, token} = Person.encoded_id(person)
++    conn = get(conn, home_path(conn, :opt_out, token, sub.id))
++    assert redirected_to(conn) == news_item_path(conn, :show, NewsItemView.slug(item))
++    refute Subscription.is_subscribed(Repo.get(Subscription, sub.id))
++  end
++
++  @tag :as_inserted_user
++  test "subscribing to a podcast", %{conn: conn} do
++    podcast = insert(:podcast)
++    conn = post(conn, home_path(conn, :subscribe, slug: podcast.slug))
++    assert conn.status == 200
++    assert count(Subscription.subscribed) == 1
++  end
++
++  @tag :as_inserted_user
++  test "unsubscribing to a podcast", %{conn: conn} do
++    podcast = insert(:podcast)
++    insert(:subscription_on_podcast, podcast: podcast, person: conn.assigns.current_user)
++    assert count(Subscription.subscribed) == 1
++    conn = post(conn, home_path(conn, :unsubscribe, slug: podcast.slug))
++    assert conn.status == 200
++    assert count(Subscription.subscribed) == 0
++  end
++
+   @tag :as_inserted_user
+   test "signed in and opting out of notifications", %{conn: conn} do
+     person = conn.assigns.current_user
+diff --git a/test/changelog_web/controllers/person_controller_test.exs b/test/changelog_web/controllers/person_controller_test.exs
+index 7fb44644b2..15809ba745 100644
+--- a/test/changelog_web/controllers/person_controller_test.exs
++++ b/test/changelog_web/controllers/person_controller_test.exs
+@@ -4,7 +4,7 @@ defmodule ChangelogWeb.PersonControllerTest do
+ 
+   import Mock
+ 
+-  alias Changelog.{Newsletters, Person}
++  alias Changelog.{Newsletters, Person, Subscription}
+ 
+   describe "joining" do
+     test "getting the form", %{conn: conn} do
+@@ -64,10 +64,9 @@ defmodule ChangelogWeb.PersonControllerTest do
+     end
+   end
+ 
+-  describe "subscribing" do
++  describe "subscribing in general" do
+     test "getting the form", %{conn: conn} do
+       conn = get(conn, person_path(conn, :subscribe))
+-
+       assert conn.status == 200
+       assert conn.resp_body =~ "form"
+     end
+@@ -78,6 +77,14 @@ defmodule ChangelogWeb.PersonControllerTest do
+       assert redirected_to(conn) == person_path(conn, :subscribe)
+       assert count(Person) == count_before
+     end
++  end
++
++  describe "subscribing to newsletters" do
++    test "getting the form", %{conn: conn} do
++      conn = get(conn, person_path(conn, :subscribe, to: "nightly"))
++      assert conn.status == 200
++      assert conn.resp_body =~ "form"
++    end
+ 
+     test "with required data creates person, subscribes, sends email, redirects", %{conn: conn} do
+       with_mock(Craisin.Subscriber, [subscribe: fn(_, _) -> nil end]) do
+@@ -99,7 +106,7 @@ defmodule ChangelogWeb.PersonControllerTest do
+         existing = insert(:person)
+         count_before = count(Person)
+ 
+-        conn = post(conn, person_path(conn, :subscribe), email: existing.email, list: "nightly")
++        conn = post(conn, person_path(conn, :subscribe), email: existing.email, to: "nightly")
+ 
+         existing = Repo.one(from p in Person, where: p.email == ^existing.email)
+ 
+@@ -110,4 +117,42 @@ defmodule ChangelogWeb.PersonControllerTest do
+       end
+     end
+   end
++
++  describe "subscribing to podcasts" do
++    test "getting the form", %{conn: conn} do
++      podcast = insert(:podcast)
++      conn = get(conn, person_path(conn, :subscribe, to: podcast.slug))
++      assert conn.status == 200
++      assert conn.resp_body =~ "form"
++    end
++
++    test "with required data creates person, subscribes, sends email, redirects", %{conn: conn} do
++      podcast = insert(:podcast)
++      count_before = count(Person)
++
++      conn = post(conn, person_path(conn, :subscribe), email: "joe@blow.com", to: podcast.slug)
++
++      person = Repo.one(from p in Person, where: p.email == "joe@blow.com")
++
++      assert_delivered_email ChangelogWeb.Email.subscriber_welcome(person, podcast)
++      assert redirected_to(conn) == root_path(conn, :index)
++      assert count(Person) == count_before + 1
++      assert count(Subscription) == 1
++    end
++
++    test "with existing email subscribes, sends email, redirects, but doesn't create person", %{conn: conn} do
++      podcast = insert(:podcast)
++      existing = insert(:person)
++      count_before = count(Person)
++
++      conn = post(conn, person_path(conn, :subscribe), email: existing.email, to: podcast.slug)
++
++      existing = Repo.one(from p in Person, where: p.email == ^existing.email)
++
++      assert_delivered_email ChangelogWeb.Email.subscriber_welcome(existing, podcast)
++      assert redirected_to(conn) == root_path(conn, :index)
++      assert count(Person) == count_before
++      assert count(Subscription) == 1
++    end
++  end
+ end
+diff --git a/test/changelog_web/email_test.exs b/test/changelog_web/email_test.exs
+index e1abc1f483..f283ccbde7 100644
+--- a/test/changelog_web/email_test.exs
++++ b/test/changelog_web/email_test.exs
+@@ -7,34 +7,30 @@ defmodule ChangelogWeb.EmailTest do
+   alias Changelog.Newsletters
+   alias ChangelogWeb.Email
+ 
+-  test "guest thanks" do
+-    person = build(:person)
+-    episode = build(:published_episode)
+-    email = Email.guest_thanks(person, episode)
+-
+-    assert email.to == person
+-    assert email.html_body =~ ~r/#{episode.title}/i
++  setup do
++    person = build(:person, auth_token: "54321", auth_token_expires_at: Timex.now)
++    {:ok, person: person}
+   end
+ 
+-  test "sign in" do
+-    person = build(:person, auth_token: "12345", auth_token_expires_at: Timex.now)
+-    email = Email.sign_in(person)
++  test "community welcome", %{person: person} do
++    email = Email.community_welcome(person)
+ 
+     assert email.to == person
+-    assert email.html_body =~ ~r/sign in/i
++    assert email.subject =~ ~r/welcome/i
++    assert email.html_body =~ ~r/welcome/i
+   end
+ 
+-  test "community welcome" do
+-    person = build(:person, auth_token: "54321", auth_token_expires_at: Timex.now)
+-    email = Email.community_welcome(person)
++  test "episode published", %{person: person} do
++    podcast = build(:podcast)
++    sub = build(:subscription_on_podcast, id: 1, person: person, podcast: podcast)
++    episode = build(:published_episode, podcast: podcast)
++    email = Email.episode_published(sub, episode)
+ 
+     assert email.to == person
+-    assert email.subject =~ ~r/welcome/i
+-    assert email.html_body =~ ~r/welcome/i
++    assert email.subject =~ ~r/#{podcast.name}/i
+   end
+ 
+-  test "guest welcome" do
+-    person = build(:person, auth_token: "54321", auth_token_expires_at: Timex.now)
++  test "guest welcome", %{person: person} do
+     email = Email.guest_welcome(person)
+ 
+     assert email.to == person
+@@ -42,8 +38,22 @@ defmodule ChangelogWeb.EmailTest do
+     assert email.html_body =~ ~r/guest/i
+   end
+ 
+-  test "subscriber welcome" do
+-    person = build(:person, auth_token: "54321", auth_token_expires_at: Timex.now)
++  test "guest thanks", %{person: person} do
++    episode = build(:published_episode)
++    email = Email.guest_thanks(person, episode)
++
++    assert email.to == person
++    assert email.html_body =~ ~r/#{episode.title}/i
++  end
++
++  test "sign in", %{person: person} do
++    email = Email.sign_in(person)
++
++    assert email.to == person
++    assert email.html_body =~ ~r/sign in/i
++  end
++
++  test "subscriber welcome to newsletter", %{person: person} do
+     email = Email.subscriber_welcome(person, Newsletters.weekly())
+ 
+     assert email.to == person
+@@ -51,4 +61,14 @@ defmodule ChangelogWeb.EmailTest do
+     assert email.html_body =~ ~r/subscribed/i
+     assert email.html_body =~ ~r/Changelog Weekly/
+   end
++
++  test "subscriber welcome to podcast", %{person: person} do
++    podcast = build(:podcast)
++    email = Email.subscriber_welcome(person, podcast)
++
++    assert email.to == person
++    assert email.subject =~ ~r/welcome/i
++    assert email.html_body =~ ~r/subscribed/i
++    assert email.html_body =~ ~r/#{podcast.name}/
++  end
+ end

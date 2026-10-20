@@ -1,0 +1,713 @@
+diff --git a/lib/bandit.ex b/lib/bandit.ex
+index a7c3f2af..4d29ad5f 100644
+--- a/lib/bandit.ex
++++ b/lib/bandit.ex
+@@ -105,6 +105,15 @@ defmodule Bandit do
+   * `response_encodings`: A list of compression encodings, expressed in order of preference.
+     Defaults to `~w(zstd gzip x-gzip deflate)`, with `zstd` only being present on platforms which
+     have the zstd library compiled in
++  * `compress_chunked`: Whether chunked responses (those sent via `Plug.Conn.send_chunked/2`) may
++    be compressed with any of the `response_encodings`. When false, chunked responses are only
++    compressed if `deflate` is the preferred encoding. Prior to OTP 29, chunked responses use the
++    next encoding the client accepts instead of `zstd` due to missing `:zstd.flush/1`. Compressed
++    chunked responses hold their compressor's state until they complete, which takes a few
++    hundred KB for gzip and deflate and up to about 3 MB for zstd at its default settings (see
++    `zstd_options`). Note that compressing a response in individually flushed chunks may make it
++    more susceptible to compression side-channel attacks such as
++    [BREACH](https://www.breachattack.com). Defaults to false
+   * `deflate_options`: A keyword list of options to set on the deflate library. A complete list can
+     be found at `t:deflate_options/0`. Note that these options only affect the behaviour of the
+     'deflate' content encoding; 'gzip' does not have any configurable options (this is a
+@@ -123,6 +132,7 @@ defmodule Bandit do
+   @type http_options :: [
+           {:compress, boolean()}
+           | {:response_encodings, list()}
++          | {:compress_chunked, boolean()}
+           | {:deflate_options, deflate_options()}
+           | {:zstd_options, zstd_options()}
+           | {:log_exceptions_with_status_codes, list() | Range.t()}
+@@ -258,7 +268,7 @@ defmodule Bandit do
+   end
+ 
+   @top_level_keys ~w(plug scheme port ip keyfile certfile otp_app cipher_suite display_plug startup_log thousand_island_options http_options http_1_options http_2_options websocket_options)a
+-  @http_keys ~w(compress response_encodings deflate_options zstd_options log_exceptions_with_status_codes log_protocol_errors log_client_closures)a
++  @http_keys ~w(compress response_encodings compress_chunked deflate_options zstd_options log_exceptions_with_status_codes log_protocol_errors log_client_closures)a
+   @http_1_keys ~w(enabled max_request_line_length max_header_length max_header_count max_requests clear_process_dict gc_every_n_keepalive_requests log_unknown_messages)a
+   @http_2_keys ~w(enabled max_header_block_size max_requests max_reset_stream_rate sendfile_chunk_size default_local_settings)a
+   @websocket_keys ~w(enabled max_frame_size max_fragmented_message_size validate_text_frames compress deflate_options max_inflate_ratio primitive_ops_module log_protocol_errors)a
+diff --git a/lib/bandit/adapter.ex b/lib/bandit/adapter.ex
+index 132f3724..ef5eace7 100644
+--- a/lib/bandit/adapter.ex
++++ b/lib/bandit/adapter.ex
+@@ -14,7 +14,7 @@ defmodule Bandit.Adapter do
+             usage_counter: nil,
+             method: nil,
+             status: nil,
+-            content_encoding: nil,
++            content_encodings: [],
+             compression_context: nil,
+             upgrade: nil,
+             expect_continue: false,
+@@ -28,7 +28,7 @@ defmodule Bandit.Adapter do
+           usage_counter: {:counters.counters_ref(), non_neg_integer()},
+           method: Plug.Conn.method() | nil,
+           status: Plug.Conn.status() | nil,
+-          content_encoding: String.t(),
++          content_encodings: [String.t()],
+           compression_context: Bandit.Compression.t() | nil,
+           upgrade: nil | {:websocket, opts :: keyword(), websocket_opts :: keyword()},
+           expect_continue: boolean(),
+@@ -40,8 +40,8 @@ defmodule Bandit.Adapter do
+         }
+ 
+   def init(owner_pid, transport, method, headers, opts) do
+-    content_encoding =
+-      Bandit.Compression.negotiate_content_encoding(
++    content_encodings =
++      Bandit.Compression.negotiate_content_encodings(
+         Bandit.Headers.get_header(headers, "accept-encoding"),
+         opts.http
+       )
+@@ -50,7 +50,7 @@ defmodule Bandit.Adapter do
+       transport: transport,
+       owner_pid: owner_pid,
+       method: method,
+-      content_encoding: content_encoding,
++      content_encodings: content_encodings,
+       expect_continue: expect_continue?(headers, Bandit.HTTPTransport.version(transport)),
+       metrics: %{req_header_end_time: Bandit.Telemetry.monotonic_time()},
+       opts: opts,
+@@ -129,13 +129,7 @@ defmodule Bandit.Adapter do
+     # Save an extra iodata_length by checking common cases
+     empty_body? = Bandit.SocketHelpers.iodata_empty?(body)
+     {headers, compression_context} = Bandit.Compression.new(adapter, status, headers, empty_body?)
+-
+-    {compress_chunk, compression_context} =
+-      Bandit.Compression.compress_chunk(body, compression_context)
+-
+-    {close_chunk, compression_metrics} = Bandit.Compression.close(compression_context)
+-
+-    encoded_body = [compress_chunk | close_chunk]
++    {encoded_body, compression_metrics} = Bandit.Compression.close(compression_context, body)
+     encoded_length = IO.iodata_length(encoded_body)
+     headers = Bandit.Headers.add_content_length(headers, encoded_length, status, adapter.method)
+ 
+diff --git a/lib/bandit/compression.ex b/lib/bandit/compression.ex
+index 2bd8039c..2aa42d0e 100644
+--- a/lib/bandit/compression.ex
++++ b/lib/bandit/compression.ex
+@@ -16,26 +16,29 @@ defmodule Bandit.Compression do
+     @accepted_encodings ~w(zstd) ++ @accepted_encodings
+   end
+ 
+-  @spec negotiate_content_encoding(nil | binary(), keyword()) :: String.t() | nil
+-  def negotiate_content_encoding(nil, _), do: nil
++  # Compressing chunked responses with zstd relies on :zstd.flush/1, which was added in OTP 29
++  @zstd_streaming? Code.ensure_loaded?(:zstd) and function_exported?(:zstd, :flush, 1)
+ 
+-  def negotiate_content_encoding(accept_encoding, http_opts) do
++  @spec negotiate_content_encodings(nil | binary(), keyword()) :: [String.t()]
++  def negotiate_content_encodings(nil, _), do: []
++
++  def negotiate_content_encodings(accept_encoding, http_opts) do
+     if Keyword.get(http_opts, :compress, true) do
+       # Parse Accept-Encoding per RFC9110§12.5.3, honoring q-values (a value of q=0 means 'not
+-      # acceptable') and the '*' wildcard, and comparing codings case-insensitively. Among the
+-      # codings the client is willing to accept, we pick the first in our own preference order
++      # acceptable') and the '*' wildcard, and comparing codings case-insensitively. Returns the
++      # codings the client is willing to accept, in our own preference order
+       accepted = parse_accept_encoding(accept_encoding)
+       wildcard_q = Enum.find_value(accepted, fn {coding, q} -> if coding == "*", do: q end)
+ 
+       Keyword.get(http_opts, :response_encodings, @accepted_encodings)
+-      |> Enum.find(fn encoding ->
++      |> Enum.filter(fn encoding ->
+         case List.keyfind(accepted, encoding, 0) do
+           {_coding, q} -> q > 0
+           nil -> wildcard_q != nil and wildcard_q > 0
+         end
+       end)
+     else
+-      nil
++      []
+     end
+   end
+ 
+@@ -80,19 +83,35 @@ defmodule Bandit.Compression do
+     # 206 responses are excluded since compressing them would change the bytes relative to the
+     # content-range the response advertises against the identity representation, corrupting
+     # range reassembly at the client
+-    if status not in [204, 206, 304] && not is_nil(adapter.content_encoding) &&
++    if status not in [204, 206, 304] && adapter.content_encodings != [] &&
+          is_nil(response_content_encoding_header) &&
+          !response_has_strong_etag(headers) && !response_indicates_no_transform(headers) &&
+          !empty_body? do
+-      case start_stream(adapter.content_encoding, adapter.opts.http, streamable) do
+-        {:ok, context} -> {[{"content-encoding", adapter.content_encoding} | headers], context}
+-        {:error, :unsupported_encoding} -> {headers, %__MODULE__{method: :identity}}
+-      end
++      # Not every encoding can be used for every response (zstd can't compress chunked responses
++      # before OTP 29), so use the first acceptable encoding that can
++      identity = {headers, %__MODULE__{method: :identity}}
++
++      Enum.find_value(candidate_encodings(adapter, streamable), identity, fn encoding ->
++        case start_stream(encoding, adapter.opts.http, streamable) do
++          {:ok, context} -> {[{"content-encoding", encoding} | headers], context}
++          {:error, :unsupported_encoding} -> nil
++        end
++      end)
+     else
+       {headers, %__MODULE__{method: :identity}}
+     end
+   end
+ 
++  # Unless compress_chunked is set, chunked responses are only compressed when deflate is the
++  # preferred encoding, so that enabling gzip and zstd for them is opt-in
++  defp candidate_encodings(adapter, true = _streamable) do
++    if Keyword.get(adapter.opts.http, :compress_chunked, false),
++      do: adapter.content_encodings,
++      else: Enum.take_while(adapter.content_encodings, &(&1 == "deflate"))
++  end
++
++  defp candidate_encodings(adapter, false = _streamable), do: adapter.content_encodings
++
+   defp maybe_add_vary_header(adapter, status, headers) do
+     if status != 204 && Keyword.get(adapter.opts.http, :compress, true) &&
+          !Bandit.Headers.header_contains_token?(headers, "vary", "accept-encoding"),
+@@ -114,25 +133,15 @@ defmodule Bandit.Compression do
+ 
+   defp start_stream("deflate", http_opts, _streamable) do
+     opts = Keyword.get(http_opts, :deflate_options, [])
+-    deflate_context = :zlib.open()
+-
+-    :zlib.deflateInit(
+-      deflate_context,
+-      Keyword.get(opts, :level, :default),
+-      :deflated,
+-      Keyword.get(opts, :window_bits, 15),
+-      Keyword.get(opts, :mem_level, 8),
+-      Keyword.get(opts, :strategy, :default)
+-    )
+-
+-    {:ok, %__MODULE__{method: :deflate, lib_context: deflate_context}}
++    {:ok, %__MODULE__{method: :deflate, lib_context: deflate_init(opts)}}
+   end
+ 
+-  defp start_stream("x-gzip", _opts, false), do: {:ok, %__MODULE__{method: :gzip}}
+-  defp start_stream("gzip", _opts, false), do: {:ok, %__MODULE__{method: :gzip}}
++  # Adding 16 to window_bits makes zlib write a gzip header and trailer instead of zlib ones
++  defp start_stream(encoding, _opts, _streamable) when encoding in ~w(gzip x-gzip),
++    do: {:ok, %__MODULE__{method: :gzip, lib_context: deflate_init(window_bits: 16 + 15)}}
+ 
+   if Code.ensure_loaded?(:zstd) do
+-    defp start_stream("zstd", http_opts, false) do
++    defp start_stream("zstd", http_opts, streamable) when not streamable or @zstd_streaming? do
+       opts = Keyword.get(http_opts, :zstd_options, %{})
+       {:ok, zstd_context} = :zstd.context(:compress, opts)
+ 
+@@ -142,70 +151,75 @@ defmodule Bandit.Compression do
+ 
+   defp start_stream(_encoding, _opts, _streamable), do: {:error, :unsupported_encoding}
+ 
+-  def compress_chunk(chunk, %__MODULE__{method: :deflate} = context) do
+-    result = :zlib.deflate(context.lib_context, chunk, :sync)
++  defp deflate_init(opts) do
++    deflate_context = :zlib.open()
+ 
+-    context =
+-      context
+-      |> Map.update!(:bytes_in, &(&1 + IO.iodata_length(chunk)))
++    :zlib.deflateInit(
++      deflate_context,
++      Keyword.get(opts, :level, :default),
++      :deflated,
++      Keyword.get(opts, :window_bits, 15),
++      Keyword.get(opts, :mem_level, 8),
++      Keyword.get(opts, :strategy, :default)
++    )
+ 
+-    {result, context}
++    deflate_context
+   end
+ 
+-  if Code.ensure_loaded?(:zstd) do
+-    def compress_chunk(chunk, %__MODULE__{method: :zstd} = context) do
+-      result = :zstd.compress(chunk, context.lib_context)
+-
+-      context =
+-        context
+-        |> Map.update!(:bytes_in, &(&1 + IO.iodata_length(chunk)))
++  def compress_chunk(chunk, %__MODULE__{method: :identity} = context), do: {chunk, context}
+ 
+-      {result, context}
+-    end
++  def compress_chunk(chunk, %__MODULE__{} = context) do
++    context = %{context | bytes_in: context.bytes_in + IO.iodata_length(chunk)}
++    {compress_and_flush(context, chunk), context}
+   end
+ 
+-  def compress_chunk(chunk, %__MODULE__{method: :gzip, lib_context: nil} = context) do
+-    result = :zlib.gzip(chunk)
++  # Chunks are flushed so that the client can decode each one as soon as it arrives
++  defp compress_and_flush(%__MODULE__{method: method, lib_context: lib_context}, chunk)
++       when method in [:deflate, :gzip],
++       do: :zlib.deflate(lib_context, chunk, :sync)
+ 
+-    context =
+-      context
+-      |> Map.update!(:bytes_in, &(&1 + IO.iodata_length(chunk)))
+-      |> Map.put(:lib_context, :done)
++  if @zstd_streaming? do
++    defp compress_and_flush(%__MODULE__{method: :zstd, lib_context: lib_context}, chunk) do
++      compressed = zstd_stream(lib_context, chunk)
++      {:continue, flushed} = :zstd.flush(lib_context)
++      [compressed, flushed]
++    end
+ 
+-    {result, context}
++    # :zstd.stream/2 returns whatever input it could not consume in a single call
++    defp zstd_stream(zstd_context, data) do
++      case :zstd.stream(zstd_context, data) do
++        {:continue, output} -> [output]
++        {:continue, remainder, output} -> [output | zstd_stream(zstd_context, remainder)]
++      end
++    end
+   end
+ 
+-  def compress_chunk(chunk, %__MODULE__{method: :identity} = context) do
+-    {chunk, context}
+-  end
++  # Finishes the compressed stream, with last_chunk as its final input
++  def close(context, last_chunk \\ [])
+ 
+-  def close(%__MODULE__{} = context) do
+-    chunk = close_context(context)
++  def close(%__MODULE__{method: :identity}, last_chunk), do: {last_chunk, %{}}
+ 
+-    if context.method == :identity do
+-      {chunk, %{}}
+-    else
+-      {chunk,
+-       %{
+-         resp_compression_method: to_string(context.method),
+-         resp_uncompressed_body_bytes: context.bytes_in
+-       }}
+-    end
++  def close(%__MODULE__{} = context, last_chunk) do
++    {close_context(context, last_chunk),
++     %{
++       resp_compression_method: to_string(context.method),
++       resp_uncompressed_body_bytes: context.bytes_in + IO.iodata_length(last_chunk)
++     }}
+   end
+ 
+-  defp close_context(%__MODULE__{method: :deflate, lib_context: lib_context}) do
+-    last = :zlib.deflate(lib_context, [], :finish)
++  defp close_context(%__MODULE__{method: method, lib_context: lib_context}, last_chunk)
++       when method in [:deflate, :gzip] do
++    last = :zlib.deflate(lib_context, last_chunk, :finish)
+     :ok = :zlib.deflateEnd(lib_context)
+     :zlib.close(lib_context)
+     last
+   end
+ 
+   if Code.ensure_loaded?(:zstd) do
+-    defp close_context(%__MODULE__{method: :zstd, lib_context: lib_context}) do
++    defp close_context(%__MODULE__{method: :zstd, lib_context: lib_context}, last_chunk) do
++      {:done, last} = :zstd.finish(lib_context, last_chunk)
+       :zstd.close(lib_context)
+-      []
++      last
+     end
+   end
+-
+-  defp close_context(_context), do: []
+ end
+diff --git a/test/bandit/http1/protocol_test.exs b/test/bandit/http1/protocol_test.exs
+index 62401a14..e703cfc6 100644
+--- a/test/bandit/http1/protocol_test.exs
++++ b/test/bandit/http1/protocol_test.exs
+@@ -1967,7 +1967,7 @@ defmodule HTTP1ProtocolTest do
+         Req.get!(context.req, url: "/send_big_body", headers: [{"accept-encoding", "deflate"}])
+ 
+       assert response.status == 200
+-      assert response.headers["content-length"] == ["40"]
++      assert response.headers["content-length"] == ["34"]
+       assert response.headers["content-encoding"] == ["deflate"]
+       assert response.headers["vary"] == ["accept-encoding"]
+ 
+@@ -2061,7 +2061,7 @@ defmodule HTTP1ProtocolTest do
+         )
+ 
+       assert response.status == 200
+-      assert response.headers["content-length"] == ["40"]
++      assert response.headers["content-length"] == ["34"]
+       assert response.headers["content-encoding"] == ["deflate"]
+       assert response.headers["vary"] == ["accept-encoding"]
+     end
+@@ -2121,7 +2121,7 @@ defmodule HTTP1ProtocolTest do
+         )
+ 
+       assert response.status == 200
+-      assert response.headers["content-length"] == ["40"]
++      assert response.headers["content-length"] == ["34"]
+       assert response.headers["content-encoding"] == ["deflate"]
+       assert response.headers["vary"] == ["accept-encoding"]
+     end
+@@ -2249,7 +2249,7 @@ defmodule HTTP1ProtocolTest do
+         Req.get!(context.req, url: "/send_iolist_body", headers: [{"accept-encoding", "deflate"}])
+ 
+       assert response.status == 200
+-      assert response.headers["content-length"] == ["40"]
++      assert response.headers["content-length"] == ["34"]
+       assert response.headers["content-encoding"] == ["deflate"]
+       assert response.headers["vary"] == ["accept-encoding"]
+ 
+@@ -2281,7 +2281,7 @@ defmodule HTTP1ProtocolTest do
+       assert inflated_body == String.duplicate("a", 10_000)
+     end
+ 
+-    test "does not gzip encode chunk responses", context do
++    test "does not gzip encode chunk responses by default", context do
+       response =
+         Req.get!(context.req,
+           url: "/send_big_body_chunked",
+@@ -2294,6 +2294,92 @@ defmodule HTTP1ProtocolTest do
+       assert response.body == String.duplicate("a", 10_000)
+     end
+ 
++    test "does not fall back to deflate for chunk responses by default", context do
++      response =
++        Req.get!(context.req,
++          url: "/send_big_body_chunked",
++          headers: [{"accept-encoding", "gzip, deflate"}]
++        )
++
++      assert response.status == 200
++      assert response.headers["content-encoding"] == nil
++      assert response.headers["vary"] == ["accept-encoding"]
++      assert response.body == String.duplicate("a", 10_000)
++    end
++
++    test "gzip encodes chunk responses", context do
++      response =
++        Req.get!(compress_chunked_req(context),
++          url: "/send_big_body_chunked",
++          headers: [{"accept-encoding", "gzip"}]
++        )
++
++      assert response.status == 200
++      assert response.headers["content-encoding"] == ["gzip"]
++      assert response.headers["vary"] == ["accept-encoding"]
++      assert :zlib.gunzip(response.body) == String.duplicate("a", 10_000)
++    end
++
++    test "x-gzip encodes chunk responses", context do
++      response =
++        Req.get!(compress_chunked_req(context),
++          url: "/send_big_body_chunked",
++          headers: [{"accept-encoding", "x-gzip"}]
++        )
++
++      assert response.status == 200
++      assert response.headers["content-encoding"] == ["x-gzip"]
++      assert response.headers["vary"] == ["accept-encoding"]
++      assert :zlib.gunzip(response.body) == String.duplicate("a", 10_000)
++    end
++
++    # TODO Remove once Erlang v29 is required
++    if Code.ensure_loaded?(:zstd) and not function_exported?(:zstd, :flush, 1) do
++      test "falls back to the next accepted encoding when zstd can't encode chunk responses",
++           context do
++        response =
++          Req.get!(compress_chunked_req(context),
++            url: "/send_big_body_chunked",
++            headers: [{"accept-encoding", "zstd, gzip"}]
++          )
++
++        assert response.status == 200
++        assert response.headers["content-encoding"] == ["gzip"]
++        assert response.headers["vary"] == ["accept-encoding"]
++        assert :zlib.gunzip(response.body) == String.duplicate("a", 10_000)
++      end
++    end
++
++    # TODO Remove conditional once Erlang v29 is required
++    if Code.ensure_loaded?(:zstd) and function_exported?(:zstd, :flush, 1) do
++      test "zstd encodes chunk responses", context do
++        response =
++          Req.get!(compress_chunked_req(context),
++            url: "/send_big_body_chunked",
++            headers: [{"accept-encoding", "zstd"}]
++          )
++
++        assert response.status == 200
++        assert response.headers["content-encoding"] == ["zstd"]
++        assert response.headers["vary"] == ["accept-encoding"]
++
++        assert :zstd.decompress(response.body) |> IO.iodata_to_binary() ==
++                 String.duplicate("a", 10_000)
++      end
++
++      test "zstd encodes chunks too large to be compressed in a single pass", context do
++        response =
++          Req.get!(compress_chunked_req(context),
++            url: "/send_incompressible_chunk",
++            headers: [{"accept-encoding", "zstd"}]
++          )
++
++        assert response.status == 200
++        assert response.headers["content-encoding"] == ["zstd"]
++        assert :zstd.decompress(response.body) |> IO.iodata_to_binary() == incompressible_data()
++      end
++    end
++
+     test "falls back to no encoding if no encodings provided", context do
+       response = Req.get!(context.req, url: "/send_big_body")
+ 
+@@ -2456,7 +2542,7 @@ defmodule HTTP1ProtocolTest do
+       assert response.headers["content-encoding"] == ["deflate"]
+ 
+       # level: 0 disables compression, so the "compressed" body is only a few bytes
+-      # larger than the raw input, rather than the 40 bytes achieved at the default level
++      # larger than the raw input, rather than the 34 bytes achieved at the default level
+       # (see the "writes out a response with deflate encoding" test above)
+       assert String.to_integer(hd(response.headers["content-length"])) > 10_000
+ 
+@@ -2515,17 +2601,28 @@ defmodule HTTP1ProtocolTest do
+     test "length-delimited send_chunked is not compressed even when negotiated", context do
+       # Compression would rewrite the body and break the declared content-length,
+       # so it must be disabled in this mode.
+-      response =
+-        Req.get!(context.req,
+-          url: "/send_known_length_stream",
+-          headers: [{"accept-encoding", "deflate"}]
+-        )
++      for encoding <- ~w(zstd gzip x-gzip deflate) do
++        response =
++          Req.get!(compress_chunked_req(context),
++            url: "/send_known_length_stream",
++            headers: [{"accept-encoding", encoding}]
++          )
+ 
+-      assert response.status == 200
+-      assert response.headers["content-length"] == ["10000"]
+-      assert response.headers["content-encoding"] == nil
+-      assert response.headers["transfer-encoding"] == nil
+-      assert response.body == String.duplicate("a", 10_000)
++        assert response.status == 200
++        assert response.headers["content-length"] == ["10000"]
++        assert response.headers["content-encoding"] == nil
++        assert response.headers["transfer-encoding"] == nil
++        assert response.body == String.duplicate("a", 10_000)
++      end
++    end
++
++    defp compress_chunked_req(context) do
++      context =
++        context
++        |> http_server(http_options: [compress_chunked: true])
++        |> Enum.into(context)
++
++      Req.merge(context.req, base_url: context.base)
+     end
+ 
+     def send_known_length_stream(conn) do
+@@ -2554,6 +2651,18 @@ defmodule HTTP1ProtocolTest do
+       conn
+     end
+ 
++    def send_incompressible_chunk(conn) do
++      conn = send_chunked(conn, 200)
++      {:ok, conn} = chunk(conn, incompressible_data())
++      conn
++    end
++
++    # Seeded so that the plug and the test generate the same bytes
++    defp incompressible_data do
++      {data, _state} = :rand.bytes_s(1_000_000, :rand.seed_s(:exsss, 1))
++      data
++    end
++
+     def send_iolist_body(conn) do
+       conn
+       |> put_resp_header("content-length", "10000")
+diff --git a/test/bandit/http1/telemetry_test.exs b/test/bandit/http1/telemetry_test.exs
+index 588823a1..dc763ace 100644
+--- a/test/bandit/http1/telemetry_test.exs
++++ b/test/bandit/http1/telemetry_test.exs
+@@ -201,6 +201,34 @@ defmodule HTTP1TelemetryTest do
+              }
+     end
+ 
++    test "it should add resp metrics to `stop` events for chunked responses with content encoding",
++         context do
++      context =
++        context
++        |> http_server(http_options: [compress_chunked: true])
++        |> Enum.into(context)
++
++      Req.get!(context.req,
++        url: "/send_chunked_200",
++        base_url: context.base,
++        headers: [{"accept-encoding", "gzip"}]
++      )
++
++      assert_receive {:telemetry, [:bandit, :request, :stop], measurements, _metadata}, 500
++
++      assert measurements
++             ~> %{
++               monotonic_time: integer(roughly: System.monotonic_time()),
++               duration: integer(max: System.convert_time_unit(1, :second, :native)),
++               req_header_end_time: integer(roughly: System.monotonic_time()),
++               resp_uncompressed_body_bytes: 2,
++               resp_body_bytes: 28,
++               resp_compression_method: "gzip",
++               resp_start_time: integer(roughly: System.monotonic_time()),
++               resp_end_time: integer(roughly: System.monotonic_time())
++             }
++    end
++
+     def send_chunked_200(conn) do
+       {:ok, conn} =
+         conn
+diff --git a/test/bandit/http2/protocol_test.exs b/test/bandit/http2/protocol_test.exs
+index a9cbe0e8..fa54f36c 100644
+--- a/test/bandit/http2/protocol_test.exs
++++ b/test/bandit/http2/protocol_test.exs
+@@ -420,7 +420,7 @@ defmodule HTTP2ProtocolTest do
+               [
+                 {":status", "200"},
+                 {"date", _date},
+-                {"content-length", "40"},
++                {"content-length", "34"},
+                 {"content-encoding", "deflate"},
+                 {"vary", "accept-encoding"},
+                 {"cache-control", "max-age=0, private, must-revalidate"}
+@@ -604,7 +604,7 @@ defmodule HTTP2ProtocolTest do
+               [
+                 {":status", "200"},
+                 {"date", _date},
+-                {"content-length", "40"},
++                {"content-length", "34"},
+                 {"content-encoding", "deflate"},
+                 {"vary", "accept-encoding"},
+                 {"cache-control", "max-age=0, private, must-revalidate"}
+@@ -725,7 +725,7 @@ defmodule HTTP2ProtocolTest do
+               [
+                 {":status", "200"},
+                 {"date", _date},
+-                {"content-length", "40"},
++                {"content-length", "34"},
+                 {"content-encoding", "deflate"},
+                 {"vary", "accept-encoding"},
+                 {"cache-control", "max-age=0, private, must-revalidate"}
+@@ -888,7 +888,7 @@ defmodule HTTP2ProtocolTest do
+               [
+                 {":status", "200"},
+                 {"date", _date},
+-                {"content-length", "40"},
++                {"content-length", "34"},
+                 {"content-encoding", "deflate"},
+                 {"vary", "accept-encoding"},
+                 {"cache-control", "max-age=0, private, must-revalidate"}
+@@ -1440,7 +1440,7 @@ defmodule HTTP2ProtocolTest do
+       assert inflated_body == "OKDOKEE"
+     end
+ 
+-    test "does not gzip encode DATA frames when chunking", context do
++    test "does not gzip encode DATA frames when chunking by default", context do
+       socket = SimpleH2Client.setup_connection(context)
+ 
+       headers = [
+@@ -1465,6 +1465,90 @@ defmodule HTTP2ProtocolTest do
+       assert {:ok, 1, false, "DOKEE"} == SimpleH2Client.recv_body(socket)
+     end
+ 
++    test "gzip encodes multiple DATA frames when chunking", context do
++      context =
++        context
++        |> https_server(http_options: [compress_chunked: true])
++        |> Enum.into(context)
++
++      socket = SimpleH2Client.setup_connection(context)
++
++      headers = [
++        {":method", "GET"},
++        {":path", "/chunk_response"},
++        {":scheme", "https"},
++        {":authority", "localhost:#{context.port}"},
++        {"accept-encoding", "gzip"}
++      ]
++
++      SimpleH2Client.send_headers(socket, 1, true, headers)
++
++      assert {:ok, 1, false,
++              [
++                {":status", "200"},
++                {"date", _date},
++                {"content-encoding", "gzip"},
++                {"vary", "accept-encoding"},
++                {"cache-control", "max-age=0, private, must-revalidate"}
++              ], _ctx} = SimpleH2Client.recv_headers(socket)
++
++      {:ok, 1, false, chunk_1} = SimpleH2Client.recv_body(socket)
++      {:ok, 1, false, chunk_2} = SimpleH2Client.recv_body(socket)
++      {:ok, 1, false, chunk_3} = SimpleH2Client.recv_body(socket)
++      assert {:ok, 1, true, ""} == SimpleH2Client.recv_body(socket)
++
++      # Each chunk is flushed, so it can be decoded without waiting for the rest of the body
++      inflate_context = :zlib.open()
++      :ok = :zlib.inflateInit(inflate_context, 31)
++      assert :zlib.inflate(inflate_context, chunk_1) |> IO.iodata_to_binary() == "OK"
++      assert :zlib.inflate(inflate_context, chunk_2) |> IO.iodata_to_binary() == "DOKEE"
++      assert :zlib.inflate(inflate_context, chunk_3) |> IO.iodata_to_binary() == ""
++      :ok = :zlib.inflateEnd(inflate_context)
++      :ok = :zlib.close(inflate_context)
++    end
++
++    # TODO Remove conditional once Erlang v29 is required
++    if Code.ensure_loaded?(:zstd) and function_exported?(:zstd, :flush, 1) do
++      test "zstd encodes multiple DATA frames when chunking", context do
++        context =
++          context
++          |> https_server(http_options: [compress_chunked: true])
++          |> Enum.into(context)
++
++        socket = SimpleH2Client.setup_connection(context)
++
++        headers = [
++          {":method", "GET"},
++          {":path", "/chunk_response"},
++          {":scheme", "https"},
++          {":authority", "localhost:#{context.port}"},
++          {"accept-encoding", "zstd"}
++        ]
++
++        SimpleH2Client.send_headers(socket, 1, true, headers)
++
++        assert {:ok, 1, false,
++                [
++                  {":status", "200"},
++                  {"date", _date},
++                  {"content-encoding", "zstd"},
++                  {"vary", "accept-encoding"},
++                  {"cache-control", "max-age=0, private, must-revalidate"}
++                ], _ctx} = SimpleH2Client.recv_headers(socket)
++
++        {:ok, 1, false, chunk_1} = SimpleH2Client.recv_body(socket)
++        {:ok, 1, false, chunk_2} = SimpleH2Client.recv_body(socket)
++        {:ok, 1, false, chunk_3} = SimpleH2Client.recv_body(socket)
++        assert {:ok, 1, true, ""} == SimpleH2Client.recv_body(socket)
++
++        # Each chunk is flushed, so it can be decoded without waiting for the rest of the body
++        {:ok, zstd_context} = :zstd.context(:decompress)
++        assert :zstd.stream(zstd_context, chunk_1) == {:continue, "OK"}
++        assert :zstd.stream(zstd_context, chunk_2) == {:continue, "DOKEE"}
++        assert :zstd.stream(zstd_context, chunk_3) == {:continue, ""}
++      end
++    end
++
+     test "does not write out a body for a chunked response to a HEAD request", context do
+       socket = SimpleH2Client.setup_connection(context)
+ 

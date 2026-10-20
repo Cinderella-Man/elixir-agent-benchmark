@@ -1,0 +1,1043 @@
+From 4a5dc7113cd401f57e239403c3ce4948c970d3d0 Mon Sep 17 00:00:00 2001
+From: Jakob Lichterfeld <jakob-lichterfeld@gmx.de>
+Date: Fri, 25 Sep 2026 10:21:30 +0200
+Subject: [PATCH 1/7] test(geocoder): pin which address label fills which
+ field, and in which order
+
+A table of the current alias lists: every label alone fills its field, and of two neighbouring labels the first wins. The next change derives the lists from Nominatim; the diff of this table then shows every behaviour change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md                                  |  1 +
+ .../teslamate/locations/geocoder_test.exs     | 46 +++++++++++++++++++
+ 2 files changed, 47 insertions(+)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 523695169c..b724f8a47b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -114,6 +114,7 @@ Upgrading directly from 4.1.x no longer preserves entity registry customizations
+ - fix(test): restart cars_id_seq at suite start so smallint cars.id never overflows across local runs (#5773 - @JakobLichterfeld)
+ - build: ship NOTICE and LICENSE in both images and both Nix packages, and declare AGPL-3.0-or-later in the Nix metadata (#5778 - @JakobLichterfeld)
+ - build(deps): bump image-size from 2.0.2 to 2.0.4 in /website (#5783)
++- test(geocoder): pin which address label fills which field, and in which order (#5785 - @JakobLichterfeld)
+ 
+ #### Dashboards
+ 
+diff --git a/elixir/test/teslamate/locations/geocoder_test.exs b/elixir/test/teslamate/locations/geocoder_test.exs
+index de23e3b2ac..143f2ed28e 100644
+--- a/elixir/test/teslamate/locations/geocoder_test.exs
++++ b/elixir/test/teslamate/locations/geocoder_test.exs
+@@ -333,4 +333,50 @@ defmodule TeslaMate.Locations.GeocoderTest do
+       end
+     end
+   end
++
++  describe "address fields" do
++    # Which address label of the Nominatim response fills which field, in
++    # order of precedence: the first label of a list that the response
++    # contains wins.
++    @fields [
++      house_number: ~w(house_number street_number),
++      road:
++        ~w(road footway street street_name residential path pedestrian road_reference road_reference_intl square place),
++      neighbourhood:
++        ~w(neighbourhood suburb city_district district quarter borough city_block residential commercial houses subdistrict subdivision ward),
++      city:
++        ~w(city town township village municipality hamlet locality croft local_administrative_area subcounty),
++      county: ~w(county county_code department),
++      state: ~w(state province territory state_code),
++      country: ~w(country country_name)
++    ]
++
++    setup_with_mocks([
++      {Tesla.Adapter.Finch, [],
++       call: fn %Tesla.Env{} = env, _opts ->
++         {:ok, %Tesla.Env{env | status: 200, body: %{"address" => Process.get(:address)}}}
++       end}
++    ]) do
++      :ok
++    end
++
++    defp address_fields(address) do
++      Process.put(:address, address)
++      {:ok, fields} = Geocoder.reverse_lookup(0.0, 0.0)
++      fields
++    end
++
++    for {field, labels} <- @fields, label <- labels do
++      test "#{label} fills #{field}" do
++        assert %{unquote(field) => "value"} = address_fields(%{unquote(label) => "value"})
++      end
++    end
++
++    for {field, labels} <- @fields, [first, second] <- Enum.chunk_every(labels, 2, 1, :discard) do
++      test "#{first} goes before #{second} for #{field}" do
++        address = %{unquote(first) => "first", unquote(second) => "second"}
++        assert %{unquote(field) => "first"} = address_fields(address)
++      end
++    end
++  end
+ end
+
+From 5e197b6cc3e204de34557fc7786a2b354e6de970 Mon Sep 17 00:00:00 2001
+From: Jakob Lichterfeld <jakob-lichterfeld@gmx.de>
+Date: Fri, 25 Sep 2026 10:27:23 +0200
+Subject: [PATCH 2/7] fix(geocoder): fill the address fields by Nominatim's
+ address ranks
+
+Each label now fills the field whose rank range holds its address rank, as Nominatim assigns ranks to GeocodeJSON fields; within a field the more specific label wins, and place and boundary labels go before landuse labels.
+Labels Nominatim never returns are gone, labels it returns but the lists missed are in. The three recorded Nominatim responses map as before; the test table shows every change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md                                  |   1 +
+ elixir/lib/teslamate/locations/geocoder.ex    | 107 ++++++------------
+ .../teslamate/locations/geocoder_test.exs     |  25 ++--
+ 3 files changed, 50 insertions(+), 83 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b724f8a47b..ea0448d814 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -39,6 +39,7 @@ Upgrading directly from 4.1.x no longer preserves entity registry customizations
+ - fix(web): report a sign-in that exits instead of crashing the sign-in page (#5781 - @JakobLichterfeld)
+ - fix(auth): keep credentials out of the log, even on the debug level (#5782 - @JakobLichterfeld)
+ - feat(web): skip the modal animation when the system asks for reduced motion, with own fade and scale CSS (#5784 - @JakobLichterfeld)
++- fix(geocoder): fill the address fields by Nominatim's address ranks (#5785 - @JakobLichterfeld)
+ 
+ #### Build, CI, internal
+ 
+diff --git a/elixir/lib/teslamate/locations/geocoder.ex b/elixir/lib/teslamate/locations/geocoder.ex
+index 3879ea04a6..1ac7df2871 100644
+--- a/elixir/lib/teslamate/locations/geocoder.ex
++++ b/elixir/lib/teslamate/locations/geocoder.ex
+@@ -77,71 +77,34 @@ defmodule TeslaMate.Locations.Geocoder do
+     end
+   end
+ 
+-  # Address Formatting
+-  # Source: https://github.com/OpenCageData/address-formatting/blob/master/conf/components.yaml
+-
+-  @road_aliases [
+-    "road",
+-    "footway",
+-    "street",
+-    "street_name",
+-    "residential",
+-    "path",
+-    "pedestrian",
+-    "road_reference",
+-    "road_reference_intl",
+-    "square",
+-    "place"
+-  ]
+-
+-  @neighbourhood_aliases [
+-    "neighbourhood",
+-    "suburb",
+-    "city_district",
+-    "district",
+-    "quarter",
+-    "borough",
+-    "city_block",
+-    "residential",
+-    "commercial",
+-    "houses",
+-    "subdistrict",
+-    "subdivision",
+-    "ward"
+-  ]
+-
+-  @municipality_aliases [
+-    "municipality",
+-    "local_administrative_area",
+-    "subcounty"
+-  ]
+-
+-  @village_aliases [
+-    "village",
+-    "municipality",
+-    "hamlet",
+-    "locality",
+-    "croft"
+-  ]
+-
+-  @city_aliases [
+-                  "city",
+-                  "town",
+-                  "township"
+-                ] ++ @village_aliases ++ @municipality_aliases
+-
+-  @county_aliases [
+-    "county",
+-    "county_code",
+-    "department"
+-  ]
+-
+-  @state_aliases [
+-    "state",
+-    "province",
+-    "territory",
+-    "state_code"
+-  ]
++  # Address fields from Nominatim's address labels
++  #
++  # A label fills the field whose rank range holds the label's address rank,
++  # the way Nominatim assigns ranks to GeocodeJSON fields (GEOCODEJSON_RANKS).
++  # The ranks come from settings/address-levels.json, and from ADMIN_LABELS for
++  # administrative boundaries; a label with two sources takes the rank of the
++  # one used more often in OSM. Within a field the more specific label goes
++  # first, and place and boundary labels go before landuse labels, which
++  # describe how land is used rather than a locality. territory is undocumented
++  # but appears on state-level boundaries (Australian Capital Territory).
++  # Sources: https://github.com/osm-search/Nominatim (docs/api/Output.md,
++  # settings/address-levels.json, src/nominatim_api/v1/)
++
++  # street: ranks 25-27
++  @road_labels ~w(road isolated_dwelling farm city_block mountain_pass square locality)
++
++  # district and locality: ranks 17-24
++  @neighbourhood_labels ~w(neighbourhood subdivision quarter suburb hamlet croft borough city_district) ++
++                          ~w(residential farmyard industrial commercial allotments retail)
++
++  # city: ranks 13-16
++  @city_labels ~w(city town village municipality)
++
++  # county: ranks 10-12
++  @county_labels ~w(county district)
++
++  # state: ranks 5-9
++  @state_labels ~w(state province territory region)
+ 
+   defp into_address(%{"error" => "Unable to geocode"} = raw) do
+     unknown_address = %{
+@@ -170,15 +133,15 @@ defmodule TeslaMate.Locations.Geocoder do
+       name:
+         Map.get(raw, "name") || get_in(raw, ["namedetails", "name"]) ||
+           get_in(raw, ["namedetails", "alt_name"]),
+-      house_number: raw["address"] |> get_first(["house_number", "street_number"]),
+-      road: raw["address"] |> get_first(@road_aliases),
+-      neighbourhood: raw["address"] |> get_first(@neighbourhood_aliases),
+-      city: raw["address"] |> get_first(@city_aliases),
+-      county: raw["address"] |> get_first(@county_aliases),
++      house_number: get_in(raw, ["address", "house_number"]),
++      road: raw["address"] |> get_first(@road_labels),
++      neighbourhood: raw["address"] |> get_first(@neighbourhood_labels),
++      city: raw["address"] |> get_first(@city_labels),
++      county: raw["address"] |> get_first(@county_labels),
+       postcode: get_in(raw, ["address", "postcode"]),
+-      state: raw["address"] |> get_first(@state_aliases),
++      state: raw["address"] |> get_first(@state_labels),
+       state_district: get_in(raw, ["address", "state_district"]),
+-      country: raw["address"] |> get_first(["country", "country_name"]),
++      country: get_in(raw, ["address", "country"]),
+       raw: raw
+     }
+ 
+diff --git a/elixir/test/teslamate/locations/geocoder_test.exs b/elixir/test/teslamate/locations/geocoder_test.exs
+index 143f2ed28e..787d2c6474 100644
+--- a/elixir/test/teslamate/locations/geocoder_test.exs
++++ b/elixir/test/teslamate/locations/geocoder_test.exs
+@@ -339,18 +339,18 @@ defmodule TeslaMate.Locations.GeocoderTest do
+     # order of precedence: the first label of a list that the response
+     # contains wins.
+     @fields [
+-      house_number: ~w(house_number street_number),
+-      road:
+-        ~w(road footway street street_name residential path pedestrian road_reference road_reference_intl square place),
++      house_number: ~w(house_number),
++      road: ~w(road isolated_dwelling farm city_block mountain_pass square locality),
+       neighbourhood:
+-        ~w(neighbourhood suburb city_district district quarter borough city_block residential commercial houses subdistrict subdivision ward),
+-      city:
+-        ~w(city town township village municipality hamlet locality croft local_administrative_area subcounty),
+-      county: ~w(county county_code department),
+-      state: ~w(state province territory state_code),
+-      country: ~w(country country_name)
++        ~w(neighbourhood subdivision quarter suburb hamlet croft borough city_district residential farmyard industrial commercial allotments retail),
++      city: ~w(city town village municipality),
++      county: ~w(county district),
++      state: ~w(state province territory region),
++      country: ~w(country)
+     ]
+ 
++    @field_names Keyword.keys(@fields)
++
+     setup_with_mocks([
+       {Tesla.Adapter.Finch, [],
+        call: fn %Tesla.Env{} = env, _opts ->
+@@ -367,8 +367,11 @@ defmodule TeslaMate.Locations.GeocoderTest do
+     end
+ 
+     for {field, labels} <- @fields, label <- labels do
+-      test "#{label} fills #{field}" do
+-        assert %{unquote(field) => "value"} = address_fields(%{unquote(label) => "value"})
++      test "#{label} fills #{field} and no other field" do
++        fields = address_fields(%{unquote(label) => "value"})
++
++        assert fields[unquote(field)] == "value"
++        assert for(name <- @field_names, fields[name] != nil, do: name) == [unquote(field)]
+       end
+     end
+ 
+
+From 4547c5f772a5a8c02f3727a88654c07c7dafa500 Mon Sep 17 00:00:00 2001
+From: Jakob Lichterfeld <jakob-lichterfeld@gmx.de>
+Date: Fri, 25 Sep 2026 10:48:48 +0200
+Subject: [PATCH 3/7] test(geocoder): pin the address fields of 18 recorded
+ Nominatim addresses
+
+Real reverse lookups from China, the US, Australia, Germany, Norway and Japan, limited to the labels the mapping uses (92 address parts, an insubstantial extract under the ODbL). Against the previous lists two of them differ: Shanghai's neighbourhood is now the quarter Lujiazui instead of Lujiazui Subdistrict, and the hamlet West Kill now fills the neighbourhood.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md                                  |   1 +
+ .../teslamate/locations/geocoder_test.exs     | 333 ++++++++++++++++++
+ 2 files changed, 334 insertions(+)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ea0448d814..1f50bd21f3 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -116,6 +116,7 @@ Upgrading directly from 4.1.x no longer preserves entity registry customizations
+ - build: ship NOTICE and LICENSE in both images and both Nix packages, and declare AGPL-3.0-or-later in the Nix metadata (#5778 - @JakobLichterfeld)
+ - build(deps): bump image-size from 2.0.2 to 2.0.4 in /website (#5783)
+ - test(geocoder): pin which address label fills which field, and in which order (#5785 - @JakobLichterfeld)
++- test(geocoder): pin the address fields of 18 recorded Nominatim addresses (#5785 - @JakobLichterfeld)
+ 
+ #### Dashboards
+ 
+diff --git a/elixir/test/teslamate/locations/geocoder_test.exs b/elixir/test/teslamate/locations/geocoder_test.exs
+index 787d2c6474..408dd7a779 100644
+--- a/elixir/test/teslamate/locations/geocoder_test.exs
++++ b/elixir/test/teslamate/locations/geocoder_test.exs
+@@ -351,6 +351,332 @@ defmodule TeslaMate.Locations.GeocoderTest do
+ 
+     @field_names Keyword.keys(@fields)
+ 
++    # Address parts of real reverse lookups on nominatim.openstreetmap.org
++    # (September 2026, parameters of reverse_lookup/3, Accept-Language: en),
++    # limited to the labels above: 92 address parts, an insubstantial extract
++    # under the ODbL (fewer than 100 features, OSMF Substantial Guideline).
++    @recorded [
++      {"Beijing, Chaoyang",
++       %{"city" => "Chaoyang District", "country" => "China", "suburb" => "Chaowai Subdistrict"},
++       %{
++         state: nil,
++         house_number: nil,
++         road: nil,
++         neighbourhood: "Chaowai Subdistrict",
++         city: "Chaoyang District",
++         county: nil,
++         country: "China"
++       }},
++      {"Shanghai, Pudong",
++       %{
++         "city" => "Pudong",
++         "country" => "China",
++         "quarter" => "Lujiazui",
++         "road" => "银城中路出口",
++         "state" => "Shanghai",
++         "suburb" => "Lujiazui Subdistrict"
++       },
++       %{
++         state: "Shanghai",
++         house_number: nil,
++         road: "银城中路出口",
++         neighbourhood: "Lujiazui",
++         city: "Pudong",
++         county: nil,
++         country: "China"
++       }},
++      {"Shenzhen, Nanshan",
++       %{
++         "city" => "Nanshan District",
++         "commercial" => "麻雀岭工业区",
++         "country" => "China",
++         "house_number" => "1",
++         "neighbourhood" => "Maling",
++         "road" => "科艺路",
++         "state" => "Guangdong",
++         "suburb" => "Yuehai Sub-district"
++       },
++       %{
++         state: "Guangdong",
++         house_number: "1",
++         road: "科艺路",
++         neighbourhood: "Maling",
++         city: "Nanshan District",
++         county: nil,
++         country: "China"
++       }},
++      {"Zhejiang, Anji County",
++       %{
++         "city" => "Anji County",
++         "country" => "China",
++         "state" => "Zhejiang",
++         "suburb" => "Changshuo"
++       },
++       %{
++         state: "Zhejiang",
++         house_number: nil,
++         road: nil,
++         neighbourhood: "Changshuo",
++         city: "Anji County",
++         county: nil,
++         country: "China"
++       }},
++      {"New York, Manhattan",
++       %{
++         "city" => "New York",
++         "city_district" => "New York County",
++         "commercial" => "Times Square",
++         "country" => "United States",
++         "neighbourhood" => "Manhattan Community Board 5",
++         "road" => "7th Avenue",
++         "state" => "New York",
++         "suburb" => "Manhattan"
++       },
++       %{
++         state: "New York",
++         house_number: nil,
++         road: "7th Avenue",
++         neighbourhood: "Manhattan Community Board 5",
++         city: "New York",
++         county: nil,
++         country: "United States"
++       }},
++      {"Palo Alto, California",
++       %{
++         "city" => "Palo Alto",
++         "country" => "United States",
++         "county" => "Santa Clara County",
++         "road" => "Middlefield Road",
++         "state" => "California"
++       },
++       %{
++         state: "California",
++         house_number: nil,
++         road: "Middlefield Road",
++         neighbourhood: nil,
++         city: "Palo Alto",
++         county: "Santa Clara County",
++         country: "United States"
++       }},
++      {"Lancaster, Pennsylvania",
++       %{
++         "city" => "Lancaster",
++         "country" => "United States",
++         "county" => "Lancaster County",
++         "neighbourhood" => "Central Business District",
++         "road" => "East King Street",
++         "state" => "Pennsylvania"
++       },
++       %{
++         state: "Pennsylvania",
++         house_number: nil,
++         road: "East King Street",
++         neighbourhood: "Central Business District",
++         city: "Lancaster",
++         county: "Lancaster County",
++         country: "United States"
++       }},
++      {"West Kill, New York",
++       %{
++         "country" => "United States",
++         "county" => "Greene County",
++         "hamlet" => "West Kill",
++         "road" => "State Route 42",
++         "state" => "New York",
++         "village" => "Town of Lexington"
++       },
++       %{
++         state: "New York",
++         house_number: nil,
++         road: "State Route 42",
++         neighbourhood: "West Kill",
++         city: "Town of Lexington",
++         county: "Greene County",
++         country: "United States"
++       }},
++      {"Austin, Texas",
++       %{
++         "city" => "Austin",
++         "country" => "United States",
++         "county" => "Travis County",
++         "house_number" => "1",
++         "road" => "Tesla Road",
++         "state" => "Texas"
++       },
++       %{
++         state: "Texas",
++         house_number: "1",
++         road: "Tesla Road",
++         neighbourhood: nil,
++         city: "Austin",
++         county: "Travis County",
++         country: "United States"
++       }},
++      {"Sydney",
++       %{
++         "city" => "Sydney",
++         "country" => "Australia",
++         "house_number" => "25",
++         "neighbourhood" => "Wynyard",
++         "road" => "Martin Place",
++         "state" => "New South Wales",
++         "suburb" => "Sydney"
++       },
++       %{
++         state: "New South Wales",
++         house_number: "25",
++         road: "Martin Place",
++         neighbourhood: "Wynyard",
++         city: "Sydney",
++         county: nil,
++         country: "Australia"
++       }},
++      {"Melbourne, Prahran",
++       %{
++         "city" => "Melbourne",
++         "country" => "Australia",
++         "house_number" => "14",
++         "road" => "Errol Street",
++         "state" => "Victoria",
++         "suburb" => "Prahran"
++       },
++       %{
++         state: "Victoria",
++         house_number: "14",
++         road: "Errol Street",
++         neighbourhood: "Prahran",
++         city: "Melbourne",
++         county: nil,
++         country: "Australia"
++       }},
++      {"Darwin, Northern Territory",
++       %{
++         "city" => "Darwin",
++         "city_district" => "Darwin City",
++         "country" => "Australia",
++         "road" => "Bennett Street",
++         "suburb" => "Darwin City",
++         "territory" => "Northern Territory"
++       },
++       %{
++         state: "Northern Territory",
++         house_number: nil,
++         road: "Bennett Street",
++         neighbourhood: "Darwin City",
++         city: "Darwin",
++         county: nil,
++         country: "Australia"
++       }},
++      {"Belli Park, Queensland",
++       %{
++         "city_district" => "Belli Park",
++         "country" => "Australia",
++         "road" => "Ford Break",
++         "state" => "Queensland"
++       },
++       %{
++         state: "Queensland",
++         house_number: nil,
++         road: "Ford Break",
++         neighbourhood: "Belli Park",
++         city: nil,
++         county: nil,
++         country: "Australia"
++       }},
++      {"Berlin, Mitte",
++       %{
++         "borough" => "Mitte",
++         "city" => "Berlin",
++         "country" => "Germany",
++         "neighbourhood" => "Nikolaiviertel",
++         "quarter" => "Spandauer Vorstadt",
++         "road" => "Spandauer Straße",
++         "suburb" => "Mitte"
++       },
++       %{
++         state: nil,
++         house_number: nil,
++         road: "Spandauer Straße",
++         neighbourhood: "Nikolaiviertel",
++         city: "Berlin",
++         county: nil,
++         country: "Germany"
++       }},
++      {"Kelheim, Bavaria",
++       %{
++         "country" => "Germany",
++         "county" => "Landkreis Kelheim",
++         "road" => "Giselastraße",
++         "state" => "Bavaria",
++         "suburb" => "Affecking",
++         "town" => "Kelheim"
++       },
++       %{
++         state: "Bavaria",
++         house_number: nil,
++         road: "Giselastraße",
++         neighbourhood: "Affecking",
++         city: "Kelheim",
++         county: "Landkreis Kelheim",
++         country: "Germany"
++       }},
++      {"Oslo",
++       %{
++         "city" => "Oslo",
++         "city_district" => "Oslo",
++         "country" => "Norway",
++         "neighbourhood" => "Sjøtomta",
++         "quarter" => "Vaterland",
++         "road" => "Storgata",
++         "suburb" => "Sentrum"
++       },
++       %{
++         state: nil,
++         house_number: nil,
++         road: "Storgata",
++         neighbourhood: "Sjøtomta",
++         city: "Oslo",
++         county: nil,
++         country: "Norway"
++       }},
++      {"Lillehammer, Innlandet",
++       %{
++         "country" => "Norway",
++         "county" => "Innlandet",
++         "house_number" => "18",
++         "municipality" => "Lillehammer",
++         "quarter" => "Langset",
++         "road" => "Høstmælingsvegen",
++         "town" => "Lillehammer"
++       },
++       %{
++         state: nil,
++         house_number: "18",
++         road: "Høstmælingsvegen",
++         neighbourhood: "Langset",
++         city: "Lillehammer",
++         county: "Innlandet",
++         country: "Norway"
++       }},
++      {"Tokyo, Shinjuku",
++       %{
++         "city" => "Shinjuku",
++         "country" => "Japan",
++         "house_number" => "1",
++         "neighbourhood" => "Nishi-Shinjuku 2",
++         "quarter" => "Nishi-Shinjuku"
++       },
++       %{
++         state: nil,
++         house_number: "1",
++         road: nil,
++         neighbourhood: "Nishi-Shinjuku 2",
++         city: "Shinjuku",
++         county: nil,
++         country: "Japan"
++       }}
++    ]
++
+     setup_with_mocks([
+       {Tesla.Adapter.Finch, [],
+        call: fn %Tesla.Env{} = env, _opts ->
+@@ -381,5 +707,12 @@ defmodule TeslaMate.Locations.GeocoderTest do
+         assert %{unquote(field) => "first"} = address_fields(address)
+       end
+     end
++
++    for {place, address, fields} <- @recorded do
++      test "recorded address: #{place}" do
++        address = unquote(Macro.escape(address))
++        assert Map.take(address_fields(address), @field_names) == unquote(Macro.escape(fields))
++      end
++    end
+   end
+ end
+
+From 3b78fed7147eb4d4e755962d2b599c20578b91e1 Mon Sep 17 00:00:00 2001
+From: Jakob Lichterfeld <jakob-lichterfeld@gmx.de>
+Date: Fri, 25 Sep 2026 10:49:05 +0200
+Subject: [PATCH 4/7] fix(geocoder): keep pedestrian areas as road and leave
+ region unmapped
+
+Real lookups showed two wrong premises: Nominatim labels a street area below rank 26 with its highway type (Red Square comes as pedestrian), and region has no fixed level (a municipal district in Ireland, a federal district in Russia). pedestrian, footway and path fill road again; region fills nothing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ elixir/lib/teslamate/locations/geocoder.ex        | 11 +++++++----
+ elixir/test/teslamate/locations/geocoder_test.exs | 12 ++++++++++--
+ 2 files changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/elixir/lib/teslamate/locations/geocoder.ex b/elixir/lib/teslamate/locations/geocoder.ex
+index 1ac7df2871..410ba56274 100644
+--- a/elixir/lib/teslamate/locations/geocoder.ex
++++ b/elixir/lib/teslamate/locations/geocoder.ex
+@@ -85,13 +85,16 @@ defmodule TeslaMate.Locations.Geocoder do
+   # administrative boundaries; a label with two sources takes the rank of the
+   # one used more often in OSM. Within a field the more specific label goes
+   # first, and place and boundary labels go before landuse labels, which
+-  # describe how land is used rather than a locality. territory is undocumented
+-  # but appears on state-level boundaries (Australian Capital Territory).
++  # describe how land is used rather than a locality. A street area below rank
++  # 26 carries its highway type as label (pedestrian: Red Square). territory
++  # is undocumented but appears on state-level boundaries (Australian Capital
++  # Territory). region is left out: its level varies by country, from a
++  # municipal district in Ireland to a federal district in Russia.
+   # Sources: https://github.com/osm-search/Nominatim (docs/api/Output.md,
+   # settings/address-levels.json, src/nominatim_api/v1/)
+ 
+   # street: ranks 25-27
+-  @road_labels ~w(road isolated_dwelling farm city_block mountain_pass square locality)
++  @road_labels ~w(road pedestrian footway path isolated_dwelling farm city_block mountain_pass square locality)
+ 
+   # district and locality: ranks 17-24
+   @neighbourhood_labels ~w(neighbourhood subdivision quarter suburb hamlet croft borough city_district) ++
+@@ -104,7 +107,7 @@ defmodule TeslaMate.Locations.Geocoder do
+   @county_labels ~w(county district)
+ 
+   # state: ranks 5-9
+-  @state_labels ~w(state province territory region)
++  @state_labels ~w(state province territory)
+ 
+   defp into_address(%{"error" => "Unable to geocode"} = raw) do
+     unknown_address = %{
+diff --git a/elixir/test/teslamate/locations/geocoder_test.exs b/elixir/test/teslamate/locations/geocoder_test.exs
+index 408dd7a779..b80af1b03a 100644
+--- a/elixir/test/teslamate/locations/geocoder_test.exs
++++ b/elixir/test/teslamate/locations/geocoder_test.exs
+@@ -340,12 +340,13 @@ defmodule TeslaMate.Locations.GeocoderTest do
+     # contains wins.
+     @fields [
+       house_number: ~w(house_number),
+-      road: ~w(road isolated_dwelling farm city_block mountain_pass square locality),
++      road:
++        ~w(road pedestrian footway path isolated_dwelling farm city_block mountain_pass square locality),
+       neighbourhood:
+         ~w(neighbourhood subdivision quarter suburb hamlet croft borough city_district residential farmyard industrial commercial allotments retail),
+       city: ~w(city town village municipality),
+       county: ~w(county district),
+-      state: ~w(state province territory region),
++      state: ~w(state province territory),
+       country: ~w(country)
+     ]
+ 
+@@ -708,6 +709,13 @@ defmodule TeslaMate.Locations.GeocoderTest do
+       end
+     end
+ 
++    # Its level varies by country: a municipal district in Ireland, a federal
++    # district in Russia.
++    test "region fills no field" do
++      fields = address_fields(%{"region" => "value"})
++      assert for(name <- @field_names, fields[name] != nil, do: name) == []
++    end
++
+     for {place, address, fields} <- @recorded do
+       test "recorded address: #{place}" do
+         address = unquote(Macro.escape(address))
+
+From d5b60dfc7320b6476a277e11e0b26b75701dee9f Mon Sep 17 00:00:00 2001
+From: Jakob Lichterfeld <jakob-lichterfeld@gmx.de>
+Date: Fri, 25 Sep 2026 12:25:12 +0200
+Subject: [PATCH 5/7] fix(geocoder): map boundary place values at their
+ boundary's level, and city_block as a locality
+
+A boundary's place value is its label at the boundary's rank. For the undocumented ones the rank follows the admin_level their boundaries carry in OSM: township and subcounty (8) fill city again, subdistrict (mostly 7) now fills city, ward (9) neighbourhood and department (6) county. city_block comes as a boundary of rank 24 in real responses (Paris, Jakarta), so it fills neighbourhood instead of road. A rural Spanish address pins the locality that fills an empty road.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ elixir/lib/teslamate/locations/geocoder.ex    | 35 +++++++++++--------
+ .../teslamate/locations/geocoder_test.exs     | 27 ++++++++++----
+ 2 files changed, 41 insertions(+), 21 deletions(-)
+
+diff --git a/elixir/lib/teslamate/locations/geocoder.ex b/elixir/lib/teslamate/locations/geocoder.ex
+index 410ba56274..324d87d956 100644
+--- a/elixir/lib/teslamate/locations/geocoder.ex
++++ b/elixir/lib/teslamate/locations/geocoder.ex
+@@ -82,29 +82,34 @@ defmodule TeslaMate.Locations.Geocoder do
+   # A label fills the field whose rank range holds the label's address rank,
+   # the way Nominatim assigns ranks to GeocodeJSON fields (GEOCODEJSON_RANKS).
+   # The ranks come from settings/address-levels.json, and from ADMIN_LABELS for
+-  # administrative boundaries; a label with two sources takes the rank of the
+-  # one used more often in OSM. Within a field the more specific label goes
+-  # first, and place and boundary labels go before landuse labels, which
+-  # describe how land is used rather than a locality. A street area below rank
+-  # 26 carries its highway type as label (pedestrian: Red Square). territory
+-  # is undocumented but appears on state-level boundaries (Australian Capital
+-  # Territory). region is left out: its level varies by country, from a
+-  # municipal district in Ireland to a federal district in Russia.
++  # administrative boundaries. A label with two sources takes the rank seen in
++  # real responses (city_block: boundaries of rank 24 in Paris and Jakarta),
++  # otherwise the rank of the source used more often in OSM. Within a field the
++  # more specific label goes first, and place and boundary labels go before
++  # landuse labels, which describe how land is used rather than a locality.
++  #
++  # Beyond the documentation: a street area below rank 26 carries its highway
++  # type as label (pedestrian: Red Square). A boundary's place value is its
++  # label at the boundary's rank; for the undocumented ones the rank follows
++  # the admin_level their boundaries carry in OSM: territory 4, department 6,
++  # subdistrict mostly 7, township and subcounty 8, ward 9. region is left out:
++  # its level varies by country, from a municipal district in Ireland to a
++  # federal district in Russia.
+   # Sources: https://github.com/osm-search/Nominatim (docs/api/Output.md,
+   # settings/address-levels.json, src/nominatim_api/v1/)
+ 
+   # street: ranks 25-27
+-  @road_labels ~w(road pedestrian footway path isolated_dwelling farm city_block mountain_pass square locality)
++  @road_labels ~w(road pedestrian footway path isolated_dwelling farm mountain_pass square locality)
+ 
+   # district and locality: ranks 17-24
+-  @neighbourhood_labels ~w(neighbourhood subdivision quarter suburb hamlet croft borough city_district) ++
++  @neighbourhood_labels ~w(neighbourhood city_block subdivision quarter suburb hamlet croft borough city_district ward) ++
+                           ~w(residential farmyard industrial commercial allotments retail)
+ 
+   # city: ranks 13-16
+-  @city_labels ~w(city town village municipality)
++  @city_labels ~w(city town village township subcounty municipality subdistrict)
+ 
+   # county: ranks 10-12
+-  @county_labels ~w(county district)
++  @county_labels ~w(county district department)
+ 
+   # state: ranks 5-9
+   @state_labels ~w(state province territory)
+@@ -151,11 +156,11 @@ defmodule TeslaMate.Locations.Geocoder do
+     {:ok, address}
+   end
+ 
+-  defp get_first(nil, _aliases), do: nil
++  defp get_first(nil, _labels), do: nil
+   defp get_first(_address, []), do: nil
+ 
+-  defp get_first(address, [key | aliases]) do
+-    with nil <- Map.get(address, key), do: get_first(address, aliases)
++  defp get_first(address, [label | labels]) do
++    with nil <- Map.get(address, label), do: get_first(address, labels)
+   end
+ 
+   defp log_level({:ok, %Tesla.Env{} = env}) when env.status >= 400, do: :warning
+diff --git a/elixir/test/teslamate/locations/geocoder_test.exs b/elixir/test/teslamate/locations/geocoder_test.exs
+index b80af1b03a..1cf5f8b92e 100644
+--- a/elixir/test/teslamate/locations/geocoder_test.exs
++++ b/elixir/test/teslamate/locations/geocoder_test.exs
+@@ -340,12 +340,11 @@ defmodule TeslaMate.Locations.GeocoderTest do
+     # contains wins.
+     @fields [
+       house_number: ~w(house_number),
+-      road:
+-        ~w(road pedestrian footway path isolated_dwelling farm city_block mountain_pass square locality),
++      road: ~w(road pedestrian footway path isolated_dwelling farm mountain_pass square locality),
+       neighbourhood:
+-        ~w(neighbourhood subdivision quarter suburb hamlet croft borough city_district residential farmyard industrial commercial allotments retail),
+-      city: ~w(city town village municipality),
+-      county: ~w(county district),
++        ~w(neighbourhood city_block subdivision quarter suburb hamlet croft borough city_district ward residential farmyard industrial commercial allotments retail),
++      city: ~w(city town village township subcounty municipality subdistrict),
++      county: ~w(county district department),
+       state: ~w(state province territory),
+       country: ~w(country)
+     ]
+@@ -354,7 +353,7 @@ defmodule TeslaMate.Locations.GeocoderTest do
+ 
+     # Address parts of real reverse lookups on nominatim.openstreetmap.org
+     # (September 2026, parameters of reverse_lookup/3, Accept-Language: en),
+-    # limited to the labels above: 92 address parts, an insubstantial extract
++    # limited to the labels above: 96 address parts, an insubstantial extract
+     # under the ODbL (fewer than 100 features, OSMF Substantial Guideline).
+     @recorded [
+       {"Beijing, Chaoyang",
+@@ -675,6 +674,22 @@ defmodule TeslaMate.Locations.GeocoderTest do
+          city: "Shinjuku",
+          county: nil,
+          country: "Japan"
++       }},
++      {"Mondéjar, Castile-La Mancha",
++       %{
++         "country" => "Spain",
++         "locality" => "Cerro de la Cabaña",
++         "state" => "Castile-La Mancha",
++         "village" => "Mondéjar"
++       },
++       %{
++         state: "Castile-La Mancha",
++         house_number: nil,
++         road: "Cerro de la Cabaña",
++         neighbourhood: nil,
++         city: "Mondéjar",
++         county: nil,
++         country: "Spain"
+        }}
+     ]
+ 
+
+From 872e875ee715b0398d00c3d0cbfbcfd69f10ddd8 Mon Sep 17 00:00:00 2001
+From: Jakob Lichterfeld <jakob-lichterfeld@gmx.de>
+Date: Fri, 25 Sep 2026 12:25:34 +0200
+Subject: [PATCH 6/7] fix(grafana): fall back to the neighbourhood where an
+ address has no city
+
+Seven dashboards print the city of an address directly. An address in a hamlet without a village, town or municipality has no city now that the geocoder follows Nominatim's ranks, so they print the neighbourhood instead, as the Locations dashboard already does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ grafana/dashboards/charges.json                 | 2 +-
+ grafana/dashboards/charging-stats.json          | 6 +++---
+ grafana/dashboards/drives.json                  | 2 +-
+ grafana/dashboards/internal/charge-details.json | 2 +-
+ grafana/dashboards/reports/dutch-tax.json       | 2 +-
+ grafana/dashboards/timeline.json                | 2 +-
+ grafana/dashboards/trip.json                    | 4 ++--
+ 7 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/grafana/dashboards/charges.json b/grafana/dashboards/charges.json
+index 4ca8be4d6e..ce1d6345b0 100644
+--- a/grafana/dashboards/charges.json
++++ b/grafana/dashboards/charges.json
+@@ -1175,7 +1175,7 @@
+           "editorMode": "code",
+           "format": "table",
+           "rawQuery": true,
+-          "rawSql": "WITH data AS (\n    SELECT\n        floor(extract(epoch FROM start_date)) * 1000 AS start_date_ts,\n        ceil(extract(epoch FROM end_date)) * 1000 AS end_date_ts,\n        start_date,\n        end_date,\n        CONCAT_WS(', ', COALESCE(addresses.name, nullif(CONCAT_WS(' ', addresses.road, addresses.house_number), '')), addresses.city) AS address,\n        g.name as geofence_name,\n        g.id as geofence_id,\n        p.latitude,\n        p.longitude,\n        cp.charge_energy_added,\n        cp.charge_energy_used,\n        duration_min,\n        start_battery_level,\n        end_battery_level,\n        end_${preferred_range}_range_km - start_${preferred_range}_range_km as range_added,\n        outside_temp_avg,\n        cp.id,\n        p.odometer - lag(p.odometer) OVER (ORDER BY start_date) AS distance,\n        cars.efficiency,\n        cp.car_id,\n        cost,\n        max(c.charger_voltage) as max_charger_voltage,\n        CASE WHEN NULLIF(mode() within group (order by charger_phases),0) is null THEN 'DC' ELSE 'AC' END AS charge_type,\n        p.odometer as odometer\n    FROM\n        charging_processes cp\n\tLEFT JOIN charges c ON cp.id = c.charging_process_id\n    LEFT JOIN positions p ON p.id = cp.position_id\n    LEFT JOIN cars ON cars.id = cp.car_id\n    LEFT JOIN addresses ON addresses.id = cp.address_id\n    LEFT JOIN geofences g ON g.id = geofence_id\n    WHERE \n        cp.car_id = $car_id AND\n        $__timeFilter(start_date) AND\n        (cp.charge_energy_added IS NULL OR cp.charge_energy_added > 0) AND\n        ('${geofence:pipe}' = '-1' OR geofence_id in ($geofence))\n    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, p.odometer\n    ORDER BY\n        start_date\n)\nSELECT\n    start_date_ts,\n    end_date_ts,\n    CASE WHEN geofence_id IS NULL THEN CONCAT('new?lat=', latitude, '&lng=', longitude)\n         WHEN geofence_id IS NOT NULL THEN CONCAT(geofence_id, '/edit')\n    END as path,\n    car_id,\n    id,\n    -- Columns\n    start_date,\n    end_date,\n    COALESCE(geofence_name, address) as address,    \n    charge_type,\n    duration_min,\n    cost,\n    cost / NULLIF(greatest(charge_energy_added, charge_energy_used), 0) as cost_per_kwh,\n    charge_energy_added,\n    greatest(charge_energy_used, charge_energy_added) as charge_energy_used,\n    charge_energy_added / greatest(charge_energy_used, charge_energy_added) as charging_efficiency,\n    convert_celsius(outside_temp_avg, '$temp_unit') AS outside_temp_avg_$temp_unit,\n    charge_energy_added * 60 / NULLIF (duration_min, 0) AS charge_energy_added_per_hour,\n    convert_km(range_added * 60 / NULLIF (duration_min, 0), '$length_unit') AS range_added_per_hour_$length_unit,\n    convert_km(range_added, '$length_unit') AS range_added_$length_unit,\n    start_battery_level,\n    end_battery_level,\n    convert_km(odometer::numeric, '$length_unit') AS odometer_$length_unit\n FROM\n    data\nWHERE\n    (distance >= 0 OR distance IS NULL)\n    AND duration_min >= '$min_duration_min'\n    AND \n        CASE\n            WHEN '$cost' !~ '^[0-9]+$' THEN TRUE \n            ELSE cost >= COALESCE(NULLIF('$cost', '')::NUMERIC, 0) \n        END\n    AND charge_type = ANY(CASE WHEN array_to_string(ARRAY[$charge_type], ',') = 'DC' THEN ARRAY['DC'] WHEN array_to_string(ARRAY[$charge_type], ',') = 'AC' THEN ARRAY['AC'] ELSE ARRAY['DC', 'AC'] END)\n    AND address ILIKE '%$location%'\nORDER BY\n  start_date DESC;",
++          "rawSql": "WITH data AS (\n    SELECT\n        floor(extract(epoch FROM start_date)) * 1000 AS start_date_ts,\n        ceil(extract(epoch FROM end_date)) * 1000 AS end_date_ts,\n        start_date,\n        end_date,\n        CONCAT_WS(', ', COALESCE(addresses.name, nullif(CONCAT_WS(' ', addresses.road, addresses.house_number), '')), COALESCE(addresses.city, addresses.neighbourhood)) AS address,\n        g.name as geofence_name,\n        g.id as geofence_id,\n        p.latitude,\n        p.longitude,\n        cp.charge_energy_added,\n        cp.charge_energy_used,\n        duration_min,\n        start_battery_level,\n        end_battery_level,\n        end_${preferred_range}_range_km - start_${preferred_range}_range_km as range_added,\n        outside_temp_avg,\n        cp.id,\n        p.odometer - lag(p.odometer) OVER (ORDER BY start_date) AS distance,\n        cars.efficiency,\n        cp.car_id,\n        cost,\n        max(c.charger_voltage) as max_charger_voltage,\n        CASE WHEN NULLIF(mode() within group (order by charger_phases),0) is null THEN 'DC' ELSE 'AC' END AS charge_type,\n        p.odometer as odometer\n    FROM\n        charging_processes cp\n\tLEFT JOIN charges c ON cp.id = c.charging_process_id\n    LEFT JOIN positions p ON p.id = cp.position_id\n    LEFT JOIN cars ON cars.id = cp.car_id\n    LEFT JOIN addresses ON addresses.id = cp.address_id\n    LEFT JOIN geofences g ON g.id = geofence_id\n    WHERE \n        cp.car_id = $car_id AND\n        $__timeFilter(start_date) AND\n        (cp.charge_energy_added IS NULL OR cp.charge_energy_added > 0) AND\n        ('${geofence:pipe}' = '-1' OR geofence_id in ($geofence))\n    GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, p.odometer\n    ORDER BY\n        start_date\n)\nSELECT\n    start_date_ts,\n    end_date_ts,\n    CASE WHEN geofence_id IS NULL THEN CONCAT('new?lat=', latitude, '&lng=', longitude)\n         WHEN geofence_id IS NOT NULL THEN CONCAT(geofence_id, '/edit')\n    END as path,\n    car_id,\n    id,\n    -- Columns\n    start_date,\n    end_date,\n    COALESCE(geofence_name, address) as address,    \n    charge_type,\n    duration_min,\n    cost,\n    cost / NULLIF(greatest(charge_energy_added, charge_energy_used), 0) as cost_per_kwh,\n    charge_energy_added,\n    greatest(charge_energy_used, charge_energy_added) as charge_energy_used,\n    charge_energy_added / greatest(charge_energy_used, charge_energy_added) as charging_efficiency,\n    convert_celsius(outside_temp_avg, '$temp_unit') AS outside_temp_avg_$temp_unit,\n    charge_energy_added * 60 / NULLIF (duration_min, 0) AS charge_energy_added_per_hour,\n    convert_km(range_added * 60 / NULLIF (duration_min, 0), '$length_unit') AS range_added_per_hour_$length_unit,\n    convert_km(range_added, '$length_unit') AS range_added_$length_unit,\n    start_battery_level,\n    end_battery_level,\n    convert_km(odometer::numeric, '$length_unit') AS odometer_$length_unit\n FROM\n    data\nWHERE\n    (distance >= 0 OR distance IS NULL)\n    AND duration_min >= '$min_duration_min'\n    AND \n        CASE\n            WHEN '$cost' !~ '^[0-9]+$' THEN TRUE \n            ELSE cost >= COALESCE(NULLIF('$cost', '')::NUMERIC, 0) \n        END\n    AND charge_type = ANY(CASE WHEN array_to_string(ARRAY[$charge_type], ',') = 'DC' THEN ARRAY['DC'] WHEN array_to_string(ARRAY[$charge_type], ',') = 'AC' THEN ARRAY['AC'] ELSE ARRAY['DC', 'AC'] END)\n    AND address ILIKE '%$location%'\nORDER BY\n  start_date DESC;",
+           "refId": "A",
+           "sql": {
+             "columns": [
+diff --git a/grafana/dashboards/charging-stats.json b/grafana/dashboards/charging-stats.json
+index 24d3256d1f..a26c018b57 100644
+--- a/grafana/dashboards/charging-stats.json
++++ b/grafana/dashboards/charging-stats.json
+@@ -1338,7 +1338,7 @@
+           "editorMode": "code",
+           "format": "table",
+           "rawQuery": true,
+-          "rawSql": "WITH charge_data AS (\nSELECT COALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, nullif(CONCAT_WS(' ', address.road, address.house_number), '')), address.city)) AS loc_nm\n, AVG(position.latitude) AS latitude\n, AVG(position.longitude) AS longitude\n, sum(charge.charge_energy_added) AS chg_total\n, count(*) as charges\nFROM charging_processes charge\nLEFT JOIN addresses address ON charge.address_id = address.id\nLEFT JOIN positions position ON charge.position_id = position.id\nLEFT JOIN geofences geofence ON charge.geofence_id = geofence.id\nWHERE $__timeFilter(charge.end_date)\nAND charge.duration_min >= $min_duration\nAND charge.car_id = $car_id\nAND ('${geofence:pipe}' = '-1' OR charge.geofence_id in ($geofence))\nGROUP BY COALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, nullif(CONCAT_WS(' ', address.road, address.house_number), '')), address.city))\n) \nSELECT loc_nm\n\t,latitude\n\t,longitude\n\t,chg_total\n\t,chg_total * 1.0 / (SELECT sum(chg_total) FROM charge_data) * 100   AS pct\n\t,charges\nFROM charge_data",
++          "rawSql": "WITH charge_data AS (\nSELECT COALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, nullif(CONCAT_WS(' ', address.road, address.house_number), '')), COALESCE(address.city, address.neighbourhood))) AS loc_nm\n, AVG(position.latitude) AS latitude\n, AVG(position.longitude) AS longitude\n, sum(charge.charge_energy_added) AS chg_total\n, count(*) as charges\nFROM charging_processes charge\nLEFT JOIN addresses address ON charge.address_id = address.id\nLEFT JOIN positions position ON charge.position_id = position.id\nLEFT JOIN geofences geofence ON charge.geofence_id = geofence.id\nWHERE $__timeFilter(charge.end_date)\nAND charge.duration_min >= $min_duration\nAND charge.car_id = $car_id\nAND ('${geofence:pipe}' = '-1' OR charge.geofence_id in ($geofence))\nGROUP BY COALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, nullif(CONCAT_WS(' ', address.road, address.house_number), '')), COALESCE(address.city, address.neighbourhood)))\n) \nSELECT loc_nm\n\t,latitude\n\t,longitude\n\t,chg_total\n\t,chg_total * 1.0 / (SELECT sum(chg_total) FROM charge_data) * 100   AS pct\n\t,charges\nFROM charge_data",
+           "refId": "A",
+           "sql": {
+             "columns": [
+@@ -2177,7 +2177,7 @@
+           "editorMode": "code",
+           "format": "table",
+           "rawQuery": true,
+-          "rawSql": "SELECT\n\tCOALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, nullif(CONCAT_WS(' ', address.road, address.house_number), '')), address.city)) AS location,\n  sum(charge_energy_added) as charge_energy_added\nFROM\n\tcharging_processes c\nLEFT JOIN addresses address ON c.address_id = address.id\nLEFT JOIN geofences geofence ON geofence_id = geofence.id\nWHERE\n\t$__timeFilter(end_date)\n\tAND duration_min >= $min_duration\n\tAND car_id = $car_id\n\tAND ('${geofence:pipe}' = '-1' OR c.geofence_id in ($geofence))\nGROUP BY\n\t1\nORDER BY\n\tSUM(charge_energy_added) DESC\nLIMIT 17;",
++          "rawSql": "SELECT\n\tCOALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, nullif(CONCAT_WS(' ', address.road, address.house_number), '')), COALESCE(address.city, address.neighbourhood))) AS location,\n  sum(charge_energy_added) as charge_energy_added\nFROM\n\tcharging_processes c\nLEFT JOIN addresses address ON c.address_id = address.id\nLEFT JOIN geofences geofence ON geofence_id = geofence.id\nWHERE\n\t$__timeFilter(end_date)\n\tAND duration_min >= $min_duration\n\tAND car_id = $car_id\n\tAND ('${geofence:pipe}' = '-1' OR c.geofence_id in ($geofence))\nGROUP BY\n\t1\nORDER BY\n\tSUM(charge_energy_added) DESC\nLIMIT 17;",
+           "refId": "A",
+           "sql": {
+             "columns": [
+@@ -2293,7 +2293,7 @@
+           "editorMode": "code",
+           "format": "table",
+           "rawQuery": true,
+-          "rawSql": "SELECT\n\tCOALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, CONCAT_WS(' ', address.road, address.house_number)), address.city)) AS location,\n\tsum(cost) as cost\nFROM\n\tcharging_processes c\n\tLEFT JOIN addresses address ON c.address_id = address.id\n\tLEFT JOIN geofences geofence ON geofence_id = geofence.id\nWHERE\n  $__timeFilter(end_date) AND\n\tduration_min >= $min_duration AND\n\tcar_id = $car_id AND\n\tCOST IS NOT NULL AND\n\t('${geofence:pipe}' = '-1' OR c.geofence_id in ($geofence))\nGROUP BY\n\t1\nORDER BY\n\t2 DESC NULLS LAST\nLIMIT 17;",
++          "rawSql": "SELECT\n\tCOALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, CONCAT_WS(' ', address.road, address.house_number)), COALESCE(address.city, address.neighbourhood))) AS location,\n\tsum(cost) as cost\nFROM\n\tcharging_processes c\n\tLEFT JOIN addresses address ON c.address_id = address.id\n\tLEFT JOIN geofences geofence ON geofence_id = geofence.id\nWHERE\n  $__timeFilter(end_date) AND\n\tduration_min >= $min_duration AND\n\tcar_id = $car_id AND\n\tCOST IS NOT NULL AND\n\t('${geofence:pipe}' = '-1' OR c.geofence_id in ($geofence))\nGROUP BY\n\t1\nORDER BY\n\t2 DESC NULLS LAST\nLIMIT 17;",
+           "refId": "A",
+           "sql": {
+             "columns": [
+diff --git a/grafana/dashboards/drives.json b/grafana/dashboards/drives.json
+index ea0c04403b..b5e0abb54e 100644
+--- a/grafana/dashboards/drives.json
++++ b/grafana/dashboards/drives.json
+@@ -1265,7 +1265,7 @@
+           "editorMode": "code",
+           "format": "table",
+           "rawQuery": true,
+-          "rawSql": "WITH data AS (\n  SELECT\n    floor(extract(epoch FROM start_date)) * 1000 AS start_date_ts,\n    ceil(extract(epoch FROM end_date)) * 1000 AS end_date_ts,\n    car.id as car_id,\n    CASE\n      WHEN start_geofence.id IS NULL THEN CONCAT('new?lat=', start_position.latitude, '&lng=', start_position.longitude)\n      WHEN start_geofence.id IS NOT NULL THEN CONCAT(start_geofence.id, '/edit')\n    END as start_path,\n    CASE\n      WHEN end_geofence.id IS NULL THEN CONCAT('new?lat=', end_position.latitude, '&lng=', end_position.longitude)\n      WHEN end_geofence.id IS NOT NULL THEN CONCAT(end_geofence.id, '/edit')\n    END as end_path,\n    TO_CHAR((duration_min * INTERVAL '1 minute'), 'HH24:MI') as duration_str,\n    drives.id as drive_id,\n    -- Columns\n    start_date,\n    COALESCE(start_geofence.name, CONCAT_WS(', ', COALESCE(start_address.name, nullif(CONCAT_WS(' ', start_address.road, start_address.house_number), '')), start_address.city)) AS start_address,\n    COALESCE(end_geofence.name, CONCAT_WS(', ', COALESCE(end_address.name, nullif(CONCAT_WS(' ', end_address.road, end_address.house_number), '')), end_address.city)) AS end_address,\n    duration_min,\n    distance,\n    start_position.battery_level as start_battery_level,\n    end_position.battery_level as end_battery_level,\n    start_${preferred_range}_range_km - end_${preferred_range}_range_km as range_diff,\n    car.efficiency as car_efficiency,\n    outside_temp_avg,\n    distance / coalesce(NULLIF(duration_min, 0) * 60, extract(epoch from end_date - start_date)) * 3600 AS avg_speed,\n    speed_max,\n    power_max,\n    ascent,\n    descent\n  FROM drives\n  LEFT JOIN addresses start_address ON start_address_id = start_address.id\n  LEFT JOIN addresses end_address ON end_address_id = end_address.id\n  LEFT JOIN positions start_position ON start_position_id = start_position.id\n  LEFT JOIN positions end_position ON end_position_id = end_position.id\n  LEFT JOIN geofences start_geofence ON start_geofence_id = start_geofence.id\n  LEFT JOIN geofences end_geofence ON end_geofence_id = end_geofence.id\n  LEFT JOIN cars car ON car.id = drives.car_id\n  WHERE $__timeFilter(start_date) AND drives.car_id = $car_id \n    AND convert_km(distance::numeric, '$length_unit') >= $min_dist \n    AND convert_km(distance::numeric, '$length_unit') / coalesce(NULLIF(duration_min, 0) * 60, extract(epoch from end_date - start_date)) * 3600 >= $min_speed \n    AND ('${geofence:pipe}' = '-1' OR start_geofence.id in ($geofence) OR end_geofence.id in ($geofence)) \n),\n\nreduced_range_info as (\n\n  select\n    drive_id,\n    case\n        when sum(case when battery_level - usable_battery_level > 0 then 1 else 0 end)::numeric / count(*) > 0.25 then true\n        else false\n    end as reduced_range\n  from positions p where $__timeFilter(date) AND car_id = $car_id and p.ideal_battery_range_km is not null group by p.drive_id  \n\n)\n\nSELECT\n    start_date_ts,\n    end_date_ts,\n    car_id,\n    start_path,\n    end_path,\n    duration_str,\n    data.drive_id,\n    -- Columns\n    start_date,\n    start_address,\n    end_address,\n    duration_min,\n    convert_km(distance::numeric, '$length_unit') AS distance_$length_unit,\n    start_battery_level as \"% Start\",\n    end_battery_level as \"% End\",\n    convert_celsius(outside_temp_avg, '$temp_unit') AS outside_temp_$temp_unit,\n    convert_km(avg_speed::numeric, '$length_unit') AS speed_avg_$length_unit,\n    convert_km(speed_max::numeric, '$length_unit') AS speed_max_$length_unit,\n    power_max,\n    reduced_range as has_reduced_range,\n    CASE\n      WHEN range_diff > 0 and 'by distance' = '$efficiency' THEN distance / range_diff\n      WHEN 'slope-adjusted' = '$efficiency' THEN\n        distance * car_efficiency -- Energy at 100% efficiency\n        / nullif((\n             (range_diff) * car_efficiency -- Actual Energy\n             + 2100 * 0.85 * 9.81 * descent / 3600 / 1000 -- Potential energy recovered from descent\n             - 2100 * 9.81 * ascent / 3600 / 1000 -- Potential energy for ascent\n        ), 0)\n      ELSE NULL\n    END as efficiency,\n    range_diff * car_efficiency as \"consumption_kWh\",\n    range_diff * car_efficiency / convert_km(distance::numeric, '$length_unit') * 1000 as consumption_kWh_$length_unit\nFROM data\n  left join reduced_range_info on data.drive_id = reduced_range_info.drive_id\nWHERE\n    start_address ILIKE '%$location%' OR end_address ILIKE '%$location%'\nORDER BY data.drive_id DESC;",
++          "rawSql": "WITH data AS (\n  SELECT\n    floor(extract(epoch FROM start_date)) * 1000 AS start_date_ts,\n    ceil(extract(epoch FROM end_date)) * 1000 AS end_date_ts,\n    car.id as car_id,\n    CASE\n      WHEN start_geofence.id IS NULL THEN CONCAT('new?lat=', start_position.latitude, '&lng=', start_position.longitude)\n      WHEN start_geofence.id IS NOT NULL THEN CONCAT(start_geofence.id, '/edit')\n    END as start_path,\n    CASE\n      WHEN end_geofence.id IS NULL THEN CONCAT('new?lat=', end_position.latitude, '&lng=', end_position.longitude)\n      WHEN end_geofence.id IS NOT NULL THEN CONCAT(end_geofence.id, '/edit')\n    END as end_path,\n    TO_CHAR((duration_min * INTERVAL '1 minute'), 'HH24:MI') as duration_str,\n    drives.id as drive_id,\n    -- Columns\n    start_date,\n    COALESCE(start_geofence.name, CONCAT_WS(', ', COALESCE(start_address.name, nullif(CONCAT_WS(' ', start_address.road, start_address.house_number), '')), COALESCE(start_address.city, start_address.neighbourhood))) AS start_address,\n    COALESCE(end_geofence.name, CONCAT_WS(', ', COALESCE(end_address.name, nullif(CONCAT_WS(' ', end_address.road, end_address.house_number), '')), COALESCE(end_address.city, end_address.neighbourhood))) AS end_address,\n    duration_min,\n    distance,\n    start_position.battery_level as start_battery_level,\n    end_position.battery_level as end_battery_level,\n    start_${preferred_range}_range_km - end_${preferred_range}_range_km as range_diff,\n    car.efficiency as car_efficiency,\n    outside_temp_avg,\n    distance / coalesce(NULLIF(duration_min, 0) * 60, extract(epoch from end_date - start_date)) * 3600 AS avg_speed,\n    speed_max,\n    power_max,\n    ascent,\n    descent\n  FROM drives\n  LEFT JOIN addresses start_address ON start_address_id = start_address.id\n  LEFT JOIN addresses end_address ON end_address_id = end_address.id\n  LEFT JOIN positions start_position ON start_position_id = start_position.id\n  LEFT JOIN positions end_position ON end_position_id = end_position.id\n  LEFT JOIN geofences start_geofence ON start_geofence_id = start_geofence.id\n  LEFT JOIN geofences end_geofence ON end_geofence_id = end_geofence.id\n  LEFT JOIN cars car ON car.id = drives.car_id\n  WHERE $__timeFilter(start_date) AND drives.car_id = $car_id \n    AND convert_km(distance::numeric, '$length_unit') >= $min_dist \n    AND convert_km(distance::numeric, '$length_unit') / coalesce(NULLIF(duration_min, 0) * 60, extract(epoch from end_date - start_date)) * 3600 >= $min_speed \n    AND ('${geofence:pipe}' = '-1' OR start_geofence.id in ($geofence) OR end_geofence.id in ($geofence)) \n),\n\nreduced_range_info as (\n\n  select\n    drive_id,\n    case\n        when sum(case when battery_level - usable_battery_level > 0 then 1 else 0 end)::numeric / count(*) > 0.25 then true\n        else false\n    end as reduced_range\n  from positions p where $__timeFilter(date) AND car_id = $car_id and p.ideal_battery_range_km is not null group by p.drive_id  \n\n)\n\nSELECT\n    start_date_ts,\n    end_date_ts,\n    car_id,\n    start_path,\n    end_path,\n    duration_str,\n    data.drive_id,\n    -- Columns\n    start_date,\n    start_address,\n    end_address,\n    duration_min,\n    convert_km(distance::numeric, '$length_unit') AS distance_$length_unit,\n    start_battery_level as \"% Start\",\n    end_battery_level as \"% End\",\n    convert_celsius(outside_temp_avg, '$temp_unit') AS outside_temp_$temp_unit,\n    convert_km(avg_speed::numeric, '$length_unit') AS speed_avg_$length_unit,\n    convert_km(speed_max::numeric, '$length_unit') AS speed_max_$length_unit,\n    power_max,\n    reduced_range as has_reduced_range,\n    CASE\n      WHEN range_diff > 0 and 'by distance' = '$efficiency' THEN distance / range_diff\n      WHEN 'slope-adjusted' = '$efficiency' THEN\n        distance * car_efficiency -- Energy at 100% efficiency\n        / nullif((\n             (range_diff) * car_efficiency -- Actual Energy\n             + 2100 * 0.85 * 9.81 * descent / 3600 / 1000 -- Potential energy recovered from descent\n             - 2100 * 9.81 * ascent / 3600 / 1000 -- Potential energy for ascent\n        ), 0)\n      ELSE NULL\n    END as efficiency,\n    range_diff * car_efficiency as \"consumption_kWh\",\n    range_diff * car_efficiency / convert_km(distance::numeric, '$length_unit') * 1000 as consumption_kWh_$length_unit\nFROM data\n  left join reduced_range_info on data.drive_id = reduced_range_info.drive_id\nWHERE\n    start_address ILIKE '%$location%' OR end_address ILIKE '%$location%'\nORDER BY data.drive_id DESC;",
+           "refId": "A",
+           "sql": {
+             "columns": [
+diff --git a/grafana/dashboards/internal/charge-details.json b/grafana/dashboards/internal/charge-details.json
+index 170db1112e..416ff18995 100644
+--- a/grafana/dashboards/internal/charge-details.json
++++ b/grafana/dashboards/internal/charge-details.json
+@@ -691,7 +691,7 @@
+           "editorMode": "code",
+           "format": "table",
+           "rawQuery": true,
+-          "rawSql": "SELECT\n  COALESCE(g.name, CONCAT_WS(', ', COALESCE(addresses.name, CONCAT_WS(' ', addresses.road, addresses.house_number)), addresses.city))\nFROM\n\tcharging_processes c\n\tLEFT JOIN addresses ON addresses.id = c.address_id\n\tLEFT JOIN geofences g ON g.id = geofence_id\nWHERE\n\tc.id = $charging_process_id",
++          "rawSql": "SELECT\n  COALESCE(g.name, CONCAT_WS(', ', COALESCE(addresses.name, CONCAT_WS(' ', addresses.road, addresses.house_number)), COALESCE(addresses.city, addresses.neighbourhood)))\nFROM\n\tcharging_processes c\n\tLEFT JOIN addresses ON addresses.id = c.address_id\n\tLEFT JOIN geofences g ON g.id = geofence_id\nWHERE\n\tc.id = $charging_process_id",
+           "refId": "A",
+           "sql": {
+             "columns": [
+diff --git a/grafana/dashboards/reports/dutch-tax.json b/grafana/dashboards/reports/dutch-tax.json
+index 5f930f6f69..d27480ec96 100644
+--- a/grafana/dashboards/reports/dutch-tax.json
++++ b/grafana/dashboards/reports/dutch-tax.json
+@@ -319,7 +319,7 @@
+           "editorMode": "code",
+           "format": "table",
+           "rawQuery": true,
+-          "rawSql": "WITH data AS (\n  SELECT\n    drives.id as drive_id,\n    floor(extract(epoch FROM start_date)) * 1000 AS start_date_ts,\n    ceil(extract(epoch FROM end_date)) * 1000 AS end_date_ts,\n    start_km,\n    end_km,\n    CONCAT_WS(', ', CONCAT_WS(' ', start_address.road, start_address.house_number), start_address.city) AS start_address,\n    CONCAT_WS(', ', CONCAT_WS(' ', end_address.road, end_address.house_number), end_address.city) AS end_address,\n    duration_min,\n    distance\n  FROM drives\n  LEFT JOIN addresses start_address ON start_address_id = start_address.id\n  LEFT JOIN addresses end_address ON end_address_id = end_address.id\n  LEFT JOIN cars car ON car.id = drives.car_id\n  WHERE $__timeFilter(start_date) AND drives.car_id = $car_id\n  ORDER BY drive_id DESC\n)\nSELECT\n    drive_id,\n    start_date_ts,\n    convert_km(start_km::numeric, '$length_unit') as start_$length_unit,\n    start_address,\n    end_date_ts,\n    convert_km(end_km::numeric, '$length_unit') as end_$length_unit,\n    end_address,\n    duration_min,\n    convert_km(distance::numeric, '$length_unit') AS distance_$length_unit\nFROM data;",
++          "rawSql": "WITH data AS (\n  SELECT\n    drives.id as drive_id,\n    floor(extract(epoch FROM start_date)) * 1000 AS start_date_ts,\n    ceil(extract(epoch FROM end_date)) * 1000 AS end_date_ts,\n    start_km,\n    end_km,\n    CONCAT_WS(', ', CONCAT_WS(' ', start_address.road, start_address.house_number), COALESCE(start_address.city, start_address.neighbourhood)) AS start_address,\n    CONCAT_WS(', ', CONCAT_WS(' ', end_address.road, end_address.house_number), COALESCE(end_address.city, end_address.neighbourhood)) AS end_address,\n    duration_min,\n    distance\n  FROM drives\n  LEFT JOIN addresses start_address ON start_address_id = start_address.id\n  LEFT JOIN addresses end_address ON end_address_id = end_address.id\n  LEFT JOIN cars car ON car.id = drives.car_id\n  WHERE $__timeFilter(start_date) AND drives.car_id = $car_id\n  ORDER BY drive_id DESC\n)\nSELECT\n    drive_id,\n    start_date_ts,\n    convert_km(start_km::numeric, '$length_unit') as start_$length_unit,\n    start_address,\n    end_date_ts,\n    convert_km(end_km::numeric, '$length_unit') as end_$length_unit,\n    end_address,\n    duration_min,\n    convert_km(distance::numeric, '$length_unit') AS distance_$length_unit\nFROM data;",
+           "refId": "A",
+           "sql": {
+             "columns": [
+diff --git a/grafana/dashboards/timeline.json b/grafana/dashboards/timeline.json
+index 7852a2eace..afe9a8b234 100644
+--- a/grafana/dashboards/timeline.json
++++ b/grafana/dashboards/timeline.json
+@@ -520,7 +520,7 @@
+           "editorMode": "code",
+           "format": "table",
+           "rawQuery": true,
+-          "rawSql": "-- CTE is used in Parking Query\r\nwith drives_and_charging_processes as (\r\n\r\n    select 'Drive' as activity, d.start_date, d.end_date, d.start_position_id, d.end_position_id, d.end_address_id, d.end_geofence_id, d.start_${preferred_range}_range_km, d.end_${preferred_range}_range_km, d.car_id, d.outside_temp_avg from drives d\r\n    \r\n    union all\r\n    \r\n    select 'Charging Process' as activity, cp.start_date, cp.end_date, cp.position_id as start_position_id, cp.position_id as end_position_id, cp.address_id as end_address_id, cp.geofence_id as end_geofence_id, cp.start_${preferred_range}_range_km, cp.end_${preferred_range}_range_km, cp.car_id, cp.outside_temp_avg from charging_processes cp\r\n\r\n)\r\n\r\nSELECT\r\n  start_date AS \"Start\",\r\n  end_date AS \"End\",\r\n  FLOOR(EXTRACT(EPOCH FROM start_date))*1000 AS start_date_ts,\r\n  CEIL(EXTRACT(EPOCH FROM end_date))*1000 AS end_date_ts,\r\n  '🚗 Driving' AS \"Action\",\r\n  drives.duration_min AS \"Duration\",\r\n  CASE WHEN start_geofence_id IS NULL THEN CONCAT('new?lat=', TP1.latitude, '&lng=', TP1.longitude)\r\n       WHEN start_geofence_id IS NOT NULL THEN CONCAT(start_geofence_id, '/edit')\r\n  END AS start_path,\r\n  CASE WHEN end_geofence_id IS NULL THEN CONCAT('new?lat=', TP2.latitude, '&lng=', TP2.longitude)\r\n       WHEN start_geofence_id IS NOT NULL THEN CONCAT(end_geofence_id, '/edit')\r\n  END AS end_path,\r\n  COALESCE(start_geofence.name, CONCAT_WS(', ', COALESCE(start_address.name, nullif(CONCAT_WS(' ', start_address.road, start_address.house_number), '')), start_address.city)) AS \"Start Address\",\r\n  COALESCE(end_geofence.name, CONCAT_WS(', ', COALESCE(end_address.name, nullif(CONCAT_WS(' ', end_address.road, end_address.house_number), '')), end_address.city)) AS \"End Address\",\r\n  convert_km(end_km::NUMERIC, '$length_unit') AS odometer_$length_unit,\r\n  convert_km(distance::NUMERIC, '$length_unit') AS distance_$length_unit,\r\n  convert_km(end_${preferred_range}_range_km::NUMERIC, '$length_unit') AS end_range_$length_unit,\r\n  (end_${preferred_range}_range_km - start_${preferred_range}_range_km) * car.efficiency AS \"kWh\",\r\n  convert_km((end_${preferred_range}_range_km - start_${preferred_range}_range_km)::NUMERIC, '$length_unit') AS range_diff_$length_unit,\r\n  TP2.battery_level AS \"SoC\",\r\n  TP2.battery_level-TP1.battery_level AS \"SoC Diff\",\r\n  convert_celsius(outside_temp_avg, '$temp_unit') AS outside_temp_avg_$temp_unit,\r\n  CONCAT('d/zm7wN6Zgz/drive-details?from=', FLOOR(EXTRACT(EPOCH FROM start_date))*1000, '&to=', CEIL(EXTRACT(EPOCH FROM end_date))*1000, '&var-car_id=', drives.car_id, '&var-drive_id=', drives.id) AS slotlink\r\nFROM drives\r\n  INNER JOIN cars AS car ON drives.car_id = car.id\r\n  INNER JOIN positions AS TP1 on drives.start_position_id = TP1.id\r\n  INNER JOIN positions AS TP2 on drives.end_position_id = TP2.id\r\n  INNER JOIN addresses start_address ON start_address_id = start_address.id\r\n  INNER JOIN addresses end_address ON  end_address_id = end_address.id\r\n  LEFT JOIN geofences start_geofence ON start_geofence_id = start_geofence.id\r\n  LEFT JOIN geofences end_geofence ON end_geofence_id = end_geofence.id\r\nWHERE \r\n  $__timeFilter(drives.start_date)\r\n  AND drives.car_id = $car_id\r\n  AND '🚗 Driving' in ($action_filter)\r\n  AND\r\n    (COALESCE(start_geofence.name, CONCAT_WS(', ', COALESCE(start_address.name, nullif(CONCAT_WS(' ', start_address.road, start_address.house_number), '')), start_address.city))::TEXT ILIKE'%$text_filter%' or\r\n    COALESCE(end_geofence.name, CONCAT_WS(', ', COALESCE(end_address.name, nullif(CONCAT_WS(' ', end_address.road, end_address.house_number), '')), end_address.city))::TEXT ILIKE'%$text_filter%')\r\n\r\nUNION\r\nSELECT\r\n  start_date AS \"Start\",\r\n  end_date AS \"End\",\r\n  FLOOR(EXTRACT(EPOCH FROM start_date))*1000 AS start_date_ts,\r\n  CEIL(EXTRACT(EPOCH FROM end_date))*1000 AS end_date_ts,\r\n  '🔋 Charging' AS \"Action\",\r\n  charging_processes.duration_min AS \"Duration\",\r\n  CASE WHEN geofence_id IS NULL THEN CONCAT('new?lat=', address.latitude, '&lng=', address.longitude)\r\n       WHEN geofence_id IS NOT NULL THEN CONCAT(geofence_id, '/edit')\r\n  END AS start_path,\r\n  NULL AS end_path,\r\n  COALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, nullif(CONCAT_WS(' ', address.road, address.house_number), '')), address.city)) AS \"Start Address\",\r\n  '' AS \"End Address\",\r\n  convert_km(position.odometer::NUMERIC, '$length_unit') AS odometer_$length_unit,\r\n  NULL AS distance_$length_unit,\r\n  convert_km(end_${preferred_range}_range_km::NUMERIC, '$length_unit') AS end_range_$length_unit,\r\n  charging_processes.charge_energy_added AS \"kWh\",\r\n  convert_km((end_${preferred_range}_range_km - start_${preferred_range}_range_km)::NUMERIC, '$length_unit') AS range_diff_$length_unit, \r\n  end_battery_level AS \"SoC\",\r\n  end_battery_level - start_battery_level AS \"SoC Diff\",\r\n  convert_celsius(outside_temp_avg, '$temp_unit') AS outside_temp_avg_$temp_unit,\r\n  CONCAT('d/BHhxFeZRz/charge-details?from=', FLOOR(EXTRACT(EPOCH FROM start_date))*1000, '&to=', CEIL(EXTRACT(EPOCH FROM end_date))*1000, '&var-car_id=', charging_processes.car_id, '&var-charging_process_id=', charging_processes.id) AS slotlink\r\nFROM charging_processes\r\n  INNER JOIN positions AS position ON position_id = position.id\r\n  INNER JOIN addresses AS address ON address_id = address.id\r\n  LEFT JOIN geofences AS geofence ON geofence_id = geofence.id\r\nWHERE\r\n  $__timeFilter(charging_processes.start_date)\r\n  AND charging_processes.charge_energy_added > 0\r\n  AND charging_processes.car_id = $car_id\r\n  AND '🔋 Charging' in ($action_filter)\r\n  AND COALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, nullif(CONCAT_WS(' ', address.road, address.house_number), '')), address.city))::TEXT ILIKE'%$text_filter%'\r\nUNION\r\nSELECT\r\n  d.end_date AS \"Start\",\r\n  LEAD(d.start_date) over w AS \"End\",\r\n  CEIL(EXTRACT(EPOCH FROM d.end_date)) * 1000 AS start_date_ts,\r\n  FLOOR(EXTRACT(EPOCH FROM LEAD(d.start_date) over w))*1000 AS end_date_ts,\r\n  '🅿️ Parking' AS \"Action\",\r\n  EXTRACT(EPOCH FROM LEAD(d.start_date) over w - d.end_date)/60 AS \"Duration\",\r\n  CASE WHEN d.end_geofence_id IS NULL THEN CONCAT('new?lat=', end_position.latitude, '&lng=', end_position.longitude)\r\n       WHEN d.end_geofence_id IS NOT NULL THEN CONCAT(d.end_geofence_id, '/edit')\r\n  END AS start_path,\r\n  NULL AS end_path,\r\n  COALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, nullif(CONCAT_WS(' ', address.road, address.house_number), '')), address.city)) AS \"Start Address\",\r\n  '' AS \"End Address\",\r\n  convert_km(end_position.odometer::NUMERIC, '$length_unit') AS odometer_$length_unit,\r\n  NULL AS distance_$length_unit,\r\n  convert_km(LEAD(d.start_${preferred_range}_range_km) over w::NUMERIC, '$length_unit') AS end_range_$length_unit,\r\n  ((LEAD(d.start_${preferred_range}_range_km) over w + (LEAD(start_position.odometer) over w - end_position.odometer)) - d.end_${preferred_range}_range_km) * car.efficiency AS \"kWh\",\r\n  convert_km(((LEAD(d.start_${preferred_range}_range_km) over w + (LEAD(start_position.odometer) over w - end_position.odometer)) - d.end_${preferred_range}_range_km)::NUMERIC, '$length_unit') AS range_diff_$length_unit,\r\n  LEAD(start_position.battery_level) over w AS \"SoC\",\r\n  LEAD(start_position.battery_level) over w - end_position.battery_level AS \"SoC Diff\",\r\n  convert_celsius(outside_temp_avg, '$temp_unit') AS outside_temp_avg_$temp_unit,\r\n  CONCAT('d/FkUpJpQZk/trip?from=', CEIL(EXTRACT(EPOCH FROM d.end_date))*1000, '&to=', FLOOR(EXTRACT(EPOCH FROM LEAD(d.start_date) over w))*1000, '&var-car_id=', d.car_id) AS slotlink\r\nFROM drives_and_charging_processes AS d\r\n  INNER JOIN cars AS car ON d.car_id = car.id\r\n  INNER JOIN positions AS start_position on d.start_position_id = start_position.id\r\n  INNER JOIN positions AS end_position on d.end_position_id = end_position.id\r\n  INNER JOIN addresses AS address ON d.end_address_id = address.id\r\n  LEFT JOIN geofences AS geofence ON d.end_geofence_id = geofence.id\r\nWHERE\r\n  $__timeFilter(d.end_date)\r\n  AND d.car_id=$car_id\r\n  AND '🅿️ Parking' in ($action_filter)\r\n  AND COALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, nullif(CONCAT_WS(' ', address.road, address.house_number), '')), address.city))::TEXT ILIKE'%$text_filter%'\r\nWINDOW w as (ORDER BY d.start_date ASC)\r\n\r\nUNION\r\nSELECT\r\n\tT1.end_date +(1 * interval '1 second') AS \"Start\", -- added 1 sec to get it after the corresponding Parking row\r\n\tT2.start_date AS \"End\",\r\n\tCEIL(EXTRACT(EPOCH FROM T1.end_date)) * 1000 - 1 AS start_date_ts,\r\n\tFLOOR(EXTRACT(EPOCH FROM T2.start_date)) * 1000 - 1 AS end_date_ts,\r\n\t'❓ Missing' AS \"Action\",\r\n\t-- EXTRACT(EPOCH FROM T2.start_date - T1.end_date)/60 AS \"Duration\",\r\n\tNULL AS \"Duration\",\r\n\tCASE WHEN T1.end_geofence_id IS NULL THEN CONCAT('new?lat=', TP1.latitude, '&lng=', TP1.longitude)\r\n\t\tWHEN T1.end_geofence_id IS NOT NULL THEN CONCAT(T1.end_geofence_id, '/edit')\r\n\tEND AS start_path,\r\n\tCASE WHEN T2.start_geofence_id IS NULL THEN CONCAT('new?lat=', TP2.latitude, '&lng=', TP2.longitude)\r\n\t\tWHEN T2.start_geofence_id IS NOT NULL THEN CONCAT(T2.start_geofence_id, '/edit')\r\n\tEND AS end_path,\r\n\tCOALESCE(start_geofence.name, CONCAT_WS(', ', COALESCE(start_address.name, nullif(CONCAT_WS(' ', start_address.road, start_address.house_number), '')), start_address.city)) AS \"Start Address\",\r\n\tCOALESCE(end_geofence.name, CONCAT_WS(', ', COALESCE(end_address.name, nullif(CONCAT_WS(' ', end_address.road, end_address.house_number), '')), end_address.city)) AS \"End Address\",\r\n\tconvert_km(TP2.odometer::NUMERIC, '$length_unit') AS odometer_$length_unit,\r\n\tconvert_km((TP2.odometer - TP1.odometer)::NUMERIC, '$length_unit') AS distance_$length_unit,\r\n  convert_km(T2.end_${preferred_range}_range_km::NUMERIC, '$length_unit') AS end_range_$length_unit,\r\n\t((TP2.${preferred_range}_battery_range_km + (TP2.odometer - TP1.odometer)) - TP1.${preferred_range}_battery_range_km) * car.efficiency AS \"kWh\",\r\n\tconvert_km(((TP2.${preferred_range}_battery_range_km + (TP2.odometer - TP1.odometer)) - TP1.${preferred_range}_battery_range_km)::NUMERIC, '$length_unit') AS range_diff_$length_unit,\r\n\tNULL AS \"SoC\",\r\n\tNULL AS \"SoC Diff\",\r\n\tNULL AS outside_temp_avg_$temp_unit,\r\n\tNULL AS slotlink\r\n\t-- TP2.battery_level AS \"SoC\",\r\n\t-- TP2.battery_level-TP1.battery_level AS \"SoC Diff\",\r\n\t-- (T1.outside_temp_avg+T2.outside_temp_avg)/2 AS outside_temp_avg_$temp_unit\r\nFROM drives AS T1\r\n  INNER JOIN cars AS car ON T1.car_id = car.id\r\n\tINNER JOIN (SELECT d.*, LAG(id) OVER (ORDER BY id ASC) AS previous_id FROM drives d WHERE d.car_id = $car_id) AS T2 ON T1.id = T2.previous_id\r\n\tINNER JOIN positions AS TP1 ON T1.end_position_id = TP1.id\r\n\tINNER JOIN positions AS TP2 ON T2.start_position_id = TP2.id\r\n\tINNER JOIN addresses AS start_address ON T1.end_address_id = start_address.id\r\n\tINNER JOIN addresses AS end_address ON T2.start_address_id = end_address.id\r\n\tLEFT JOIN geofences AS start_geofence ON T1.end_geofence_id = start_geofence.id\r\n\tLEFT JOIN geofences AS end_geofence ON T2.start_geofence_id = end_geofence.id\r\nWHERE\r\n\t$__timeFilter(T1.end_date)\r\n\tAND TP2.odometer - TP1.odometer > 0.5\r\n  AND T1.end_address_id <> T2.start_address_id AND ((COALESCE(T1.end_geofence_id, 0) <> COALESCE(T2.start_geofence_id, 0)) OR (T1.end_geofence_id IS NULL AND T2.start_geofence_id IS NULL))\r\n  AND '❓ Missing' in ($action_filter)\r\n\tAND (\r\n\t  (COALESCE(start_geofence.name, CONCAT_WS(', ', COALESCE(start_address.name, nullif(CONCAT_WS(' ', start_address.road, start_address.house_number), '')), start_address.city))::TEXT ILIKE'%$text_filter%') or\r\n\t  (COALESCE(end_geofence.name, CONCAT_WS(', ', COALESCE(end_address.name, nullif(CONCAT_WS(' ', end_address.road, end_address.house_number), '')), end_address.city)))::TEXT ILIKE'%$text_filter%')\r\nUNION\r\nSELECT\r\n  start_date AS \"Start\",\r\n  end_date AS \"End\",\r\n  FLOOR(EXTRACT(EPOCH FROM start_date))*1000 AS start_date_ts, \r\n  CEIL(EXTRACT(EPOCH FROM end_date))*1000 AS end_date_ts, \r\n  '💾 Updating' AS \"Action\",\r\n\tEXTRACT(EPOCH FROM end_date - start_date)/60  AS \"Duration\",\r\n  NULL AS start_path,\r\n  NULL AS end_path,\r\n  version AS \"Start Address\",\r\n  '' AS \"End Address\",\r\n  NULL AS odometer_$length_unit,\r\n  NULL AS distance_$length_unit,\r\n  NULL AS end_range_$length_unit,\r\n  NULL AS \"kWh\",\r\n  NULL AS range_diff_$length_unit,\r\n  NULL AS \"SoC\",\r\n  NULL AS \"SoC Diff\",\r\n  NULL AS outside_temp_avg_$temp_unit,\r\n  CONCAT('https://www.notateslaapp.com/software-updates/version/', split_part(version, ' ', 1), '/release-notes') AS slotlink\r\nFROM updates\r\nWHERE \r\n  $__timeFilter(start_date)\r\n  AND car_id = $car_id \r\n  AND '💾 Updating' in ($action_filter)\r\n  AND version::TEXT ILIKE'%$text_filter%'\r\n\r\nORDER BY \"Start\" DESC;",
++          "rawSql": "-- CTE is used in Parking Query\r\nwith drives_and_charging_processes as (\r\n\r\n    select 'Drive' as activity, d.start_date, d.end_date, d.start_position_id, d.end_position_id, d.end_address_id, d.end_geofence_id, d.start_${preferred_range}_range_km, d.end_${preferred_range}_range_km, d.car_id, d.outside_temp_avg from drives d\r\n    \r\n    union all\r\n    \r\n    select 'Charging Process' as activity, cp.start_date, cp.end_date, cp.position_id as start_position_id, cp.position_id as end_position_id, cp.address_id as end_address_id, cp.geofence_id as end_geofence_id, cp.start_${preferred_range}_range_km, cp.end_${preferred_range}_range_km, cp.car_id, cp.outside_temp_avg from charging_processes cp\r\n\r\n)\r\n\r\nSELECT\r\n  start_date AS \"Start\",\r\n  end_date AS \"End\",\r\n  FLOOR(EXTRACT(EPOCH FROM start_date))*1000 AS start_date_ts,\r\n  CEIL(EXTRACT(EPOCH FROM end_date))*1000 AS end_date_ts,\r\n  '🚗 Driving' AS \"Action\",\r\n  drives.duration_min AS \"Duration\",\r\n  CASE WHEN start_geofence_id IS NULL THEN CONCAT('new?lat=', TP1.latitude, '&lng=', TP1.longitude)\r\n       WHEN start_geofence_id IS NOT NULL THEN CONCAT(start_geofence_id, '/edit')\r\n  END AS start_path,\r\n  CASE WHEN end_geofence_id IS NULL THEN CONCAT('new?lat=', TP2.latitude, '&lng=', TP2.longitude)\r\n       WHEN start_geofence_id IS NOT NULL THEN CONCAT(end_geofence_id, '/edit')\r\n  END AS end_path,\r\n  COALESCE(start_geofence.name, CONCAT_WS(', ', COALESCE(start_address.name, nullif(CONCAT_WS(' ', start_address.road, start_address.house_number), '')), COALESCE(start_address.city, start_address.neighbourhood))) AS \"Start Address\",\r\n  COALESCE(end_geofence.name, CONCAT_WS(', ', COALESCE(end_address.name, nullif(CONCAT_WS(' ', end_address.road, end_address.house_number), '')), COALESCE(end_address.city, end_address.neighbourhood))) AS \"End Address\",\r\n  convert_km(end_km::NUMERIC, '$length_unit') AS odometer_$length_unit,\r\n  convert_km(distance::NUMERIC, '$length_unit') AS distance_$length_unit,\r\n  convert_km(end_${preferred_range}_range_km::NUMERIC, '$length_unit') AS end_range_$length_unit,\r\n  (end_${preferred_range}_range_km - start_${preferred_range}_range_km) * car.efficiency AS \"kWh\",\r\n  convert_km((end_${preferred_range}_range_km - start_${preferred_range}_range_km)::NUMERIC, '$length_unit') AS range_diff_$length_unit,\r\n  TP2.battery_level AS \"SoC\",\r\n  TP2.battery_level-TP1.battery_level AS \"SoC Diff\",\r\n  convert_celsius(outside_temp_avg, '$temp_unit') AS outside_temp_avg_$temp_unit,\r\n  CONCAT('d/zm7wN6Zgz/drive-details?from=', FLOOR(EXTRACT(EPOCH FROM start_date))*1000, '&to=', CEIL(EXTRACT(EPOCH FROM end_date))*1000, '&var-car_id=', drives.car_id, '&var-drive_id=', drives.id) AS slotlink\r\nFROM drives\r\n  INNER JOIN cars AS car ON drives.car_id = car.id\r\n  INNER JOIN positions AS TP1 on drives.start_position_id = TP1.id\r\n  INNER JOIN positions AS TP2 on drives.end_position_id = TP2.id\r\n  INNER JOIN addresses start_address ON start_address_id = start_address.id\r\n  INNER JOIN addresses end_address ON  end_address_id = end_address.id\r\n  LEFT JOIN geofences start_geofence ON start_geofence_id = start_geofence.id\r\n  LEFT JOIN geofences end_geofence ON end_geofence_id = end_geofence.id\r\nWHERE \r\n  $__timeFilter(drives.start_date)\r\n  AND drives.car_id = $car_id\r\n  AND '🚗 Driving' in ($action_filter)\r\n  AND\r\n    (COALESCE(start_geofence.name, CONCAT_WS(', ', COALESCE(start_address.name, nullif(CONCAT_WS(' ', start_address.road, start_address.house_number), '')), COALESCE(start_address.city, start_address.neighbourhood)))::TEXT ILIKE'%$text_filter%' or\r\n    COALESCE(end_geofence.name, CONCAT_WS(', ', COALESCE(end_address.name, nullif(CONCAT_WS(' ', end_address.road, end_address.house_number), '')), COALESCE(end_address.city, end_address.neighbourhood)))::TEXT ILIKE'%$text_filter%')\r\n\r\nUNION\r\nSELECT\r\n  start_date AS \"Start\",\r\n  end_date AS \"End\",\r\n  FLOOR(EXTRACT(EPOCH FROM start_date))*1000 AS start_date_ts,\r\n  CEIL(EXTRACT(EPOCH FROM end_date))*1000 AS end_date_ts,\r\n  '🔋 Charging' AS \"Action\",\r\n  charging_processes.duration_min AS \"Duration\",\r\n  CASE WHEN geofence_id IS NULL THEN CONCAT('new?lat=', address.latitude, '&lng=', address.longitude)\r\n       WHEN geofence_id IS NOT NULL THEN CONCAT(geofence_id, '/edit')\r\n  END AS start_path,\r\n  NULL AS end_path,\r\n  COALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, nullif(CONCAT_WS(' ', address.road, address.house_number), '')), COALESCE(address.city, address.neighbourhood))) AS \"Start Address\",\r\n  '' AS \"End Address\",\r\n  convert_km(position.odometer::NUMERIC, '$length_unit') AS odometer_$length_unit,\r\n  NULL AS distance_$length_unit,\r\n  convert_km(end_${preferred_range}_range_km::NUMERIC, '$length_unit') AS end_range_$length_unit,\r\n  charging_processes.charge_energy_added AS \"kWh\",\r\n  convert_km((end_${preferred_range}_range_km - start_${preferred_range}_range_km)::NUMERIC, '$length_unit') AS range_diff_$length_unit, \r\n  end_battery_level AS \"SoC\",\r\n  end_battery_level - start_battery_level AS \"SoC Diff\",\r\n  convert_celsius(outside_temp_avg, '$temp_unit') AS outside_temp_avg_$temp_unit,\r\n  CONCAT('d/BHhxFeZRz/charge-details?from=', FLOOR(EXTRACT(EPOCH FROM start_date))*1000, '&to=', CEIL(EXTRACT(EPOCH FROM end_date))*1000, '&var-car_id=', charging_processes.car_id, '&var-charging_process_id=', charging_processes.id) AS slotlink\r\nFROM charging_processes\r\n  INNER JOIN positions AS position ON position_id = position.id\r\n  INNER JOIN addresses AS address ON address_id = address.id\r\n  LEFT JOIN geofences AS geofence ON geofence_id = geofence.id\r\nWHERE\r\n  $__timeFilter(charging_processes.start_date)\r\n  AND charging_processes.charge_energy_added > 0\r\n  AND charging_processes.car_id = $car_id\r\n  AND '🔋 Charging' in ($action_filter)\r\n  AND COALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, nullif(CONCAT_WS(' ', address.road, address.house_number), '')), COALESCE(address.city, address.neighbourhood)))::TEXT ILIKE'%$text_filter%'\r\nUNION\r\nSELECT\r\n  d.end_date AS \"Start\",\r\n  LEAD(d.start_date) over w AS \"End\",\r\n  CEIL(EXTRACT(EPOCH FROM d.end_date)) * 1000 AS start_date_ts,\r\n  FLOOR(EXTRACT(EPOCH FROM LEAD(d.start_date) over w))*1000 AS end_date_ts,\r\n  '🅿️ Parking' AS \"Action\",\r\n  EXTRACT(EPOCH FROM LEAD(d.start_date) over w - d.end_date)/60 AS \"Duration\",\r\n  CASE WHEN d.end_geofence_id IS NULL THEN CONCAT('new?lat=', end_position.latitude, '&lng=', end_position.longitude)\r\n       WHEN d.end_geofence_id IS NOT NULL THEN CONCAT(d.end_geofence_id, '/edit')\r\n  END AS start_path,\r\n  NULL AS end_path,\r\n  COALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, nullif(CONCAT_WS(' ', address.road, address.house_number), '')), COALESCE(address.city, address.neighbourhood))) AS \"Start Address\",\r\n  '' AS \"End Address\",\r\n  convert_km(end_position.odometer::NUMERIC, '$length_unit') AS odometer_$length_unit,\r\n  NULL AS distance_$length_unit,\r\n  convert_km(LEAD(d.start_${preferred_range}_range_km) over w::NUMERIC, '$length_unit') AS end_range_$length_unit,\r\n  ((LEAD(d.start_${preferred_range}_range_km) over w + (LEAD(start_position.odometer) over w - end_position.odometer)) - d.end_${preferred_range}_range_km) * car.efficiency AS \"kWh\",\r\n  convert_km(((LEAD(d.start_${preferred_range}_range_km) over w + (LEAD(start_position.odometer) over w - end_position.odometer)) - d.end_${preferred_range}_range_km)::NUMERIC, '$length_unit') AS range_diff_$length_unit,\r\n  LEAD(start_position.battery_level) over w AS \"SoC\",\r\n  LEAD(start_position.battery_level) over w - end_position.battery_level AS \"SoC Diff\",\r\n  convert_celsius(outside_temp_avg, '$temp_unit') AS outside_temp_avg_$temp_unit,\r\n  CONCAT('d/FkUpJpQZk/trip?from=', CEIL(EXTRACT(EPOCH FROM d.end_date))*1000, '&to=', FLOOR(EXTRACT(EPOCH FROM LEAD(d.start_date) over w))*1000, '&var-car_id=', d.car_id) AS slotlink\r\nFROM drives_and_charging_processes AS d\r\n  INNER JOIN cars AS car ON d.car_id = car.id\r\n  INNER JOIN positions AS start_position on d.start_position_id = start_position.id\r\n  INNER JOIN positions AS end_position on d.end_position_id = end_position.id\r\n  INNER JOIN addresses AS address ON d.end_address_id = address.id\r\n  LEFT JOIN geofences AS geofence ON d.end_geofence_id = geofence.id\r\nWHERE\r\n  $__timeFilter(d.end_date)\r\n  AND d.car_id=$car_id\r\n  AND '🅿️ Parking' in ($action_filter)\r\n  AND COALESCE(geofence.name, CONCAT_WS(', ', COALESCE(address.name, nullif(CONCAT_WS(' ', address.road, address.house_number), '')), COALESCE(address.city, address.neighbourhood)))::TEXT ILIKE'%$text_filter%'\r\nWINDOW w as (ORDER BY d.start_date ASC)\r\n\r\nUNION\r\nSELECT\r\n\tT1.end_date +(1 * interval '1 second') AS \"Start\", -- added 1 sec to get it after the corresponding Parking row\r\n\tT2.start_date AS \"End\",\r\n\tCEIL(EXTRACT(EPOCH FROM T1.end_date)) * 1000 - 1 AS start_date_ts,\r\n\tFLOOR(EXTRACT(EPOCH FROM T2.start_date)) * 1000 - 1 AS end_date_ts,\r\n\t'❓ Missing' AS \"Action\",\r\n\t-- EXTRACT(EPOCH FROM T2.start_date - T1.end_date)/60 AS \"Duration\",\r\n\tNULL AS \"Duration\",\r\n\tCASE WHEN T1.end_geofence_id IS NULL THEN CONCAT('new?lat=', TP1.latitude, '&lng=', TP1.longitude)\r\n\t\tWHEN T1.end_geofence_id IS NOT NULL THEN CONCAT(T1.end_geofence_id, '/edit')\r\n\tEND AS start_path,\r\n\tCASE WHEN T2.start_geofence_id IS NULL THEN CONCAT('new?lat=', TP2.latitude, '&lng=', TP2.longitude)\r\n\t\tWHEN T2.start_geofence_id IS NOT NULL THEN CONCAT(T2.start_geofence_id, '/edit')\r\n\tEND AS end_path,\r\n\tCOALESCE(start_geofence.name, CONCAT_WS(', ', COALESCE(start_address.name, nullif(CONCAT_WS(' ', start_address.road, start_address.house_number), '')), COALESCE(start_address.city, start_address.neighbourhood))) AS \"Start Address\",\r\n\tCOALESCE(end_geofence.name, CONCAT_WS(', ', COALESCE(end_address.name, nullif(CONCAT_WS(' ', end_address.road, end_address.house_number), '')), COALESCE(end_address.city, end_address.neighbourhood))) AS \"End Address\",\r\n\tconvert_km(TP2.odometer::NUMERIC, '$length_unit') AS odometer_$length_unit,\r\n\tconvert_km((TP2.odometer - TP1.odometer)::NUMERIC, '$length_unit') AS distance_$length_unit,\r\n  convert_km(T2.end_${preferred_range}_range_km::NUMERIC, '$length_unit') AS end_range_$length_unit,\r\n\t((TP2.${preferred_range}_battery_range_km + (TP2.odometer - TP1.odometer)) - TP1.${preferred_range}_battery_range_km) * car.efficiency AS \"kWh\",\r\n\tconvert_km(((TP2.${preferred_range}_battery_range_km + (TP2.odometer - TP1.odometer)) - TP1.${preferred_range}_battery_range_km)::NUMERIC, '$length_unit') AS range_diff_$length_unit,\r\n\tNULL AS \"SoC\",\r\n\tNULL AS \"SoC Diff\",\r\n\tNULL AS outside_temp_avg_$temp_unit,\r\n\tNULL AS slotlink\r\n\t-- TP2.battery_level AS \"SoC\",\r\n\t-- TP2.battery_level-TP1.battery_level AS \"SoC Diff\",\r\n\t-- (T1.outside_temp_avg+T2.outside_temp_avg)/2 AS outside_temp_avg_$temp_unit\r\nFROM drives AS T1\r\n  INNER JOIN cars AS car ON T1.car_id = car.id\r\n\tINNER JOIN (SELECT d.*, LAG(id) OVER (ORDER BY id ASC) AS previous_id FROM drives d WHERE d.car_id = $car_id) AS T2 ON T1.id = T2.previous_id\r\n\tINNER JOIN positions AS TP1 ON T1.end_position_id = TP1.id\r\n\tINNER JOIN positions AS TP2 ON T2.start_position_id = TP2.id\r\n\tINNER JOIN addresses AS start_address ON T1.end_address_id = start_address.id\r\n\tINNER JOIN addresses AS end_address ON T2.start_address_id = end_address.id\r\n\tLEFT JOIN geofences AS start_geofence ON T1.end_geofence_id = start_geofence.id\r\n\tLEFT JOIN geofences AS end_geofence ON T2.start_geofence_id = end_geofence.id\r\nWHERE\r\n\t$__timeFilter(T1.end_date)\r\n\tAND TP2.odometer - TP1.odometer > 0.5\r\n  AND T1.end_address_id <> T2.start_address_id AND ((COALESCE(T1.end_geofence_id, 0) <> COALESCE(T2.start_geofence_id, 0)) OR (T1.end_geofence_id IS NULL AND T2.start_geofence_id IS NULL))\r\n  AND '❓ Missing' in ($action_filter)\r\n\tAND (\r\n\t  (COALESCE(start_geofence.name, CONCAT_WS(', ', COALESCE(start_address.name, nullif(CONCAT_WS(' ', start_address.road, start_address.house_number), '')), COALESCE(start_address.city, start_address.neighbourhood)))::TEXT ILIKE'%$text_filter%') or\r\n\t  (COALESCE(end_geofence.name, CONCAT_WS(', ', COALESCE(end_address.name, nullif(CONCAT_WS(' ', end_address.road, end_address.house_number), '')), COALESCE(end_address.city, end_address.neighbourhood))))::TEXT ILIKE'%$text_filter%')\r\nUNION\r\nSELECT\r\n  start_date AS \"Start\",\r\n  end_date AS \"End\",\r\n  FLOOR(EXTRACT(EPOCH FROM start_date))*1000 AS start_date_ts, \r\n  CEIL(EXTRACT(EPOCH FROM end_date))*1000 AS end_date_ts, \r\n  '💾 Updating' AS \"Action\",\r\n\tEXTRACT(EPOCH FROM end_date - start_date)/60  AS \"Duration\",\r\n  NULL AS start_path,\r\n  NULL AS end_path,\r\n  version AS \"Start Address\",\r\n  '' AS \"End Address\",\r\n  NULL AS odometer_$length_unit,\r\n  NULL AS distance_$length_unit,\r\n  NULL AS end_range_$length_unit,\r\n  NULL AS \"kWh\",\r\n  NULL AS range_diff_$length_unit,\r\n  NULL AS \"SoC\",\r\n  NULL AS \"SoC Diff\",\r\n  NULL AS outside_temp_avg_$temp_unit,\r\n  CONCAT('https://www.notateslaapp.com/software-updates/version/', split_part(version, ' ', 1), '/release-notes') AS slotlink\r\nFROM updates\r\nWHERE \r\n  $__timeFilter(start_date)\r\n  AND car_id = $car_id \r\n  AND '💾 Updating' in ($action_filter)\r\n  AND version::TEXT ILIKE'%$text_filter%'\r\n\r\nORDER BY \"Start\" DESC;",
+           "refId": "A",
+           "sql": {
+             "columns": [
+diff --git a/grafana/dashboards/trip.json b/grafana/dashboards/trip.json
+index 6399bc2869..8bb6d1e39d 100644
+--- a/grafana/dashboards/trip.json
++++ b/grafana/dashboards/trip.json
+@@ -1835,7 +1835,7 @@
+           "editorMode": "code",
+           "format": "table",
+           "rawQuery": true,
+-          "rawSql": "WITH data AS (\n  SELECT\n    floor(extract(epoch FROM start_date)) * 1000 AS start_date_ts,\n    ceil(extract(epoch FROM end_date)) * 1000 AS end_date_ts,\n    car.id as car_id,\n    CASE WHEN start_geofence.id IS NULL THEN CONCAT('new?lat=', start_position.latitude, '&lng=', start_position.longitude)\n         WHEN start_geofence.id IS NOT NULL THEN CONCAT(start_geofence.id, '/edit')\n    END as start_path,\n    CASE WHEN end_geofence.id IS NULL THEN CONCAT('new?lat=', end_position.latitude, '&lng=', end_position.longitude)\n         WHEN end_geofence.id IS NOT NULL THEN CONCAT(end_geofence.id, '/edit')\n    END as end_path,\n    TO_CHAR((duration_min * INTERVAL '1 minute'), 'HH24:MI') as duration_str,\n    drives.id as drive_id,\n    -- Columns\n    start_date,\n    COALESCE(start_geofence.name, CONCAT_WS(', ', COALESCE(start_address.name, nullif(CONCAT_WS(' ', start_address.road, start_address.house_number), '')), start_address.city)) AS start_address,\n    COALESCE(end_geofence.name, CONCAT_WS(', ', COALESCE(end_address.name, nullif(CONCAT_WS(' ', end_address.road, end_address.house_number), '')), end_address.city)) AS end_address,\n    duration_min,\n    distance,\n    start_position.usable_battery_level as start_usable_battery_level,\n    start_position.battery_level as start_battery_level,\n    end_position.usable_battery_level as end_usable_battery_level,\n    end_position.battery_level as end_battery_level,\n    start_position.battery_level != start_position.usable_battery_level OR end_position.battery_level != end_position.usable_battery_level  as reduced_range,\n    duration_min > 1 AND distance > 1 AND ( \n      start_position.usable_battery_level IS NULL OR end_position.usable_battery_level IS NULL\tOR\n      (end_position.battery_level - end_position.usable_battery_level) = 0 \n    ) as is_sufficiently_precise,\n    start_${preferred_range}_range_km - end_${preferred_range}_range_km as range_diff,\n    car.efficiency as car_efficiency,\n    outside_temp_avg,\n    distance / NULLIF(duration_min, 0) * 60 AS avg_speed\n  FROM drives\n  LEFT JOIN addresses start_address ON start_address_id = start_address.id\n  LEFT JOIN addresses end_address ON end_address_id = end_address.id\n  LEFT JOIN positions start_position ON start_position_id = start_position.id\n  LEFT JOIN positions end_position ON end_position_id = end_position.id\n  LEFT JOIN geofences start_geofence ON start_geofence_id = start_geofence.id\n  LEFT JOIN geofences end_geofence ON end_geofence_id = end_geofence.id\n  LEFT JOIN cars car ON car.id = drives.car_id\n  WHERE $__timeFilter(start_date) AND drives.car_id = $car_id\n  ORDER BY start_date DESC\n)\nSELECT\n    start_date_ts,\n    end_date_ts,\n    car_id,\n    start_path,\n    end_path,\n    duration_str,\n    drive_id,\n    -- Columns\n    start_date,\n    start_address,\n    end_address,\n    duration_min,\n    convert_km(distance::numeric, '$length_unit') AS distance_$length_unit,\n    start_battery_level as \"% Start\",\n    end_battery_level as \"% End\",\n    CASE WHEN is_sufficiently_precise THEN range_diff * car_efficiency / convert_km(distance::numeric, '$length_unit') * 1000\n    END AS consumption_kWh_$length_unit\nFROM data;",
++          "rawSql": "WITH data AS (\n  SELECT\n    floor(extract(epoch FROM start_date)) * 1000 AS start_date_ts,\n    ceil(extract(epoch FROM end_date)) * 1000 AS end_date_ts,\n    car.id as car_id,\n    CASE WHEN start_geofence.id IS NULL THEN CONCAT('new?lat=', start_position.latitude, '&lng=', start_position.longitude)\n         WHEN start_geofence.id IS NOT NULL THEN CONCAT(start_geofence.id, '/edit')\n    END as start_path,\n    CASE WHEN end_geofence.id IS NULL THEN CONCAT('new?lat=', end_position.latitude, '&lng=', end_position.longitude)\n         WHEN end_geofence.id IS NOT NULL THEN CONCAT(end_geofence.id, '/edit')\n    END as end_path,\n    TO_CHAR((duration_min * INTERVAL '1 minute'), 'HH24:MI') as duration_str,\n    drives.id as drive_id,\n    -- Columns\n    start_date,\n    COALESCE(start_geofence.name, CONCAT_WS(', ', COALESCE(start_address.name, nullif(CONCAT_WS(' ', start_address.road, start_address.house_number), '')), COALESCE(start_address.city, start_address.neighbourhood))) AS start_address,\n    COALESCE(end_geofence.name, CONCAT_WS(', ', COALESCE(end_address.name, nullif(CONCAT_WS(' ', end_address.road, end_address.house_number), '')), COALESCE(end_address.city, end_address.neighbourhood))) AS end_address,\n    duration_min,\n    distance,\n    start_position.usable_battery_level as start_usable_battery_level,\n    start_position.battery_level as start_battery_level,\n    end_position.usable_battery_level as end_usable_battery_level,\n    end_position.battery_level as end_battery_level,\n    start_position.battery_level != start_position.usable_battery_level OR end_position.battery_level != end_position.usable_battery_level  as reduced_range,\n    duration_min > 1 AND distance > 1 AND ( \n      start_position.usable_battery_level IS NULL OR end_position.usable_battery_level IS NULL\tOR\n      (end_position.battery_level - end_position.usable_battery_level) = 0 \n    ) as is_sufficiently_precise,\n    start_${preferred_range}_range_km - end_${preferred_range}_range_km as range_diff,\n    car.efficiency as car_efficiency,\n    outside_temp_avg,\n    distance / NULLIF(duration_min, 0) * 60 AS avg_speed\n  FROM drives\n  LEFT JOIN addresses start_address ON start_address_id = start_address.id\n  LEFT JOIN addresses end_address ON end_address_id = end_address.id\n  LEFT JOIN positions start_position ON start_position_id = start_position.id\n  LEFT JOIN positions end_position ON end_position_id = end_position.id\n  LEFT JOIN geofences start_geofence ON start_geofence_id = start_geofence.id\n  LEFT JOIN geofences end_geofence ON end_geofence_id = end_geofence.id\n  LEFT JOIN cars car ON car.id = drives.car_id\n  WHERE $__timeFilter(start_date) AND drives.car_id = $car_id\n  ORDER BY start_date DESC\n)\nSELECT\n    start_date_ts,\n    end_date_ts,\n    car_id,\n    start_path,\n    end_path,\n    duration_str,\n    drive_id,\n    -- Columns\n    start_date,\n    start_address,\n    end_address,\n    duration_min,\n    convert_km(distance::numeric, '$length_unit') AS distance_$length_unit,\n    start_battery_level as \"% Start\",\n    end_battery_level as \"% End\",\n    CASE WHEN is_sufficiently_precise THEN range_diff * car_efficiency / convert_km(distance::numeric, '$length_unit') * 1000\n    END AS consumption_kWh_$length_unit\nFROM data;",
+           "refId": "A",
+           "sql": {
+             "columns": [
+@@ -2275,7 +2275,7 @@
+           "editorMode": "code",
+           "format": "table",
+           "rawQuery": true,
+-          "rawSql": "WITH data AS (\n    SELECT\n        floor(extract(epoch FROM start_date)) * 1000 AS start_date_ts,\n        ceil(extract(epoch FROM end_date)) * 1000 AS end_date_ts,\n        start_date,\n        end_date,\n        CONCAT_WS(', ', COALESCE(addresses.name, CONCAT_WS(' ', addresses.road, addresses.house_number)), addresses.city) AS address,\n        g.name as geofence_name,\n        g.id as geofence_id,\n        p.latitude,\n        p.longitude,\n        charge_energy_added,\n        charge_energy_used,\n        duration_min,\n        start_battery_level,\n        end_battery_level,\n        end_${preferred_range}_range_km - start_${preferred_range}_range_km as range_added,\n        outside_temp_avg,\n        c.id,\n        p.odometer - lag(p.odometer) OVER (ORDER BY start_date) AS distance,\n        cars.efficiency,\n        c.car_id,\n        cost\n    FROM\n        charging_processes c\n    LEFT JOIN positions p ON p.id = c.position_id\n    LEFT JOIN cars ON cars.id = c.car_id\n    LEFT JOIN addresses ON addresses.id = c.address_id\n    LEFT JOIN geofences g ON g.id = geofence_id\nWHERE \n    (charge_energy_added IS NULL OR charge_energy_added > 0) AND\n    c.car_id = $car_id AND\n    $__timeFilter(start_date)\nORDER BY\n    start_date\n)\nSELECT\n    start_date_ts,\n    end_date_ts,\n    CASE WHEN geofence_id IS NULL THEN CONCAT('new?lat=', latitude, '&lng=', longitude)\n         WHEN geofence_id IS NOT NULL THEN CONCAT(geofence_id, '/edit')\n    END as path,\n    car_id,\n    id,\n    -- Columns\n    start_date,\n    COALESCE(geofence_name, address) as address,    \n    duration_min,\n    cost,\n    charge_energy_added,\n    charge_energy_used,\n    charge_energy_added * 60 / NULLIF (duration_min, 0) AS charge_energy_added_per_hour,\n    convert_km(range_added, '$length_unit') AS range_added_$length_unit,\n    start_battery_level,\n    end_battery_level\nFROM\n    data\nWHERE\n    (distance >= 0 OR distance IS NULL)\nORDER BY\n  start_date DESC;\n    ",
++          "rawSql": "WITH data AS (\n    SELECT\n        floor(extract(epoch FROM start_date)) * 1000 AS start_date_ts,\n        ceil(extract(epoch FROM end_date)) * 1000 AS end_date_ts,\n        start_date,\n        end_date,\n        CONCAT_WS(', ', COALESCE(addresses.name, CONCAT_WS(' ', addresses.road, addresses.house_number)), COALESCE(addresses.city, addresses.neighbourhood)) AS address,\n        g.name as geofence_name,\n        g.id as geofence_id,\n        p.latitude,\n        p.longitude,\n        charge_energy_added,\n        charge_energy_used,\n        duration_min,\n        start_battery_level,\n        end_battery_level,\n        end_${preferred_range}_range_km - start_${preferred_range}_range_km as range_added,\n        outside_temp_avg,\n        c.id,\n        p.odometer - lag(p.odometer) OVER (ORDER BY start_date) AS distance,\n        cars.efficiency,\n        c.car_id,\n        cost\n    FROM\n        charging_processes c\n    LEFT JOIN positions p ON p.id = c.position_id\n    LEFT JOIN cars ON cars.id = c.car_id\n    LEFT JOIN addresses ON addresses.id = c.address_id\n    LEFT JOIN geofences g ON g.id = geofence_id\nWHERE \n    (charge_energy_added IS NULL OR charge_energy_added > 0) AND\n    c.car_id = $car_id AND\n    $__timeFilter(start_date)\nORDER BY\n    start_date\n)\nSELECT\n    start_date_ts,\n    end_date_ts,\n    CASE WHEN geofence_id IS NULL THEN CONCAT('new?lat=', latitude, '&lng=', longitude)\n         WHEN geofence_id IS NOT NULL THEN CONCAT(geofence_id, '/edit')\n    END as path,\n    car_id,\n    id,\n    -- Columns\n    start_date,\n    COALESCE(geofence_name, address) as address,    \n    duration_min,\n    cost,\n    charge_energy_added,\n    charge_energy_used,\n    charge_energy_added * 60 / NULLIF (duration_min, 0) AS charge_energy_added_per_hour,\n    convert_km(range_added, '$length_unit') AS range_added_$length_unit,\n    start_battery_level,\n    end_battery_level\nFROM\n    data\nWHERE\n    (distance >= 0 OR distance IS NULL)\nORDER BY\n  start_date DESC;\n    ",
+           "refId": "A",
+           "sql": {
+             "columns": [
+
+From 009cafc53bfc0d872b332cb4872a576bf243b026 Mon Sep 17 00:00:00 2001
+From: Jakob Lichterfeld <jakob-lichterfeld@gmx.de>
+Date: Fri, 25 Sep 2026 12:50:24 +0200
+Subject: [PATCH 7/7] docs: update changelog
+
+---
+ CHANGELOG.md | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1f50bd21f3..5a2e1b4aab 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -116,12 +116,13 @@ Upgrading directly from 4.1.x no longer preserves entity registry customizations
+ - build: ship NOTICE and LICENSE in both images and both Nix packages, and declare AGPL-3.0-or-later in the Nix metadata (#5778 - @JakobLichterfeld)
+ - build(deps): bump image-size from 2.0.2 to 2.0.4 in /website (#5783)
+ - test(geocoder): pin which address label fills which field, and in which order (#5785 - @JakobLichterfeld)
+-- test(geocoder): pin the address fields of 18 recorded Nominatim addresses (#5785 - @JakobLichterfeld)
++- test(geocoder): pin the address fields of 19 recorded Nominatim addresses (#5785 - @JakobLichterfeld)
+ 
+ #### Dashboards
+ 
+ - feat(grafana): add `total` period to the Statistics dashboard for one aggregated row over the selected time range (#5680 - @micku7zu)
+ - fix(grafana): count asleep/offline states that cross a parking boundary in the vampire drain standby time (#5729 - @rewse)
++- fix(grafana): fall back to the neighbourhood where an address has no city (#5785 - @JakobLichterfeld)
+ 
+ #### Translations
+ 

@@ -1,0 +1,85 @@
+diff --git a/lib/ecto/query/planner.ex b/lib/ecto/query/planner.ex
+index 6cfe8b25a5..424e24f3c7 100644
+--- a/lib/ecto/query/planner.ex
++++ b/lib/ecto/query/planner.ex
+@@ -2207,8 +2207,8 @@ defmodule Ecto.Query.Planner do
+       {{:ok, {:struct, _}}, {:fragment, _, _}} ->
+         error!(query, "it is not possible to return a struct subset of a fragment")
+ 
+-      {{:ok, {:struct, _}}, %Ecto.SubQuery{}} ->
+-        error!(query, "it is not possible to return a struct subset of a subquery")
++      {{:ok, {:struct, fields}}, %Ecto.SubQuery{select: select}} ->
++        subquery_select_fields(select, fields, ix, query)
+ 
+       {{:ok, {_, []}}, {_, _, _}} ->
+         error!(
+@@ -2280,6 +2280,35 @@ defmodule Ecto.Query.Planner do
+     end)
+   end
+ 
++  defp subquery_select_fields(select, requested_fields, ix, query) do
++    available_fields = subquery_source_fields(select)
++    requested_fields = List.wrap(requested_fields)
++
++    schema =
++      case select do
++        {:source, {_, schema}, _, _} when not is_nil(schema) -> schema
++
++        _ ->
++          error!(query, "it is not possible to return a struct subset of a subquery that does not return a schema struct")
++      end
++
++    types =
++      Enum.map(requested_fields, fn field ->
++        case subquery_type_for(select, field) do
++          {:ok, type} ->
++            {field, type}
++
++          :error ->
++            error!(query, "field `#{field}` in struct/2 is not available in the subquery. " <>
++                         "Subquery only returns fields: #{inspect(available_fields)}")
++        end
++      end)
++
++    field_exprs = Enum.map(requested_fields, &select_field(&1, ix, :always))
++
++    {{:source, {nil, schema}, nil, types}, field_exprs}
++  end
++
+   defp select_field(field, ix, writable) do
+     {{:., [writable: writable], [{:&, [], [ix]}, field]}, [], []}
+   end
+diff --git a/test/ecto/query/subquery_test.exs b/test/ecto/query/subquery_test.exs
+index c9c0e38990..8ce3601d43 100644
+--- a/test/ecto/query/subquery_test.exs
++++ b/test/ecto/query/subquery_test.exs
+@@ -447,8 +447,28 @@ defmodule Ecto.Query.SubqueryTest do
+       subquery = from p in Post, select: %{id: p.id, title: p.title}
+       query = normalize(from(p in subquery(subquery), select: map(p, [:title])))
+       assert [{{:., _, [{:&, [], [0]}, :title]}, [], []}] = query.select.fields
++    end
++
++    test "struct/2 with subqueries" do
++      subquery = from p in Post, select: p
++      query = normalize(from(p in subquery(subquery), select: struct(p, [:id, :title])))
++      assert query.select.fields == [
++        {{:., [writable: :always], [{:&, [], [0]}, :id]}, [], []},
++        {{:., [writable: :always], [{:&, [], [0]}, :title]}, [], []}
++      ]
++
++      subquery = from p in Post, select: p
++      query = normalize(from(c in Comment, join: p in subquery(subquery), on: true, select: struct(p, [:title])))
++      assert query.select.fields == [{{:., [writable: :always], [{:&, [], [1]}, :title]}, [], []}]
++
++      subquery = from p in Post, select: struct(p, [:id, :title, :text])
++      query = normalize(from(p in subquery(subquery), select: struct(p, [:id, :title])))
++      assert query.select.fields == [
++        {{:., [writable: :always], [{:&, [], [0]}, :id]}, [], []},
++        {{:., [writable: :always], [{:&, [], [0]}, :title]}, [], []}
++      ]
+ 
+-      assert_raise Ecto.QueryError, ~r/it is not possible to return a struct subset of a subquery/, fn ->
++      assert_raise Ecto.QueryError, ~r/it is not possible to return a struct subset of a subquery that does not return a schema struct/, fn ->
+         subquery = from p in Post, select: %{id: p.id, title: p.title}
+         normalize(from(p in subquery(subquery), select: struct(p, [:title])))
+       end

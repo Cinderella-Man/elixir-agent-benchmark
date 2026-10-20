@@ -1,0 +1,493 @@
+diff --git a/tracker/package.json b/tracker/package.json
+index 9b3b9dbe2faf..8eae0fe07262 100644
+--- a/tracker/package.json
++++ b/tracker/package.json
+@@ -1,5 +1,5 @@
+ {
+-  "tracker_script_version": 10,
++  "tracker_script_version": 11,
+   "type": "module",
+   "scripts": {
+     "deploy": "node compile.js",
+diff --git a/tracker/src/plausible.js b/tracker/src/plausible.js
+index 0b17b775cf74..9d1023a02137 100644
+--- a/tracker/src/plausible.js
++++ b/tracker/src/plausible.js
+@@ -491,6 +491,16 @@ function init(overrides) {
+         })
+       }
+     }
++    
++    if (COMPILE_CONFIG && config.formSubmissions) {
++      function trackFormSubmission(e) {
++        if (e.target.hasAttribute('novalidate') || e.target.checkValidity()) {
++          plausible('Form Submission', { props: { path: location.pathname } });
++        }
++      }
++
++      document.addEventListener('submit', trackFormSubmission, true);
++    }
+ 
+     if (COMPILE_TAGGED_EVENTS && (!COMPILE_CONFIG || config.taggedEvents)) {
+       // Finds event attributes by iterating over the given element's (or its
+diff --git a/tracker/test/form-submissions.spec.ts b/tracker/test/form-submissions.spec.ts
+new file mode 100644
+index 000000000000..05b2e2c7222a
+--- /dev/null
++++ b/tracker/test/form-submissions.spec.ts
+@@ -0,0 +1,321 @@
++import { test, Page } from '@playwright/test'
++import { LOCAL_SERVER_ADDR } from './support/server'
++import {
++  expectPlausibleInAction,
++  ignoreEngagementRequests
++} from './support/test-utils'
++import { initializePageDynamically } from './support/initialize-page-dynamically'
++import { ScriptConfig } from './support/types'
++
++const DEFAULT_CONFIG: ScriptConfig = {
++  domain: 'example.com',
++  endpoint: `${LOCAL_SERVER_ADDR}/api/event`,
++  local: true
++}
++
++test('does not track form submissions when the feature is disabled', async ({
++  page
++}, { testId }) => {
++  const { url } = await initializePageDynamically(page, {
++    testId,
++    scriptConfig: DEFAULT_CONFIG,
++    bodyContent: `
++      <div>
++        <form>
++          <input type="text" /><input type="submit" value="Submit" />
++        </form>
++      </div>
++      `
++  })
++
++  await expectPlausibleInAction(page, {
++    action: async () => {
++      await page.goto(url)
++      await page.click('input[type="submit"]')
++    },
++    shouldIgnoreRequest: ignoreEngagementRequests,
++    expectedRequests: [{ n: 'pageview' }],
++    refutedRequests: [
++      {
++        n: 'Form Submission'
++      }
++    ]
++  })
++})
++
++test.describe('form submissions feature is enabled', () => {
++  test('tracks forms that use GET method', async ({ page, browserName }, {
++    testId
++  }) => {
++    test.skip(
++      browserName === 'firefox',
++      'flaky on Firefox versions less than v133 due to missing fetch keepalive implementation'
++    )
++    const { url } = await initializePageDynamically(page, {
++      testId,
++      scriptConfig: { ...DEFAULT_CONFIG, formSubmissions: true },
++      bodyContent: `
++      <div>
++        <form method="GET">
++          <input id="name" type="text" placeholder="Name" /><input type="submit" value="Submit" />
++        </form>
++      </div>
++      `
++    })
++
++    await expectPlausibleInAction(page, {
++      action: async () => {
++        await page.goto(url)
++        await ensurePlausibleInitialized(page)
++        await page.fill('input[type="text"]', 'Any Name')
++        await page.click('input[type="submit"]')
++      },
++      shouldIgnoreRequest: isViewOrEngagementEvent,
++      expectedRequests: [
++        {
++          n: 'Form Submission',
++          p: { path: url }
++        }
++      ]
++    })
++  })
++
++  test('tracks form submissions triggered with submit button with custom onsubmit', async ({
++    page
++  }, { testId }) => {
++    const { url } = await initializePageDynamically(page, {
++      testId,
++      scriptConfig: { ...DEFAULT_CONFIG, formSubmissions: true },
++      bodyContent: `
++      <div>
++        <form onsubmit="${customSubmitHandlerStub}">
++          <input type="text" /><input type="submit" value="Submit" />
++        </form>
++      </div>
++      `
++    })
++
++    await expectPlausibleInAction(page, {
++      action: async () => {
++        await page.goto(url)
++        await ensurePlausibleInitialized(page)
++        await page.click('input[type="submit"]')
++      },
++      shouldIgnoreRequest: isViewOrEngagementEvent,
++      expectedRequests: [
++        {
++          n: 'Form Submission',
++          p: { path: url }
++        }
++      ]
++    })
++  })
++
++  test('tracks dynamically inserted forms', async ({ page }, { testId }) => {
++    const { url } = await initializePageDynamically(page, {
++      testId,
++      scriptConfig: { ...DEFAULT_CONFIG, formSubmissions: true },
++      bodyContent: `
++      <div>
++        <button id="dynamically-insert-form" onclick="createForm()">Open form</button>
++        <script>
++          function createForm() {
++            const form = document.createElement('form');
++            form.setAttribute('onsubmit', "${customSubmitHandlerStub}");
++            const submit = document.createElement('input');
++            submit.type = 'submit';
++            submit.value = 'Submit';
++            form.appendChild(submit);
++            document.body.appendChild(form);
++          }
++        </script>
++      </div>
++      `
++    })
++
++    await expectPlausibleInAction(page, {
++      action: async () => {
++        await page.goto(url)
++        await ensurePlausibleInitialized(page)
++        await page.click('button#dynamically-insert-form')
++        await page.click('input[type="submit"]')
++      },
++      shouldIgnoreRequest: isViewOrEngagementEvent,
++      expectedRequests: [
++        {
++          n: 'Form Submission',
++          p: { path: url }
++        }
++      ]
++    })
++  })
++
++  test('tracks form submissions that do not pass checkValidity if the form has novalidate attribute', async ({
++    page
++  }, { testId }) => {
++    const { url } = await initializePageDynamically(page, {
++      testId,
++      scriptConfig: { ...DEFAULT_CONFIG, formSubmissions: true },
++      bodyContent: `
++      <div>
++        <form novalidate onsubmit="${customSubmitHandlerStub}">
++          <input type="email" />
++          <input type="submit" value="Submit" />
++        </form>
++      </div>
++      `
++    })
++
++    await expectPlausibleInAction(page, {
++      action: async () => {
++        await page.goto(url)
++        await ensurePlausibleInitialized(page)
++
++        await page.fill('input[type="email"]', 'invalid email')
++        await page.click('input[type="submit"]')
++      },
++      shouldIgnoreRequest: isViewOrEngagementEvent,
++      expectedRequests: [
++        {
++          n: 'Form Submission',
++          p: { path: url }
++        }
++      ]
++    })
++  })
++
++  test('does not track form submissions that do not pass checkValidity', async ({
++    page
++  }, { testId }) => {
++    const { url } = await initializePageDynamically(page, {
++      testId,
++      scriptConfig: { ...DEFAULT_CONFIG, formSubmissions: true },
++      bodyContent: `
++      <div>
++        <form>
++          <input type="email" />
++          <input type="submit" value="Submit" />
++        </form>
++      </div>
++      `
++    })
++
++    await expectPlausibleInAction(page, {
++      action: async () => {
++        await page.goto(url)
++        await ensurePlausibleInitialized(page)
++        await page.fill('input[type="email"]', 'invalid email')
++        await page.click('input[type="submit"]')
++      },
++      shouldIgnoreRequest: ignoreEngagementRequests,
++      expectedRequests: [{ n: 'pageview' }],
++      refutedRequests: [
++        {
++          n: 'Form Submission'
++        }
++      ]
++    })
++  })
++
++  test('limitation: does not detect forms submitted using FormElement.submit() method', async ({
++    page
++  }, { testId }) => {
++    const { url } = await initializePageDynamically(page, {
++      testId,
++      scriptConfig: { ...DEFAULT_CONFIG, formSubmissions: true },
++      bodyContent: `
++      <div>
++        <form id="form">
++          <input type="text" placeholder="Name" />
++        </form>
++        <button id="trigger-FormElement-submit" onclick="document.getElementById('form').submit()">Submit</button>
++      </div>
++      `
++    })
++
++    await expectPlausibleInAction(page, {
++      action: async () => {
++        await page.goto(url)
++        await ensurePlausibleInitialized(page)
++
++        await page.click('button#trigger-FormElement-submit')
++      },
++      shouldIgnoreRequest: ignoreEngagementRequests,
++      expectedRequests: [{ n: 'pageview' }],
++      refutedRequests: [
++        {
++          n: 'Form Submission'
++        }
++      ]
++    })
++  })
++
++  test('limitation: tracks _all_ forms on the same page, but _records them indistinguishably_', async ({
++    page
++  }, { testId }) => {
++    const { url } = await initializePageDynamically(page, {
++      testId,
++      scriptConfig: { ...DEFAULT_CONFIG, formSubmissions: true },
++      bodyContent: `
++      <div>
++        <form onsubmit="${customSubmitHandlerStub}">
++          <h2>Form 1</h2>
++          <input type="text" /><input type="submit" value="Submit" />
++        </form>
++        <form onsubmit="${customSubmitHandlerStub}">
++          <h2>Form 2</h2>
++          <input type="email" />
++        </form>
++      </div>
++      `
++    })
++
++    await expectPlausibleInAction(page, {
++      action: async () => {
++        await page.goto(url)
++        await ensurePlausibleInitialized(page)
++        await page.click('input[type="submit"]')
++      },
++      shouldIgnoreRequest: isViewOrEngagementEvent,
++      expectedRequests: [
++        {
++          n: 'Form Submission',
++          p: { path: url }
++        }
++      ]
++    })
++
++    await expectPlausibleInAction(page, {
++      action: async () => {
++        await page.fill('input[type="email"]', 'customer@example.com')
++        await page.keyboard.press('Enter')
++      },
++      shouldIgnoreRequest: isViewOrEngagementEvent,
++      expectedRequests: [
++        {
++          n: 'Form Submission',
++          p: { path: url }
++        }
++      ]
++    })
++  })
++})
++/**
++ * This function mitigates test flakiness due to the test runner triggering the submit action
++ * before the tracker script has attached the event listener.
++ * This flakiness will happen in the real world as well:
++ * forms submitted before the tracker script attaches the event listener will not be tracked.
++ */
++function ensurePlausibleInitialized(page: Page) {
++  return page.waitForFunction(() => (window as any).plausible?.l === true)
++}
++
++const isViewOrEngagementEvent = ({ n }) =>
++  ['pageview', 'engagement'].includes(n)
++
++/**
++ * This is a stub for custom form onsubmit handlers Plausible users may have on their websites.
++ * Overriding onsubmit with a custom handler is common practice in web development for a variety of reasons (mostly UX),
++ * so it's important to track form submissions from forms with such handlers.
++ */
++const customSubmitHandlerStub = "event.preventDefault(); console.log('Form submitted')"
+diff --git a/tracker/test/support/dynamic-page-template.html b/tracker/test/support/dynamic-page-template.html
+new file mode 100644
+index 000000000000..ca631abe1527
+--- /dev/null
++++ b/tracker/test/support/dynamic-page-template.html
+@@ -0,0 +1,29 @@
++<!doctype html>
++<html lang="en">
++  <head>
++    <meta charset="UTF-8" />
++    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
++    <meta http-equiv="X-UA-Compatible" content="ie=edge" />
++    <title>Plausible Playwright tests</title>
++    <script>
++      // This must be kept in sync with the actual script snippet that customers should use
++      (window.plausible =
++        window.plausible ||
++        function () {
++          (window.plausible.q = window.plausible.q || []).push(arguments);
++        }),
++        (window.plausible.init = function (i) {
++          window.plausible.o = i || {};
++        });
++      var script = document.createElement("script");
++      (script.type = "text/javascript"),
++        (script.defer = !0),
++        (script.src = "<%= plausible_script_url %>");
++      var r = document.getElementsByTagName("script")[0];
++      r.parentNode.insertBefore(script, r);
++      plausible.init();
++    </script>
++  </head>
++
++  <body></body>
++</html>
+diff --git a/tracker/test/support/initialize-page-dynamically.ts b/tracker/test/support/initialize-page-dynamically.ts
+new file mode 100644
+index 000000000000..b8fdb91c3fe3
+--- /dev/null
++++ b/tracker/test/support/initialize-page-dynamically.ts
+@@ -0,0 +1,42 @@
++import { Page } from "@playwright/test";
++import { ScriptConfig } from "./types";
++import { readFileSync } from "node:fs";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++
++const TEMPLATE = readFileSync(
++  path.resolve(__dirname, "./dynamic-page-template.html")
++).toString();
++
++interface DynamicPageOptions {
++  scriptConfig: ScriptConfig;
++  /** vanilla HTML string, which can contain JS, will be set in the body of the page */
++  bodyContent: string;
++  testId: string;
++}
++
++interface DynamicPageInfo {
++  /** the url where the page is served */
++  url: string;
++}
++
++export async function initializePageDynamically(
++  page: Page,
++  { testId, scriptConfig, bodyContent }: DynamicPageOptions
++): Promise<DynamicPageInfo> {
++  const url = `/dynamic/${testId}`;
++  await page.route(url, async (route) => {
++    await route.fulfill({
++      body: TEMPLATE.replace(
++        "<%= plausible_script_url %>",
++        `/tracker/js/plausible-main.js?script_config=${encodeURIComponent(
++          JSON.stringify(scriptConfig)
++        )}`
++      ).replace("<body></body>", `<body>${bodyContent}</body>`),
++      contentType: "text/html",
++    });
++  });
++  return { url };
++}
+diff --git a/tracker/test/support/server.js b/tracker/test/support/server.js
+index fa3a9aac48c4..329ff44e9579 100644
+--- a/tracker/test/support/server.js
++++ b/tracker/test/support/server.js
+@@ -27,7 +27,7 @@ export function runLocalFileServer() {
+       code = code.replace('"<%= @config_js %>"', req.query.script_config)
+     }
+ 
+-    res.send(code)
++    res.type('application/javascript').send(code)
+   });
+ 
+   // A test utility - serve an image with an artificial delay
+diff --git a/tracker/test/support/test-utils.js b/tracker/test/support/test-utils.js
+index c373cfcb9a73..4583b5da193b 100644
+--- a/tracker/test/support/test-utils.js
++++ b/tracker/test/support/test-utils.js
+@@ -72,8 +72,10 @@ export const mockManyRequests = function({ page, path, numberOfRequests, respons
+  *  is `expectedRequests.length + refutedRequests.length`.
+  * @param {number} [args.expectedRequestCount] - When provided, expects the total amount of
+  *  event requests made to match this number.
++ * @param {Function} [args.shouldIgnoreRequest] - When provided, ignores certain requests
+  * @param {number} [args.responseDelay] - When provided, delays the response from the Plausible
+  *  API by the given number of milliseconds.
++ *  @param {Function} [args.mockRequestTimeout] - How long to wait for the requests to be made
+  */
+ export const expectPlausibleInAction = async function (page, {
+   action,
+diff --git a/tracker/test/support/types.ts b/tracker/test/support/types.ts
+new file mode 100644
+index 000000000000..2fa535cede0b
+--- /dev/null
++++ b/tracker/test/support/types.ts
+@@ -0,0 +1,17 @@
++export type Options = {
++  hash: boolean;
++  local: boolean;
++  exclusions: boolean;
++  manual: boolean;
++  revenue: boolean;
++  pageviewProps: boolean;
++  outboundLinks: boolean;
++  fileDownloads: boolean;
++  taggedEvents: boolean;
++  formSubmissions: boolean;
++};
++
++export type ScriptConfig = {
++  domain: string;
++  endpoint: string;
++} & Partial<Options>;

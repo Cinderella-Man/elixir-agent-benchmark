@@ -1,0 +1,311 @@
+diff --git a/config/runtime.exs b/config/runtime.exs
+index 9b8585f5b..89d1d1aae 100644
+--- a/config/runtime.exs
++++ b/config/runtime.exs
+@@ -25,6 +25,21 @@ config :pinchflat,
+   basic_auth_username: System.get_env("BASIC_AUTH_USERNAME"),
+   basic_auth_password: System.get_env("BASIC_AUTH_PASSWORD")
+ 
++arch_string = to_string(:erlang.system_info(:system_architecture))
++
++system_arch =
++  cond do
++    String.contains?(arch_string, "arm") -> "arm"
++    String.contains?(arch_string, "aarch") -> "arm"
++    String.contains?(arch_string, "x86") -> "x86"
++    true -> "unknown"
++  end
++
++config :pinchflat, Pinchflat.Repo,
++  load_extensions: [
++    Path.join([:code.priv_dir(:pinchflat), "repo", "extensions", "sqlean-linux-#{system_arch}", "sqlean"])
++  ]
++
+ if config_env() == :prod do
+   config_path =
+     System.get_env("CONFIG_PATH") ||
+diff --git a/lib/pinchflat/media/media.ex b/lib/pinchflat/media/media.ex
+index e074ce1e1..e457ae70b 100644
+--- a/lib/pinchflat/media/media.ex
++++ b/lib/pinchflat/media/media.ex
+@@ -66,6 +66,7 @@ defmodule Pinchflat.Media do
+     |> where([mi], mi.source_id == ^source.id and is_nil(mi.media_filepath))
+     |> where(^build_format_clauses(media_profile))
+     |> where(^maybe_apply_cutoff_date(source))
++    |> where(^maybe_apply_title_regex(source))
+     |> Repo.maybe_limit(limit)
+     |> Repo.all()
+   end
+@@ -247,6 +248,14 @@ defmodule Pinchflat.Media do
+     end
+   end
+ 
++  defp maybe_apply_title_regex(source) do
++    if source.title_filter_regex do
++      dynamic([mi], fragment("regexp_like(?, ?)", mi.title, ^source.title_filter_regex))
++    else
++      dynamic(true)
++    end
++  end
++
+   defp build_format_clauses(media_profile) do
+     mapped_struct = Map.from_struct(media_profile)
+ 
+diff --git a/lib/pinchflat/sources/source.ex b/lib/pinchflat/sources/source.ex
+index ec3075ffe..266ac8516 100644
+--- a/lib/pinchflat/sources/source.ex
++++ b/lib/pinchflat/sources/source.ex
+@@ -28,6 +28,7 @@ defmodule Pinchflat.Sources.Source do
+     last_indexed_at
+     original_url
+     download_cutoff_date
++    title_filter_regex
+     media_profile_id
+   )a
+ 
+@@ -57,11 +58,6 @@ defmodule Pinchflat.Sources.Source do
+     field :collection_name, :string
+     field :collection_id, :string
+     field :collection_type, Ecto.Enum, values: [:channel, :playlist]
+-    field :nfo_filepath, :string
+-    field :poster_filepath, :string
+-    field :fanart_filepath, :string
+-    field :banner_filepath, :string
+-    field :series_directory, :string
+     field :index_frequency_minutes, :integer, default: 60 * 24
+     field :fast_index, :boolean, default: false
+     field :download_media, :boolean, default: true
+@@ -69,6 +65,13 @@ defmodule Pinchflat.Sources.Source do
+     # Only download media items that were published after this date
+     field :download_cutoff_date, :date
+     field :original_url, :string
++    field :title_filter_regex, :string
++
++    field :series_directory, :string
++    field :nfo_filepath, :string
++    field :poster_filepath, :string
++    field :fanart_filepath, :string
++    field :banner_filepath, :string
+ 
+     belongs_to :media_profile, MediaProfile
+ 
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
+index 33976a238..f662a202b 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
+@@ -238,7 +238,7 @@
+       />
+     </section>
+ 
+-    <.button class="my-10 sm:mb-7.5 w-full sm:w-auto">Save Media profile</.button>
++    <.button class="my-10 sm:mb-7.5 w-full sm:w-auto" rounding="rounded-lg">Save Media profile</.button>
+   </section>
+ 
+   <div class="rounded-sm dark:bg-meta-4 p-4 md:p-6 mb-5">
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex b/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
+index 564296b99..8d61ceb44 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
+@@ -1,11 +1,22 @@
+-<.simple_form :let={f} for={@changeset} action={@action}>
++<.simple_form
++  :let={f}
++  for={@changeset}
++  action={@action}
++  x-data="{ advancedMode: !!JSON.parse(localStorage.getItem('advancedMode')) }"
++  x-init="$watch('advancedMode', value => localStorage.setItem('advancedMode', JSON.stringify(value)))"
++>
+   <.error :if={@changeset.action}>
+     Oops, something went wrong! Please check the errors below.
+   </.error>
+ 
+-  <h3 class="mt-8 text-2xl text-black dark:text-white">
+-    General Options
+-  </h3>
++  <section class="flex justify-between items-center mt-8">
++    <h3 class=" text-2xl text-black dark:text-white">
++      General Options
++    </h3>
++    <span class="cursor-pointer hover:underline" x-on:click="advancedMode = !advancedMode">
++      Editing Mode: <span x-text="advancedMode ? 'Advanced' : 'Basic'"></span>
++    </span>
++  </section>
+ 
+   <.input
+     field={f[:custom_name]}
+@@ -69,7 +80,24 @@
+     help="Only download media uploaded after this date. Leave blank to download all media. Must be in YYYY-MM-DD format"
+   />
+ 
+-  <.button class="my-10 sm:mb-7.5 w-full sm:w-auto">Save Source</.button>
++  <section x-show="advancedMode">
++    <h3 class="mt-8 text-2xl text-black dark:text-white">
++      Advanced Options
++    </h3>
++    <p class="text-sm mt-2">
++      Tread carefully
++    </p>
++
++    <.input
++      field={f[:title_filter_regex]}
++      type="text"
++      label="Title Filter Regex"
++      placeholder="(?i)^How to Bike$"
++      help="A PCRE-compatible regex. Only media with titles that match this regex will be downloaded. Look up 'SQLean Regex docs' for more"
++    />
++  </section>
++
++  <.button class="my-10 sm:mb-7.5 w-full sm:w-auto" rounding="rounded-lg">Save Source</.button>
+ 
+   <div class="rounded-sm dark:bg-meta-4 p-4 md:p-6 mb-5">
+     <.fast_indexing_help />
+diff --git a/priv/repo/extensions/sqlean-linux-arm/crypto.so b/priv/repo/extensions/sqlean-linux-arm/crypto.so
+new file mode 100755
+index 000000000..42c7dbcf3
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-arm/crypto.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-arm/define.so b/priv/repo/extensions/sqlean-linux-arm/define.so
+new file mode 100755
+index 000000000..579b7e666
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-arm/define.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-arm/fileio.so b/priv/repo/extensions/sqlean-linux-arm/fileio.so
+new file mode 100755
+index 000000000..a5607aad9
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-arm/fileio.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-arm/fuzzy.so b/priv/repo/extensions/sqlean-linux-arm/fuzzy.so
+new file mode 100755
+index 000000000..7d04add5d
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-arm/fuzzy.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-arm/ipaddr.so b/priv/repo/extensions/sqlean-linux-arm/ipaddr.so
+new file mode 100755
+index 000000000..e04334604
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-arm/ipaddr.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-arm/math.so b/priv/repo/extensions/sqlean-linux-arm/math.so
+new file mode 100755
+index 000000000..8359a9230
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-arm/math.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-arm/regexp.so b/priv/repo/extensions/sqlean-linux-arm/regexp.so
+new file mode 100755
+index 000000000..24ef59823
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-arm/regexp.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-arm/sqlean.so b/priv/repo/extensions/sqlean-linux-arm/sqlean.so
+new file mode 100755
+index 000000000..9cdd77966
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-arm/sqlean.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-arm/stats.so b/priv/repo/extensions/sqlean-linux-arm/stats.so
+new file mode 100755
+index 000000000..138916ea7
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-arm/stats.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-arm/text.so b/priv/repo/extensions/sqlean-linux-arm/text.so
+new file mode 100755
+index 000000000..44cae90d0
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-arm/text.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-arm/unicode.so b/priv/repo/extensions/sqlean-linux-arm/unicode.so
+new file mode 100755
+index 000000000..5b749a2b0
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-arm/unicode.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-arm/uuid.so b/priv/repo/extensions/sqlean-linux-arm/uuid.so
+new file mode 100755
+index 000000000..cce35ab7b
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-arm/uuid.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-arm/vsv.so b/priv/repo/extensions/sqlean-linux-arm/vsv.so
+new file mode 100755
+index 000000000..7ab781cd2
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-arm/vsv.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-x86/crypto.so b/priv/repo/extensions/sqlean-linux-x86/crypto.so
+new file mode 100755
+index 000000000..2555ca720
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-x86/crypto.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-x86/define.so b/priv/repo/extensions/sqlean-linux-x86/define.so
+new file mode 100755
+index 000000000..c07a9299a
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-x86/define.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-x86/fileio.so b/priv/repo/extensions/sqlean-linux-x86/fileio.so
+new file mode 100755
+index 000000000..3871d6c14
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-x86/fileio.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-x86/fuzzy.so b/priv/repo/extensions/sqlean-linux-x86/fuzzy.so
+new file mode 100755
+index 000000000..cfdb86491
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-x86/fuzzy.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-x86/ipaddr.so b/priv/repo/extensions/sqlean-linux-x86/ipaddr.so
+new file mode 100755
+index 000000000..c4fbea3ff
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-x86/ipaddr.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-x86/math.so b/priv/repo/extensions/sqlean-linux-x86/math.so
+new file mode 100755
+index 000000000..d578670d0
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-x86/math.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-x86/regexp.so b/priv/repo/extensions/sqlean-linux-x86/regexp.so
+new file mode 100755
+index 000000000..1016b23e9
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-x86/regexp.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-x86/sqlean.so b/priv/repo/extensions/sqlean-linux-x86/sqlean.so
+new file mode 100755
+index 000000000..ae6191f12
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-x86/sqlean.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-x86/stats.so b/priv/repo/extensions/sqlean-linux-x86/stats.so
+new file mode 100755
+index 000000000..fe2094bce
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-x86/stats.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-x86/text.so b/priv/repo/extensions/sqlean-linux-x86/text.so
+new file mode 100755
+index 000000000..4b977bca6
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-x86/text.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-x86/unicode.so b/priv/repo/extensions/sqlean-linux-x86/unicode.so
+new file mode 100755
+index 000000000..dd56481b1
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-x86/unicode.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-x86/uuid.so b/priv/repo/extensions/sqlean-linux-x86/uuid.so
+new file mode 100755
+index 000000000..4764755d8
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-x86/uuid.so differ
+diff --git a/priv/repo/extensions/sqlean-linux-x86/vsv.so b/priv/repo/extensions/sqlean-linux-x86/vsv.so
+new file mode 100755
+index 000000000..cbd5e87ef
+Binary files /dev/null and b/priv/repo/extensions/sqlean-linux-x86/vsv.so differ
+diff --git a/priv/repo/migrations/20240320153902_add_title_regex_to_source.exs b/priv/repo/migrations/20240320153902_add_title_regex_to_source.exs
+new file mode 100644
+index 000000000..ab451447b
+--- /dev/null
++++ b/priv/repo/migrations/20240320153902_add_title_regex_to_source.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddTitleRegexToSource do
++  use Ecto.Migration
++
++  def change do
++    alter table(:sources) do
++      add :title_filter_regex, :string
++    end
++  end
++end
+diff --git a/test/pinchflat/media_test.exs b/test/pinchflat/media_test.exs
+index 500628e38..21cdf2c7d 100644
+--- a/test/pinchflat/media_test.exs
++++ b/test/pinchflat/media_test.exs
+@@ -239,6 +239,26 @@ defmodule Pinchflat.MediaTest do
+     end
+   end
+ 
++  describe "list_pending_media_items_for/1 when testing title regex" do
++    test "returns only media items that match the title regex" do
++      source = source_fixture(%{title_filter_regex: "(?i)^FOO$"})
++
++      matching_media_item = media_item_fixture(%{source_id: source.id, media_filepath: nil, title: "foo"})
++      _non_matching_media_item = media_item_fixture(%{source_id: source.id, media_filepath: nil, title: "bar"})
++
++      assert Media.list_pending_media_items_for(source) == [matching_media_item]
++    end
++
++    test "does not apply a regex if none is specified" do
++      source = source_fixture(%{title_filter_regex: nil})
++
++      media_item_one = media_item_fixture(%{source_id: source.id, media_filepath: nil, title: "foo"})
++      media_item_two = media_item_fixture(%{source_id: source.id, media_filepath: nil, title: "bar"})
++
++      assert Media.list_pending_media_items_for(source) == [media_item_one, media_item_two]
++    end
++  end
++
+   describe "list_downloaded_media_items_for/1" do
+     test "returns only media items with a media_filepath" do
+       source = source_fixture()

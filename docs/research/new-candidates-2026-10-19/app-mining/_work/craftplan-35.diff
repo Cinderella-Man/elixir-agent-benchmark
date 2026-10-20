@@ -1,0 +1,267 @@
+diff --git a/lib/craftplan/accounts/user.ex b/lib/craftplan/accounts/user.ex
+index be439185..1fb23fa7 100644
+--- a/lib/craftplan/accounts/user.ex
++++ b/lib/craftplan/accounts/user.ex
+@@ -158,14 +158,12 @@ defmodule Craftplan.Accounts.User do
+     create :register_with_password do
+       description "Register a new user with a email and password."
+ 
++      skip_unknown_inputs [:role, "role"]
++
+       argument :email, :ci_string do
+         allow_nil? false
+       end
+ 
+-      argument :role, :atom do
+-        default :customer
+-      end
+-
+       argument :password, :string do
+         description "The proposed password for the user, in plain text."
+         allow_nil? false
+@@ -182,7 +180,8 @@ defmodule Craftplan.Accounts.User do
+       # Sets the email from the argument
+       change set_attribute(:email, arg(:email))
+ 
+-      change set_attribute(:role, arg(:role))
++      # Public registration must never grant a privileged role.
++      change set_attribute(:role, :customer)
+ 
+       # Hashes the provided password
+       change HashPasswordChange
+@@ -199,6 +198,32 @@ defmodule Craftplan.Accounts.User do
+       end
+     end
+ 
++    create :create_initial_admin_with_password do
++      description "Create the initial administrator during instance setup."
++
++      argument :email, :ci_string do
++        allow_nil? false
++      end
++
++      argument :password, :string do
++        description "The proposed password for the user, in plain text."
++        allow_nil? false
++        constraints min_length: 8
++        sensitive? true
++      end
++
++      argument :password_confirmation, :string do
++        description "The proposed password for the user (again), in plain text."
++        allow_nil? false
++        sensitive? true
++      end
++
++      change set_attribute(:email, arg(:email))
++      change set_attribute(:role, :admin)
++      change {HashPasswordChange, strategy_name: :password}
++      validate {PasswordConfirmationValidation, strategy_name: :password}
++    end
++
+     action :request_password_reset_with_password do
+       description "Send password reset instructions to a user if they exist."
+ 
+diff --git a/lib/craftplan_web/live/setup_live.ex b/lib/craftplan_web/live/setup_live.ex
+index e3cec40f..220cc12d 100644
+--- a/lib/craftplan_web/live/setup_live.ex
++++ b/lib/craftplan_web/live/setup_live.ex
+@@ -13,7 +13,7 @@ defmodule CraftplanWeb.SetupLive do
+        |> redirect(to: ~p"/sign-in")}
+     else
+       form =
+-        AshPhoenix.Form.for_create(User, :register_with_password,
++        AshPhoenix.Form.for_create(User, :create_initial_admin_with_password,
+           as: "user",
+           authorize?: false
+         )
+@@ -77,8 +77,6 @@ defmodule CraftplanWeb.SetupLive do
+        |> put_flash(:error, "Setup already complete.")
+        |> redirect(to: ~p"/sign-in")}
+     else
+-      user_params = Map.put(user_params, "role", "admin")
+-
+       case AshPhoenix.Form.submit(socket.assigns.form, params: user_params, authorize?: false) do
+         {:ok, _user} ->
+           {:noreply,
+diff --git a/test/craftplan_web/controllers/auth_registration_controller_test.exs b/test/craftplan_web/controllers/auth_registration_controller_test.exs
+new file mode 100644
+index 00000000..db6cb0fb
+--- /dev/null
++++ b/test/craftplan_web/controllers/auth_registration_controller_test.exs
+@@ -0,0 +1,21 @@
++defmodule CraftplanWeb.AuthRegistrationControllerTest do
++  use CraftplanWeb.ConnCase, async: true
++
++  test "public registration cannot assign an administrator role", %{conn: conn} do
++    email = "registration-role+#{System.unique_integer([:positive])}@test.com"
++
++    conn =
++      post(conn, ~p"/auth/user/password/register", %{
++        "user" => %{
++          "email" => email,
++          "password" => "Password12345!",
++          "password_confirmation" => "Password12345!",
++          "role" => "admin"
++        }
++      })
++
++    assert redirected_to(conn) == ~p"/manage/overview"
++    assert {:ok, user} = Craftplan.Accounts.get_user_by_email(email, authorize?: false)
++    assert user.role == :customer
++  end
++end
+diff --git a/test/craftplan_web/live/manage/settings_members_live_test.exs b/test/craftplan_web/live/manage/settings_members_live_test.exs
+index ba0c440d..da092336 100644
+--- a/test/craftplan_web/live/manage/settings_members_live_test.exs
++++ b/test/craftplan_web/live/manage/settings_members_live_test.exs
+@@ -4,22 +4,10 @@ defmodule CraftplanWeb.SettingsMembersLiveTest do
+   import Phoenix.LiveViewTest
+ 
+   alias Ash.Error.Forbidden
+-  alias Craftplan.Accounts.User
++  alias Craftplan.Test.AuthHelpers
+ 
+   defp create_staff_member!(email) do
+-    User
+-    |> Ash.Changeset.for_create(:register_with_password, %{
+-      email: email,
+-      role: :staff,
+-      password: "TestPassword123!",
+-      password_confirmation: "TestPassword123!"
+-    })
+-    |> Ash.create!(
+-      context: %{
+-        strategy: AshAuthentication.Strategy.Password,
+-        private: %{ash_authentication?: true}
+-      }
+-    )
++    AuthHelpers.register_user!(email: email, role: :staff)
+   end
+ 
+   describe "authorization" do
+diff --git a/test/craftplan_web/live/setup_live_test.exs b/test/craftplan_web/live/setup_live_test.exs
+new file mode 100644
+index 00000000..67f402c5
+--- /dev/null
++++ b/test/craftplan_web/live/setup_live_test.exs
+@@ -0,0 +1,25 @@
++defmodule CraftplanWeb.SetupLiveTest do
++  use CraftplanWeb.ConnCase, async: true
++
++  import Phoenix.LiveViewTest
++
++  test "creates the initial user as an administrator", %{conn: conn} do
++    email = "initial-admin+#{System.unique_integer([:positive])}@test.com"
++
++    {:ok, view, _html} = live(conn, ~p"/setup")
++
++    view
++    |> form("#setup-form", %{
++      "user" => %{
++        "email" => email,
++        "password" => "Password12345!",
++        "password_confirmation" => "Password12345!"
++      }
++    })
++    |> render_submit()
++
++    assert_redirect(view, ~p"/sign-in")
++    assert {:ok, user} = Craftplan.Accounts.get_user_by_email(email, authorize?: false)
++    assert user.role == :admin
++  end
++end
+diff --git a/test/support/auth_helpers.ex b/test/support/auth_helpers.ex
+index b205e0c3..65d69332 100644
+--- a/test/support/auth_helpers.ex
++++ b/test/support/auth_helpers.ex
+@@ -20,7 +20,6 @@ defmodule Craftplan.Test.AuthHelpers do
+     User
+     |> Ash.Changeset.for_create(:register_with_password, %{
+       email: email,
+-      role: role,
+       password: @default_password,
+       password_confirmation: @default_password
+     })
+@@ -30,6 +29,7 @@ defmodule Craftplan.Test.AuthHelpers do
+         private: %{ash_authentication?: true}
+       }
+     )
++    |> assign_role!(role)
+   end
+ 
+   @doc """
+@@ -60,4 +60,15 @@ defmodule Craftplan.Test.AuthHelpers do
+   end
+ 
+   defp unique_email(role), do: "#{role}+#{System.unique_integer([:positive])}@local"
++
++  defp assign_role!(user, :customer), do: user
++
++  defp assign_role!(user, role) do
++    updated_user =
++      user
++      |> Ash.Changeset.for_update(:update_role, %{role: role})
++      |> Ash.update!(authorize?: false)
++
++    %{updated_user | __metadata__: user.__metadata__}
++  end
+ end
+diff --git a/test/support/data_case.ex b/test/support/data_case.ex
+index 35851874..7a3af4f0 100644
+--- a/test/support/data_case.ex
++++ b/test/support/data_case.ex
+@@ -16,8 +16,7 @@ defmodule Craftplan.DataCase do
+ 
+   use ExUnit.CaseTemplate
+ 
+-  alias AshAuthentication.Strategy.Password
+-  alias Craftplan.Accounts.User
++  alias Craftplan.Test.AuthHelpers
+   alias Ecto.Adapters.SQL.Sandbox
+ 
+   using do
+@@ -64,41 +63,13 @@ defmodule Craftplan.DataCase do
+   Create a staff user for use as an actor in tests that require authorization.
+   """
+   def staff_actor do
+-    email = "staff+#{System.unique_integer([:positive])}@local"
+-
+-    User
+-    |> Ash.Changeset.for_create(:register_with_password, %{
+-      email: email,
+-      password: "Passw0rd!!",
+-      password_confirmation: "Passw0rd!!",
+-      role: :staff
+-    })
+-    |> Ash.create!(
+-      context: %{
+-        strategy: Password,
+-        private: %{ash_authentication?: true}
+-      }
+-    )
++    AuthHelpers.register_user!(role: :staff)
+   end
+ 
+   @doc """
+   Create or fetch an admin user for tests requiring elevated privileges.
+   """
+   def admin_actor do
+-    email = "admin+#{System.unique_integer([:positive])}@local"
+-
+-    User
+-    |> Ash.Changeset.for_create(:register_with_password, %{
+-      email: email,
+-      password: "Passw0rd!!",
+-      password_confirmation: "Passw0rd!!",
+-      role: :admin
+-    })
+-    |> Ash.create!(
+-      context: %{
+-        strategy: Password,
+-        private: %{ash_authentication?: true}
+-      }
+-    )
++    AuthHelpers.register_user!(role: :admin)
+   end
+ end

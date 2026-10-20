@@ -1,0 +1,377 @@
+diff --git a/lib/mydia/jobs/media_import.ex b/lib/mydia/jobs/media_import.ex
+index f82e156f56..37940eabf7 100644
+--- a/lib/mydia/jobs/media_import.ex
++++ b/lib/mydia/jobs/media_import.ex
+@@ -1569,10 +1569,52 @@ defmodule Mydia.Jobs.MediaImport do
+         # File exists but not in DB - this is a conflict
+         handle_file_conflict(file, dest_path, episode, download, library_path, args)
+ 
+-      existing_file ->
+-        # File exists and is in DB - reuse it
+-        Logger.info("Reusing existing media file", path: dest_path)
+-        {:ok, existing_file}
++      %{id: id} = existing_file ->
++        case download.metadata do
++          %{"upgrade_target_media_file_id" => ^id} ->
++            import_onto_upgrade_target(
++              file,
++              dest_path,
++              existing_file,
++              episode,
++              download,
++              library_path,
++              args
++            )
++
++          _ ->
++            reuse_existing_file(dest_path, existing_file)
++        end
++    end
++  end
++
++  defp reuse_existing_file(dest_path, existing_file) do
++    Logger.info("Reusing existing media file", path: dest_path)
++    {:ok, existing_file}
++  end
++
++  # An upgrade whose destination is the very file it targets is one of two
++  # things, told apart by size as handle_file_conflict/6 does. The same size is
++  # the release already on disk: blacklist it, or the sweep grabs it every
++  # night, since no new file means finalize never rejects it. A different size
++  # is another release that renaming mapped to the same name, a real
++  # candidate: place it beside the target so finalize compares the two.
++  defp import_onto_upgrade_target(file, dest_path, target, episode, download, library_path, args) do
++    case file_size(dest_path) do
++      {:ok, size} when size == file.size ->
++        Upgrades.blacklist_redundant_upgrade(download, target)
++        reuse_existing_file(dest_path, target)
++
++      {:ok, _other} ->
++        place_conflicting_file(file, dest_path, episode, download, library_path, args)
++
++      {:error, error} ->
++        Logger.error("Could not read the size of the existing destination",
++          dest: dest_path,
++          reason: inspect(error)
++        )
++
++        {:error, error}
+     end
+   end
+ 
+diff --git a/lib/mydia/upgrades.ex b/lib/mydia/upgrades.ex
+index e9c4e6efd0..f8008a743a 100644
+--- a/lib/mydia/upgrades.ex
++++ b/lib/mydia/upgrades.ex
+@@ -831,7 +831,7 @@ defmodule Mydia.Upgrades do
+   defp blacklist_release(new_file) do
+     with download_id when is_binary(download_id) <- download_id_for(new_file),
+          %Download{} = download <- Repo.get(Download, download_id) do
+-      maybe_blacklist_download(new_file, download)
++      maybe_blacklist_download(download, media_file_id: new_file.id)
+     else
+       _ ->
+         Logger.error(
+@@ -861,27 +861,48 @@ defmodule Mydia.Upgrades do
+   # missing-episode season search. Skip it: a pack that really is bad
+   # simply fails the gate again, which costs a re-download rather than
+   # permanently burning a good release.
+-  defp maybe_blacklist_download(new_file, %Download{} = download) do
++  defp maybe_blacklist_download(%Download{} = download, log_metadata) do
+     if season_pack?(download) do
+       Logger.info(
+         "Not blacklisting a season pack whose per-episode copy lost the upgrade comparison: " <>
+           "a pack can legitimately upgrade some episodes and not others",
+-        media_file_id: new_file.id,
+-        download_id: download.id
++        Keyword.put(log_metadata, :download_id, download.id)
+       )
+ 
+       false
+     else
+-      do_blacklist(new_file, download)
++      do_blacklist(download, log_metadata)
+     end
+   end
+ 
++  @doc """
++  Blacklists the release behind an upgrade grab whose import landed on the
++  very file it was meant to replace: the release already on disk.
++
++  That import creates no new file, so `finalize_upgrade/1` never runs and
++  never rejects it. Without this, whatever made the release look like an
++  upgrade (a misread language tag, say) holds again at the next sweep, which
++  grabs it again, every night. Season packs are skipped for the reason
++  `maybe_blacklist_download/2` gives. Returns whether it blacklisted.
++  """
++  @spec blacklist_redundant_upgrade(Download.t(), MediaFile.t()) :: boolean()
++  def blacklist_redundant_upgrade(%Download{} = download, %MediaFile{} = target) do
++    Logger.warning(
++      "Upgrade grab imported onto the file it was meant to replace; blacklisting the release",
++      media_file_id: target.id,
++      download_id: download.id,
++      title: download.title
++    )
++
++    maybe_blacklist_download(download, media_file_id: target.id)
++  end
++
+   defp season_pack?(%Download{metadata: metadata}) when is_map(metadata),
+     do: metadata["season_pack"] == true
+ 
+   defp season_pack?(%Download{}), do: false
+ 
+-  defp do_blacklist(new_file, %Download{} = download) do
++  defp do_blacklist(%Download{} = download, log_metadata) do
+     with guid when is_binary(guid) and guid != "" <- get_in(download.metadata || %{}, ["guid"]),
+          indexer when is_binary(indexer) and indexer != "" <- download.indexer do
+       case Blacklists.add(indexer, guid, download.title || "Unknown release", "upgrade_rejected",
+@@ -891,10 +912,9 @@ defmodule Mydia.Upgrades do
+           true
+ 
+         {:error, changeset} ->
+-          Logger.error("Failed to blacklist rejected upgrade release",
+-            media_file_id: new_file.id,
+-            download_id: download.id,
+-            errors: inspect(changeset.errors)
++          Logger.error(
++            "Failed to blacklist rejected upgrade release",
++            log_metadata ++ [download_id: download.id, errors: inspect(changeset.errors)]
+           )
+ 
+           false
+@@ -904,7 +924,7 @@ defmodule Mydia.Upgrades do
+         Logger.error(
+           "Could not blacklist rejected upgrade release: no traceable (indexer, guid) " <>
+             "for the originating download",
+-          media_file_id: new_file.id
++          log_metadata
+         )
+ 
+         false
+diff --git a/priv/release_languages/tokens.exs b/priv/release_languages/tokens.exs
+index 3c82575a0d..234453c34c 100644
+--- a/priv/release_languages/tokens.exs
++++ b/priv/release_languages/tokens.exs
+@@ -34,6 +34,9 @@
+     %{patterns: ["korean", "kor"], languages: ["ko"]},
+     %{patterns: ["chinese", "chi"], languages: ["zh"]},
+     %{patterns: ["hindi"], languages: ["hi"]},
+-    %{patterns: ["portuguese", "por"], languages: ["pt"]}
++    %{patterns: ["portuguese", "por"], languages: ["pt"]},
++    # Polish scene releases tag the language as a bare "PL", and "Lektor" is
++    # the Polish voice-over track.
++    %{patterns: ["polish", "pl[ ._-]?dub(?:bing)?", "pl", "lektor"], languages: ["pl"]}
+   ]
+ }
+diff --git a/test/mydia/indexers/release_languages_test.exs b/test/mydia/indexers/release_languages_test.exs
+index 07fd8c0409..7161d60e03 100644
+--- a/test/mydia/indexers/release_languages_test.exs
++++ b/test/mydia/indexers/release_languages_test.exs
+@@ -38,7 +38,16 @@ defmodule Mydia.Indexers.ReleaseLanguagesTest do
+     {"Paper.Lantern.Club.2024.1080p.WEB.x264-DUALiTY", "en", ["en"], true},
+     # German abbreviations, not just the full word.
+     {"Paper.Lantern.Club.2024.GER.DL.1080p.BluRay.x264", "en", ["de"], false},
+-    {"Paper.Lantern.Club.2024.DEU.1080p.WEB.x264", "en", ["de"], false}
++    {"Paper.Lantern.Club.2024.DEU.1080p.WEB.x264", "en", ["de"], false},
++    # Polish scene tags. A bare PL left untagged read as the original
++    # language, so a Polish copy kept "upgrading" to itself.
++    {"Paper.Lantern.Club.2024.PL.1080p.WEB-DL.x264.AC3-R22", "en", ["pl"], false},
++    {"[SOME-TRACKER.PL] Paper.Lantern.Club.2024.PL.1080p.WEB-DL.x264", "fr", ["pl"], false},
++    {"Paper.Lantern.Club.2024.PLDUB.1080p.WEB.x264", "en", ["pl"], false},
++    {"Paper.Lantern.Club.2024.1080p.WEB.x264.Lektor.PL", "en", ["pl"], false},
++    {"Paper.Lantern.Club.2024.POLISH.1080p.BluRay.x264", "en", ["pl"], false},
++    # PL only as a token, never inside a word.
++    {"Paper.Lantern.Club.2024.1080p.WEB.x264-PLAYWEB", "en", ["en"], true}
+   ]
+ 
+   for {{title, original, languages, assumed?}, index} <- Enum.with_index(@cases) do
+diff --git a/test/mydia/jobs/media_import_test.exs b/test/mydia/jobs/media_import_test.exs
+index 65bd8eff8a..e502e426ee 100644
+--- a/test/mydia/jobs/media_import_test.exs
++++ b/test/mydia/jobs/media_import_test.exs
+@@ -2349,6 +2349,184 @@ defmodule Mydia.Jobs.MediaImportTest do
+       assert new_file, "expected the regular movie file to import"
+       assert is_nil(new_file.supersedes_media_file_id)
+     end
++
++    # An upgrade grab of the release already on disk imports onto the file it
++    # was meant to replace. No new file means no finalize comparison and no
++    # rejection, so without a blacklist here the nightly sweep grabbed the same
++    # release forever (a title the language detector misread kept "winning").
++    @tag :tmp_dir
++    test "an upgrade that lands on its own target blacklists the release",
++         %{tmp_dir: tmp_dir} do
++      _library_path = create_test_library_path(tmp_dir, :movies)
++
++      download_dir = Path.join(tmp_dir, "downloads")
++      File.mkdir_p!(download_dir)
++      File.write!(Path.join(download_dir, "Same.Release.Movie.2024.1080p.mkv"), "content")
++
++      media_item = media_item_fixture(%{type: "movie", title: "Same Release Movie", year: 2024})
++
++      {:ok, _} =
++        Settings.create_download_client_config(%{
++          name: "SameReleaseClient",
++          type: :qbittorrent,
++          host: "nonexistent.invalid",
++          port: 9999,
++          username: "test",
++          password: "test",
++          enabled: true,
++          priority: 1
++        })
++
++      download_attrs = %{
++        media_item_id: media_item.id,
++        status: "completed",
++        completed_at: DateTime.utc_now(),
++        download_client: "SameReleaseClient",
++        download_client_id: "same-release-1"
++      }
++
++      first = download_fixture(Map.put(download_attrs, :metadata, %{"guid" => "same-guid"}))
++
++      assert {:ok, :imported} =
++               perform_job(MediaImport, %{"download_id" => first.id, "save_path" => download_dir})
++
++      [existing_file] = Library.list_media_files()
++
++      # The queue deletes the stale row for the same torrent before the regrab.
++      Mydia.Repo.delete!(first)
++
++      regrab =
++        download_fixture(
++          Map.put(download_attrs, :metadata, %{
++            "guid" => "same-guid",
++            "upgrade_target_media_file_id" => existing_file.id
++          })
++        )
++
++      assert {:ok, :imported} =
++               perform_job(MediaImport, %{"download_id" => regrab.id, "save_path" => download_dir})
++
++      assert [%{id: id}] = Library.list_media_files()
++      assert id == existing_file.id
++      assert Mydia.Downloads.Blacklists.blacklisted?(regrab.indexer, "same-guid")
++    end
++
++    # Renaming can map a genuinely different release onto the target's name.
++    # Those bytes are a real candidate, so they must reach finalize, not the
++    # blacklist.
++    @tag :tmp_dir
++    test "an upgrade with different content at its target's path is placed beside it",
++         %{tmp_dir: tmp_dir} do
++      _library_path = create_test_library_path(tmp_dir, :movies)
++
++      download_dir = Path.join(tmp_dir, "downloads")
++      File.mkdir_p!(download_dir)
++      source = Path.join(download_dir, "Renamed.Movie.2024.1080p.mkv")
++      File.write!(source, "content")
++
++      media_item = media_item_fixture(%{type: "movie", title: "Renamed Movie", year: 2024})
++
++      {:ok, _} =
++        Settings.create_download_client_config(%{
++          name: "RenamedClient",
++          type: :qbittorrent,
++          host: "nonexistent.invalid",
++          port: 9999,
++          username: "test",
++          password: "test",
++          enabled: true,
++          priority: 1
++        })
++
++      download_attrs = %{
++        media_item_id: media_item.id,
++        status: "completed",
++        completed_at: DateTime.utc_now(),
++        download_client: "RenamedClient"
++      }
++
++      first =
++        download_fixture(
++          Map.merge(download_attrs, %{
++            download_client_id: "renamed-1",
++            metadata: %{"guid" => "first-guid"}
++          })
++        )
++
++      assert {:ok, :imported} =
++               perform_job(MediaImport, %{"download_id" => first.id, "save_path" => download_dir})
++
++      [existing_file] = Library.list_media_files()
++      # A fresh inode: the first import may have hardlinked the source.
++      File.rm!(source)
++      File.write!(source, "different, larger content")
++
++      upgrade =
++        download_fixture(
++          Map.merge(download_attrs, %{
++            download_client_id: "renamed-2",
++            metadata: %{
++              "guid" => "upgrade-guid",
++              "upgrade_target_media_file_id" => existing_file.id
++            }
++          })
++        )
++
++      assert {:ok, :imported} =
++               perform_job(MediaImport, %{
++                 "download_id" => upgrade.id,
++                 "save_path" => download_dir
++               })
++
++      new_file = Library.list_media_files() |> Enum.find(&(&1.id != existing_file.id))
++
++      assert new_file, "expected the different release to import as its own file"
++      assert new_file.supersedes_media_file_id == existing_file.id
++      refute Mydia.Downloads.Blacklists.blacklisted?(upgrade.indexer, "upgrade-guid")
++    end
++
++    @tag :tmp_dir
++    test "a non-upgrade import onto an existing file blacklists nothing", %{tmp_dir: tmp_dir} do
++      _library_path = create_test_library_path(tmp_dir, :movies)
++
++      download_dir = Path.join(tmp_dir, "downloads")
++      File.mkdir_p!(download_dir)
++      File.write!(Path.join(download_dir, "Reimport.Movie.2024.1080p.mkv"), "content")
++
++      media_item = media_item_fixture(%{type: "movie", title: "Reimport Movie", year: 2024})
++
++      {:ok, _} =
++        Settings.create_download_client_config(%{
++          name: "ReimportClient",
++          type: :qbittorrent,
++          host: "nonexistent.invalid",
++          port: 9999,
++          username: "test",
++          password: "test",
++          enabled: true,
++          priority: 1
++        })
++
++      for attempt <- 1..2 do
++        download =
++          download_fixture(%{
++            media_item_id: media_item.id,
++            status: "completed",
++            completed_at: DateTime.utc_now(),
++            download_client: "ReimportClient",
++            download_client_id: "reimport-#{attempt}",
++            metadata: %{"guid" => "reimport-guid"}
++          })
++
++        assert {:ok, :imported} =
++                 perform_job(MediaImport, %{
++                   "download_id" => download.id,
++                   "save_path" => download_dir
++                 })
++      end
++
++      refute Mydia.Downloads.Blacklists.blacklisted?("test-indexer", "reimport-guid")
++    end
+   end
+ 
+   describe "import candidate snapshot" do

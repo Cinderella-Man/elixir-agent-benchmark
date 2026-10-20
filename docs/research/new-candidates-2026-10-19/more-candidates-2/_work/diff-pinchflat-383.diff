@@ -1,0 +1,166 @@
+diff --git a/lib/pinchflat/downloading/download_option_builder.ex b/lib/pinchflat/downloading/download_option_builder.ex
+index 3e0447210..333d1d5e3 100644
+--- a/lib/pinchflat/downloading/download_option_builder.ex
++++ b/lib/pinchflat/downloading/download_option_builder.ex
+@@ -127,11 +127,12 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+   defp quality_options(media_profile) do
+     vcodec = Settings.get!(:video_codec_preference)
+     acodec = Settings.get!(:audio_codec_preference)
++    container = media_profile.media_container
+ 
+     case media_profile.preferred_resolution do
+       # Also be aware that :audio disabled all embedding options for subtitles
+       :audio ->
+-        [:extract_audio, format_sort: "+acodec:#{acodec}"]
++        [:extract_audio, format_sort: "+acodec:#{acodec}", audio_format: container || "best"]
+ 
+       resolution_atom ->
+         {resolution_string, _} =
+@@ -141,7 +142,7 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+ 
+         [
+           # Since Plex doesn't support reading metadata from MKV
+-          remux_video: "mp4",
++          remux_video: container || "mp4",
+           format_sort: "res:#{resolution_string},+codec:#{vcodec}:#{acodec}"
+         ]
+     end
+diff --git a/lib/pinchflat/profiles/media_profile.ex b/lib/pinchflat/profiles/media_profile.ex
+index da86df394..3158bdfcb 100644
+--- a/lib/pinchflat/profiles/media_profile.ex
++++ b/lib/pinchflat/profiles/media_profile.ex
+@@ -27,6 +27,7 @@ defmodule Pinchflat.Profiles.MediaProfile do
+     shorts_behaviour
+     livestream_behaviour
+     preferred_resolution
++    media_container
+     redownload_delay_days
+     marked_for_deletion_at
+   )a
+@@ -65,6 +66,7 @@ defmodule Pinchflat.Profiles.MediaProfile do
+     field :shorts_behaviour, Ecto.Enum, values: ~w(include exclude only)a, default: :include
+     field :livestream_behaviour, Ecto.Enum, values: ~w(include exclude only)a, default: :include
+     field :preferred_resolution, Ecto.Enum, values: ~w(4320p 2160p 1080p 720p 480p 360p audio)a, default: :"1080p"
++    field :media_container, :string, default: nil
+ 
+     field :marked_for_deletion_at, :utc_datetime
+ 
+diff --git a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
+index a088aaa60..778d6747e 100644
+--- a/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
++++ b/lib/pinchflat_web/controllers/media_profiles/media_profile_html/media_profile_form.html.heex
+@@ -1,4 +1,10 @@
+-<.simple_form :let={f} for={@changeset} action={@action}>
++<.simple_form
++  :let={f}
++  for={@changeset}
++  action={@action}
++  x-data="{ advancedMode: !!JSON.parse(localStorage.getItem('advancedMode')) }"
++  x-init="$watch('advancedMode', value => localStorage.setItem('advancedMode', JSON.stringify(value)))"
++>
+   <.error :if={@changeset.action}>
+     Oops, something went wrong! Please check the errors below.
+   </.error>
+@@ -30,10 +36,14 @@
+       </.input>
+     </section>
+ 
+-    <h3 class="mt-8 text-2xl text-black dark:text-white">
+-      General Options
+-    </h3>
+-
++    <section class="flex justify-between items-center mt-8">
++      <h3 class="text-2xl text-white">
++        General Options
++      </h3>
++      <span class="cursor-pointer hover:underline" x-on:click="advancedMode = !advancedMode">
++        Editing Mode: <span x-text="advancedMode ? 'Advanced' : 'Standard'"></span>
++      </span>
++    </section>
+     <section x-data="{ 
+         presets: { 
+           default: 'Default',
+@@ -203,6 +213,16 @@
+       />
+     </section>
+ 
++    <section x-show="advancedMode">
++      <.input
++        field={f[:media_container]}
++        type="text"
++        label="Media Container"
++        placeholder="mp4"
++        help="Don't change this if you're going to consume media via Plex. Leave blank for default"
++      />
++    </section>
++
+     <section x-data="{ presets: { default: null, media_center: 1, audio: null, archiving: 1 } }">
+       <.input
+         field={f[:redownload_delay_days]}
+diff --git a/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex b/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
+index 50055f152..6dcead789 100644
+--- a/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
++++ b/lib/pinchflat_web/controllers/sources/source_html/source_form.html.heex
+@@ -12,7 +12,7 @@
+ 
+   <section x-data="{ mediaProfileId: null }">
+     <section class="flex justify-between items-center mt-4">
+-      <h3 class=" text-2xl text-black dark:text-white">
++      <h3 class="text-2xl text-white">
+         General Options
+       </h3>
+       <span class="cursor-pointer hover:underline" x-on:click="advancedMode = !advancedMode">
+diff --git a/priv/repo/erd.png b/priv/repo/erd.png
+index a6e9441ef..06525bc01 100644
+Binary files a/priv/repo/erd.png and b/priv/repo/erd.png differ
+diff --git a/priv/repo/migrations/20240910173050_add_media_container_to_media_profiles.exs b/priv/repo/migrations/20240910173050_add_media_container_to_media_profiles.exs
+new file mode 100644
+index 000000000..3ad34d0db
+--- /dev/null
++++ b/priv/repo/migrations/20240910173050_add_media_container_to_media_profiles.exs
+@@ -0,0 +1,9 @@
++defmodule Pinchflat.Repo.Migrations.AddMediaContainerToMediaProfiles do
++  use Ecto.Migration
++
++  def change do
++    alter table(:media_profiles) do
++      add :media_container, :string
++    end
++  end
++end
+diff --git a/test/pinchflat/downloading/download_option_builder_test.exs b/test/pinchflat/downloading/download_option_builder_test.exs
+index 5670c388f..98aff6f57 100644
+--- a/test/pinchflat/downloading/download_option_builder_test.exs
++++ b/test/pinchflat/downloading/download_option_builder_test.exs
+@@ -252,7 +252,7 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilderTest do
+     end
+   end
+ 
+-  describe "build/1 when testing quality options" do
++  describe "build/1 when testing media quality and format options" do
+     test "includes quality options" do
+       resolutions = ["360", "480", "720", "1080", "2160", "4320"]
+ 
+@@ -291,6 +291,22 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilderTest do
+ 
+       assert {:format_sort, "res:1080,+codec:av01:aac"} in res
+     end
++
++    test "includes custom remux target for videos if specified", %{media_item: media_item} do
++      media_item = update_media_profile_attribute(media_item, %{media_container: "mkv"})
++
++      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
++
++      assert {:remux_video, "mkv"} in res
++    end
++
++    test "includes custom format target for audio if specified", %{media_item: media_item} do
++      media_item = update_media_profile_attribute(media_item, %{media_container: "flac", preferred_resolution: :audio})
++
++      assert {:ok, res} = DownloadOptionBuilder.build(media_item)
++
++      assert {:audio_format, "flac"} in res
++    end
+   end
+ 
+   describe "build/1 when testing sponsorblock options" do

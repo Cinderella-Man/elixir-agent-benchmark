@@ -1,0 +1,1244 @@
+diff --git a/README.md b/README.md
+index c1f67264d..a4a1ab972 100644
+--- a/README.md
++++ b/README.md
+@@ -66,6 +66,7 @@ If it doesn't work for your use case, please make a feature request! You can als
+ - Can pass cookies to YouTube to download your private playlists ([docs](https://github.com/kieraneglin/pinchflat/wiki/YouTube-Cookies))
+ - Sponsorblock integration
+ - \[Advanced\] allows custom `yt-dlp` options ([docs](https://github.com/kieraneglin/pinchflat/wiki/%5BAdvanced%5D-Custom-yt%E2%80%90dlp-options))
++- \[Advanced\] supports running custom scripts when after downloading/deleting media (alpha - [docs](https://github.com/kieraneglin/pinchflat/wiki/%5BAdvanced%5D-Custom-lifecycle-scripts))
+ 
+ ## Screenshots
+ 
+diff --git a/config/config.exs b/config/config.exs
+index c157fabf2..b40608866 100644
+--- a/config/config.exs
++++ b/config/config.exs
+@@ -14,7 +14,7 @@ config :pinchflat,
+   yt_dlp_executable: System.find_executable("yt-dlp"),
+   apprise_executable: System.find_executable("apprise"),
+   yt_dlp_runner: Pinchflat.YtDlp.CommandRunner,
+-  apprise_runner: Pinchflat.Notifications.CommandRunner,
++  apprise_runner: Pinchflat.Lifecycle.Notifications.CommandRunner,
+   media_directory: "/downloads",
+   # The user may or may not store metadata for their needs, but the app will always store its copy
+   metadata_directory: "/config/metadata",
+diff --git a/dev.Dockerfile b/dev.Dockerfile
+index c6e6132cf..460543e62 100644
+--- a/dev.Dockerfile
++++ b/dev.Dockerfile
+@@ -7,7 +7,7 @@ FROM ${DEV_IMAGE}
+ 
+ # Install debian packages
+ RUN apt-get update -qq
+-RUN apt-get install -y inotify-tools ffmpeg curl git openssh-client \
++RUN apt-get install -y inotify-tools ffmpeg curl git openssh-client jq \
+   python3 python3-pip python3-setuptools python3-wheel python3-dev locales procps
+ 
+ # Install nodejs
+diff --git a/lib/pinchflat/boot/pre_job_startup_tasks.ex b/lib/pinchflat/boot/pre_job_startup_tasks.ex
+index 9f6bcf7c8..129582df8 100644
+--- a/lib/pinchflat/boot/pre_job_startup_tasks.ex
++++ b/lib/pinchflat/boot/pre_job_startup_tasks.ex
+@@ -33,6 +33,7 @@ defmodule Pinchflat.Boot.PreJobStartupTasks do
+   def init(state) do
+     reset_executing_jobs()
+     create_blank_yt_dlp_files()
++    create_blank_user_script_file()
+     apply_default_settings()
+ 
+     {:ok, state}
+@@ -65,6 +66,18 @@ defmodule Pinchflat.Boot.PreJobStartupTasks do
+     end)
+   end
+ 
++  defp create_blank_user_script_file do
++    base_dir = Application.get_env(:pinchflat, :extras_directory)
++    filepath = Path.join([base_dir, "user-scripts", "lifecycle"])
++
++    if !File.exists?(filepath) do
++      Logger.info("Creating blank file and making it executable: #{filepath}")
++
++      FilesystemUtils.write_p!(filepath, "")
++      File.chmod(filepath, 0o755)
++    end
++  end
++
+   defp apply_default_settings do
+     {:ok, yt_dlp_version} = yt_dlp_runner().version()
+     {:ok, apprise_version} = apprise_runner().version()
+diff --git a/lib/pinchflat/downloading/download_option_builder.ex b/lib/pinchflat/downloading/download_option_builder.ex
+index 578029486..a9eeba5f4 100644
+--- a/lib/pinchflat/downloading/download_option_builder.ex
++++ b/lib/pinchflat/downloading/download_option_builder.ex
+@@ -8,6 +8,8 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+   alias Pinchflat.Media.MediaItem
+   alias Pinchflat.Downloading.OutputPathBuilder
+ 
++  alias Pinchflat.Utils.FilesystemUtils, as: FSUtils
++
+   @doc """
+   Builds the options for yt-dlp to download media based on the given media's profile.
+ 
+@@ -154,12 +156,10 @@ defmodule Pinchflat.Downloading.DownloadOptionBuilder do
+       Enum.reduce(filenames, [], fn filename, acc ->
+         filepath = Path.join(base_dir, filename)
+ 
+-        case File.read(filepath) do
+-          {:ok, file_data} ->
+-            if String.trim(file_data) != "", do: [filepath | acc], else: acc
+-
+-          {:error, _} ->
+-            acc
++        if FSUtils.exists_and_nonempty?(filepath) do
++          [filepath | acc]
++        else
++          acc
+         end
+       end)
+ 
+diff --git a/lib/pinchflat/downloading/media_download_worker.ex b/lib/pinchflat/downloading/media_download_worker.ex
+index b97713284..c211977ce 100644
+--- a/lib/pinchflat/downloading/media_download_worker.ex
++++ b/lib/pinchflat/downloading/media_download_worker.ex
+@@ -14,6 +14,8 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+   alias Pinchflat.Media
+   alias Pinchflat.Downloading.MediaDownloader
+ 
++  alias Pinchflat.Lifecycle.UserScripts.CommandRunner, as: UserScriptRunner
++
+   @doc """
+   Starts the media_item media download worker and creates a task for the media_item.
+ 
+@@ -56,11 +58,14 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+ 
+   defp download_media_and_schedule_jobs(media_item, is_redownload) do
+     case MediaDownloader.download_for_media_item(media_item) do
+-      {:ok, updated_media_item} ->
+-        Media.update_media_item(updated_media_item, %{
+-          media_size_bytes: compute_media_filesize(updated_media_item),
+-          media_redownloaded_at: get_redownloaded_at(is_redownload)
+-        })
++      {:ok, downloaded_media_item} ->
++        {:ok, updated_media_item} =
++          Media.update_media_item(downloaded_media_item, %{
++            media_size_bytes: compute_media_filesize(downloaded_media_item),
++            media_redownloaded_at: get_redownloaded_at(is_redownload)
++          })
++
++        :ok = run_user_script(updated_media_item)
+ 
+         {:ok, updated_media_item}
+ 
+@@ -74,21 +79,13 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+ 
+   defp compute_media_filesize(media_item) do
+     case File.stat(media_item.media_filepath) do
+-      {:ok, %{size: size}} ->
+-        size
+-
+-      _ ->
+-        nil
++      {:ok, %{size: size}} -> size
++      _ -> nil
+     end
+   end
+ 
+-  defp get_redownloaded_at(is_redownload) do
+-    if is_redownload do
+-      DateTime.utc_now()
+-    else
+-      nil
+-    end
+-  end
++  defp get_redownloaded_at(true), do: DateTime.utc_now()
++  defp get_redownloaded_at(_), do: nil
+ 
+   defp action_on_error(message) do
+     # This will attempt re-download at the next indexing, but it won't be retried
+@@ -103,4 +100,12 @@ defmodule Pinchflat.Downloading.MediaDownloadWorker do
+       {:error, :download_failed}
+     end
+   end
++
++  # NOTE: I like this pattern of using the default value so that I don't have to
++  # define it in config.exs (and friends). Consider using this elsewhere.
++  defp run_user_script(media_item) do
++    runner = Application.get_env(:pinchflat, :user_script_runner, UserScriptRunner)
++
++    runner.run(:media_downloaded, media_item)
++  end
+ end
+diff --git a/lib/pinchflat/fast_indexing/fast_indexing_worker.ex b/lib/pinchflat/fast_indexing/fast_indexing_worker.ex
+index 0f85d4098..ccd712636 100644
+--- a/lib/pinchflat/fast_indexing/fast_indexing_worker.ex
++++ b/lib/pinchflat/fast_indexing/fast_indexing_worker.ex
+@@ -15,7 +15,7 @@ defmodule Pinchflat.FastIndexing.FastIndexingWorker do
+   alias Pinchflat.Settings
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.FastIndexing.FastIndexingHelpers
+-  alias Pinchflat.Notifications.SourceNotifications
++  alias Pinchflat.Lifecycle.Notifications.SourceNotifications
+ 
+   @doc """
+   Starts the source fast indexing worker and creates a task for the source.
+diff --git a/lib/pinchflat/notifications/apprise_command_runner.ex b/lib/pinchflat/lifecycle/notifications/apprise_command_runner.ex
+similarity index 85%
+rename from lib/pinchflat/notifications/apprise_command_runner.ex
+rename to lib/pinchflat/lifecycle/notifications/apprise_command_runner.ex
+index 13ad3276d..8251b9584 100644
+--- a/lib/pinchflat/notifications/apprise_command_runner.ex
++++ b/lib/pinchflat/lifecycle/notifications/apprise_command_runner.ex
+@@ -1,4 +1,4 @@
+-defmodule Pinchflat.Notifications.AppriseCommandRunner do
++defmodule Pinchflat.Lifecycle.Notifications.AppriseCommandRunner do
+   @moduledoc """
+   A behaviour for running CLI commands against a notification backend (apprise).
+ 
+diff --git a/lib/pinchflat/notifications/command_runner.ex b/lib/pinchflat/lifecycle/notifications/command_runner.ex
+similarity index 86%
+rename from lib/pinchflat/notifications/command_runner.ex
+rename to lib/pinchflat/lifecycle/notifications/command_runner.ex
+index 782b1a9a2..a8e08a5f5 100644
+--- a/lib/pinchflat/notifications/command_runner.ex
++++ b/lib/pinchflat/lifecycle/notifications/command_runner.ex
+@@ -1,4 +1,4 @@
+-defmodule Pinchflat.Notifications.CommandRunner do
++defmodule Pinchflat.Lifecycle.Notifications.CommandRunner do
+   @moduledoc """
+   Runs apprise commands using the `System.cmd/3` function
+   """
+@@ -7,7 +7,7 @@ defmodule Pinchflat.Notifications.CommandRunner do
+ 
+   alias Pinchflat.Utils.CliUtils
+   alias Pinchflat.Utils.FunctionUtils
+-  alias Pinchflat.Notifications.AppriseCommandRunner
++  alias Pinchflat.Lifecycle.Notifications.AppriseCommandRunner
+ 
+   @behaviour AppriseCommandRunner
+ 
+@@ -28,10 +28,10 @@ defmodule Pinchflat.Notifications.CommandRunner do
+     default_opts = [:verbose]
+     parsed_opts = CliUtils.parse_options(default_opts ++ command_opts)
+ 
+-    {output, return_code} = CliUtils.wrap_cmd(backend_executable(), parsed_opts ++ endpoints)
++    {output, exit_code} = CliUtils.wrap_cmd(backend_executable(), parsed_opts ++ endpoints)
+     Logger.info("[apprise] response: #{output}")
+ 
+-    case return_code do
++    case exit_code do
+       0 -> {:ok, String.trim(output)}
+       _ -> {:error, String.trim(output)}
+     end
+diff --git a/lib/pinchflat/notifications/source_notifications.ex b/lib/pinchflat/lifecycle/notifications/source_notifications.ex
+similarity index 96%
+rename from lib/pinchflat/notifications/source_notifications.ex
+rename to lib/pinchflat/lifecycle/notifications/source_notifications.ex
+index 88cc18947..4d0cf28a6 100644
+--- a/lib/pinchflat/notifications/source_notifications.ex
++++ b/lib/pinchflat/lifecycle/notifications/source_notifications.ex
+@@ -1,4 +1,4 @@
+-defmodule Pinchflat.Notifications.SourceNotifications do
++defmodule Pinchflat.Lifecycle.Notifications.SourceNotifications do
+   @moduledoc """
+   Contains utilities for sending notifications about sources
+   """
+diff --git a/lib/pinchflat/lifecycle/user_scripts/command_runner.ex b/lib/pinchflat/lifecycle/user_scripts/command_runner.ex
+new file mode 100644
+index 000000000..b346bbefd
+--- /dev/null
++++ b/lib/pinchflat/lifecycle/user_scripts/command_runner.ex
+@@ -0,0 +1,76 @@
++defmodule Pinchflat.Lifecycle.UserScripts.CommandRunner do
++  @moduledoc """
++  Runs custom user commands commands using the `System.cmd/3` function
++  """
++
++  require Logger
++
++  alias Pinchflat.Utils.CliUtils
++  alias Pinchflat.Utils.FilesystemUtils
++  alias Pinchflat.Lifecycle.UserScripts.UserScriptCommandRunner
++
++  @behaviour UserScriptCommandRunner
++
++  @event_types [
++    :media_downloaded,
++    :media_deleted
++  ]
++
++  @doc """
++  Runs the user script command for the given event type. Passes the event
++  and the encoded data to the user script command.
++
++  This function will succeed in almost all cases, even if the user script command
++  failed - this is because I don't want bad scripts to stop the whole process.
++  If something fails, it'll be logged.
++
++  The only things that can cause a true failure are passing in an invalid event
++  type or if the passed data cannot be encoded into JSON - both indicative of
++  failures in the development process.
++
++  Returns :ok
++  """
++  @impl UserScriptCommandRunner
++  def run(event_type, encodable_data) when event_type in @event_types do
++    case backend_executable() do
++      {:ok, :no_executable} ->
++        :ok
++
++      {:ok, executable_path} ->
++        {:ok, encoded_data} = Phoenix.json_library().encode(encodable_data)
++
++        {output, exit_code} =
++          CliUtils.wrap_cmd(
++            executable_path,
++            [to_string(event_type), encoded_data],
++            [],
++            logging_arg_override: "[suppressed]"
++          )
++
++        handle_output(output, exit_code)
++    end
++  end
++
++  def run(event_type, _encodable_data) do
++    raise ArgumentError, "Invalid event type: #{inspect(event_type)}"
++  end
++
++  defp handle_output(output, exit_code) do
++    Logger.debug("Custom lifecycle script exit code: #{exit_code} with output: #{output}")
++
++    :ok
++  end
++
++  defp backend_executable do
++    base_dir = Application.get_env(:pinchflat, :extras_directory)
++    filepath = Path.join([base_dir, "user-scripts", "lifecycle"])
++
++    if FilesystemUtils.exists_and_nonempty?(filepath) do
++      {:ok, filepath}
++    else
++      Logger.warning("User scripts lifecyle file either not present or is empty. Skipping.")
++
++      {:ok, :no_executable}
++    end
++  end
++end
+diff --git a/lib/pinchflat/lifecycle/user_scripts/user_script_command_runner.ex b/lib/pinchflat/lifecycle/user_scripts/user_script_command_runner.ex
+new file mode 100644
+index 000000000..a0f623441
+--- /dev/null
++++ b/lib/pinchflat/lifecycle/user_scripts/user_script_command_runner.ex
+@@ -0,0 +1,10 @@
++defmodule Pinchflat.Lifecycle.UserScripts.UserScriptCommandRunner do
++  @moduledoc """
++  A behaviour for running custom user scripts on certain events.
++
++  Used so we can implement Mox for testing without actually running the
++  user's command.
++  """
++
++  @callback run(atom(), map()) :: :ok | {:error, binary()}
++end
+diff --git a/lib/pinchflat/media/media.ex b/lib/pinchflat/media/media.ex
+index 43f7b6e0a..9178a67e1 100644
+--- a/lib/pinchflat/media/media.ex
++++ b/lib/pinchflat/media/media.ex
+@@ -10,8 +10,10 @@ defmodule Pinchflat.Media do
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.Media.MediaItem
+   alias Pinchflat.Media.MediaQuery
+-  alias Pinchflat.Metadata.MediaMetadata
+   alias Pinchflat.Utils.FilesystemUtils
++  alias Pinchflat.Metadata.MediaMetadata
++
++  alias Pinchflat.Lifecycle.UserScripts.CommandRunner, as: UserScriptRunner
+ 
+   @doc """
+   Returns the list of media_items.
+@@ -180,6 +182,7 @@ defmodule Pinchflat.Media do
+ 
+     if delete_files do
+       {:ok, _} = do_delete_media_files(media_item)
++      :ok = run_user_script(:media_deleted, media_item)
+     end
+ 
+     # Should delete these no matter what
+@@ -202,6 +205,7 @@ defmodule Pinchflat.Media do
+ 
+     Tasks.delete_tasks_for(media_item)
+     {:ok, _} = do_delete_media_files(media_item)
++    :ok = run_user_script(:media_deleted, media_item)
+ 
+     update_media_item(media_item, Map.merge(filepath_attrs, addl_attrs))
+   end
+@@ -237,4 +241,10 @@ defmodule Pinchflat.Media do
+     |> Enum.filter(&is_binary/1)
+     |> Enum.each(&FilesystemUtils.delete_file_and_remove_empty_directories/1)
+   end
++
++  defp run_user_script(event, media_item) do
++    runner = Application.get_env(:pinchflat, :user_script_runner, UserScriptRunner)
++
++    runner.run(event, media_item)
++  end
+ end
+diff --git a/lib/pinchflat/media/media_item.ex b/lib/pinchflat/media/media_item.ex
+index a671d5833..fbf740fba 100644
+--- a/lib/pinchflat/media/media_item.ex
++++ b/lib/pinchflat/media/media_item.ex
+@@ -7,6 +7,8 @@ defmodule Pinchflat.Media.MediaItem do
+   import Ecto.Changeset
+   import Pinchflat.Utils.ChangesetUtils
+ 
++  alias __MODULE__
++  alias Pinchflat.Repo
+   alias Pinchflat.Tasks.Task
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.Metadata.MediaMetadata
+@@ -116,4 +118,18 @@ defmodule Pinchflat.Media.MediaItem do
+     end)
+     |> Enum.into(%{})
+   end
++
++  @doc false
++  def json_exluded_fields do
++    ~w(__meta__ __struct__ metadata tasks media_items_search_index)a
++  end
++
++  defimpl Jason.Encoder, for: MediaItem do
++    def encode(value, opts) do
++      value
++      |> Repo.preload(:source)
++      |> Map.drop(MediaItem.json_exluded_fields())
++      |> Jason.Encode.map(opts)
++    end
++  end
+ end
+diff --git a/lib/pinchflat/profiles/media_profile.ex b/lib/pinchflat/profiles/media_profile.ex
+index be6c6a09f..fadc90b30 100644
+--- a/lib/pinchflat/profiles/media_profile.ex
++++ b/lib/pinchflat/profiles/media_profile.ex
+@@ -6,6 +6,7 @@ defmodule Pinchflat.Profiles.MediaProfile do
+   use Ecto.Schema
+   import Ecto.Changeset
+ 
++  alias __MODULE__
+   alias Pinchflat.Sources.Source
+ 
+   @allowed_fields ~w(
+@@ -84,4 +85,17 @@ defmodule Pinchflat.Profiles.MediaProfile do
+   def ext_regex do
+     ~r/\.({{ ?ext ?}}|%\( ?ext ?\)[sS])$/
+   end
++
++  @doc false
++  def json_exluded_fields do
++    ~w(__meta__ __struct__ sources)a
++  end
++
++  defimpl Jason.Encoder, for: MediaProfile do
++    def encode(value, opts) do
++      value
++      |> Map.drop(MediaProfile.json_exluded_fields())
++      |> Jason.Encode.map(opts)
++    end
++  end
+ end
+diff --git a/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex b/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex
+index 678a9a527..50af81e93 100644
+--- a/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex
++++ b/lib/pinchflat/slow_indexing/media_collection_indexing_worker.ex
+@@ -15,7 +15,7 @@ defmodule Pinchflat.SlowIndexing.MediaCollectionIndexingWorker do
+   alias Pinchflat.Sources.Source
+   alias Pinchflat.FastIndexing.FastIndexingWorker
+   alias Pinchflat.SlowIndexing.SlowIndexingHelpers
+-  alias Pinchflat.Notifications.SourceNotifications
++  alias Pinchflat.Lifecycle.Notifications.SourceNotifications
+ 
+   @doc """
+   Starts the source slow indexing worker and creates a task for the source.
+diff --git a/lib/pinchflat/sources/source.ex b/lib/pinchflat/sources/source.ex
+index a02c8c0b6..02af5bd46 100644
+--- a/lib/pinchflat/sources/source.ex
++++ b/lib/pinchflat/sources/source.ex
+@@ -7,6 +7,8 @@ defmodule Pinchflat.Sources.Source do
+   import Ecto.Changeset
+   import Pinchflat.Utils.ChangesetUtils
+ 
++  alias __MODULE__
++  alias Pinchflat.Repo
+   alias Pinchflat.Tasks.Task
+   alias Pinchflat.Media.MediaItem
+   alias Pinchflat.Profiles.MediaProfile
+@@ -133,4 +135,18 @@ defmodule Pinchflat.Sources.Source do
+   def filepath_attributes do
+     ~w(nfo_filepath fanart_filepath poster_filepath banner_filepath)a
+   end
++
++  @doc false
++  def json_exluded_fields do
++    ~w(__meta__ __struct__ metadata tasks media_items)a
++  end
++
++  defimpl Jason.Encoder, for: Source do
++    def encode(value, opts) do
++      value
++      |> Repo.preload(:media_profile)
++      |> Map.drop(Source.json_exluded_fields())
++      |> Jason.Encode.map(opts)
++    end
++  end
+ end
+diff --git a/lib/pinchflat/utils/cli_utils.ex b/lib/pinchflat/utils/cli_utils.ex
+index 1426a1bac..1b9c7b91b 100644
+--- a/lib/pinchflat/utils/cli_utils.ex
++++ b/lib/pinchflat/utils/cli_utils.ex
+@@ -13,17 +13,22 @@ defmodule Pinchflat.Utils.CliUtils do
+   commands if the job runner is cancelled.
+ 
+   Delegates to `System.cmd/3` and any options/output
+-  are passed through.
++  are passed through. Custom options can be passed in.
++
++  Custom options:
++    - logging_arg_override: if set, the passed value will be logged in place of
++      the actual arguments passed to the command
+ 
+   Returns {binary(), integer()}
+   """
+-  def wrap_cmd(command, args, opts \\ []) do
++  def wrap_cmd(command, args, passthrough_opts \\ [], opts \\ []) do
+     wrapper_command = Path.join(:code.priv_dir(:pinchflat), "cmd_wrapper.sh")
+     actual_command = [command] ++ args
++    logging_arg_override = Keyword.get(opts, :logging_arg_override, Enum.join(args, " "))
+ 
+-    Logger.info("[command_wrapper]: #{command} called with: #{Enum.join(args, " ")}")
++    Logger.info("[command_wrapper]: #{command} called with: #{logging_arg_override}")
+ 
+-    System.cmd(wrapper_command, actual_command, opts)
++    System.cmd(wrapper_command, actual_command, passthrough_opts)
+   end
+ 
+   @doc """
+diff --git a/lib/pinchflat/utils/filesystem_utils.ex b/lib/pinchflat/utils/filesystem_utils.ex
+index 831521826..86521923b 100644
+--- a/lib/pinchflat/utils/filesystem_utils.ex
++++ b/lib/pinchflat/utils/filesystem_utils.ex
+@@ -5,6 +5,21 @@ defmodule Pinchflat.Utils.FilesystemUtils do
+   alias Pinchflat.Media
+   alias Pinchflat.Utils.StringUtils
+ 
++  @doc """
++  Checks if a file exists and has non-whitespace contents.
++
++  Returns boolean()
++  """
++  def exists_and_nonempty?(filepath) do
++    case File.read(filepath) do
++      {:ok, contents} ->
++        String.trim(contents) != ""
++
++      _ ->
++        false
++    end
++  end
++
+   @doc """
+   Generates a temporary file and returns its path. The file is empty and has the given type.
+   Generates all the directories in the path if they don't exist.
+diff --git a/lib/pinchflat/yt_dlp/command_runner.ex b/lib/pinchflat/yt_dlp/command_runner.ex
+index 7a03df796..ed4cba015 100644
+--- a/lib/pinchflat/yt_dlp/command_runner.ex
++++ b/lib/pinchflat/yt_dlp/command_runner.ex
+@@ -81,16 +81,10 @@ defmodule Pinchflat.YtDlp.CommandRunner do
+     Enum.reduce(filename_options_map, [], fn {opt_name, filename}, acc ->
+       filepath = Path.join(base_dir, filename)
+ 
+-      case File.read(filepath) do
+-        {:ok, file_data} ->
+-          if String.trim(file_data) != "" do
+-            [{opt_name, filepath} | acc]
+-          else
+-            acc
+-          end
+-
+-        {:error, _} ->
+-          acc
++      if FSUtils.exists_and_nonempty?(filepath) do
++        [{opt_name, filepath} | acc]
++      else
++        acc
+       end
+     end)
+   end
+diff --git a/selfhosted.Dockerfile b/selfhosted.Dockerfile
+index fd3bd9122..9a9d96b1c 100644
+--- a/selfhosted.Dockerfile
++++ b/selfhosted.Dockerfile
+@@ -79,7 +79,7 @@ ARG PORT=8945
+ 
+ RUN apt-get update -y
+ RUN apt-get install -y libstdc++6 openssl libncurses5 locales ca-certificates \
+-  ffmpeg curl git openssh-client nano python3 python3-pip
++  ffmpeg curl git openssh-client nano python3 python3-pip jq procps
+ RUN apt-get clean && rm -f /var/lib/apt/lists/*_*
+ 
+ # Download and update YT-DLP
+diff --git a/test/pinchflat/boot/pre_job_startup_tasks_test.exs b/test/pinchflat/boot/pre_job_startup_tasks_test.exs
+index 66ecfce52..2aca8cfcd 100644
+--- a/test/pinchflat/boot/pre_job_startup_tasks_test.exs
++++ b/test/pinchflat/boot/pre_job_startup_tasks_test.exs
+@@ -53,6 +53,30 @@ defmodule Pinchflat.Boot.PreJobStartupTasksTest do
+     end
+   end
+ 
++  describe "create_blank_user_script_file" do
++    test "creates a blank script file" do
++      base_dir = Application.get_env(:pinchflat, :extras_directory)
++      filepath = Path.join([base_dir, "user-scripts", "lifecycle"])
++      File.rm(filepath)
++
++      refute File.exists?(filepath)
++
++      PreJobStartupTasks.init(%{})
++
++      assert File.exists?(filepath)
++    end
++
++    test "gives it 755 permissions" do
++      base_dir = Application.get_env(:pinchflat, :extras_directory)
++      filepath = Path.join([base_dir, "user-scripts", "lifecycle"])
++      File.rm(filepath)
++
++      PreJobStartupTasks.init(%{})
++
++      assert File.stat!(filepath).mode == 0o100755
++    end
++  end
++
+   describe "apply_default_settings" do
+     test "sets yt_dlp version" do
+       Settings.set(yt_dlp_version: nil)
+diff --git a/test/pinchflat/downloading/media_download_worker_test.exs b/test/pinchflat/downloading/media_download_worker_test.exs
+index e9155fa09..f937bcecb 100644
+--- a/test/pinchflat/downloading/media_download_worker_test.exs
++++ b/test/pinchflat/downloading/media_download_worker_test.exs
+@@ -12,9 +12,8 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+   setup :verify_on_exit!
+ 
+   setup do
+-    stub(HTTPClientMock, :get, fn _url, _headers, _opts ->
+-      {:ok, ""}
+-    end)
++    stub(UserScriptRunnerMock, :run, fn _event_type, _data -> :ok end)
++    stub(HTTPClientMock, :get, fn _url, _headers, _opts -> {:ok, ""} end)
+ 
+     media_item =
+       %{media_filepath: nil}
+@@ -185,6 +184,20 @@ defmodule Pinchflat.Downloading.MediaDownloadWorkerTest do
+       assert media_item.media_redownloaded_at == nil
+     end
+ 
++    test "calls the user script runner", %{media_item: media_item} do
++      expect(YtDlpRunnerMock, :run, fn _url, _opts, _ot, _addl ->
++        {:ok, render_metadata(:media_metadata)}
++      end)
++
++      expect(UserScriptRunnerMock, :run, fn :media_downloaded, data ->
++        assert data.id == media_item.id
++
++        :ok
++      end)
++
++      perform_job(MediaDownloadWorker, %{id: media_item.id})
++    end
++
+     test "does not blow up if the record doesn't exist" do
+       assert :ok = perform_job(MediaDownloadWorker, %{id: 0})
+     end
+diff --git a/test/pinchflat/downloading/media_retention_worker_test.exs b/test/pinchflat/downloading/media_retention_worker_test.exs
+index a77fd76b5..3ae1eaa75 100644
+--- a/test/pinchflat/downloading/media_retention_worker_test.exs
++++ b/test/pinchflat/downloading/media_retention_worker_test.exs
+@@ -1,13 +1,22 @@
+ defmodule Pinchflat.Downloading.MediaRetentionWorkerTest do
+   use Pinchflat.DataCase
+ 
++  import Mox
+   import Pinchflat.MediaFixtures
+   import Pinchflat.SourcesFixtures
+ 
+   alias Pinchflat.Media
+   alias Pinchflat.Downloading.MediaRetentionWorker
+ 
++  setup :verify_on_exit!
++
+   describe "perform/1" do
++    setup do
++      stub(UserScriptRunnerMock, :run, fn _event_type, _data -> :ok end)
++
++      :ok
++    end
++
+     test "deletes media files that are past their retention date" do
+       {_source, old_media_item, new_media_item} = prepare_records()
+ 
+diff --git a/test/pinchflat/downloading/output_path/parser_test.exs b/test/pinchflat/downloading/output_path/parser_test.exs
+index 44b27b9bb..f50a497e1 100644
+--- a/test/pinchflat/downloading/output_path/parser_test.exs
++++ b/test/pinchflat/downloading/output_path/parser_test.exs
+@@ -1,5 +1,5 @@
+ defmodule Pinchflat.Downloading.OutputPath.ParserTest do
+-  use ExUnit.Case, async: true
++  use ExUnit.Case, async: false
+ 
+   alias Pinchflat.Downloading.OutputPath.Parser
+ 
+diff --git a/test/pinchflat/notifications/command_runner_test.exs b/test/pinchflat/lifecycle/notifications/command_runner_test.exs
+similarity index 91%
+rename from test/pinchflat/notifications/command_runner_test.exs
+rename to test/pinchflat/lifecycle/notifications/command_runner_test.exs
+index 0ed4cc642..d0969d179 100644
+--- a/test/pinchflat/notifications/command_runner_test.exs
++++ b/test/pinchflat/lifecycle/notifications/command_runner_test.exs
+@@ -1,7 +1,7 @@
+-defmodule Pinchflat.Notifications.CommandRunnerTest do
+-  use ExUnit.Case, async: true
++defmodule Pinchflat.Lifecycle.Notifications.CommandRunnerTest do
++  use ExUnit.Case, async: false
+ 
+-  alias Pinchflat.Notifications.CommandRunner, as: Runner
++  alias Pinchflat.Lifecycle.Notifications.CommandRunner, as: Runner
+ 
+   @original_executable Application.compile_env(:pinchflat, :apprise_executable)
+ 
+diff --git a/test/pinchflat/notifications/source_notifications_test.exs b/test/pinchflat/lifecycle/notifications/source_notifications_test.exs
+similarity index 96%
+rename from test/pinchflat/notifications/source_notifications_test.exs
+rename to test/pinchflat/lifecycle/notifications/source_notifications_test.exs
+index 79757849e..42bbd7fc8 100644
+--- a/test/pinchflat/notifications/source_notifications_test.exs
++++ b/test/pinchflat/lifecycle/notifications/source_notifications_test.exs
+@@ -1,11 +1,11 @@
+-defmodule Pinchflat.Notifications.SourceNotificationsTest do
++defmodule Pinchflat.Lifecycle.Notifications.SourceNotificationsTest do
+   use Pinchflat.DataCase
+ 
+   import Mox
+   import Pinchflat.MediaFixtures
+   import Pinchflat.SourcesFixtures
+ 
+-  alias Pinchflat.Notifications.SourceNotifications
++  alias Pinchflat.Lifecycle.Notifications.SourceNotifications
+ 
+   @apprise_servers ["server_1", "server_2"]
+ 
+diff --git a/test/pinchflat/lifecycle/user_scripts/command_runner_test.exs b/test/pinchflat/lifecycle/user_scripts/command_runner_test.exs
+new file mode 100644
+index 000000000..4b97d3db6
+--- /dev/null
++++ b/test/pinchflat/lifecycle/user_scripts/command_runner_test.exs
+@@ -0,0 +1,79 @@
++defmodule Pinchflat.Lifecycle.UserScripts.CommandRunnerTest do
++  use ExUnit.Case, async: false
++
++  alias Pinchflat.Utils.FilesystemUtils
++  alias Pinchflat.Lifecycle.UserScripts.CommandRunner, as: Runner
++
++  setup do
++    FilesystemUtils.write_p!(filepath(), "")
++    File.chmod(filepath(), 0o755)
++
++    :ok
++  end
++
++  describe "run/2" do
++    test "runs the provided lifecycle file if present" do
++      # We *love* indirectly testing side effects
++      tmp_dir = Application.get_env(:pinchflat, :tmpfile_directory)
++      File.write(filepath(), "#!/bin/bash\ntouch #{tmp_dir}/test_file\n")
++
++      refute File.exists?("#{tmp_dir}/test_file")
++      assert :ok = Runner.run(:media_downloaded, %{})
++      assert File.exists?("#{tmp_dir}/test_file")
++    end
++
++    test "passes the event name to the script" do
++      tmp_dir = Application.get_env(:pinchflat, :tmpfile_directory)
++      File.write(filepath(), "#!/bin/bash\necho $1 > #{tmp_dir}/event_name\n")
++
++      assert :ok = Runner.run(:media_downloaded, %{})
++      assert File.read!("#{tmp_dir}/event_name") == "media_downloaded\n"
++    end
++
++    test "passes the encoded data to the script" do
++      tmp_dir = Application.get_env(:pinchflat, :tmpfile_directory)
++      File.write(filepath(), "#!/bin/bash\necho $2 > #{tmp_dir}/encoded_data\n")
++
++      assert :ok = Runner.run(:media_downloaded, %{foo: "bar"})
++      assert File.read!("#{tmp_dir}/encoded_data") == "{\"foo\":\"bar\"}\n"
++    end
++
++    test "does nothing if the lifecycle file is not present" do
++      :ok = File.rm(filepath())
++
++      assert :ok = Runner.run(:media_downloaded, %{})
++    end
++
++    test "does nothing if the lifecycle file is empty" do
++      File.write(filepath(), "")
++
++      assert :ok = Runner.run(:media_downloaded, %{})
++    end
++
++    test "returns :ok if the command exits with a non-zero status" do
++      File.write(filepath(), "#!/bin/bash\nexit 1\n")
++
++      assert :ok = Runner.run(:media_downloaded, %{})
++    end
++
++    test "gets upset if you pass an invalid event type" do
++      assert_raise ArgumentError, "Invalid event type: :invalid_event", fn ->
++        Runner.run(:invalid_event, %{})
++      end
++    end
++
++    test "gets upset if the record cannot be decoded" do
++      File.write(filepath(), "#!/bin/bash")
++
++      assert_raise MatchError, fn ->
++        Runner.run(:media_downloaded, %Ecto.Changeset{})
++      end
++    end
++  end
++
++  defp filepath do
++    base_dir = Application.get_env(:pinchflat, :extras_directory)
++
++    Path.join([base_dir, "user-scripts", "lifecycle"])
++  end
++end
+diff --git a/test/pinchflat/media_test.exs b/test/pinchflat/media_test.exs
+index f9722599e..cf238c14a 100644
+--- a/test/pinchflat/media_test.exs
++++ b/test/pinchflat/media_test.exs
+@@ -29,6 +29,12 @@ defmodule Pinchflat.MediaTest do
+         Repo.reload!(metadata)
+       end
+     end
++
++    test "can be JSON encoded without error" do
++      media_item = media_item_fixture()
++
++      assert {:ok, _} = Phoenix.json_library().encode(media_item)
++    end
+   end
+ 
+   describe "list_media_items/0" do
+@@ -743,6 +749,12 @@ defmodule Pinchflat.MediaTest do
+   end
+ 
+   describe "delete_media_item/2 when testing file deletion" do
++    setup do
++      stub(UserScriptRunnerMock, :run, fn _event_type, _data -> :ok end)
++
++      :ok
++    end
++
+     test "deletes the media item's files" do
+       media_item = media_item_with_attachments()
+ 
+@@ -793,9 +805,27 @@ defmodule Pinchflat.MediaTest do
+       :ok = File.rm(Path.join([root_directory, "test.txt"]))
+       :ok = File.rmdir(root_directory)
+     end
++
++    test "calls the user script runner" do
++      media_item = media_item_with_attachments()
++
++      expect(UserScriptRunnerMock, :run, fn :media_deleted, data ->
++        assert data.id == media_item.id
++
++        :ok
++      end)
++
++      assert {:ok, _} = Media.delete_media_item(media_item, delete_files: true)
++    end
+   end
+ 
+   describe "delete_media_files/2" do
++    setup do
++      stub(UserScriptRunnerMock, :run, fn _event_type, _data -> :ok end)
++
++      :ok
++    end
++
+     test "does not delete the media_item" do
+       media_item = media_item_fixture()
+ 
+@@ -848,6 +878,18 @@ defmodule Pinchflat.MediaTest do
+       assert {:ok, updated_media_item} = Media.delete_media_files(media_item, %{prevent_download: true})
+       assert updated_media_item.prevent_download
+     end
++
++    test "calls the user script runner" do
++      media_item = media_item_with_attachments()
++
++      expect(UserScriptRunnerMock, :run, fn :media_deleted, data ->
++        assert data.id == media_item.id
++
++        :ok
++      end)
++
++      assert {:ok, _} = Media.delete_media_files(media_item)
++    end
+   end
+ 
+   describe "change_media_item/1" do
+diff --git a/test/pinchflat/profiles_test.exs b/test/pinchflat/profiles_test.exs
+index 6bb597ea7..e81ad58df 100644
+--- a/test/pinchflat/profiles_test.exs
++++ b/test/pinchflat/profiles_test.exs
+@@ -1,6 +1,7 @@
+ defmodule Pinchflat.ProfilesTest do
+   use Pinchflat.DataCase
+ 
++  import Mox
+   import Pinchflat.MediaFixtures
+   import Pinchflat.SourcesFixtures
+   import Pinchflat.ProfilesFixtures
+@@ -10,6 +11,16 @@ defmodule Pinchflat.ProfilesTest do
+ 
+   @invalid_attrs %{name: nil, output_path_template: nil}
+ 
++  setup :verify_on_exit!
++
++  describe "schema" do
++    test "can be JSON encoded without error" do
++      profile = media_profile_fixture()
++
++      assert {:ok, _} = Phoenix.json_library().encode(profile)
++    end
++  end
++
+   describe "list_media_profiles/0" do
+     test "it returns all media_profiles" do
+       media_profile = media_profile_fixture()
+@@ -104,6 +115,12 @@ defmodule Pinchflat.ProfilesTest do
+   end
+ 
+   describe "delete_media_profile/2 when deleting files" do
++    setup do
++      stub(UserScriptRunnerMock, :run, fn _event_type, _data -> :ok end)
++
++      :ok
++    end
++
+     test "still deletes all the needful records" do
+       media_profile = media_profile_fixture()
+       source = source_fixture(media_profile_id: media_profile.id)
+diff --git a/test/pinchflat/slow_indexing/file_follower_server_test.exs b/test/pinchflat/slow_indexing/file_follower_server_test.exs
+index ff09695f4..eb38aaa04 100644
+--- a/test/pinchflat/slow_indexing/file_follower_server_test.exs
++++ b/test/pinchflat/slow_indexing/file_follower_server_test.exs
+@@ -1,5 +1,5 @@
+ defmodule Pinchflat.SlowIndexing.FileFollowerServerTest do
+-  use ExUnit.Case, async: true
++  use ExUnit.Case, async: false
+ 
+   alias alias Pinchflat.Utils.FilesystemUtils
+   alias Pinchflat.SlowIndexing.FileFollowerServer
+diff --git a/test/pinchflat/sources_test.exs b/test/pinchflat/sources_test.exs
+index 4fb350967..47034504d 100644
+--- a/test/pinchflat/sources_test.exs
++++ b/test/pinchflat/sources_test.exs
+@@ -32,6 +32,12 @@ defmodule Pinchflat.SourcesTest do
+         Repo.reload!(metadata)
+       end
+     end
++
++    test "can be JSON encoded without error" do
++      source = source_fixture()
++
++      assert {:ok, _} = Phoenix.json_library().encode(source)
++    end
+   end
+ 
+   describe "output_path_template/1" do
+@@ -612,6 +618,12 @@ defmodule Pinchflat.SourcesTest do
+   end
+ 
+   describe "delete_source/2 when deleting files" do
++    setup do
++      stub(UserScriptRunnerMock, :run, fn _event_type, _data -> :ok end)
++
++      :ok
++    end
++
+     test "deletes source and media_items" do
+       source = source_fixture()
+       media_item = media_item_with_attachments(%{source_id: source.id})
+diff --git a/test/pinchflat/utils/changeset_utils_test.exs b/test/pinchflat/utils/changeset_utils_test.exs
+index 83eadd7c7..43bcf7068 100644
+--- a/test/pinchflat/utils/changeset_utils_test.exs
++++ b/test/pinchflat/utils/changeset_utils_test.exs
+@@ -1,5 +1,5 @@
+ defmodule Pinchflat.Utils.ChangesetUtilsTest do
+-  use ExUnit.Case, async: true
++  use ExUnit.Case, async: false
+ 
+   defmodule MockSchema do
+     use Ecto.Schema
+diff --git a/test/pinchflat/utils/cli_utils_test.exs b/test/pinchflat/utils/cli_utils_test.exs
+index 0c676b74e..75f92c191 100644
+--- a/test/pinchflat/utils/cli_utils_test.exs
++++ b/test/pinchflat/utils/cli_utils_test.exs
+@@ -1,5 +1,5 @@
+ defmodule Pinchflat.Utils.CliUtilsTest do
+-  use ExUnit.Case, async: true
++  use ExUnit.Case, async: false
+ 
+   alias Pinchflat.Utils.CliUtils
+ 
+diff --git a/test/pinchflat/utils/datetime_utils_test.exs b/test/pinchflat/utils/datetime_utils_test.exs
+index 166b9c04d..4a5243881 100644
+--- a/test/pinchflat/utils/datetime_utils_test.exs
++++ b/test/pinchflat/utils/datetime_utils_test.exs
+@@ -1,5 +1,5 @@
+ defmodule Pinchflat.Utils.DatetimeUtilsTest do
+-  use ExUnit.Case, async: true
++  use ExUnit.Case, async: false
+ 
+   alias Pinchflat.Utils.DatetimeUtils
+ 
+diff --git a/test/pinchflat/utils/filesystem_utils_test.exs b/test/pinchflat/utils/filesystem_utils_test.exs
+index 7d86cbc54..a964e486e 100644
+--- a/test/pinchflat/utils/filesystem_utils_test.exs
++++ b/test/pinchflat/utils/filesystem_utils_test.exs
+@@ -5,6 +5,38 @@ defmodule Pinchflat.Utils.FilesystemUtilsTest do
+ 
+   alias Pinchflat.Utils.FilesystemUtils
+ 
++  describe "exists_and_nonempty?" do
++    test "returns true if a file exists and has contents" do
++      filepath = FilesystemUtils.generate_metadata_tmpfile(:json)
++      File.write(filepath, "{}")
++
++      assert FilesystemUtils.exists_and_nonempty?(filepath)
++
++      File.rm!(filepath)
++    end
++
++    test "returns false if a file doesn't exist" do
++      refute FilesystemUtils.exists_and_nonempty?("/nonexistent/file.json")
++    end
++
++    test "returns false if a file exists but is empty" do
++      filepath = FilesystemUtils.generate_metadata_tmpfile(:json)
++
++      refute FilesystemUtils.exists_and_nonempty?(filepath)
++
++      File.rm!(filepath)
++    end
++
++    test "trims the contents before checking" do
++      filepath = FilesystemUtils.generate_metadata_tmpfile(:json)
++      File.write(filepath, "  \n\n  \r\n  ")
++
++      refute FilesystemUtils.exists_and_nonempty?(filepath)
++
++      File.rm!(filepath)
++    end
++  end
++
+   describe "generate_metadata_tmpfile/1" do
+     test "creates a tmpfile and returns its path" do
+       res = FilesystemUtils.generate_metadata_tmpfile(:json)
+diff --git a/test/pinchflat/utils/function_utils_test.exs b/test/pinchflat/utils/function_utils_test.exs
+index 64785990f..8f3e2086e 100644
+--- a/test/pinchflat/utils/function_utils_test.exs
++++ b/test/pinchflat/utils/function_utils_test.exs
+@@ -1,5 +1,5 @@
+ defmodule Pinchflat.Utils.FunctionUtilsTest do
+-  use ExUnit.Case, async: true
++  use ExUnit.Case, async: false
+ 
+   alias Pinchflat.Utils.FunctionUtils
+ 
+diff --git a/test/pinchflat/utils/number_utils_test.exs b/test/pinchflat/utils/number_utils_test.exs
+index 48efe4181..f775f20fb 100644
+--- a/test/pinchflat/utils/number_utils_test.exs
++++ b/test/pinchflat/utils/number_utils_test.exs
+@@ -1,5 +1,5 @@
+ defmodule Pinchflat.Utils.NumberUtilsTest do
+-  use ExUnit.Case, async: true
++  use ExUnit.Case, async: false
+ 
+   alias Pinchflat.Utils.NumberUtils
+ 
+diff --git a/test/pinchflat/utils/string_utils_test.exs b/test/pinchflat/utils/string_utils_test.exs
+index 51172e3bc..76ea3b6f2 100644
+--- a/test/pinchflat/utils/string_utils_test.exs
++++ b/test/pinchflat/utils/string_utils_test.exs
+@@ -1,5 +1,5 @@
+ defmodule Pinchflat.Utils.StringUtilsTest do
+-  use ExUnit.Case, async: true
++  use ExUnit.Case, async: false
+ 
+   alias Pinchflat.Utils.StringUtils
+ 
+diff --git a/test/pinchflat/utils/xml_utils_test.exs b/test/pinchflat/utils/xml_utils_test.exs
+index 883cfc2b5..25aca921b 100644
+--- a/test/pinchflat/utils/xml_utils_test.exs
++++ b/test/pinchflat/utils/xml_utils_test.exs
+@@ -1,5 +1,5 @@
+ defmodule Pinchflat.Utils.XmlUtilsTest do
+-  use ExUnit.Case, async: true
++  use ExUnit.Case, async: false
+ 
+   alias Pinchflat.Utils.XmlUtils
+ 
+diff --git a/test/pinchflat/yt_dlp/command_runner_test.exs b/test/pinchflat/yt_dlp/command_runner_test.exs
+index f4c93092c..86e45513a 100644
+--- a/test/pinchflat/yt_dlp/command_runner_test.exs
++++ b/test/pinchflat/yt_dlp/command_runner_test.exs
+@@ -1,5 +1,5 @@
+ defmodule Pinchflat.YtDlp.CommandRunnerTest do
+-  use ExUnit.Case, async: true
++  use ExUnit.Case, async: false
+ 
+   alias Pinchflat.Utils.FilesystemUtils
+ 
+@@ -75,6 +75,9 @@ defmodule Pinchflat.YtDlp.CommandRunnerTest do
+ 
+       refute String.contains?(output, "--cookies")
+       refute String.contains?(output, cookie_file)
++
++      # Cleanup
++      FilesystemUtils.write_p!(cookie_file, "")
+     end
+   end
+ 
+diff --git a/test/pinchflat_web/controllers/error_html_test.exs b/test/pinchflat_web/controllers/error_html_test.exs
+index 506e1a5e7..d9baab3f3 100644
+--- a/test/pinchflat_web/controllers/error_html_test.exs
++++ b/test/pinchflat_web/controllers/error_html_test.exs
+@@ -1,5 +1,5 @@
+ defmodule PinchflatWeb.ErrorHTMLTest do
+-  use PinchflatWeb.ConnCase, async: true
++  use PinchflatWeb.ConnCase, async: false
+ 
+   # Bring render_to_string/4 for testing custom views
+   import Phoenix.Template
+diff --git a/test/pinchflat_web/controllers/error_json_test.exs b/test/pinchflat_web/controllers/error_json_test.exs
+index 981c51bb9..ee8d8d2f2 100644
+--- a/test/pinchflat_web/controllers/error_json_test.exs
++++ b/test/pinchflat_web/controllers/error_json_test.exs
+@@ -1,5 +1,5 @@
+ defmodule PinchflatWeb.ErrorJSONTest do
+-  use PinchflatWeb.ConnCase, async: true
++  use PinchflatWeb.ConnCase, async: false
+ 
+   test "renders 404" do
+     assert PinchflatWeb.ErrorJSON.render("404.json", %{}) == %{errors: %{detail: "Not Found"}}
+diff --git a/test/pinchflat_web/controllers/media_item_controller_test.exs b/test/pinchflat_web/controllers/media_item_controller_test.exs
+index 5a2dbd940..bd22f591a 100644
+--- a/test/pinchflat_web/controllers/media_item_controller_test.exs
++++ b/test/pinchflat_web/controllers/media_item_controller_test.exs
+@@ -1,11 +1,14 @@
+ defmodule PinchflatWeb.MediaItemControllerTest do
+   use PinchflatWeb.ConnCase
+ 
++  import Mox
+   import Pinchflat.MediaFixtures
+ 
+   alias Pinchflat.Repo
+   alias Pinchflat.Downloading.MediaDownloadWorker
+ 
++  setup :verify_on_exit!
++
+   describe "show media" do
+     setup [:create_media_item]
+ 
+@@ -49,6 +52,7 @@ defmodule PinchflatWeb.MediaItemControllerTest do
+   describe "delete media" do
+     setup do
+       media_item = media_item_with_attachments()
++      stub(UserScriptRunnerMock, :run, fn _event_type, _data -> :ok end)
+ 
+       %{media_item: media_item}
+     end
+diff --git a/test/pinchflat_web/controllers/media_profile_controller_test.exs b/test/pinchflat_web/controllers/media_profile_controller_test.exs
+index df1013bde..37fcaf69d 100644
+--- a/test/pinchflat_web/controllers/media_profile_controller_test.exs
++++ b/test/pinchflat_web/controllers/media_profile_controller_test.exs
+@@ -1,6 +1,7 @@
+ defmodule PinchflatWeb.MediaProfileControllerTest do
+   use PinchflatWeb.ConnCase
+ 
++  import Mox
+   import Pinchflat.MediaFixtures
+   import Pinchflat.SourcesFixtures
+   import Pinchflat.ProfilesFixtures
+@@ -15,6 +16,8 @@ defmodule PinchflatWeb.MediaProfileControllerTest do
+   }
+   @invalid_attrs %{name: nil, output_path_template: nil}
+ 
++  setup :verify_on_exit!
++
+   setup do
+     Settings.set(onboarding: false)
+ 
+@@ -136,6 +139,12 @@ defmodule PinchflatWeb.MediaProfileControllerTest do
+   describe "delete media_profile when deleting the records and files" do
+     setup [:create_media_profile]
+ 
++    setup do
++      stub(UserScriptRunnerMock, :run, fn _event_type, _data -> :ok end)
++
++      :ok
++    end
++
+     test "deletes chosen media_profile and its associations", %{conn: conn, media_profile: media_profile} do
+       source = source_fixture(media_profile_id: media_profile.id)
+       media_item = media_item_with_attachments(%{source_id: source.id})
+diff --git a/test/pinchflat_web/controllers/source_controller_test.exs b/test/pinchflat_web/controllers/source_controller_test.exs
+index 85996884f..02ec83819 100644
+--- a/test/pinchflat_web/controllers/source_controller_test.exs
++++ b/test/pinchflat_web/controllers/source_controller_test.exs
+@@ -145,6 +145,12 @@ defmodule PinchflatWeb.SourceControllerTest do
+   describe "delete source when deleting the records and files" do
+     setup [:create_source]
+ 
++    setup do
++      stub(UserScriptRunnerMock, :run, fn _event_type, _data -> :ok end)
++
++      :ok
++    end
++
+     test "deletes chosen source and media_items", %{conn: conn, source: source, media_item: media_item} do
+       delete(conn, ~p"/sources/#{source}?delete_files=true")
+ 
+diff --git a/test/test_helper.exs b/test/test_helper.exs
+index e6cd91ef3..3a05c78e8 100644
+--- a/test/test_helper.exs
++++ b/test/test_helper.exs
+@@ -1,12 +1,15 @@
+ Mox.defmock(YtDlpRunnerMock, for: Pinchflat.YtDlp.YtDlpCommandRunner)
+ Application.put_env(:pinchflat, :yt_dlp_runner, YtDlpRunnerMock)
+ 
+-Mox.defmock(AppriseRunnerMock, for: Pinchflat.Notifications.AppriseCommandRunner)
++Mox.defmock(AppriseRunnerMock, for: Pinchflat.Lifecycle.Notifications.AppriseCommandRunner)
+ Application.put_env(:pinchflat, :apprise_runner, AppriseRunnerMock)
+ 
+ Mox.defmock(HTTPClientMock, for: Pinchflat.HTTP.HTTPBehaviour)
+ Application.put_env(:pinchflat, :http_client, HTTPClientMock)
+ 
++Mox.defmock(UserScriptRunnerMock, for: Pinchflat.Lifecycle.UserScripts.UserScriptCommandRunner)
++Application.put_env(:pinchflat, :user_script_runner, UserScriptRunnerMock)
++
+ ExUnit.start()
+ Ecto.Adapters.SQL.Sandbox.mode(Pinchflat.Repo, :manual)
+ Faker.start()
