@@ -28,6 +28,8 @@ beam_path = :code.which(Eab.Measurement) |> List.to_string()
 {:ok, {Eab.Measurement, beam_md5}} = :beam_lib.md5(String.to_charlist(beam_path))
 unless Eab.Measurement.module_info(:md5) == beam_md5,
   do: raise("Loaded observer differs from the rebuilt module")
+unless Eab.Measurement.label(%{"attempt_ms" => 1000}) == "1.0 s",
+  do: raise("Loaded observer still has disabled behavior")
 
 release = Release.freeze()
 Release.verify!(release)
@@ -43,6 +45,7 @@ record = %{
   "qualification_hash" => Inventory.qualification_hash(),
   "repository_observer_source_sha256" => normal_observer,
   "loaded_observer_matches_rebuilt_module" => true,
+  "normal_observer_behavior_verified_without_reading_a_clock" => true,
   "controller_idle_and_clean" => true,
   "model_run_started_for_restoration" => false
 }

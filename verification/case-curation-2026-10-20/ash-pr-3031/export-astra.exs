@@ -95,7 +95,7 @@ record = %{
   "schema" => 1, "functional_validation_only" => true,
   "two_fresh_blind_runs" => true, "distinct_session_keys" => true,
   "matching_frozen_inputs" => true, "serving_revision_available" => false,
-  "prior_attempts" => [Inventory.read_json(Path.join(__DIR__, "astra-1.json"))],
+  "prior_attempts" => Store.read("#{prefix}/prior-attempts.json") || raise("Prior attempt history missing"),
   "runs" => records
 }
 File.write!(Path.join(out, "astra-results.json"), Jason.encode!(record, pretty: true) <> "\n")
