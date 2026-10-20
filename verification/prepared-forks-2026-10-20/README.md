@@ -1,8 +1,8 @@
 # Prepared fork migration
 
-Status: **read-only audit complete; migration pending Ash completion**. Work remains on `codex/curate-researched-multifile-case`. The user authorized preparing and using their forks for every runnable case and specifically required inspecting existing Plausible branches before making changes.
+Status: **read-only audit complete; migration deferred by the user**. Work remains on `codex/curate-researched-multifile-case`. The user authorized preparing and using their forks for every runnable case and specifically required inspecting existing Plausible branches before making changes.
 
-The [Ash 3031 record](../case-curation-2026-10-20/ash-pr-3031/README.md) tracks the current new-case validation. Finish, restore and commit that case before executing the migration utilities. This directory currently contains read-only audits and independently reviewed procedures, not completed migration claims.
+The [Ash 3031 record](../case-curation-2026-10-20/ash-pr-3031/README.md) tracks the current new-case validation. The user subsequently requested finishing Ash and then stopping to limit token consumption. Do not execute these migration utilities without a renewed request. This directory contains read-only audits and independently reviewed procedures, not completed migration claims. No other fork or case source has been changed.
 
 ## What the audit established
 
