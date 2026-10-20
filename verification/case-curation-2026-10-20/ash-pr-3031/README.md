@@ -18,6 +18,10 @@ The first fork qualification is active via `/tmp/ash-qualify-fork.exs`. The repe
 
 Next: require all three fresh fork rounds to match complete named outcomes, export with admission, rebuild the singleton controller, install the disabled timing observer, and run the ordinary Pi benchmark twice with fresh Astra contexts. Review both sealed results and patches, then restore all 14 unchanged bundles and the normal controller before committing/pushing the completed branch. Do not import the old `/tmp/ash-draft`: it contains the superseded upstream candidate.
 
+## Authorized follow-on work
+
+After finishing and committing this Ash case, audit every active case one by one on this branch. The user has supplied `Cinderella-Man/operately`, `Cinderella-Man/live_beats`, `Cinderella-Man/accent`, `Cinderella-Man/livebook`, and `Cinderella-Man/plausible-analytics`. Verify each case uses a prepared branch in the corresponding fork; create and push missing preparation/reference branches, migrate the case with renewed source/runtime validation, and retain prior evidence honestly. Update the operational READMEs and case-addition guidance to require prepared fork branches. The user requested unattended completion; this follow-on work does not replace the remaining Ash gates. The user specifically notes that the Plausible fork already has many branches: inspect every supplied fork and compare existing branch commits/preparation before creating or changing any branch. Reuse matching prepared branches; an upstream URL in a case manifest does not establish that a prepared fork branch is missing.
+
 ## Retained earlier evidence
 
 No model attempt occurred in any earlier candidate version. No assertion was weakened or removed.
