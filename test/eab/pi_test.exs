@@ -137,7 +137,8 @@ defmodule Eab.PiTest do
       assert Pi.finish(result) == %{
                "calls" => 2,
                "generated_tokens" => 24,
-               "stop_reason" => "agent_completed"
+               "stop_reason" => "agent_completed",
+               "measurement" => %{"attempt_ms" => 0}
              }
 
       assert File.read!(Path.join(workspace, "repaired.txt")) == "fixed"
@@ -150,8 +151,8 @@ defmodule Eab.PiTest do
       assert_receive {:generation, ^backend, first}
 
       if backend == "strata" do
-        assert first["thinking"]["type"] == "enabled"
-        assert first["thinking"]["budget_tokens"] > 0
+        refute Map.has_key?(first, "thinking")
+        refute Map.has_key?(first, "output_config")
         refute Map.has_key?(first, "reasoning_budget_tokens")
       end
 

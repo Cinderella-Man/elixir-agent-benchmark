@@ -101,7 +101,8 @@ defmodule Eab.OpenAITest do
     assert Pi.finish(result) == %{
              "calls" => 2,
              "generated_tokens" => 24,
-             "stop_reason" => "agent_completed"
+             "stop_reason" => "agent_completed",
+             "measurement" => %{"attempt_ms" => 0}
            }
 
     assert File.read!(Path.join(workspace, "repaired.txt")) == "fixed"

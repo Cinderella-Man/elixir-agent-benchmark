@@ -93,23 +93,35 @@ defmodule Eab.ResultsTest do
         do: refute(Jason.encode!(result) =~ private)
   end
 
-  test "preserves tokens and only explicit measurements" do
+  test "preserves tokens and case durations and rejects invalid durations" do
     source =
       run()
       |> put_in(["attempts", "case-a", "generated_tokens"], 1234)
       |> put_in(["attempts", "case-a", "calls"], 12)
       |> put_in(["attempts", "case-a", "measurement"], %{
-        "environment" => "synthetic",
-        "attempt_ms" => 120_000,
-        "inference_ms" => 45000
+        "attempt_ms" => 120_000
       })
 
     [a, b] = Results.export!(source)["cases"]
     assert a["generated_tokens"] == 1234 and a["model_calls"] == 12
     assert a["measurement"]["attempt_ms"] == 120_000
     assert b["measurement"] == nil and b["generated_tokens"] == nil
-    bad = put_in(source, ["attempts", "case-a", "measurement", "inference_ms"], 120_001)
-    assert_raise ArgumentError, ~r/exceeds attempt/, fn -> Results.export!(bad) end
+    bad = put_in(source, ["attempts", "case-a", "measurement", "attempt_ms"], -1)
+    assert_raise ArgumentError, ~r/Invalid measured duration/, fn -> Results.export!(bad) end
+  end
+
+  test "thinking presets survive public export without backfilling old runs" do
+    assert Results.export!(run())["settings"]["reasoning_effort"] == nil
+
+    for effort <- ~w(off on low medium high xhigh max ultra default unsupported) do
+      settings =
+        Eab.Thinking.settings(%{}, %{"reasoning_effort" => effort})
+        |> Map.merge(run()["settings"])
+
+      result = Results.export!(Map.put(run(), "settings", settings))
+      assert result["settings"]["reasoning_effort"] == effort
+      assert result["settings"]["reasoning_effort_source"] == "operator_declared"
+    end
   end
 
   test "snapshots must match artifact, backend and context" do

@@ -88,7 +88,7 @@ defmodule Eab.Results do
       end
 
     record = %{
-      "schema_version" => 3,
+      "schema_version" => 4,
       "run_id" => run["id"],
       "created_at" => run["created_at"],
       "model" => %{
@@ -218,7 +218,7 @@ defmodule Eab.Results do
     require!(Enum.uniq(ids) == ids, "Duplicate run ID")
 
     payload = %{
-      "schema_version" => 3,
+      "schema_version" => 4,
       "benchmark" => %{"id" => inventory["id"], "case_count" => length(inventory["cases"])},
       "results" =>
         Enum.map(

@@ -210,12 +210,16 @@ defmodule Eab.Pi do
   def handle(_, _), do: raise("Unexpected Pi transport record")
 
   def finish(%{"state" => state, "returncode" => code}) do
+    measurement = Eab.Measurement.finish(state.measurement)
+    # Also preserve the final duration when Pi exits with a transport/tool error.
+    PiGateway.persist(state, measurement)
+
     cond do
       state.error ->
         raise Store.redact(state.error, state.key)
 
       state.stop_reason ->
-        summary(state, state.stop_reason)
+        summary(state, state.stop_reason, measurement)
 
       code != 0 or state.exit_code != 0 ->
         raise "Pi exited unsuccessfully; see pi-diagnostics.jsonl"
@@ -224,21 +228,17 @@ defmodule Eab.Pi do
         raise "Pi exited without completing an attempt; see pi-events.jsonl"
 
       true ->
-        summary(state, "agent_completed")
+        summary(state, "agent_completed", measurement)
     end
   end
 
-  defp summary(state, reason) do
-    summary = %{
+  defp summary(state, reason, measurement) do
+    %{
       "calls" => state.calls,
       "generated_tokens" => state.generated_tokens,
-      "stop_reason" => reason
+      "stop_reason" => reason,
+      "measurement" => measurement
     }
-
-    case Eab.Measurement.finish(state.measurement) do
-      nil -> summary
-      measurement -> Map.put(summary, "measurement", measurement)
-    end
   end
 
   defp append(state, file, data) do

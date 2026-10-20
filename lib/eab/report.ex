@@ -25,7 +25,7 @@ defmodule Eab.Report do
             _ -> attempt["status"] || "Not attempted"
           end
 
-        "| #{id} | #{outcome} | #{attempt["calls"] || 0} | #{escape(Evidence.verdict(attempt))} |"
+        "| #{id} | #{outcome} | #{attempt["calls"] || 0} | #{Eab.Measurement.label(attempt["measurement"])} | #{escape(Evidence.verdict(attempt))} |"
       end)
 
     evidence =
@@ -51,6 +51,8 @@ defmodule Eab.Report do
     - Model: #{escape(Eab.ModelIdentity.label(model))}
     - Model weights: #{Eab.ModelIdentity.size_label(model)}
     - Backend: #{model["backend"] || "Unknown"}
+    - Thinking: #{escape(Eab.Thinking.label(run["settings"]))}
+    - Thinking source: #{get_in(run, ["settings", "reasoning_effort_source"]) || if(model["backend"] == "openai_subscription", do: "provider request", else: "not recorded")}
     - Release: #{run["release_id"] || "Historical protocol only"}
     - Experiment: #{run["experiment_id"] || "Not sealed"}
     - Resumptions: #{run["resume_count"] || 0}
@@ -71,8 +73,10 @@ defmodule Eab.Report do
     #{Jason.encode!(run["settings"] || %{}, pretty: true)}
     ```
 
-    | Case | Result | Model calls | Explanation |
-    | --- | --- | ---: | --- |
+    Case time covers Pi startup, model calls and tools through completion, excluding fixture preparation and independent grading. Missing timings are not reconstructed from logs.
+
+    | Case | Result | Model calls | Case time | Explanation |
+    | --- | --- | ---: | ---: | --- |
     #{rows}
 
     | Group | Value | Passed | Failed | Incomplete/error |
