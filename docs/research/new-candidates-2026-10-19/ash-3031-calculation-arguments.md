@@ -1,6 +1,6 @@
 # Ash #3031 — Validate calculation arguments once and preserve input errors
 
-**Status:** in curation as `ash-pr-3031` (2026-10-20)\
+**Status:** admitted as `ash-pr-3031` (2026-10-20), with three matching qualification rounds and one successful Astra run explicitly authorized by the user\
 **Source type:** historical PR  
 **Project:** [ash-project/ash](https://github.com/ash-project/ash)  
 **PR:** [#3031](https://github.com/ash-project/ash/pull/3031)  
