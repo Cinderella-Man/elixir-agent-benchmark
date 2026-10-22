@@ -177,6 +177,7 @@ defmodule Eab.FixturesTest do
       assert sync < deps and deps < compile and compile < fixture
       refute recipe =~ "/opt/pi"
       assert AgentImage.recipe("project", "node") =~ "COPY --from=pi /opt/pi /opt/pi"
+      assert AgentImage.recipe("project", "node") =~ "COPY --chmod=0755 bash-watchdog.mjs"
       refute recipe =~ "reference.patch"
       refute recipe =~ "acceptance.patch"
       assert recipe =~ "mix deps.clean --unused"

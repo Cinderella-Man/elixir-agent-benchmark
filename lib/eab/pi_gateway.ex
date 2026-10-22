@@ -6,7 +6,7 @@ defmodule Eab.PiGateway do
     route =
       case state.endpoint["backend"] do
         "openai_subscription" -> "/v1/responses"
-        "strata" -> "/v1/messages"
+        backend when backend in ["strata", "anthropic"] -> "/v1/messages"
         _ -> "/v1/chat/completions"
       end
 
@@ -66,6 +66,38 @@ defmodule Eab.PiGateway do
 
       error ->
         error_reply(frame, state, Exception.message(error))
+    end
+  end
+
+  defp exchange(frame, %{endpoint: %{"backend" => "anthropic"}} = state) do
+    payload = Eab.Anthropic.payload(frame["body"], state.endpoint, state.settings)
+    step = state.calls |> Integer.to_string() |> String.pad_leading(4, "0")
+    Store.write("#{state.prefix}/request-#{step}.json", payload, state.key)
+    state = %{state | calls: state.calls + 1}
+    persist(state)
+
+    try do
+      Activity.note(
+        "Model call #{state.calls}: Claude API; provider-enforced context. Generated so far: #{state.generated_tokens}/#{state.settings["max_tokens"]} tokens (soft threshold). Waiting for model response…"
+      )
+
+      body = Eab.Anthropic.stream(state.endpoint, state.key, payload)
+      Store.write_text("#{state.prefix}/response-#{step}.sse", body, state.key)
+      usage = Eab.Anthropic.usage(body)
+      Store.write("#{state.prefix}/usage-#{step}.json", usage, state.key)
+      state = %{state | generated_tokens: state.generated_tokens + usage["output_tokens"]}
+      persist(state)
+      state.emit.("Pi: call #{state.calls}, #{state.generated_tokens} generated tokens")
+      {reply(frame, 200, "text/event-stream", body), state}
+    rescue
+      error in Eab.Anthropic.Error ->
+        details = Eab.Anthropic.error_details(error)
+        Store.write("#{state.prefix}/provider-error-#{step}.json", details, state.key)
+        Store.write("#{state.prefix}/provider-error.json", details, state.key)
+        error_reply(frame, state, Store.redact(Exception.message(error), state.key))
+
+      error ->
+        error_reply(frame, state, Store.redact(Exception.message(error), state.key))
     end
   end
 

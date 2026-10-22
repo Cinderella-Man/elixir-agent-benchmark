@@ -52,7 +52,7 @@ defmodule Eab.Report do
     - Model weights: #{Eab.ModelIdentity.size_label(model)}
     - Backend: #{model["backend"] || "Unknown"}
     - Thinking: #{escape(Eab.Thinking.label(run["settings"]))}
-    - Thinking source: #{get_in(run, ["settings", "reasoning_effort_source"]) || if(model["backend"] == "openai_subscription", do: "provider request", else: "not recorded")}
+    - Thinking source: #{get_in(run, ["settings", "reasoning_effort_source"]) || if(model["backend"] in ["openai_subscription", "anthropic"], do: "provider request", else: "not recorded")}
     - Release: #{run["release_id"] || "Historical protocol only"}
     - Experiment: #{run["experiment_id"] || "Not sealed"}
     - Resumptions: #{run["resume_count"] || 0}

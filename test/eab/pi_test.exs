@@ -257,6 +257,64 @@ defmodule Eab.PiTest do
     assert File.read!(Path.join(workspace, "repaired.txt")) == "fixed"
   end
 
+  test "the bash watchdog kills a command that never exits and Pi continues", %{prefix: prefix} do
+    parent = self()
+    model = endpoint("llama_cpp")
+    settings = Model.settings(model)
+    workspace = Store.path("#{prefix}/workspace")
+    File.mkdir_p!(workspace)
+    config = Pi.config(model, settings, "Run the check.", "Use bash.")
+    assert config["settings"]["shellPath"] == "/opt/pi/bash-watchdog.mjs"
+    assert config["bash_timeout_seconds"] == 1200
+    Store.write("#{prefix}/config.json", %{config | "bash_timeout_seconds" => 3})
+    marker = "eab-watchdog-#{System.unique_integer([:positive])}"
+    # The livebook-pr-2800 stall: a VM without halt() leaves head waiting for more lines.
+    command =
+      "echo started; erl -noshell -eval 'io:format(\"ready~n\")' -extra #{marker} | head -5"
+
+    Application.put_env(:eab, :http_request, fn opts ->
+      messages = opts[:json]["messages"] || []
+
+      body =
+        cond do
+          String.ends_with?(opts[:url], "tokens") ->
+            %{"input_tokens" => 42}
+
+          tool = Enum.find(messages, &(&1["role"] == "tool")) ->
+            send(parent, {:tool_result, Jason.encode!(tool["content"])})
+            response("llama_cpp", true)
+
+          true ->
+            bash_call(command)
+        end
+
+      {:ok, %{status: 200, body: body}}
+    end)
+
+    result =
+      Command.exchange(
+        "/opt/pi/node",
+        ["/opt/pi/bridge.mjs", Store.path("#{prefix}/config.json")],
+        Pi.state(model, "", settings, prefix, fn _ -> :ok end),
+        &Pi.handle/2,
+        cd: workspace,
+        timeout: 45
+      )
+
+    assert Pi.finish(result)["stop_reason"] == "agent_completed"
+    assert_receive {:tool_result, output}
+    assert output =~ "started"
+    assert output =~ "Command timed out after 3 seconds"
+
+    survivors =
+      for pid <- File.ls!("/proc"),
+          {:ok, cmdline} <- [File.read("/proc/#{pid}/cmdline")],
+          cmdline =~ marker,
+          do: pid
+
+    assert survivors == []
+  end
+
   test "both adapters continue past 32 calls and stop exactly at the generation budget", %{
     prefix: prefix
   } do
@@ -560,5 +618,32 @@ defmodule Eab.PiTest do
     ]
 
     Enum.map_join(events, fn e -> "event: " <> e["type"] <> "\n" <> sse([e]) end)
+  end
+
+  defp bash_call(command) do
+    call = %{
+      "index" => 0,
+      "id" => "call_1",
+      "type" => "function",
+      "function" => %{"name" => "bash", "arguments" => Jason.encode!(%{"command" => command})}
+    }
+
+    sse([
+      %{
+        "id" => "synthetic",
+        "choices" => [
+          %{
+            "index" => 0,
+            "delta" => %{"role" => "assistant", "tool_calls" => [call]},
+            "finish_reason" => nil
+          }
+        ]
+      },
+      %{
+        "id" => "synthetic",
+        "choices" => [%{"index" => 0, "delta" => %{}, "finish_reason" => "tool_calls"}],
+        "usage" => %{"prompt_tokens" => 42, "completion_tokens" => 12}
+      }
+    ]) <> "data: [DONE]\n\n"
   end
 end

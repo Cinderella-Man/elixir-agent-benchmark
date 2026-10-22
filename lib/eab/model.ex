@@ -96,6 +96,9 @@ defmodule Eab.Model do
   def settings(endpoint, input \\ %{})
   def settings(%{"backend" => "openai_subscription"}, input), do: Eab.OpenAI.settings(input)
 
+  def settings(%{"backend" => "anthropic"} = endpoint, input),
+    do: Eab.Anthropic.settings(endpoint, input)
+
   def settings(endpoint, input) do
     defaults = Eab.Inventory.definition()["defaults"]
 
@@ -211,6 +214,9 @@ defmodule Eab.Model do
   def unchanged!(%{"backend" => "openai_subscription"} = endpoint, _key),
     do: Eab.OpenAI.unchanged!(endpoint)
 
+  def unchanged!(%{"backend" => "anthropic"} = endpoint, key),
+    do: Eab.Anthropic.unchanged!(endpoint, key)
+
   def unchanged!(endpoint, key) do
     current = discover(endpoint["url"], key)
 
@@ -312,6 +318,11 @@ defmodule Eab.Model do
     end
   end
 
+  @doc false
+  # Shared connection-retry policy for hosted transports with their own status handling.
+  def request(request, opts, route, key),
+    do: request_with_retry(request, opts, route, key, @retry_delays)
+
   defp request_with_retry(request, opts, route, key, delays) do
     {result, phase} = request_once(request, opts)
 
@@ -374,7 +385,8 @@ defmodule Eab.Model do
     end
   end
 
-  defp integer(input, key, default, min, max) do
+  @doc false
+  def integer(input, key, default, min, max) do
     value =
       case input[key] do
         nil ->

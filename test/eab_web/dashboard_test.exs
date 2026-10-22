@@ -277,6 +277,62 @@ defmodule EabWeb.DashboardTest do
     assert has_element?(view, "#run:not([disabled])")
   end
 
+  test "Claude connects with an API key and offers the selected model's effort levels" do
+    parent = self()
+
+    Application.put_env(:eab, :http_request, fn opts ->
+      send(parent, {:request, opts})
+
+      effort =
+        Map.new(~w(low medium high xhigh max), &{&1, %{"supported" => true}})
+        |> Map.put("supported", true)
+
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "data" => [
+             %{
+               "id" => "claude-haiku-5-5",
+               "display_name" => "Claude Haiku 5.5",
+               "max_input_tokens" => 1_000_000,
+               "max_tokens" => 128_000,
+               "capabilities" => %{
+                 "effort" => effort,
+                 "thinking" => %{"types" => %{"adaptive" => %{"supported" => true}}}
+               }
+             }
+           ]
+         }
+       }}
+    end)
+
+    on_exit(fn -> Application.delete_env(:eab, :http_request) end)
+    {:ok, view, _} = live(build_conn(), "/")
+    view |> form("#provider-choice", provider: "claude") |> render_change()
+    assert has_element?(view, "#provider-panel[aria-label='Claude settings'] #claude-key-form")
+    refute has_element?(view, "#connection")
+    view |> form("#claude-key-form", claude: %{key: "sk-ant-dashboard"}) |> render_submit()
+    assert render_async(view) =~ "Claude Haiku 5.5"
+    assert_receive {:request, opts}
+    assert opts[:url] == "https://api.anthropic.com/v1/models?limit=100"
+    assert {"x-api-key", "sk-ant-dashboard"} in opts[:headers]
+    assert has_element?(view, "#run[disabled]")
+    view |> form("#claude-model-form", model: "claude-haiku-5-5") |> render_change()
+    assert has_element?(view, "#claude-effort option[value=xhigh]", "Extra high (xhigh)")
+    assert has_element?(view, "#claude-effort option[value=high][selected]")
+    view |> form("#settings", settings: %{reasoning_effort: "xhigh"}) |> render_change()
+    assert has_element?(view, "#claude-effort option[value=xhigh][selected]")
+    assert render(view) =~ "CLAUDE API"
+    assert has_element?(view, "#run:not([disabled])")
+
+    # Switching away and back keeps each provider's settings separately.
+    view |> form("#provider-choice", provider: "local") |> render_change()
+    assert has_element?(view, "#connection")
+    view |> form("#provider-choice", provider: "claude") |> render_change()
+    assert render_async(view) =~ "Claude Haiku 5.5"
+  end
+
   test "clearing an endpoint cancels pending discovery and cannot restore its stale model" do
     parent = self()
 

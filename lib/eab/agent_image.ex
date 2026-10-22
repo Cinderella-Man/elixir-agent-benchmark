@@ -9,6 +9,7 @@ defmodule Eab.AgentImage do
       "pi" => Pi.identity(),
       "node" => Pi.node_image(spec),
       "bridge" => Inventory.hash_file(Inventory.path("priv/pi/bridge.mjs")),
+      "watchdog" => Inventory.hash_file(Inventory.path("priv/pi/bash-watchdog.mjs")),
       "recipe" => Inventory.hash(recipe("PROJECT", "NODE"))
     }
   end
@@ -29,6 +30,7 @@ defmodule Eab.AgentImage do
     COPY package.json package-lock.json ./
     RUN npm ci --ignore-scripts --no-audit --no-fund
     COPY bridge.mjs ./
+    COPY --chmod=0755 bash-watchdog.mjs ./
     FROM #{project}
     COPY --from=pi /opt/pi /opt/pi
     COPY --from=pi /usr/local/bin/node /opt/pi/node
@@ -41,7 +43,7 @@ defmodule Eab.AgentImage do
     dest = Store.path("build/agents/#{id}")
     File.mkdir_p!(dest)
 
-    for file <- ["package.json", "package-lock.json", "bridge.mjs"],
+    for file <- ["package.json", "package-lock.json", "bridge.mjs", "bash-watchdog.mjs"],
         do: File.cp!(Inventory.path("priv/pi/#{file}"), Path.join(dest, file))
 
     project = BuildCache.tag(inputs["project"], "project")

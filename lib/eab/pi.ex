@@ -1,6 +1,8 @@
 defmodule Eab.Pi do
   @moduledoc "Launches the pinned Pi CLI in a problem's Docker workspace."
   alias Eab.{Command, Inventory, PiGateway, Sandbox, Store}
+  # Hang guard for each bash tool command, twice the grader's test limit; not a speed budget.
+  @bash_timeout_seconds 1200
 
   def identity do
     %{
@@ -20,37 +22,47 @@ defmodule Eab.Pi do
 
   def config(endpoint, settings, prompt, instructions) do
     strata = endpoint["backend"] == "strata"
+    anthropic = endpoint["backend"] == "anthropic"
     subscription = endpoint["backend"] == "openai_subscription"
     provider = if subscription, do: "openai", else: "benchmark"
 
     compat =
-      if strata,
-        do: %{
-          "allowEmptySignature" => true,
-          "supportsCacheControlOnTools" => false,
-          "supportsEagerToolInputStreaming" => false
-        },
-        else: %{
-          "supportsStore" => false,
-          "supportsDeveloperRole" => false,
-          "supportsReasoningEffort" => false,
-          "supportsUsageInStreaming" => true,
-          "maxTokensField" => "max_tokens"
-        }
+      cond do
+        strata ->
+          %{
+            "allowEmptySignature" => true,
+            "supportsCacheControlOnTools" => false,
+            "supportsEagerToolInputStreaming" => false
+          }
+
+        # The gateway freezes thinking and effort; this keeps Pi's own request consistent.
+        anthropic ->
+          %{"forceAdaptiveThinking" => true, "supportsTemperature" => false}
+
+        true ->
+          %{
+            "supportsStore" => false,
+            "supportsDeveloperRole" => false,
+            "supportsReasoningEffort" => false,
+            "supportsUsageInStreaming" => true,
+            "maxTokensField" => "max_tokens"
+          }
+      end
 
     %{
       "model" => endpoint["model"],
       "provider" => provider,
-      "api_prefix" => if(strata, do: "", else: "/v1"),
+      "api_prefix" => if(strata or anthropic, do: "", else: "/v1"),
       "prompt" => prompt,
       "instructions" => instructions,
+      "bash_timeout_seconds" => @bash_timeout_seconds,
       "models" => %{
         "providers" => %{
           provider => %{
             "api" =>
               cond do
                 subscription -> "openai-responses"
-                strata -> "anthropic-messages"
+                strata or anthropic -> "anthropic-messages"
                 true -> "openai-completions"
               end,
             "apiKey" => "local-transport",
@@ -67,7 +79,8 @@ defmodule Eab.Pi do
               %{
                 "id" => endpoint["model"],
                 "name" => endpoint["model"],
-                "reasoning" => subscription or strata or reasoning_supported?(endpoint),
+                "reasoning" =>
+                  subscription or strata or anthropic or reasoning_supported?(endpoint),
                 "input" => ["text"],
                 # Pi requires numeric bookkeeping values. Subscription requests remove its
                 # output cap; compaction is off and these are not provider capacity claims.
@@ -85,7 +98,8 @@ defmodule Eab.Pi do
         "httpIdleTimeoutMs" => 1_260_000,
         "cacheWarming" => "off",
         "images" => %{"blockImages" => true},
-        "defaultProjectTrust" => "never"
+        "defaultProjectTrust" => "never",
+        "shellPath" => "/opt/pi/bash-watchdog.mjs"
       }
     }
   end

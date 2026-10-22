@@ -3,6 +3,7 @@ WORKDIR /opt/pi
 COPY priv/pi/package.json priv/pi/package-lock.json ./
 RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY priv/pi/bridge.mjs ./
+COPY --chmod=0755 priv/pi/bash-watchdog.mjs ./
 
 FROM hexpm/elixir@sha256:73e79b5a183c6ba8c060a664a430b30f571a890907f899a66ed13b0bd4aa03c2 AS tooling
 ENV ERL_FLAGS="+S 2:2"

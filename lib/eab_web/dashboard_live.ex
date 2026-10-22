@@ -37,14 +37,18 @@ defmodule EabWeb.DashboardLive do
         url: "",
         local_url: "",
         local_key: "",
-        chatgpt: false,
+        claude_key: "",
+        provider: "local",
         accounts: Eab.ChatGPTAuth.accounts(),
         account: params["chatgpt"] || "",
         models: [],
         key: "",
         settings: @defaults,
-        local_settings: @defaults,
-        subscription_settings: subscription_defaults(),
+        saved_settings: %{
+          "local" => @defaults,
+          "chatgpt" => subscription_defaults(),
+          "claude" => claude_defaults()
+        },
         error: Phoenix.Flash.get(socket.assigns.flash, :error),
         detecting: false,
         selected: selected,
@@ -81,11 +85,7 @@ defmodule EabWeb.DashboardLive do
       do:
         {:ok,
          discover_chatgpt(
-           assign(socket,
-             url: "https://api.openai.com",
-             chatgpt: true,
-             settings: subscription_defaults()
-           )
+           assign(switch_provider(socket, "chatgpt"), url: "https://api.openai.com")
          )},
       else: {:ok, socket}
   end
@@ -93,14 +93,24 @@ defmodule EabWeb.DashboardLive do
   defp subscription_defaults,
     do: Map.merge(@defaults, %{"max_tokens" => "262144", "reasoning_effort" => "high"})
 
+  defp claude_defaults, do: Map.put(subscription_defaults(), "response_tokens", "")
+
   def handle_event("provider", %{"provider" => "chatgpt"}, socket) do
     Eab.ChatGPTAuth.retry_requests(socket.assigns.account)
 
     {:noreply,
      socket
-     |> provider_settings(true)
-     |> assign(chatgpt: true, url: "https://api.openai.com", key: "")
+     |> switch_provider("chatgpt")
+     |> assign(url: "https://api.openai.com", key: "")
      |> discover_chatgpt()}
+  end
+
+  def handle_event("provider", %{"provider" => "claude"}, socket) do
+    {:noreply,
+     socket
+     |> switch_provider("claude")
+     |> assign(url: "https://api.anthropic.com", key: socket.assigns.claude_key)
+     |> discover_claude()}
   end
 
   def handle_event("provider", %{"provider" => "local"}, socket) do
@@ -125,24 +135,52 @@ defmodule EabWeb.DashboardLive do
       |> cancel_async(:discovery)
       |> assign(url: url, key: key, endpoint: nil, error: nil, detecting: String.trim(url) != "")
 
-    if Eab.OpenAI.endpoint?(url) do
-      Eab.ChatGPTAuth.retry_requests(socket.assigns.account)
+    cond do
+      Eab.OpenAI.endpoint?(url) ->
+        Eab.ChatGPTAuth.retry_requests(socket.assigns.account)
+        {:noreply, discover_chatgpt(assign(switch_provider(socket, "chatgpt"), key: ""))}
 
-      socket = provider_settings(socket, true)
-      {:noreply, discover_chatgpt(assign(socket, chatgpt: true, key: ""))}
-    else
-      {:noreply,
-       socket
-       |> provider_settings(false)
-       |> assign(chatgpt: false, models: [], local_url: url, local_key: key)
-       |> start_async(:discovery, fn ->
-         try do
-           {:ok, if(String.trim(url) == "", do: nil, else: Model.discover(url, key))}
-         rescue
-           e -> {:error, Exception.message(e)}
-         end
-       end)}
+      Eab.Anthropic.endpoint?(url) ->
+        {:noreply,
+         discover_claude(assign(switch_provider(socket, "claude"), claude_key: key, key: key))}
+
+      true ->
+        {:noreply,
+         socket
+         |> switch_provider("local")
+         |> assign(models: [], local_url: url, local_key: key)
+         |> start_async(:discovery, fn ->
+           try do
+             {:ok, if(String.trim(url) == "", do: nil, else: Model.discover(url, key))}
+           rescue
+             e -> {:error, Exception.message(e)}
+           end
+         end)}
     end
+  end
+
+  def handle_event("claude_connect", %{"claude" => %{"key" => key}}, socket),
+    do: {:noreply, discover_claude(assign(socket, claude_key: key, key: key))}
+
+  def handle_event("claude_model", %{"model" => model}, socket) do
+    row = Enum.find(socket.assigns.models, &(&1["id"] == model))
+    endpoint = if row, do: Eab.Anthropic.endpoint(row)
+    efforts = if row, do: row["efforts"], else: []
+    effort = socket.assigns.settings["reasoning_effort"]
+
+    # Keep the chosen effort when the newly selected model supports it.
+    effort =
+      cond do
+        effort in efforts -> effort
+        "high" in efforts -> "high"
+        true -> "default"
+      end
+
+    {:noreply,
+     assign(socket,
+       endpoint: endpoint,
+       settings: Map.put(socket.assigns.settings, "reasoning_effort", effort)
+     )}
   end
 
   def handle_event("chatgpt_account", %{"account" => id}, socket) do
@@ -423,22 +461,37 @@ defmodule EabWeb.DashboardLive do
     {:noreply, load_log(socket)}
   end
 
-  defp provider_settings(socket, subscription) do
-    cond do
-      socket.assigns.chatgpt == subscription ->
-        socket
+  # Each model source keeps its own unsaved settings while the user switches between them.
+  defp switch_provider(%{assigns: %{provider: provider}} = socket, provider), do: socket
 
-      subscription ->
-        assign(socket,
-          local_settings: socket.assigns.settings,
-          settings: socket.assigns.subscription_settings
-        )
+  defp switch_provider(socket, provider) do
+    saved =
+      Map.put(socket.assigns.saved_settings, socket.assigns.provider, socket.assigns.settings)
 
-      true ->
-        assign(socket,
-          subscription_settings: socket.assigns.settings,
-          settings: socket.assigns.local_settings
-        )
+    assign(socket, provider: provider, saved_settings: saved, settings: saved[provider])
+  end
+
+  defp discover_claude(socket) do
+    key = socket.assigns.claude_key
+
+    socket =
+      socket
+      |> cancel_async(:discovery)
+      |> assign(endpoint: nil, models: [], detecting: false, error: nil)
+
+    if String.trim(key) == "" do
+      # Replace any queued discovery so a stale catalog cannot reconnect.
+      start_async(socket, :discovery, fn -> {:ok, nil} end)
+    else
+      socket
+      |> assign(detecting: true)
+      |> start_async(:discovery, fn ->
+        try do
+          {:catalog, Eab.Anthropic.catalog(key)}
+        rescue
+          e -> {:error, Store.redact(Exception.message(e), key)}
+        end
+      end)
     end
   end
 
@@ -647,215 +700,344 @@ defmodule EabWeb.DashboardLive do
           <form id="provider-choice" phx-change="provider">
             <fieldset class="provider-options">
               <legend>Model source</legend>
-              <label class={["provider-option", @chatgpt && "is-selected"]}>
-                <input type="radio" name="provider" value="chatgpt" checked={@chatgpt} />
-                <svg
-                  aria-hidden="true"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.6"
+              <div class="provider-tabs">
+                <label
+                  class={["provider-option", @provider == "local" && "is-selected"]}
+                  title="Local server: llama.cpp or Strata"
                 >
-                  <path d="M20 11a8 8 0 0 1-8 8H5l-4 3V11a9 9 0 0 1 9-9h2a8 8 0 0 1 8 9Z" />
-                  <path d="M7 9h8M7 13h5" />
-                </svg>
-                <span><strong>ChatGPT</strong><small>Use your subscription</small></span>
-              </label>
-              <label class={["provider-option", not @chatgpt && "is-selected"]}>
-                <input type="radio" name="provider" value="local" checked={not @chatgpt} />
-                <svg
-                  aria-hidden="true"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.6"
+                  <input type="radio" name="provider" value="local" checked={@provider == "local"} />
+                  <svg
+                    aria-hidden="true"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                  >
+                    <rect x="3" y="3" width="18" height="7" rx="2" /><rect
+                      x="3"
+                      y="14"
+                      width="18"
+                      height="7"
+                      rx="2"
+                    />
+                    <path d="M7 6.5h.01M7 17.5h.01M11 6.5h6M11 17.5h6" stroke-linecap="round" />
+                  </svg>
+                  <span>Local</span>
+                </label>
+                <label
+                  class={["provider-option", @provider == "chatgpt" && "is-selected"]}
+                  title="ChatGPT: use your subscription"
                 >
-                  <rect x="3" y="3" width="18" height="7" rx="2" /><rect
-                    x="3"
-                    y="14"
-                    width="18"
-                    height="7"
-                    rx="2"
+                  <input
+                    type="radio"
+                    name="provider"
+                    value="chatgpt"
+                    checked={@provider == "chatgpt"}
                   />
-                  <path d="M7 6.5h.01M7 17.5h.01M11 6.5h6M11 17.5h6" stroke-linecap="round" />
-                </svg>
-                <span><strong>Local server</strong><small>llama.cpp or Strata</small></span>
-              </label>
+                  <svg
+                    aria-hidden="true"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                  >
+                    <path d="M20 11a8 8 0 0 1-8 8H5l-4 3V11a9 9 0 0 1 9-9h2a8 8 0 0 1 8 9Z" />
+                    <path d="M7 9h8M7 13h5" />
+                  </svg>
+                  <span>ChatGPT</span>
+                </label>
+                <label
+                  class={["provider-option", @provider == "claude" && "is-selected"]}
+                  title="Claude: use an API key"
+                >
+                  <input
+                    type="radio"
+                    name="provider"
+                    value="claude"
+                    checked={@provider == "claude"}
+                  />
+                  <svg
+                    aria-hidden="true"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                    stroke-linecap="round"
+                  >
+                    <path d="M12 2.5v19M2.5 12h19M5.3 5.3l13.4 13.4M18.7 5.3 5.3 18.7" />
+                  </svg>
+                  <span>Claude</span>
+                </label>
+              </div>
             </fieldset>
           </form>
-          <form :if={not @chatgpt} id="connection" phx-change="connect" phx-submit="connect">
-            <label for="endpoint">Server endpoint</label>
-            <div class="input-row">
-              <input
-                id="endpoint"
-                name="connection[url]"
-                type="url"
-                placeholder="http://localhost:8080"
-                value={@url}
-                phx-debounce="600"
-                required
-                autocomplete="url"
-              /><button type="submit" class="secondary" disabled={@detecting}>Connect</button>
-            </div>
-            <details>
-              <summary>Server credentials</summary><label for="key">API key
-              <span class="muted">— optional, kept in memory</span></label><input
-                id="key"
-                name="connection[key]"
-                type="password"
-                value={@key}
-                phx-debounce="600"
-                autocomplete="off"
-              />
-            </details>
-          </form>
-          <div :if={@chatgpt} class="chatgpt-connection" id="chatgpt-connection">
-            <p class="muted">Sign in to choose a model available to your ChatGPT account.</p>
-            <form :if={@accounts != []} id="chatgpt-account-form" phx-change="chatgpt_account">
-              <label for="chatgpt-account">ChatGPT account / workspace</label>
-              <select id="chatgpt-account" name="account">
-                <option value="" selected={@account == ""}>Add an account or workspace</option>
-                <option
-                  :for={account <- @accounts}
-                  value={account["id"]}
-                  selected={@account == account["id"]}
-                >
-                  {account["label"]}{if account["signed_in"], do: "", else: " (sign in required)"}
-                </option>
-              </select>
-            </form>
-            <a
-              class="secondary chatgpt-sign-in"
-              href={EabWeb.ChatGPTController.base_url() <> "/auth/chatgpt?" <> URI.encode_query(%{"account" => @account})}
-            >Continue with ChatGPT</a>
-            <p class="fine-print">
-              Use your usual sign-in method, including Google, on the next page.
-            </p>
-            <button
-              :if={Enum.any?(@accounts, &(&1["id"] == @account and &1["signed_in"]))}
-              type="button"
-              class="secondary"
-              phx-click="chatgpt_sign_out"
-            >Sign out</button>
-            <p class="fine-print">
-              Uses your ChatGPT plan allowance.
-              <a href="https://chatgpt.com/settings/usage" target="_blank" rel="noreferrer">Manage usage and access</a>
-            </p>
-            <form :if={@models != []} id="chatgpt-model-form" phx-change="chatgpt_model">
-              <label for="chatgpt-model">Available model</label>
-              <select id="chatgpt-model" name="model">
-                <option value="" selected={is_nil(@endpoint)}>Choose a model</option>
-                <option
-                  :for={model <- @models}
-                  value={model["slug"]}
-                  selected={@endpoint && @endpoint["model"] == model["slug"]}
-                >
-                  {model["display_name"] || model["slug"]}
-                </option>
-              </select>
-            </form>
-          </div>
-          <div :if={@detecting} class="model-card" role="status">Reading model details…</div>
-          <div :if={@endpoint} class="model-card">
-            <span class="badge">CONNECTED · {case @endpoint["backend"] do
-              "openai_subscription" -> "CHATGPT"
-              "strata" -> "STRATA"
-              _ -> "LLAMA.CPP"
-            end}</span>
-            <h3>{Eab.ModelIdentity.label(@endpoint)}</h3>
-            <dl :if={not @chatgpt}>
-              <div>
-                <dt>Context capacity</dt><dd>{@endpoint["context"]} tokens</dd>
-              </div><div>
-                <dt>Quantization</dt><dd>
-                  {Eab.ModelIdentity.details(@endpoint)["quantization"] || "Not reported"}
-                </dd>
-              </div><div>
-                <dt>Model weights</dt><dd>{Eab.ModelIdentity.size_label(@endpoint)}</dd>
-              </div><div>
-                <dt>Parameters</dt><dd>{model_detail(@endpoint, "n_params")}</dd>
-              </div><div>
-                <dt>Server build</dt><dd>{@endpoint["profile"]["build_info"] || "Not reported"}</dd>
+          <div
+            id="provider-panel"
+            class="provider-panel"
+            role="group"
+            aria-label={
+              case @provider do
+                "chatgpt" -> "ChatGPT settings"
+                "claude" -> "Claude settings"
+                _ -> "Local server settings"
+              end
+            }
+          >
+            <form
+              :if={@provider == "local"}
+              id="connection"
+              phx-change="connect"
+              phx-submit="connect"
+            >
+              <p class="muted">Connect to a llama.cpp or Strata server you run.</p>
+              <label for="endpoint">Server endpoint</label>
+              <div class="input-row">
+                <input
+                  id="endpoint"
+                  name="connection[url]"
+                  type="url"
+                  placeholder="http://localhost:8080"
+                  value={@url}
+                  phx-debounce="600"
+                  required
+                  autocomplete="url"
+                /><button type="submit" class="secondary" disabled={@detecting}>Connect</button>
               </div>
-            </dl>
-            <p class="fine-print">
-              {@endpoint["identity_note"] ||
-                "Server-reported metadata. Artifact identity is unverified."}
-            </p>
-            <p :if={not @chatgpt} id="memory-collection-status" class="fine-print">
-              {Eab.MemoryMonitor.configuration_label(@endpoint)}
-            </p>
-            <p :if={not @chatgpt} id="server-thinking" class="fine-print">
-              Server thinking preset: {Eab.Thinking.reported(@endpoint) || "Not reported"}
-            </p>
-          </div>
-          <form id="settings" phx-change="settings">
-            <label :if={not @chatgpt}>
-              Model host thinking preset
-              <input
-                name="settings[reasoning_effort]"
-                value={@settings["reasoning_effort"]}
-                list="thinking-presets"
-                maxlength="64"
-                placeholder="Automatic if reported; otherwise enter the host preset"
-              />
-              <datalist id="thinking-presets">
-                <option
-                  :for={effort <- ~w(off on minimal low medium high xhigh max default unsupported)}
-                  value={effort}
+              <details>
+                <summary>Server credentials</summary><label for="key">API key
+                <span class="muted">— optional, kept in memory</span></label><input
+                  id="key"
+                  name="connection[key]"
+                  type="password"
+                  value={@key}
+                  phx-debounce="600"
+                  autocomplete="off"
                 />
-              </datalist>
-            </label>
-            <p :if={not @chatgpt} class="fine-print">
-              Records the preset selected on your model host; does not change it.
-              Use “on” for thinking without a level, or enter the exact level name.
-              Blank uses server metadata when available; otherwise it is saved as not reported.
-            </p>
-            <p id="case-timing-status" class="fine-print">
-              Case timing is always recorded. Preparation and grading are excluded.
-            </p>
-            <details class="advanced">
-              <summary>Advanced run settings</summary>
-              <p :if={not @chatgpt} class="fine-print">
-                Defaults use the detected context up to 262,144 tokens. Full history is retained.
-                Model and tool calls are unlimited.
+              </details>
+            </form>
+            <div :if={@provider == "claude"} class="chatgpt-connection" id="claude-connection">
+              <p class="muted">
+                Connect with a Claude API key to choose a model. Usage is billed per token to the key's organization.
               </p>
-              <p :if={@chatgpt} class="fine-print">
-                Full history is retained. The generated-token threshold is checked between completed responses and can be exceeded by one response. OpenAI controls context and response limits; seed and strict response caps are unavailable. Reasoning tokens count toward the threshold.
+              <form id="claude-key-form" phx-submit="claude_connect">
+                <label for="claude-key">API key <span class="muted">— kept in memory</span></label>
+                <div class="input-row">
+                  <input
+                    id="claude-key"
+                    name="claude[key]"
+                    type="password"
+                    value={@claude_key}
+                    autocomplete="off"
+                    required
+                  /><button type="submit" class="secondary" disabled={@detecting}>Connect</button>
+                </div>
+              </form>
+              <p class="fine-print">
+                <a href="https://platform.claude.com/settings/keys" target="_blank" rel="noreferrer">Manage API keys</a>
+                ·
+                <a href="https://platform.claude.com/usage" target="_blank" rel="noreferrer">Usage and cost</a>
               </p>
-              <label :if={@chatgpt}>
-                Reasoning effort
-                <select name="settings[reasoning_effort]">
+              <form :if={@models != []} id="claude-model-form" phx-change="claude_model">
+                <label for="claude-model">Model</label>
+                <select id="claude-model" name="model">
+                  <option value="" selected={is_nil(@endpoint)}>Choose a model</option>
                   <option
-                    :for={effort <- ~w(default low medium high xhigh)}
+                    :for={model <- @models}
+                    value={model["id"]}
+                    selected={@endpoint && @endpoint["model"] == model["id"]}
+                  >
+                    {model["display_name"]}
+                  </option>
+                </select>
+              </form>
+            </div>
+            <div :if={@provider == "chatgpt"} class="chatgpt-connection" id="chatgpt-connection">
+              <p class="muted">Sign in to choose a model available to your ChatGPT account.</p>
+              <form :if={@accounts != []} id="chatgpt-account-form" phx-change="chatgpt_account">
+                <label for="chatgpt-account">ChatGPT account / workspace</label>
+                <select id="chatgpt-account" name="account">
+                  <option value="" selected={@account == ""}>Add an account or workspace</option>
+                  <option
+                    :for={account <- @accounts}
+                    value={account["id"]}
+                    selected={@account == account["id"]}
+                  >
+                    {account["label"]}{if account["signed_in"], do: "", else: " (sign in required)"}
+                  </option>
+                </select>
+              </form>
+              <a
+                class="secondary chatgpt-sign-in"
+                href={EabWeb.ChatGPTController.base_url() <> "/auth/chatgpt?" <> URI.encode_query(%{"account" => @account})}
+              >Continue with ChatGPT</a>
+              <p class="fine-print">
+                Use your usual sign-in method, including Google, on the next page.
+              </p>
+              <button
+                :if={Enum.any?(@accounts, &(&1["id"] == @account and &1["signed_in"]))}
+                type="button"
+                class="secondary"
+                phx-click="chatgpt_sign_out"
+              >Sign out</button>
+              <p class="fine-print">
+                Uses your ChatGPT plan allowance.
+                <a href="https://chatgpt.com/settings/usage" target="_blank" rel="noreferrer">Manage usage and access</a>
+              </p>
+              <form :if={@models != []} id="chatgpt-model-form" phx-change="chatgpt_model">
+                <label for="chatgpt-model">Available model</label>
+                <select id="chatgpt-model" name="model">
+                  <option value="" selected={is_nil(@endpoint)}>Choose a model</option>
+                  <option
+                    :for={model <- @models}
+                    value={model["slug"]}
+                    selected={@endpoint && @endpoint["model"] == model["slug"]}
+                  >
+                    {model["display_name"] || model["slug"]}
+                  </option>
+                </select>
+              </form>
+            </div>
+            <div :if={@detecting} class="model-card" role="status">Reading model details…</div>
+            <div :if={@endpoint} class="model-card">
+              <span class="badge">CONNECTED · {case @endpoint["backend"] do
+                "openai_subscription" -> "CHATGPT"
+                "anthropic" -> "CLAUDE API"
+                "strata" -> "STRATA"
+                _ -> "LLAMA.CPP"
+              end}</span>
+              <h3>{Eab.ModelIdentity.label(@endpoint)}</h3>
+              <dl :if={@provider == "claude"}>
+                <div>
+                  <dt>Model ID</dt><dd>{@endpoint["model"]}</dd>
+                </div><div>
+                  <dt>Context window</dt><dd>{@endpoint["context"] || "Not reported"} tokens</dd>
+                </div><div>
+                  <dt>Max output</dt><dd>
+                    {@endpoint["profile"]["max_tokens"] || "Not reported"} tokens
+                  </dd>
+                </div>
+              </dl>
+              <dl :if={@provider == "local"}>
+                <div>
+                  <dt>Context capacity</dt><dd>{@endpoint["context"]} tokens</dd>
+                </div><div>
+                  <dt>Quantization</dt><dd>
+                    {Eab.ModelIdentity.details(@endpoint)["quantization"] || "Not reported"}
+                  </dd>
+                </div><div>
+                  <dt>Model weights</dt><dd>{Eab.ModelIdentity.size_label(@endpoint)}</dd>
+                </div><div>
+                  <dt>Parameters</dt><dd>{model_detail(@endpoint, "n_params")}</dd>
+                </div><div>
+                  <dt>Server build</dt><dd>{@endpoint["profile"]["build_info"] || "Not reported"}</dd>
+                </div>
+              </dl>
+              <p class="fine-print">
+                {@endpoint["identity_note"] ||
+                  "Server-reported metadata. Artifact identity is unverified."}
+              </p>
+              <p :if={@provider == "local"} id="memory-collection-status" class="fine-print">
+                {Eab.MemoryMonitor.configuration_label(@endpoint)}
+              </p>
+              <p :if={@provider == "local"} id="server-thinking" class="fine-print">
+                Server thinking preset: {Eab.Thinking.reported(@endpoint) || "Not reported"}
+              </p>
+            </div>
+            <form id="settings" phx-change="settings">
+              <label :if={@provider == "claude" and @endpoint}>
+                Effort
+                <select id="claude-effort" name="settings[reasoning_effort]">
+                  <option
+                    :for={effort <- (@endpoint["profile"]["efforts"] || []) ++ ["default"]}
                     value={effort}
                     selected={@settings["reasoning_effort"] == effort}
                   >
-                    {effort}
+                    {Eab.Anthropic.effort_label(effort)}
                   </option>
                 </select>
               </label>
-              <div class="settings-grid">
-                <label :for={
-                  {key, title} <-
-                    if(@chatgpt,
-                      do: [{"max_tokens", "Generated-token threshold per case"}],
-                      else: [
-                        {"window_tokens", "Context tokens (blank = automatic)"},
-                        {"response_tokens", "Tokens per response (blank = up to 8,192)"},
-                        {"max_tokens", "Generated tokens per case"},
-                        {"seed", "Seed"}
-                      ]
-                    )
-                }>{title}<input
-                  type="number"
-                  min={if key == "seed", do: "0", else: "1"}
-                  name={"settings[#{key}]"}
-                  value={@settings[key]}
-                /></label>
-              </div>
-            </details>
-          </form>
+              <p :if={@provider == "claude" and @endpoint} class="fine-print">
+                Sent as the API effort level with adaptive thinking on every request. Thinking counts toward the token limits.
+              </p>
+              <label :if={@provider == "local"}>
+                Model host thinking preset
+                <input
+                  name="settings[reasoning_effort]"
+                  value={@settings["reasoning_effort"]}
+                  list="thinking-presets"
+                  maxlength="64"
+                  placeholder="Automatic if reported; otherwise enter the host preset"
+                />
+                <datalist id="thinking-presets">
+                  <option
+                    :for={effort <- ~w(off on minimal low medium high xhigh max default unsupported)}
+                    value={effort}
+                  />
+                </datalist>
+              </label>
+              <p :if={@provider == "local"} class="fine-print">
+                Records the preset selected on your model host; does not change it.
+                Use “on” for thinking without a level, or enter the exact level name.
+                Blank uses server metadata when available; otherwise it is saved as not reported.
+              </p>
+              <p id="case-timing-status" class="fine-print">
+                Case timing is always recorded. Preparation and grading are excluded.
+              </p>
+              <details class="advanced">
+                <summary>Advanced run settings</summary>
+                <p :if={@provider == "local"} class="fine-print">
+                  Defaults use the detected context up to 262,144 tokens. Full history is retained.
+                  Model and tool calls are unlimited.
+                </p>
+                <p :if={@provider == "chatgpt"} class="fine-print">
+                  Full history is retained. The generated-token threshold is checked between completed responses and can be exceeded by one response. OpenAI controls context and response limits; seed and strict response caps are unavailable. Reasoning tokens count toward the threshold.
+                </p>
+                <p :if={@provider == "claude"} class="fine-print">
+                  Full history is retained. The generated-token threshold is checked between completed responses and can be exceeded by one response. The Claude API enforces the model's context window; seed is unavailable. Thinking tokens count toward the threshold and each response cap.
+                </p>
+                <label :if={@provider == "chatgpt"}>
+                  Reasoning effort
+                  <select name="settings[reasoning_effort]">
+                    <option
+                      :for={effort <- ~w(default low medium high xhigh)}
+                      value={effort}
+                      selected={@settings["reasoning_effort"] == effort}
+                    >
+                      {effort}
+                    </option>
+                  </select>
+                </label>
+                <div class="settings-grid">
+                  <label :for={
+                    {key, title} <-
+                      case @provider do
+                        "chatgpt" ->
+                          [{"max_tokens", "Generated-token threshold per case"}]
+
+                        "claude" ->
+                          [
+                            {"max_tokens", "Generated-token threshold per case"},
+                            {"response_tokens", "Tokens per response (blank = up to 64,000)"}
+                          ]
+
+                        _ ->
+                          [
+                            {"window_tokens", "Context tokens (blank = automatic)"},
+                            {"response_tokens", "Tokens per response (blank = up to 8,192)"},
+                            {"max_tokens", "Generated tokens per case"},
+                            {"seed", "Seed"}
+                          ]
+                      end
+                  }>{title}<input
+                    type="number"
+                    min={if key == "seed", do: "0", else: "1"}
+                    name={"settings[#{key}]"}
+                    value={@settings[key]}
+                  /></label>
+                </div>
+              </details>
+            </form>
+          </div>
           <button
             id="run"
             class="primary"

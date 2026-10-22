@@ -20,6 +20,7 @@ const fail = (error) => {
 };
 process.on('uncaughtException', fail);
 process.on('unhandledRejection', fail);
+if (!(config.bash_timeout_seconds > 0)) fail(new Error('Missing bash timeout'));
 
 function lines(stream, callback) {
   let buffer = '';
@@ -83,7 +84,8 @@ server.listen(0, '127.0.0.1', () => {
     '--append-system-prompt', instructions, `@${prompt}`
   ], {
     cwd: process.cwd(), detached: true, stdio: ['ignore', 'pipe', 'pipe'],
-    env: {...process.env, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: '1', PI_TELEMETRY: '0'}
+    env: {...process.env, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: '1', PI_TELEMETRY: '0',
+      EAB_BASH_TIMEOUT_SECONDS: String(config.bash_timeout_seconds)}
   });
   child.on('error', fail);
   lines(child.stdout, (event) => emit({type: 'event', event}));
