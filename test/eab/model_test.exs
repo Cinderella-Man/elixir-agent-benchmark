@@ -69,6 +69,32 @@ defmodule Eab.ModelTest do
     assert_raise RuntimeError, fn -> Model.stream_usage(endpoint("strata"), strata, 10, 20) end
     assert_raise RuntimeError, fn -> Model.stream_usage(endpoint("strata"), strata, 100, 11) end
 
+    # Strata 0.2 streams the whole prompt first, then re-reports it as one input
+    # token plus cache creation and reuse.
+    strata_0_2 =
+      "data: " <>
+        Jason.encode!(%{
+          "type" => "message_start",
+          "message" => %{"usage" => %{"input_tokens" => 100, "output_tokens" => 0}}
+        }) <>
+        "\n\ndata: " <>
+        Jason.encode!(%{
+          "type" => "message_delta",
+          "usage" => %{
+            "input_tokens" => 1,
+            "cache_creation_input_tokens" => 65,
+            "cache_read_input_tokens" => 34,
+            "output_tokens" => 12
+          }
+        }) <>
+        "\n\ndata: {\"type\":\"message_stop\"}\n\n"
+
+    assert Model.stream_usage(endpoint("strata"), strata_0_2, 100, 20)["input_tokens"] == 100
+
+    assert_raise RuntimeError, fn ->
+      Model.stream_usage(endpoint("strata"), strata_0_2, 35, 20)
+    end
+
     llama =
       "data: " <>
         Jason.encode!(%{

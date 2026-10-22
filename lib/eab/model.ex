@@ -184,11 +184,14 @@ defmodule Eab.Model do
            end)}
       end
 
+    # Strata 0.2 reports a prompt as input_tokens 1 plus cache_creation_input_tokens
+    # (Anthropic's split); its prompt size is the sum of all three fields.
     {input, output} =
       if endpoint["backend"] == "strata",
         do:
-          {add_usage(usage["input_tokens"], usage["cache_read_input_tokens"] || 0),
-           usage["output_tokens"]},
+          {usage["input_tokens"]
+           |> add_usage(usage["cache_creation_input_tokens"] || 0)
+           |> add_usage(usage["cache_read_input_tokens"] || 0), usage["output_tokens"]},
         else: {usage["prompt_tokens"], usage["completion_tokens"]}
 
     unless complete, do: raise("Model stream ended without a completion marker")
